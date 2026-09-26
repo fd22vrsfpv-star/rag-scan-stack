@@ -23768,6 +23768,139 @@ def export_msf_options_endpoint(_: bool = Depends(auth)):
     return {"ok": True, "count": len(modules), "yaml": yaml_text}
 
 
+# ── Vuln-class skill authoring (DB overlay on the read-only YAML) ────────────
+# Mirrors the flow/enumeration-rule overlay: operators add skills that merge over
+# knowledge/vuln_class_methodology.yaml (via common/vuln_skills._classes) and embed
+# into rag_documents, with no code change per skill.
+VULN_SKILL_RAG_SOURCE = "custom_vuln_skill"
+
+_CUSTOM_SKILLS_DDL = """
+CREATE TABLE IF NOT EXISTS public.custom_vuln_skills (
+    id text PRIMARY KEY, skill jsonb NOT NULL,
+    enabled boolean NOT NULL DEFAULT true, engagement_id uuid,
+    created_by text, created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now())
+"""
+
+
+def _skill_rag_text(cid: str, skill: Dict[str, Any]) -> tuple:
+    aliases = ", ".join(str(a) for a in (skill.get("aliases") or []))
+    wh = str(skill.get("web_hint") or "").strip()
+    sm = str(skill.get("synth_methodology") or "").strip()
+    title = f"Exploitation methodology: {cid}"
+    body = (f"Vulnerability class '{cid}' (aliases: {aliases}). "
+            f"Web testing/exploitation: {wh} Proving impact: {sm}")
+    return title, body
+
+
+def _load_skill_into_rag(cid: str, skill: Dict[str, Any]) -> bool:
+    try:
+        title, body = _skill_rag_text(cid, skill)
+        vec = _embed_text(f"{title}\n{body}")
+        vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+        meta = {"source": VULN_SKILL_RAG_SOURCE, "kind": "vuln_skill", "skill_id": cid}
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM rag_documents WHERE metadata->>'source' = %s "
+                        "AND metadata->>'skill_id' = %s", (VULN_SKILL_RAG_SOURCE, cid))
+            cur.execute("INSERT INTO rag_documents (title, text_chunk, metadata, embedding) "
+                        "VALUES (%s, %s, %s, %s::vector)", (title, body, Json(meta), vec_str))
+            conn.commit()
+        return True
+    except Exception as e:  # noqa: BLE001
+        logging.warning("skill->rag load failed for %s: %s", cid, e)
+        return False
+
+
+def _remove_skill_from_rag(cid: str) -> None:
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM rag_documents WHERE metadata->>'source' = %s "
+                        "AND metadata->>'skill_id' = %s", (VULN_SKILL_RAG_SOURCE, cid))
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("skill->rag delete failed for %s: %s", cid, e)
+
+
+class VulnSkill(BaseModel):
+    id: str
+    aliases: List[str] = []
+    web_hint: Optional[str] = ""
+    synth_methodology: Optional[str] = ""
+    enabled: bool = True
+    engagement_id: Optional[str] = None
+
+
+class SkillTestBody(BaseModel):
+    issue_type: Optional[str] = None
+    cwe: Optional[str] = None
+    name: Optional[str] = None
+
+
+@app.get("/skills", tags=["Skills"])
+def list_vuln_skills(_: bool = Depends(auth)):
+    """Every vuln-class skill: the YAML packs plus the operator DB overlay."""
+    from common import vuln_skills as _vs
+    yaml_pack = _vs.load_pack().get("classes", {}) or {}
+    custom = {}
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(_CUSTOM_SKILLS_DDL)
+            cur.execute("SELECT id, skill, enabled FROM custom_vuln_skills")
+            for cid, skill, en in cur.fetchall():
+                custom[cid] = {**(skill or {}), "enabled": en}
+    except Exception:  # noqa: BLE001
+        pass
+    return {"yaml_skills": yaml_pack, "custom_skills": custom,
+            "total": len(set(yaml_pack) | set(custom))}
+
+
+@app.post("/skills/test", tags=["Skills"])
+def test_vuln_skill(body: SkillTestBody, _: bool = Depends(auth)):
+    """Resolve a finding to a vuln-class skill (YAML + overlay) and preview it."""
+    from common import vuln_skills as _vs
+    m = _vs.match(issue_type=body.issue_type, cwe=body.cwe, name=body.name)
+    return {"matched": bool(m), "skill": m}
+
+
+@app.post("/skills", tags=["Skills"])
+def add_vuln_skill(skill: VulnSkill,
+                   x_operator: str = Header("operator", alias="X-Operator"),
+                   _: bool = Depends(auth)):
+    """Add or update a custom vuln-class skill in the DB overlay + embed into RAG."""
+    cid = skill.id.strip()
+    if not cid:
+        raise HTTPException(400, "skill needs an id (the canonical class, e.g. sqli)")
+    if len(skill.web_hint or "") > 700 or len(skill.synth_methodology or "") > 1500:
+        raise HTTPException(400, "web_hint<=700 and synth_methodology<=1500 chars")
+    payload = {"aliases": skill.aliases, "web_hint": skill.web_hint or "",
+               "synth_methodology": skill.synth_methodology or ""}
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute(_CUSTOM_SKILLS_DDL)
+        cur.execute(
+            """INSERT INTO custom_vuln_skills (id, skill, enabled, engagement_id, created_by)
+               VALUES (%s, %s, %s, %s::uuid, %s)
+               ON CONFLICT (id) DO UPDATE SET skill = EXCLUDED.skill,
+                   enabled = EXCLUDED.enabled, engagement_id = EXCLUDED.engagement_id,
+                   updated_at = now()""",
+            (cid, json.dumps(payload), skill.enabled, skill.engagement_id, x_operator))
+        conn.commit()
+    rag_loaded = _load_skill_into_rag(cid, payload) if skill.enabled else False
+    return {"ok": True, "id": cid, "rag_loaded": rag_loaded}
+
+
+@app.delete("/skills/{skill_id}", tags=["Skills"])
+def delete_vuln_skill(skill_id: str, _: bool = Depends(auth)):
+    """Remove a custom skill from the overlay (YAML packs are not affected)."""
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM custom_vuln_skills WHERE id = %s", (skill_id,))
+        n = cur.rowcount
+        conn.commit()
+    if not n:
+        raise HTTPException(404, f"custom skill {skill_id} not found")
+    _remove_skill_from_rag(skill_id)
+    return {"ok": True, "deleted": skill_id}
+
+
 class FlowRule(BaseModel):
     id: str
     when: Dict[str, Any]

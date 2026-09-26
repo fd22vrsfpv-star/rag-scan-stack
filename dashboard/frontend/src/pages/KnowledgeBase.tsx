@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { cn } from '@/lib/utils'
 import PageHelp from '@/components/PageHelp'
 import { useIngestPlaybooks, useServiceDocs } from '@/api/rag'
 import {
@@ -30,6 +31,7 @@ import {
   type FlowRule,
   type FlowProposal,
 } from '@/api/flows'
+import { useSkills, useAddSkill, useDeleteSkill } from '@/api/skills'
 import { useEngagements } from '@/api/engagements'
 import { useUIStore } from '@/stores/ui'
 
@@ -1202,6 +1204,62 @@ function FlowsPanel() {
   )
 }
 
+function SkillsPanel() {
+  const { data } = useSkills()
+  const add = useAddSkill()
+  const del = useDeleteSkill()
+  const [open, setOpen] = useState(false)
+  const [f, setF] = useState({ id: '', aliases: '', web_hint: '', synth_methodology: '' })
+  const inp = 'w-full bg-muted rounded-md px-2 py-1 text-sm border border-border outline-none focus:border-primary'
+  const yaml = data?.yaml_skills || {}
+  const custom = data?.custom_skills || {}
+  return (
+    <div className="border border-border rounded-lg p-3 space-y-2">
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-medium">Vuln-class skills <span className="text-xs text-muted-foreground">({data?.total ?? 0})</span></h3>
+        <button onClick={() => setOpen(o => !o)} className="text-xs text-primary">{open ? 'Hide' : 'Add / manage'}</button>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        Curated per-class methodology fed to the exploit builders. Shipped packs are
+        read-only; add or override a class in the DB overlay — no code change, embeds into RAG.
+      </p>
+      {open && (
+        <div className="space-y-2">
+          <div className="grid grid-cols-2 gap-2">
+            <input className={inp} placeholder="class id (e.g. deserialization)" value={f.id} onChange={e => setF(v => ({ ...v, id: e.target.value }))} />
+            <input className={inp} placeholder="aliases (comma-separated)" value={f.aliases} onChange={e => setF(v => ({ ...v, aliases: e.target.value }))} />
+          </div>
+          <textarea className={cn(inp, 'font-mono h-16')} placeholder="web_hint (<=700 chars: techniques, payloads, success signals)" value={f.web_hint} onChange={e => setF(v => ({ ...v, web_hint: e.target.value }))} />
+          <textarea className={cn(inp, 'font-mono h-20')} placeholder="synth_methodology (<=1500 chars: how to prove impact)" value={f.synth_methodology} onChange={e => setF(v => ({ ...v, synth_methodology: e.target.value }))} />
+          <button
+            onClick={() => add.mutate({ id: f.id.trim(), aliases: f.aliases.split(',').map(a => a.trim()).filter(Boolean), web_hint: f.web_hint, synth_methodology: f.synth_methodology, enabled: true },
+              { onSuccess: () => setF({ id: '', aliases: '', web_hint: '', synth_methodology: '' }) })}
+            disabled={add.isPending || !f.id.trim() || (!f.web_hint && !f.synth_methodology)}
+            className="px-3 py-1.5 bg-primary text-primary-foreground rounded-md text-sm disabled:opacity-50">
+            {add.isPending ? 'Saving\u2026' : 'Add / update skill'}
+          </button>
+          {add.isError && <p className="text-xs text-red-400">{String((add.error as Error)?.message || 'save failed')}</p>}
+          <div className="text-xs">
+            <p className="text-muted-foreground mt-2 mb-1">Custom (overlay):</p>
+            {Object.keys(custom).length === 0 ? <p className="text-muted-foreground">none yet</p> : (
+              <ul className="space-y-1">
+                {Object.keys(custom).sort().map(id => (
+                  <li key={id} className="flex items-center justify-between border border-border rounded px-2 py-1">
+                    <span className="font-mono">{id}</span>
+                    <button onClick={() => del.mutate(id)} className="text-red-400 text-[11px]">delete</button>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <p className="text-muted-foreground mt-2 mb-1">Shipped (read-only): <span className="font-mono">{Object.keys(yaml).sort().join(', ')}</span></p>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+
 export default function KnowledgeBase() {
   const { data, isLoading } = useKBServices()
   const [selected, setSelected] = useState<string | null>(null)
@@ -1328,6 +1386,7 @@ export default function KnowledgeBase() {
 
       <AskKnowledgeBase />
       <FlowsPanel />
+      <SkillsPanel />
       <TrainingDataPanel />
       <RetrievalQualityPanel />
 

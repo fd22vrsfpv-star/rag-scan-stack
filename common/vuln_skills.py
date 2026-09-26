@@ -70,8 +70,49 @@ def load_pack() -> Dict[str, Any]:
         return _cache
 
 
+_overlay_cache: Optional[Dict[str, Any]] = None
+_overlay_at: float = 0.0
+_OVERLAY_TTL = float(os.environ.get("VULN_SKILL_OVERLAY_TTL", "30"))
+
+
+def _load_custom_skills() -> Dict[str, Any]:
+    """Enabled rows from the custom_vuln_skills DB overlay (operator-added skills),
+    or {}. Best-effort + short TTL cache so the exploit-build hot path never blocks
+    on the DB; fail-soft keeps the last good cache. Mirrors how post_enumeration
+    merges YAML rules with a DB overlay."""
+    global _overlay_cache, _overlay_at
+    import time
+    now = time.time()
+    if _overlay_cache is not None and (now - _overlay_at) < _OVERLAY_TTL:
+        return _overlay_cache
+    dsn = os.environ.get("DB_DSN")
+    out: Dict[str, Any] = {}
+    if dsn:
+        try:
+            import psycopg2
+            conn = psycopg2.connect(dsn, connect_timeout=3)
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT id, skill FROM custom_vuln_skills WHERE enabled")
+                for cid, skill in cur.fetchall():
+                    if isinstance(skill, dict):
+                        out[str(cid)] = skill
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001
+            out = _overlay_cache or {}   # fail-soft: never block a build
+    _overlay_cache, _overlay_at = out, now
+    return out
+
+
 def _classes() -> Dict[str, Any]:
-    return load_pack().get("classes", {}) or {}
+    # YAML classes + the operator DB overlay (overlay wins: add or override).
+    base = dict(load_pack().get("classes", {}) or {})
+    try:
+        base.update(_load_custom_skills())
+    except Exception:  # noqa: BLE001
+        pass
+    return base
 
 
 def resolve(
