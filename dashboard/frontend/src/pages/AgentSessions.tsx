@@ -30,6 +30,7 @@ import {
   useCompareSources,
 } from '@/api/securityTests'
 import type { SecurityTest, WstgGuide } from '@/api/securityTests'
+import { useAddSkill } from '@/api/skills'
 import { apiFetch } from '@/api/client'
 import { useScopeNames, useScope } from '@/api/scope'
 import { StatusDot } from '@/components/common/StatusDot'
@@ -1358,6 +1359,18 @@ function SourceCompareForm({ sessionId }: { sessionId?: string }) {
   const [open, setOpen] = useState(false)
   const [f, setF] = useState({ issue_type: '', url: '', cwe: '', name: '', target: '' })
   const cmp = useCompareSources(sessionId)
+  const addSkill = useAddSkill()
+  const [saved, setSaved] = useState<Record<string, string>>({})
+  const saveAsSkill = (sc: string, spec: { tool?: string; command?: string; rationale?: string }) => {
+    const dflt = (f.issue_type || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '')
+    const id = window.prompt(`Save "${sc}" output as a skill for which vuln class? (existing id updates it)`, dflt || sc)
+    if (!id) return
+    const synth = `Proven (${sc}/${spec.tool || 'tool'}): ${spec.command || ''}\nWhy: ${spec.rationale || ''}`.slice(0, 1500)
+    addSkill.mutate(
+      { id: id.trim(), aliases: f.issue_type ? [f.issue_type] : [], synth_methodology: synth, enabled: true },
+      { onSuccess: () => setSaved(v => ({ ...v, [sc]: id.trim() })) },
+    )
+  }
   const inp = 'w-full bg-muted rounded-md px-2 py-1 text-sm border border-border outline-none focus:border-primary'
   const bySource = cmp.data?.by_source
   const order = ['skill', 'rag', 'yaml']
@@ -1400,6 +1413,12 @@ function SourceCompareForm({ sessionId }: { sessionId?: string }) {
                         <pre className="text-[11px] font-mono whitespace-pre-wrap break-all bg-background/60 border border-border rounded p-1 max-h-40 overflow-auto">{spec.command}</pre>
                         <pre className="text-[10px] font-mono whitespace-pre-wrap bg-background/40 rounded p-1 max-h-24 overflow-auto">{JSON.stringify(spec.assertion)}</pre>
                         <p className="text-[10px] text-muted-foreground">{spec.rationale}</p>
+                        <button
+                          onClick={() => saveAsSkill(sc, spec)}
+                          disabled={addSkill.isPending}
+                          className="text-[10px] px-1.5 py-0.5 rounded border border-border hover:border-primary disabled:opacity-50">
+                          {saved[sc] ? `\u2713 saved as ${saved[sc]}` : 'Save as skill'}
+                        </button>
                       </>
                     ) : (
                       <p className="text-[11px] text-red-400">{r.error || 'no result'}</p>

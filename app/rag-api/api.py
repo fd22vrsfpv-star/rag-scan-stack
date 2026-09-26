@@ -23888,6 +23888,33 @@ def add_vuln_skill(skill: VulnSkill,
     return {"ok": True, "id": cid, "rag_loaded": rag_loaded}
 
 
+@app.get("/skills/export-yaml", tags=["Skills"])
+def export_skills_yaml(_: bool = Depends(auth)):
+    """Merged skills (shipped YAML packs + enabled DB overlay) as a YAML document,
+    so an operator can PROMOTE overlay additions into the committed
+    knowledge/vuln_class_methodology.yaml (read-only in the container). Overlay wins
+    per class. Use scripts/promote-skills.sh to write + review the file."""
+    import yaml as _yaml
+    from common import vuln_skills as _vs
+    pack = _vs.load_pack()
+    classes = dict(pack.get("classes", {}) or {})
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(_CUSTOM_SKILLS_DDL)
+            cur.execute("SELECT id, skill FROM custom_vuln_skills WHERE enabled")
+            for cid, skill in cur.fetchall():
+                if isinstance(skill, dict):
+                    classes[str(cid)] = {
+                        "aliases": skill.get("aliases") or [],
+                        "web_hint": skill.get("web_hint") or "",
+                        "synth_methodology": skill.get("synth_methodology") or ""}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"overlay read failed: {e}")
+    doc = {"version": pack.get("version", 1), "classes": classes}
+    text = _yaml.safe_dump(doc, sort_keys=True, allow_unicode=True, width=100)
+    return {"ok": True, "classes": len(classes), "yaml": text}
+
+
 @app.delete("/skills/{skill_id}", tags=["Skills"])
 def delete_vuln_skill(skill_id: str, _: bool = Depends(auth)):
     """Remove a custom skill from the overlay (YAML packs are not affected)."""
