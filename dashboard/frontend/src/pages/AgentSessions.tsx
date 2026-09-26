@@ -17,6 +17,7 @@ import {
 } from '@/api/agentSessions'
 import type { AgentSession, AgentMessage, SessionScan } from '@/api/agentSessions'
 import { useModelPerformanceWarning } from '@/api/agents'
+import { usePendingExploits } from '@/api/exploits'
 import {
   useSessionSecurityTests,
   useSecurityTestRuns,
@@ -564,8 +565,17 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   // which is why /resume (a new child session) is the wrong control here.
   const isAwaitingApproval = session?.status === 'awaiting_approval'
   const { data: pendingApproval } = usePendingApproval(sessionId, isAwaitingApproval)
+  // Pending exploits to offer as an approval dropdown (instead of typing an id).
+  // Only fetched while paused for approval; falls back to manual entry if empty.
+  const { data: pendingExploits } = usePendingExploits(isAwaitingApproval)
   const approveSession = useApproveSession()
   const [approveExploitId, setApproveExploitId] = useState('')
+  useEffect(() => {
+    if (isAwaitingApproval && !approveExploitId
+        && pendingExploits && pendingExploits.length === 1) {
+      setApproveExploitId(pendingExploits[0].id)
+    }
+  }, [isAwaitingApproval, pendingExploits, approveExploitId])
   const [approveNote, setApproveNote] = useState('')
 
   const handleResume = () => {
@@ -725,12 +735,30 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <input
-              value={approveExploitId}
-              onChange={e => setApproveExploitId(e.target.value)}
-              placeholder="pending_exploit_id (required to approve)"
-              className="flex-1 min-w-[18rem] px-2 py-1.5 bg-background border border-border rounded-md text-xs font-mono"
-            />
+            {pendingExploits && pendingExploits.length > 0 ? (
+              <select
+                value={approveExploitId}
+                onChange={e => setApproveExploitId(e.target.value)}
+                className="flex-1 min-w-[18rem] px-2 py-1.5 bg-background border border-border rounded-md text-xs font-mono"
+              >
+                <option value="">Select the exploit to approve…</option>
+                {pendingExploits.map(ex => (
+                  <option key={ex.id} value={ex.id}>
+                    {(ex.title || ex.module_path || ex.exploit_id || ex.id)}
+                    {ex.target_ip ? ` — ${ex.target_ip}${ex.target_port ? ':' + ex.target_port : ''}` : ''}
+                    {ex.exploit_type ? ` [${ex.exploit_type}]` : ''}
+                    {` (${ex.id.slice(0, 8)})`}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                value={approveExploitId}
+                onChange={e => setApproveExploitId(e.target.value)}
+                placeholder="pending_exploit_id (no pending exploits listed — paste an id)"
+                className="flex-1 min-w-[18rem] px-2 py-1.5 bg-background border border-border rounded-md text-xs font-mono"
+              />
+            )}
             <input
               value={approveNote}
               onChange={e => setApproveNote(e.target.value)}
