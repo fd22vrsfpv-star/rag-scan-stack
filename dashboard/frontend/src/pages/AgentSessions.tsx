@@ -27,8 +27,10 @@ import {
   useExportTestBurp,
   useSendTestToBurp,
   useSynthesizeTest,
+  useCompareSources,
 } from '@/api/securityTests'
 import type { SecurityTest, WstgGuide } from '@/api/securityTests'
+import { useAddSkill } from '@/api/skills'
 import { apiFetch } from '@/api/client'
 import { useScopeNames, useScope } from '@/api/scope'
 import { StatusDot } from '@/components/common/StatusDot'
@@ -565,6 +567,12 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   const isAwaitingApproval = session?.status === 'awaiting_approval'
   const { data: pendingApproval } = usePendingApproval(sessionId, isAwaitingApproval)
   const approveSession = useApproveSession()
+  // The operator picks from THIS session's queued exploits, not a free-text UUID
+  // — pasting the session id from the URL was how an approval became "Exploit
+  // not found". Empty selection = approve everything queued.
+  const queuedExploits = pendingApproval?.pending?.queued_exploits ?? []
+  const queuedIds = pendingApproval?.pending?.queued_exploit_ids ?? []
+  const hasQueuedList = queuedExploits.length > 0 || queuedIds.length > 0
   const [approveExploitId, setApproveExploitId] = useState('')
   const [approveNote, setApproveNote] = useState('')
 
@@ -725,12 +733,33 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <input
-              value={approveExploitId}
-              onChange={e => setApproveExploitId(e.target.value)}
-              placeholder="pending_exploit_id (required to approve)"
-              className="flex-1 min-w-[18rem] px-2 py-1.5 bg-background border border-border rounded-md text-xs font-mono"
-            />
+            {hasQueuedList ? (
+              <select
+                value={approveExploitId}
+                onChange={e => setApproveExploitId(e.target.value)}
+                className="flex-1 min-w-[18rem] px-2 py-1.5 bg-background border border-border rounded-md text-xs font-mono"
+              >
+                <option value="">
+                  All queued exploit(s) ({queuedExploits.length || queuedIds.length})
+                </option>
+                {queuedExploits.length
+                  ? queuedExploits.map(q => (
+                      <option key={q.id} value={q.id}>
+                        {(q.title || q.source || 'exploit')}{q.target ? ` → ${q.target}` : ''} ({q.id.slice(0, 8)})
+                      </option>
+                    ))
+                  : queuedIds.map(id => (
+                      <option key={id} value={id}>{id}</option>
+                    ))}
+              </select>
+            ) : (
+              <input
+                value={approveExploitId}
+                onChange={e => setApproveExploitId(e.target.value)}
+                placeholder="pending_exploit_id (required to approve)"
+                className="flex-1 min-w-[18rem] px-2 py-1.5 bg-background border border-border rounded-md text-xs font-mono"
+              />
+            )}
             <input
               value={approveNote}
               onChange={e => setApproveNote(e.target.value)}
@@ -741,13 +770,19 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
               onClick={() => approveSession.mutate({
                 id: sessionId,
                 approved: true,
-                pending_exploit_id: approveExploitId.trim(),
+                // A list is available: empty selection = approve all queued
+                // (omit ids). Fallback text box: send the one typed id.
+                ...(hasQueuedList
+                  ? (approveExploitId ? { pending_exploit_ids: [approveExploitId] } : {})
+                  : { pending_exploit_id: approveExploitId.trim() }),
                 note: approveNote || undefined,
               })}
-              disabled={!approveExploitId.trim() || approveSession.isPending}
-              title={approveExploitId.trim()
-                ? 'Execute the queued exploit and continue'
-                : 'Enter the pending_exploit_id to approve'}
+              disabled={approveSession.isPending || (!hasQueuedList && !approveExploitId.trim())}
+              title={hasQueuedList
+                ? (approveExploitId ? 'Execute the selected exploit and continue'
+                                    : 'Execute every queued exploit and continue')
+                : (approveExploitId.trim() ? 'Execute the queued exploit and continue'
+                                           : 'Enter the pending_exploit_id to approve')}
               className="flex items-center gap-1.5 px-3 py-1.5 bg-purple-600 text-white rounded-md text-sm hover:bg-purple-700 disabled:opacity-50"
             >
               <Check className="h-3.5 w-3.5" /> Approve &amp; run
@@ -1353,12 +1388,94 @@ function CustomPayloadForm({ sessionId }: { sessionId?: string }) {
   )
 }
 
+function SourceCompareForm({ sessionId }: { sessionId?: string }) {
+  const [open, setOpen] = useState(false)
+  const [f, setF] = useState({ issue_type: '', url: '', cwe: '', name: '', target: '' })
+  const cmp = useCompareSources(sessionId)
+  const addSkill = useAddSkill()
+  const [saved, setSaved] = useState<Record<string, string>>({})
+  const saveAsSkill = (sc: string, spec: { tool?: string; command?: string; rationale?: string }) => {
+    const dflt = (f.issue_type || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '')
+    const id = window.prompt(`Save "${sc}" output as a skill for which vuln class? (existing id updates it)`, dflt || sc)
+    if (!id) return
+    const synth = `Proven (${sc}/${spec.tool || 'tool'}): ${spec.command || ''}\nWhy: ${spec.rationale || ''}`.slice(0, 1500)
+    addSkill.mutate(
+      { id: id.trim(), aliases: f.issue_type ? [f.issue_type] : [], synth_methodology: synth, enabled: true },
+      { onSuccess: () => setSaved(v => ({ ...v, [sc]: id.trim() })) },
+    )
+  }
+  const inp = 'w-full bg-muted rounded-md px-2 py-1 text-sm border border-border outline-none focus:border-primary'
+  const bySource = cmp.data?.by_source
+  const order = ['skill', 'rag', 'yaml']
+  return (
+    <div className="border border-border rounded-lg p-3 space-y-2">
+      <button onClick={() => setOpen(o => !o)} className="text-sm font-medium flex items-center gap-1">
+        {open ? '\u25be' : '\u25b8'} Compare knowledge sources (skill vs RAG vs YAML)
+      </button>
+      {open && (
+        <>
+          <div className="grid grid-cols-2 gap-2">
+            <input className={inp} placeholder="issue_type (e.g. SQL Injection)" value={f.issue_type} onChange={e => setF(v => ({ ...v, issue_type: e.target.value }))} />
+            <input className={inp} placeholder="url" value={f.url} onChange={e => setF(v => ({ ...v, url: e.target.value }))} />
+            <input className={inp} placeholder="cwe (e.g. CWE-89)" value={f.cwe} onChange={e => setF(v => ({ ...v, cwe: e.target.value }))} />
+            <input className={inp} placeholder="target (host)" value={f.target} onChange={e => setF(v => ({ ...v, target: e.target.value }))} />
+            <input className={cn(inp, 'col-span-2')} placeholder="name / title" value={f.name} onChange={e => setF(v => ({ ...v, name: e.target.value }))} />
+          </div>
+          <button
+            onClick={() => cmp.mutate({ ...f, persist: false, sources: ['skill', 'rag', 'yaml'] })}
+            disabled={cmp.isPending || (!f.issue_type && !f.cwe && !f.name)}
+            className="px-3 py-1.5 bg-primary text-primary-foreground rounded-md text-sm disabled:opacity-50">
+            {cmp.isPending ? 'Building\u2026' : 'Compare sources'}
+          </button>
+          {cmp.isError && <p className="text-xs text-red-400">{String((cmp.error as Error)?.message || 'compare failed')}</p>}
+          {bySource && (
+            <div className="grid grid-cols-3 gap-2 mt-2">
+              {order.filter(sc => bySource[sc]).map(sc => {
+                const r = bySource[sc]
+                const spec = r.spec
+                return (
+                  <div key={sc} className="border border-border rounded-md p-2 space-y-1 bg-card">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-semibold uppercase">{sc}</span>
+                      {spec && <span className={cn('text-[10px] px-1.5 py-0.5 rounded border',
+                        spec.tier === 'impactful' ? 'text-amber-400 border-amber-500/40' : 'text-green-400 border-green-500/40')}>{spec.tier}</span>}
+                    </div>
+                    {r.ok && spec ? (
+                      <>
+                        <div className="text-[11px] text-muted-foreground">{spec.tool}{r.requires_approval ? ' \u00b7 approval' : ''}</div>
+                        <pre className="text-[11px] font-mono whitespace-pre-wrap break-all bg-background/60 border border-border rounded p-1 max-h-40 overflow-auto">{spec.command}</pre>
+                        <pre className="text-[10px] font-mono whitespace-pre-wrap bg-background/40 rounded p-1 max-h-24 overflow-auto">{JSON.stringify(spec.assertion)}</pre>
+                        <p className="text-[10px] text-muted-foreground">{spec.rationale}</p>
+                        <button
+                          onClick={() => saveAsSkill(sc, spec)}
+                          disabled={addSkill.isPending}
+                          className="text-[10px] px-1.5 py-0.5 rounded border border-border hover:border-primary disabled:opacity-50">
+                          {saved[sc] ? `\u2713 saved as ${saved[sc]}` : 'Save as skill'}
+                        </button>
+                      </>
+                    ) : (
+                      <p className="text-[11px] text-red-400">{r.error || 'no result'}</p>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          )}
+          {cmp.data?.comparison_group && <p className="text-[10px] text-muted-foreground">group: {cmp.data.comparison_group}</p>}
+        </>
+      )}
+    </div>
+  )
+}
+
+
 function SecurityTestsPanel({ sessionId, tests }: { sessionId?: string; tests: SecurityTest[] }) {
   const safe = tests.filter(t => t.tier === 'safe').length
   const impactful = tests.length - safe
   return (
     <div className="space-y-2">
       <CustomPayloadForm sessionId={sessionId} />
+      <SourceCompareForm sessionId={sessionId} />
       {tests.length === 0 ? (
         <p className="text-sm text-muted-foreground text-center py-6">
           No agent-generated tests yet. Launch a session with the attack-surface

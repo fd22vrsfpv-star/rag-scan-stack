@@ -6085,6 +6085,20 @@ CREATE TABLE IF NOT EXISTS public.custom_enumeration_rules (
     updated_at    timestamptz NOT NULL DEFAULT now()
 );
 
+-- Operator-added vuln-class skills: a DB overlay on the read-only
+-- knowledge/vuln_class_methodology.yaml (mirrors custom_enumeration_rules).
+-- common/vuln_skills._classes() merges these over the YAML; rag-api /skills
+-- manages them and embeds each into rag_documents.
+CREATE TABLE IF NOT EXISTS public.custom_vuln_skills (
+    id            text PRIMARY KEY,          -- canonical vuln-class id (e.g. sqli)
+    skill         jsonb NOT NULL,            -- {aliases[], web_hint, synth_methodology}
+    enabled       boolean NOT NULL DEFAULT true,
+    engagement_id uuid,
+    created_by    text,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);
+
 -- NOTE: this DDL belongs ABOVE the data-repair transaction further down. It
 -- was appended after that block's COMMIT, which left the file's last CREATE
 -- TABLE *after* the repairs — the arrangement tests/test_db_init_order.py

@@ -560,7 +560,30 @@ def _render_ad_attacks(data: Dict[str, Any]) -> List[Doc]:
     return out
 
 
+def _render_vuln_class_methodology(data: Dict[str, Any]) -> List[Doc]:
+    """Per-vuln-class exploitation methodology -> one retrievable doc per class,
+    so the planner can recall "how do I test/exploit an SQLi/SSRF/..." by
+    similarity too. The SAME file is read deterministically by-name at exploit
+    time via common/vuln_skills.py; this renderer only adds the RAG copy."""
+    classes = (data or {}).get("classes")
+    if not isinstance(classes, dict):
+        return []
+    out: List[Doc] = []
+    for cid, entry in classes.items():
+        if not isinstance(entry, dict):
+            continue
+        wh = str(entry.get("web_hint") or "").strip()
+        sm = str(entry.get("synth_methodology") or "").strip()
+        aliases = ", ".join(str(a) for a in (entry.get("aliases") or []))
+        out.append((
+            f"Exploitation methodology: {cid}",
+            f"Vulnerability class '{cid}' (aliases: {aliases}). "
+            f"Web testing/exploitation: {wh} Proving impact: {sm}"))
+    return out
+
+
 RENDERERS = {
+    "vuln_class_methodology": _render_vuln_class_methodology,
     "msf_learned_options": _render_msf_learned_options,
     "ajax_spider_signals": _render_ajax_spider_signals,
     "business_logic_tests": _render_business_logic_tests,

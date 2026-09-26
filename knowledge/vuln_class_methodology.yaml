@@ -1,0 +1,258 @@
+# Per-vulnerability-class exploitation methodology ("skills").
+#
+# Read DIRECTLY by common/vuln_skills.py (by canonical class), and ALSO embedded
+# into rag_documents via etl/load_knowledge_documents.py so it is RAG-retrievable.
+# Keyed by a canonical coarse class id; `aliases` absorb every other identifier the
+# stack uses (human names, wstg_map ids, owasp_param_tests categories, CWE ids,
+# nuclei tags prefixed "nuclei:") so all resolve to ONE skill.
+#
+# Two length-budgeted fields per class:
+#   web_hint          <= 700 chars — terse, for the small exploit_gen web model.
+#   synth_methodology <= 1500 chars — fuller "prove impact", for the synth model.
+# Authored terse on purpose; do NOT let these grow past the caps (a test enforces
+# it) — they compete with target context in a small model's window.
+version: 1
+classes:
+
+  sqli:
+    aliases: [sql injection, sql-injection, sqli_detect, sqli_dump, error-based sqli,
+              blind sqli, boolean sqli, time-based sqli, "CWE-89", "nuclei:sqli",
+              "nuclei:sql-injection"]
+    web_hint: >-
+      Order: error -> boolean -> UNION -> time. Break syntax with a single quote or
+      a paren, then observe. Boolean: ' OR '1'='1 vs ' AND '1'='2 (page differs).
+      UNION: ' UNION SELECT NULL-- , pad NULLs until column count matches. Time
+      (blind): ' OR SLEEP(5)-- (MySQL), ' OR pg_sleep(5)-- (Postgres), '; WAITFOR
+      DELAY '0:0:5'-- (MSSQL). Success = SQL error text, a response that flips with
+      the boolean, or a delay that tracks the predicate. Bypass: /**/ comments,
+      mixed case, URL/hex encoding, 0x literals, doubled quotes.
+    synth_methodology: >-
+      Prove impact, do not stop at detection. Fingerprint the DB from an error or a
+      version marker (version(), @@version, current_database()). Confirm with a
+      boolean pair that flips the response, then escalate to a UNION that reflects a
+      UNIQUE marker, e.g. ' UNION SELECT 'CANARY7f3',NULL-- . If blind, gate a time
+      delay on a true/false predicate and show the timing tracks it. Proof = the
+      marker or version string echoed back, or the predicate-linked delay. Fastest
+      confirmation: sqlmap --batch --technique=BEUST against the exact parameter;
+      capture the retrieved banner / current_user as evidence. Do NOT dump tables or
+      modify data — one version/marker row proves exploitability.
+
+  xss:
+    aliases: [cross-site scripting, cross site scripting, reflected xss, stored xss,
+              dom xss, xss_detect, xss_reflected, xss_stored, xss_dom, "CWE-79",
+              "nuclei:xss"]
+    web_hint: >-
+      Reflect a unique marker first (e.g. zz9pk) and find where it lands: HTML body,
+      attribute, JS string, or URL. Choose the payload for the context. HTML:
+      <svg onload=alert(1)>. Attribute: "><svg onload=alert(1)>. JS string:
+      ';alert(1)// . Confirm the marker renders as an element/executes, not encoded
+      text. Bypass: mixed case <ScRiPt>, no-space svg/onload, event handlers over
+      <script>, HTML-entity/URL encoding, backtick template strings. Note stored vs
+      reflected (does it persist across a reload?).
+    synth_methodology: >-
+      Show script execution in the response context, not just reflection. Inject a
+      context-appropriate payload carrying a UNIQUE token and prove the token
+      appears UNENCODED inside an executable position (a real tag/handler), e.g.
+      <img src=x onerror=console.log('CANARY7f3')>. For DOM XSS, trace the source
+      (location.hash/search) to a sink (innerHTML, eval, document.write). Proof =
+      the payload present as live markup in the returned HTML (grep the raw
+      response for the tag, not the encoded form). Detection-only fallback: the
+      marker reflected without encoding. Benign payload only (console.log/alert),
+      never a real credential-stealing or navigation payload against the target.
+
+  command_injection:
+    aliases: [command injection, os command injection, os-command-injection, rce,
+              remote code execution, cmd_injection, code injection, deserialization,
+              insecure deserialization, file_upload, unrestricted file upload,
+              "CWE-77", "CWE-78", "CWE-94", "CWE-502", "nuclei:rce"]
+    web_hint: >-
+      Append a command with a shell separator: ; | & && || `cmd` $(cmd), and
+      newline %0a. Echo a unique marker: ;echo CANARY7f3 . Blind? Use time: ;sleep 5
+      or | ping -c 5 127.0.0.1, and confirm the delay. OOB: trigger a DNS/HTTP
+      callback to a controlled host. Success = the marker in output or the timed
+      delay/callback. Bypass: ${IFS} for spaces, quotes to split tokens (w'h'oami),
+      $@ , base64|sh. For uploads: plant a benign script and request it back.
+    synth_methodology: >-
+      Prove code execution with a benign, unique marker — never a destructive or
+      state-changing command. Inject a separator plus echo of a random token
+      (e.g. ;echo CANARY7f3;) and show the token in the response. If output is not
+      reflected (blind), use a deterministic time delay (sleep N) keyed so the
+      response time proves execution, or an out-of-band DNS/HTTP callback to a host
+      you control. For deserialization, craft a gadget whose only effect is the
+      marker/delay. Proof = the echoed token, the predicate-linked delay, or the
+      OOB callback log. Read a canary (id, hostname) at most; do NOT spawn a shell,
+      write files, or run anything that changes the target.
+
+  ssrf:
+    aliases: [ssrf, server-side request forgery, server side request forgery,
+              ssrf_detect, "CWE-918", "nuclei:ssrf"]
+    web_hint: >-
+      Point a URL/host/webhook/image/import parameter at something you observe.
+      Best proof: an out-of-band callback to a host you control (unique subdomain)
+      — confirms the server made the request. Then probe internal targets:
+      http://127.0.0.1:PORT/ , http://169.254.169.254/ (cloud metadata),
+      http://[::1]/ . Success = OOB hit, or an internal response body/latency/error
+      that differs from an external one. Bypass filters: decimal/hex/octal IP,
+      redirects, @-tricks, alternate schemes (gopher/file/dict), DNS rebinding.
+    synth_methodology: >-
+      Prove the server fetches an attacker-chosen destination. Strongest proof is an
+      out-of-band callback: set the parameter to a unique host you control and show
+      the inbound DNS/HTTP hit came from the target. Escalate carefully to internal
+      reachability — request http://127.0.0.1 or a known-closed vs known-open
+      internal port and show the response/latency/error distinguishes them. Cloud:
+      169.254.169.254 metadata is high impact — demonstrate reachability but capture
+      only a non-secret marker (e.g. the metadata index), not credentials. Proof =
+      the OOB callback, or a differential internal response. Do not pivot further or
+      exfiltrate secrets — reachability is the finding.
+
+  lfi:
+    aliases: [lfi, local file inclusion, local-file-inclusion, rfi,
+              remote file inclusion, path traversal, path-traversal,
+              directory traversal, directory-traversal, lfi_read, "CWE-22", "CWE-98",
+              "nuclei:lfi", "nuclei:traversal"]
+    web_hint: >-
+      Point a file/path/template/download parameter at a canary. Traversal:
+      ../../../../etc/passwd (and Windows ..\..\windows\win.ini). Success = the
+      canary file's content in the response (root:x:0:0 for /etc/passwd). PHP: try
+      php://filter/convert.base64-encode/resource=index.php to read source. Bypass:
+      URL-encode (%2e%2e%2f), double-encode, nested ....//, absolute paths, null
+      byte on legacy stacks, strip trailing extension with ? or #. RFI: if remote
+      URLs load, host a benign marker file and read it back.
+    synth_methodology: >-
+      Prove arbitrary file read, not just an error. Retrieve a stable canary whose
+      content is unmistakable: /etc/passwd (expect a root:x:0:0 line) or, on Windows,
+      C:\windows\win.ini. Use the minimal traversal depth that works and record the
+      exact payload. If the app wraps the path (prefix/suffix), defeat it with
+      encoding or a PHP filter wrapper to base64-encode application source as proof.
+      Proof = the canary content (or decoded source) present in the response. Read
+      one canary only — do not enumerate the filesystem, pull secrets, or chain to
+      code execution in the PoC.
+
+  open_redirect:
+    aliases: [open redirect, open-redirect, unvalidated redirect, url redirection,
+              open_redirect_detect, "CWE-601", "nuclei:redirect"]
+    web_hint: >-
+      Set a redirect/next/return/url/dest parameter to an external host and follow
+      it. Payloads: https://evil.example , //evil.example , /\evil.example ,
+      https:evil.example , and %2f%2fevil.example (encoded). Success = a 3xx
+      Location header (or JS/meta redirect) pointing OFF the target's domain.
+      Bypass: whitelisted-host prefix tricks (evil.example#target.com,
+      target.com.evil.example, target.com@evil.example), backslashes, double-encode.
+      Use a benign external host you control, not a real phishing target.
+    synth_methodology: >-
+      Prove the app redirects to an attacker-controlled external origin. Set the
+      parameter to a benign host you control and show the response redirects there:
+      a 3xx with a Location header off-domain, or a client-side (meta/JS) redirect.
+      Record the exact payload and the resulting Location. If a host allowlist is in
+      place, demonstrate the specific bypass that defeats it (prefix/@/backslash).
+      Proof = the off-domain Location/redirect in the response. Impact is
+      phishing/token-leak potential — do not actually target a third party; use your
+      own benign host as the redirect destination.
+
+  csrf:
+    aliases: [csrf, cross-site request forgery, cross site request forgery, xsrf,
+              csrf_detect, "CWE-352", "nuclei:csrf"]
+    web_hint: >-
+      Find a state-changing request (POST/PUT/DELETE). Check for an anti-CSRF token
+      and whether it is VALIDATED: remove it, reuse another session's token, or
+      swap its value — if the action still succeeds, it is vulnerable. Check
+      SameSite on the session cookie (None/absent = cross-site sendable) and whether
+      the action accepts GET or a simple content-type (form/urlencoded) that skips
+      preflight. Success = the action completes with a forged, cross-origin-style
+      request and no valid token.
+    synth_methodology: >-
+      Prove a state-changing action succeeds without a valid, per-session CSRF
+      token. Capture a legitimate request, then replay it with the token removed,
+      emptied, or replaced by an unrelated value while keeping the victim's session
+      cookie — success proves the token is not enforced. Note SameSite (None/absent
+      lets the cookie ride cross-site) and whether GET or a simple content-type is
+      accepted. Proof = the action's success response (state changed) with no valid
+      token. Demonstrate on a benign, reversible action (e.g. a profile field), not
+      a destructive one, and revert it.
+
+  xxe:
+    aliases: [xxe, xml external entity, xml-external-entity, xxe injection,
+              xxe_detect, "CWE-611", "CWE-827", "nuclei:xxe"]
+    web_hint: >-
+      Any XML sink (SOAP, SAML, DOCX/SVG upload, REST with application/xml). Inject a
+      DOCTYPE with an external entity: <!DOCTYPE r [<!ENTITY x SYSTEM
+      "file:///etc/passwd">]> then reference &x; in a reflected element. Success =
+      file content (root:x:0:0) in the response. Blind/no reflection: use an OOB
+      parameter entity to fetch an external DTD and trigger a callback to a host you
+      control. Also try SSRF via http:// SYSTEM URLs. Bypass: php://filter to
+      base64-encode, UTF-16, parameter entities.
+    synth_methodology: >-
+      Prove external entity resolution. If the parsed value is reflected, define an
+      external entity for file:///etc/passwd and show its content (root:x:0:0) in the
+      response. If nothing reflects (blind), use an out-of-band parameter-entity
+      chain: your external DTD triggers a DNS/HTTP callback (and can exfiltrate a
+      file via a query string) to a host you control — the callback is the proof.
+      XXE can also be an SSRF primitive via SYSTEM "http://internal". Proof = the
+      canary file content in the response or the OOB callback. Read one canary only;
+      do not exfiltrate secrets or pivot in the PoC.
+
+  idor:
+    aliases: [idor, insecure direct object reference, bola,
+              broken object level authorization, broken_object_level_authorization,
+              broken access control, forced browsing, "CWE-639", "CWE-284",
+              "CWE-566", "nuclei:idor"]
+    web_hint: >-
+      Find requests carrying an object id (numeric, UUID, filename, account no.) in
+      path/query/body/header. Change it to another tenant's id and see if you get
+      their data or can act on it. Try id+/-1, adjacent UUIDs, guessable ids, and
+      re-add a removed id parameter. Test with a LOW-priv (or second) account's
+      session against a HIGHER-priv object. Success = you read/modify an object your
+      session should not own. Also try method/param swaps that skip the auth check.
+    synth_methodology: >-
+      Prove cross-account/object access with authorization held constant. Establish
+      two references you own or control, then, as account A (or unauthenticated),
+      request or mutate account B's object by swapping only its identifier — the
+      session/token stays A's. Proof = B's data returned to A, or B's object changed
+      by A, shown by a field that unmistakably belongs to B (name, email, a marker
+      you planted in B). Prefer a read, or a benign reversible write you then revert.
+      This is authorization, not input parsing — the assertion is "A sees/does what
+      only B should", captured from the response. Do not harvest other users' real
+      data beyond the one proof record.
+
+  business_logic:
+    aliases: [business logic, business-logic, business logic flaw, logic flaw,
+              value tampering, price manipulation, race condition, workflow bypass,
+              insufficient workflow validation, "CWE-840", "CWE-841", "CWE-362"]
+    web_hint: >-
+      Abuse intended functionality, not a parser. Tamper values the client "owns":
+      price, quantity (negative/zero/huge), currency, discount, role/flag, other
+      users' ids. Skip or reorder steps in a multi-stage flow (jump straight to the
+      confirm/fulfilment endpoint). Replay one-time actions (coupon, transfer,
+      vote). Race: fire N concurrent requests to double-spend or bypass a limit.
+      Success = an outcome the workflow should forbid (negative total accepted,
+      step skipped, limit exceeded).
+    synth_methodology: >-
+      Prove the system reaches a state its rules should forbid, holding auth
+      constant. Identify the invariant (price >= 0, one coupon per order, step B
+      requires A, quota N) and construct the minimal request sequence that breaks
+      it: tamper a trusted value, skip a workflow step, replay a single-use token,
+      or fire concurrent requests to win a race. Proof = the server accepting the
+      illegal state — a confirmation/receipt/balance showing the broken invariant,
+      captured from the response. These rarely have a payload signature, so the
+      assertion is outcome-based (a specific value or status in the response). Use a
+      test account and reverse any state change you make.
+
+  ssti:
+    aliases: [ssti, server-side template injection, server side template injection,
+              template injection, ssti_detect, "CWE-1336", "CWE-94", "nuclei:ssti"]
+    web_hint: >-
+      Inject a template expression into any field that is rendered server-side. Probe
+      with arithmetic that must evaluate: {{7*7}} , ${7*7} , #{7*7} , <%= 7*7 %> ,
+      *{7*7} — a response containing 49 proves evaluation and fingerprints the engine
+      (Jinja2/Twig/Freemarker/ERB/Velocity). Escalate per engine to read data or
+      exec, e.g. Jinja2 {{config}} or {{''.__class__...}}. Success = 49 (or the
+      engine's evaluated output) reflected, not the literal expression.
+    synth_methodology: >-
+      Prove server-side evaluation, then fingerprint. Submit a benign arithmetic
+      marker that only a template engine would compute (e.g. {{7*7}} expecting 49,
+      or ${7*7}); the evaluated result in the response proves SSTI and narrows the
+      engine. Escalate only as far as reading a benign engine object/config value to
+      confirm impact (e.g. Jinja2 {{config.items()}} — capture a non-secret key), or
+      an echo of a unique marker via the engine. Proof = the computed value (49) or
+      the engine object content in the response, not the literal payload. Stop at
+      proof-of-evaluation; do not run OS commands or read secrets in the PoC.

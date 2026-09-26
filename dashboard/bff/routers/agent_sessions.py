@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import List, Optional
 import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -78,6 +78,10 @@ class ApprovalRequest(BaseModel):
     """Operator answer to a paused LangGraph approval interrupt."""
     approved: bool
     pending_exploit_id: Optional[str] = None
+    # The select list sends this. Omit (or empty) to approve everything queued;
+    # naming a subset runs only those. Forwarded to autogen, which fails closed
+    # on an id that is not a queued pending exploit for the session.
+    pending_exploit_ids: Optional[List[str]] = None
     note: Optional[str] = None
 
 
@@ -317,6 +321,8 @@ class SynthesizeTestRequest(BaseModel):
     edb_id: Optional[str] = None
     session_id: Optional[str] = None
     persist: bool = True
+    knowledge_source: Optional[str] = "all"
+    sources: Optional[list] = None
 
 
 @router.post("/api/synthesize-test")
@@ -328,6 +334,22 @@ async def synthesize_test(req: SynthesizeTestRequest):
     async with httpx.AsyncClient(timeout=120) as c:
         resp = await c.post(
             f"{s.autogen_url}/synthesize-test",
+            json=req.model_dump(),
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.post("/api/synthesize-test/compare")
+async def synthesize_test_compare(req: SynthesizeTestRequest):
+    """Build the same finding several ways (skill/rag/yaml) and return them side by
+    side (upstream: autogen). Three LLM builds -> a longer timeout."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=240) as c:
+        resp = await c.post(
+            f"{s.autogen_url}/synthesize-test/compare",
             json=req.model_dump(),
             headers={"x-api-key": s.api_key, **engagement_headers()},
         )

@@ -219,3 +219,6 @@ certs/ca-bundle.crt
 # Generated report/export artifacts (PDF/CSV/URL lists from the export endpoints
 # and ad-hoc extracts). Deliverables, not source.
 exports/
+
+# promote-skills.sh backups of the vuln-class methodology pack
+knowledge/*.bak-*

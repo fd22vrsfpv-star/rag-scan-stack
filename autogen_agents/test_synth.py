@@ -18,6 +18,7 @@ backend. Reuses langgraph_engine's classifier + category vocab (no duplication).
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any, Dict, Optional
 
@@ -108,12 +109,33 @@ Reply with ONLY this JSON (no prose):
 "tier":"safe|impactful","assertion":{{...}},"rationale":"<=160 chars why this proves it"}}"""
 
 
+def _prepend_methodology(guidance: str, finding: Dict[str, Any]) -> str:
+    """Prepend per-vuln-class methodology to the synth guidance.
+
+    Deterministic by-name lookup via common.vuln_skills (NOT similarity), keyed off
+    the finding's class signals. ON BY DEFAULT (SYNTH_METHODOLOGY=0 disables) and best-effort (any
+    failure returns guidance unchanged). PREPENDED on purpose: synthesize caps
+    guidance at [:3500], so leading with the curated class methodology guarantees
+    it survives even when WSTG/ExploitDB prose is large.
+    """
+    try:
+        from common import vuln_skills
+        return vuln_skills.synth_block(guidance, finding)
+    except Exception:
+        return guidance
+
+
 def synthesize(finding: Dict[str, Any], guidance: str = "",
-               *, max_tokens: int = 700) -> Dict[str, Any]:
+               *, max_tokens: int = 700,
+               apply_skill: Optional[bool] = None) -> Dict[str, Any]:
     """Author a candidate custom test for `finding`. Returns
     {ok, spec:{name,tool,command,category,tier,assertion,rationale}, raw, error}.
     The returned tier is the FAIL-SAFE tier, not necessarily the LLM's."""
     issue = finding.get("issue_type") or finding.get("finding_type") or finding.get("name") or ""
+    # apply_skill=False suppresses the skill source (used by the rag/yaml selectors);
+    # None keeps the default (env-gated) behaviour.
+    if apply_skill is not False:
+        guidance = _prepend_methodology(guidance, finding)
     prompt = _PROMPT.format(
         issue_type=issue, name=finding.get("name") or "",
         cwe=finding.get("cwe") or "", target=finding.get("target") or "",
@@ -151,4 +173,18 @@ def synthesize(finding: Dict[str, Any], guidance: str = "",
         "assertion": assertion or {"min_output_bytes": 1},
         "rationale": str(obj.get("rationale") or "")[:200],
     }
+    # Observability: record which vuln-class skill shaped this synthesis.
+    try:
+        from common import vuln_skills as _vs
+        if apply_skill is not False and _vs.enabled("SYNTH_METHODOLOGY"):
+            _cid = _vs.resolve(
+                issue_type=finding.get("issue_type") or finding.get("finding_type"),
+                cwe=finding.get("cwe"), name=finding.get("name"))
+            if _cid:
+                spec.setdefault("metadata", {})["methodology_skill"] = _cid
+                _vs.emit_selected(_cid, source="autogen", phase="synth",
+                                  knowledge_source="skill",
+                                  target=finding.get("target") or finding.get("url"))
+    except Exception:  # noqa: BLE001
+        pass
     return {"ok": True, "spec": spec, "raw": raw[:400], "error": None}
