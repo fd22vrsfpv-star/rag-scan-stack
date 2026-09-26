@@ -27,6 +27,7 @@ import {
   useExportTestBurp,
   useSendTestToBurp,
   useSynthesizeTest,
+  useCompareSources,
 } from '@/api/securityTests'
 import type { SecurityTest, WstgGuide } from '@/api/securityTests'
 import { apiFetch } from '@/api/client'
@@ -1353,12 +1354,76 @@ function CustomPayloadForm({ sessionId }: { sessionId?: string }) {
   )
 }
 
+function SourceCompareForm({ sessionId }: { sessionId?: string }) {
+  const [open, setOpen] = useState(false)
+  const [f, setF] = useState({ issue_type: '', url: '', cwe: '', name: '', target: '' })
+  const cmp = useCompareSources(sessionId)
+  const inp = 'w-full bg-muted rounded-md px-2 py-1 text-sm border border-border outline-none focus:border-primary'
+  const bySource = cmp.data?.by_source
+  const order = ['skill', 'rag', 'yaml']
+  return (
+    <div className="border border-border rounded-lg p-3 space-y-2">
+      <button onClick={() => setOpen(o => !o)} className="text-sm font-medium flex items-center gap-1">
+        {open ? '\u25be' : '\u25b8'} Compare knowledge sources (skill vs RAG vs YAML)
+      </button>
+      {open && (
+        <>
+          <div className="grid grid-cols-2 gap-2">
+            <input className={inp} placeholder="issue_type (e.g. SQL Injection)" value={f.issue_type} onChange={e => setF(v => ({ ...v, issue_type: e.target.value }))} />
+            <input className={inp} placeholder="url" value={f.url} onChange={e => setF(v => ({ ...v, url: e.target.value }))} />
+            <input className={inp} placeholder="cwe (e.g. CWE-89)" value={f.cwe} onChange={e => setF(v => ({ ...v, cwe: e.target.value }))} />
+            <input className={inp} placeholder="target (host)" value={f.target} onChange={e => setF(v => ({ ...v, target: e.target.value }))} />
+            <input className={cn(inp, 'col-span-2')} placeholder="name / title" value={f.name} onChange={e => setF(v => ({ ...v, name: e.target.value }))} />
+          </div>
+          <button
+            onClick={() => cmp.mutate({ ...f, persist: false, sources: ['skill', 'rag', 'yaml'] })}
+            disabled={cmp.isPending || (!f.issue_type && !f.cwe && !f.name)}
+            className="px-3 py-1.5 bg-primary text-primary-foreground rounded-md text-sm disabled:opacity-50">
+            {cmp.isPending ? 'Building\u2026' : 'Compare sources'}
+          </button>
+          {cmp.isError && <p className="text-xs text-red-400">{String((cmp.error as Error)?.message || 'compare failed')}</p>}
+          {bySource && (
+            <div className="grid grid-cols-3 gap-2 mt-2">
+              {order.filter(sc => bySource[sc]).map(sc => {
+                const r = bySource[sc]
+                const spec = r.spec
+                return (
+                  <div key={sc} className="border border-border rounded-md p-2 space-y-1 bg-card">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-semibold uppercase">{sc}</span>
+                      {spec && <span className={cn('text-[10px] px-1.5 py-0.5 rounded border',
+                        spec.tier === 'impactful' ? 'text-amber-400 border-amber-500/40' : 'text-green-400 border-green-500/40')}>{spec.tier}</span>}
+                    </div>
+                    {r.ok && spec ? (
+                      <>
+                        <div className="text-[11px] text-muted-foreground">{spec.tool}{r.requires_approval ? ' \u00b7 approval' : ''}</div>
+                        <pre className="text-[11px] font-mono whitespace-pre-wrap break-all bg-background/60 border border-border rounded p-1 max-h-40 overflow-auto">{spec.command}</pre>
+                        <pre className="text-[10px] font-mono whitespace-pre-wrap bg-background/40 rounded p-1 max-h-24 overflow-auto">{JSON.stringify(spec.assertion)}</pre>
+                        <p className="text-[10px] text-muted-foreground">{spec.rationale}</p>
+                      </>
+                    ) : (
+                      <p className="text-[11px] text-red-400">{r.error || 'no result'}</p>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          )}
+          {cmp.data?.comparison_group && <p className="text-[10px] text-muted-foreground">group: {cmp.data.comparison_group}</p>}
+        </>
+      )}
+    </div>
+  )
+}
+
+
 function SecurityTestsPanel({ sessionId, tests }: { sessionId?: string; tests: SecurityTest[] }) {
   const safe = tests.filter(t => t.tier === 'safe').length
   const impactful = tests.length - safe
   return (
     <div className="space-y-2">
       <CustomPayloadForm sessionId={sessionId} />
+      <SourceCompareForm sessionId={sessionId} />
       {tests.length === 0 ? (
         <p className="text-sm text-muted-foreground text-center py-6">
           No agent-generated tests yet. Launch a session with the attack-surface
