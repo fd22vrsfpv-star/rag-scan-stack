@@ -17,14 +17,95 @@ import docker
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Container configuration - which containers to monitor
-MONITORED_CONTAINERS = {
-    "zap": {"name": "zap", "color": "#2ecc71", "description": "OWASP ZAP Scanner"},
-    "metasploit": {"name": "metasploit", "color": "#9b59b6", "description": "Metasploit Framework"}
+# Curated DISPLAY metadata for well-known containers (colour + description).
+# This is NOT an allow-list: the log viewer shows EVERY container in this
+# compose project (see _log_targets), discovered live via the
+# com.docker.compose.project label, so a service added to docker-compose.yml is
+# viewable with no edit here. These entries only give nicer colours/labels where
+# we have them; anything else gets an auto-assigned colour and its compose
+# service name as the description. Keyed by compose SERVICE name (== container
+# name for every service in this stack).
+CONTAINER_META = {
+    "zap": {"color": "#2ecc71", "description": "OWASP ZAP Scanner"},
+    "metasploit": {"color": "#9b59b6", "description": "Metasploit Framework"},
+    "rag-api": {"color": "#3498db", "description": "RAG API"},
+    "autogen-agents": {"color": "#e67e22", "description": "LangGraph Agents"},
+    "exploit-runner": {"color": "#e74c3c", "description": "Exploit Runner"},
+    "pentest-dashboard": {"color": "#1abc9c", "description": "Dashboard (BFF + UI)"},
+    "scan-recommender": {"color": "#f39c12", "description": "Scan Recommender"},
+    "kali-listener": {"color": "#16a085", "description": "Kali Listener"},
+    "node-manager": {"color": "#8e44ad", "description": "Node Manager (SOCKS)"},
+    "container-logs": {"color": "#7f8c8d", "description": "Container Logs Proxy"},
 }
+
+# Palette for containers we have no curated colour for — stable per name so a
+# given service keeps the same colour across refreshes.
+_PALETTE = ["#3498db", "#e67e22", "#1abc9c", "#e74c3c", "#f1c40f", "#9b59b6",
+            "#2ecc71", "#34495e", "#16a085", "#d35400", "#8e44ad", "#27ae60"]
+
+
+def _auto_color(name: str) -> str:
+    return _PALETTE[sum(ord(c) for c in (name or "x")) % len(_PALETTE)]
+
 
 # Docker client
 docker_client = docker.from_env()
+
+
+def _discover_project_containers(all_states: bool = True) -> dict:
+    """Every container that belongs to THIS docker-compose project, keyed by
+    container name.
+
+    Discovered live through the `com.docker.compose.project` label, so any
+    service added to docker-compose.yml is picked up automatically — there is no
+    hand-maintained allow-list to fall out of sync. `all_states=True` includes
+    stopped/exited containers so a crashed service is still visible. Fail-soft:
+    returns {} on any docker error rather than breaking a caller.
+    """
+    out: dict = {}
+    try:
+        # COMPOSE_PROJECT is assigned later at module scope; resolved at call
+        # time (this runs per-request), with a direct fallback if unset.
+        project = globals().get("COMPOSE_PROJECT") or _resolve_compose_project()
+        filters = {"label": f"com.docker.compose.project={project}"} if project else {}
+        for c in docker_client.containers.list(all=all_states, filters=filters):
+            labels = c.labels or {}
+            svc = labels.get("com.docker.compose.service", c.name)
+            out[c.name] = {
+                "name": c.name,
+                "service": svc,
+                "status": c.status,
+                "running": c.status == "running",
+                "id": c.short_id,
+            }
+    except Exception as e:  # noqa: BLE001
+        logger.warning("container discovery failed: %s", e)
+    return out
+
+
+def _log_targets() -> dict:
+    """{key: {name, color, description}} for every viewable container.
+
+    The union of (a) every container in this compose project and (b) the curated
+    CONTAINER_META entries (so zap/metasploit still appear even before they are
+    started). Curated colour/description wins where present; otherwise an
+    auto-assigned colour and the compose service name. Key == container name.
+    """
+    targets: dict = {}
+    for name, info in _discover_project_containers().items():
+        meta = CONTAINER_META.get(info.get("service")) or CONTAINER_META.get(name) or {}
+        targets[name] = {
+            "name": name,
+            "color": meta.get("color") or _auto_color(name),
+            "description": meta.get("description") or info.get("service") or name,
+        }
+    for name, meta in CONTAINER_META.items():
+        targets.setdefault(name, {
+            "name": name,
+            "color": meta.get("color") or _auto_color(name),
+            "description": meta.get("description") or name,
+        })
+    return targets
 
 
 def get_container_logs(container_name: str, lines: int = 200, since: Optional[str] = None) -> List[dict]:
@@ -140,9 +221,9 @@ def container_status_endpoint(name: str):
 
 @app.get("/containers")
 def list_containers():
-    """List monitored containers and their status"""
+    """List every container in this compose project (auto-discovered) + status."""
     result = []
-    for key, config in MONITORED_CONTAINERS.items():
+    for key, config in sorted(_log_targets().items()):
         status = get_container_status(config["name"])
         result.append({
             "key": key,
@@ -156,15 +237,22 @@ def list_containers():
 def get_logs(
     container_key: str,
     lines: int = Query(200, description="Number of log lines to fetch"),
+    tail: Optional[int] = Query(None, description="Alias for lines (BFF compat)"),
     search: Optional[str] = Query(None, description="Search filter"),
     level: Optional[str] = Query(None, description="Filter by log level")
 ):
-    """Get logs for a specific container"""
-    if container_key not in MONITORED_CONTAINERS:
-        return {"error": f"Unknown container: {container_key}", "logs": []}
-
-    container_name = MONITORED_CONTAINERS[container_key]["name"]
-    logs = get_container_logs(container_name, lines=lines)
+    """Get logs for a specific container (any container in this compose project)."""
+    targets = _log_targets()
+    if container_key not in targets:
+        # Last-resort: allow an exact live container name even if discovery
+        # missed it (e.g. label filter unavailable), rather than a false "unknown".
+        if container_key not in _discover_project_containers():
+            return {"error": f"Unknown container: {container_key}",
+                    "logs": [], "known": sorted(targets.keys())}
+        container_name = container_key
+    else:
+        container_name = targets[container_key]["name"]
+    logs = get_container_logs(container_name, lines=tail or lines)
 
     # Apply filters
     if level:
@@ -178,10 +266,11 @@ def get_logs(
 @app.get("/logs/ui/{container_key}", response_class=HTMLResponse)
 def logs_ui(container_key: str):
     """Container-specific logs UI"""
-    if container_key not in MONITORED_CONTAINERS:
+    targets = _log_targets()
+    config = targets.get(container_key)
+    if config is None:
         return HTMLResponse(content=f"<h1>Unknown container: {container_key}</h1>", status_code=404)
 
-    config = MONITORED_CONTAINERS[container_key]
     color = config["color"]
     title = config["description"]
 
@@ -376,19 +465,41 @@ def index():
 
 # ── Profile-based service control ──
 
+# Curated grouping for the Services panel's grouped start/stop UI. This is the
+# EXPECTED set (so a group's toggle still lists a service that has never been
+# started and therefore has no container to discover). It is NOT the limit of
+# what can be controlled or shown: services_status() folds in any project
+# container not named here under an "other" group, and control_container()
+# accepts any live project container. Keep this in step with docker-compose.yml
+# when a service has a natural home group; anything missed still works via the
+# dynamic paths.
 PROFILE_CONTAINERS = {
-    "core": ["rag-api", "rag-postgres", "pentest-dashboard", "container-logs", "embedder"],
+    "core": ["rag-api", "rag-postgres", "pentest-dashboard", "container-logs",
+             "embedder", "embedder-gpu"],
     "scan": ["zap", "web-scanner", "nuclei-runner", "osint-runner", "pd-runner",
-             "brutus-runner", "nmap_scanner", "scan-recommender", "playwright-scanner"],
+             "brutus-runner", "nmap_scanner", "scan-recommender",
+             "playwright-scanner", "news-runner"],
     "offensive": ["exploit-runner", "metasploit", "kali-listener", "sliver-server",
                   "chisel-server", "node-manager"],
     "ai": ["autogen-agents", "mcp-server", "mcp-test", "mcp-streamable", "mcpo",
-           "llm_query", "ollama"],
-    "optional": ["open-webui", "vllm", "kong", "swagger-ui", "specs", "grpo-trainer"],
+           "burp-mcp-proxy", "llm_query", "ollama"],
+    "optional": ["open-webui", "vllm", "kong", "swagger-ui", "specs", "grpo-trainer",
+                 "wg-server", "vault", "host-helper"],
     "ssh-tunnel": ["ssh-tunnel"],
 }
 
 ALL_MANAGED = [c for group in PROFILE_CONTAINERS.values() for c in group]
+
+
+def _managed_names() -> set:
+    """Curated managed set ∪ every live container in this compose project, so a
+    newly added service is controllable without editing PROFILE_CONTAINERS."""
+    names = set(ALL_MANAGED)
+    try:
+        names |= set(_discover_project_containers().keys())
+    except Exception:  # noqa: BLE001
+        pass
+    return names
 
 
 @app.get("/services/status")
@@ -418,6 +529,27 @@ def services_status():
             "containers": profile_status,
             "running": running_count,
             "total": len(containers),
+            "active": running_count > 0,
+        }
+
+    # Auto-include any project container that is not in a curated group, so a
+    # service added to docker-compose.yml shows up here with no code change.
+    seen = {name for group in PROFILE_CONTAINERS.values() for name in group}
+    discovered = _discover_project_containers()
+    extra = sorted(n for n in discovered if n not in seen)
+    if extra:
+        profile_status = []
+        for name in extra:
+            info = discovered[name]
+            profile_status.append({
+                "name": name, "status": info["status"], "running": info["running"],
+                "health": "healthy" if info["running"] else "",
+            })
+        running_count = sum(1 for s in profile_status if s["running"])
+        result["other"] = {
+            "containers": profile_status,
+            "running": running_count,
+            "total": len(profile_status),
             "active": running_count > 0,
         }
     return {"profiles": result}
@@ -456,9 +588,11 @@ def control_container(action: str, container_name: str):
     """Start or stop a single container. action: start|stop"""
     if action not in ("start", "stop"):
         return {"ok": False, "error": "action must be 'start' or 'stop'"}
-    # Only allow controlling managed containers
-    if container_name not in ALL_MANAGED:
-        return {"ok": False, "error": f"Container '{container_name}' is not managed. Valid: {ALL_MANAGED}"}
+    # Only allow controlling containers in this compose project (curated set ∪
+    # live-discovered), so a new service is controllable without a code change
+    # but arbitrary host containers are still refused.
+    if container_name not in _managed_names():
+        return {"ok": False, "error": f"Container '{container_name}' is not managed."}
     try:
         c = docker_client.containers.get(container_name)
         if action == "start" and c.status != "running":
