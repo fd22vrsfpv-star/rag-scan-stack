@@ -261,6 +261,7 @@ services:
     volumes:
       - ./nmap_out:/app/nmap_out
       - ./etl:/app/etl:ro
+      - ./common:/app/common:ro    # /skills reuses common/vuln_skills.py
       - ${WORDLISTS_DIR:-./wordlists}:/wordlists
       - ./knowledge:/knowledge:ro
       # The canonical DDL, so POST /health/sql/apply-schema can apply the SAME

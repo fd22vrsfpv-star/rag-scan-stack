@@ -225,3 +225,26 @@ def test_synth_prepend_methodology_flagged(monkeypatch):
     assert "WSTG-PROSE" in out
     monkeypatch.setenv("SYNTH_METHODOLOGY", "0")             # explicit off disables
     assert ts._prepend_methodology("WSTG-PROSE", finding) == "WSTG-PROSE"
+
+
+def test_db_overlay_merge(monkeypatch):
+    """Custom skills from the DB overlay merge over the YAML (overlay wins), and a
+    new class becomes resolvable — the expand-skills contract. DB is monkeypatched
+    so this runs without one."""
+    # a brand-new class + an override of an existing one
+    monkeypatch.setattr(vuln_skills, "_load_custom_skills", lambda: {
+        "graphql_injection": {"aliases": ["graphql injection", "CWE-943"],
+                              "web_hint": "probe introspection", "synth_methodology": "prove schema leak"},
+        "sqli": {"aliases": ["sql injection"], "web_hint": "OVERRIDDEN", "synth_methodology": "x"},
+    })
+    vuln_skills._cache = None
+    # new class resolvable by alias and CWE
+    assert vuln_skills.resolve(issue_type="graphql injection") == "graphql_injection"
+    assert vuln_skills.resolve(cwe="CWE-943") == "graphql_injection"
+    # overlay overrides the YAML entry
+    assert vuln_skills.get("sqli")["web_hint"] == "OVERRIDDEN"
+    # fail-soft: a raising overlay leaves the YAML classes intact
+    def _boom():
+        raise RuntimeError("db down")
+    monkeypatch.setattr(vuln_skills, "_load_custom_skills", _boom)
+    assert vuln_skills.resolve(issue_type="sqli") == "sqli"
