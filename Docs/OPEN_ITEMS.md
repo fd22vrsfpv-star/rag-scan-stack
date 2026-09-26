@@ -444,3 +444,22 @@ pre-approval check precedes SCAN_TOOLS_CREDENTIAL — keep that ordering)
 - **Likely fix:** reduce the active-scan footprint — scope the active scan to the authenticated area (/bank) rather than the whole tree, lower thread_per_host, cap max_scan_duration, and/or disable the ajax spider during the authenticated active scan; or give ZAP exclusive memory headroom. The authenticated crawl/seeding (the capability built this session) is unaffected and verified.
 - **Enforced by:** not enforced (live-scan/infra behavior).
 
+
+## Engagement attribution
+
+### Collected-data writers are not audited for engagement population
+**Found:** 2026-09-25
+**Evidence:** `tests/test_engagement_attribution.py` proves each collected-data
+table HAS an `engagement_id`/`asset_id` column, but nothing proves the WRITERS
+populate it. `identities` had the column and a NULL-writing writer, and the test
+stayed green throughout. ~40 `etl/parse_*.py` modules INSERT collected-data rows;
+which of them leave engagement_id NULL is unaudited.
+**Where:** the `etl/parse_*.py` family and `app/rag-api` writers that INSERT into
+`credential_findings`, `web_findings`, `vulns`, `recon_findings`,
+`enumeration_observations`, `identities`.
+**Why it matters:** a column that exists but is never filled reads as "attributed"
+to the schema test while every row leaks across engagements and survives a purge.
+**Done when:** each collected-data writer either sets engagement_id (resolved from
+host/scope) or is a declared exception, checked by a test that executes the writer
+rather than inspecting the schema.
+**Enforced by:** not enforced
