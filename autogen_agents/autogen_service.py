@@ -2756,38 +2756,55 @@ class SynthesizeTestRequest(BaseModel):
     edb_id: Optional[str] = None       # or a specific ExploitDB entry
     session_id: Optional[str] = None
     persist: bool = True
+    knowledge_source: Optional[str] = "all"   # skill | rag | yaml | all
+    sources: Optional[List[str]] = None       # for /synthesize-test/compare
 
 
-@app.post("/synthesize-test")
-async def synthesize_test(req: SynthesizeTestRequest):
-    """LLM-author a CUSTOM security test for one web finding (prototype of the
-    'move past straight tools' direction).
+def _yaml_spec(entry: dict, finding: dict):
+    """Deterministic test spec straight from a WSTG-map entry (no LLM). Returns
+    None when the entry has no usable command."""
+    cmd = entry.get("command_rendered") or entry.get("command") or ""
+    if not cmd:
+        return None
+    assertion = entry.get("assertion") if isinstance(entry.get("assertion"), dict) else {}
+    wid = entry.get("wstg_id") or (finding.get("issue_type") or "test")
+    return {
+        "name": f"WSTG:{wid}"[:60],
+        "tool": entry.get("tool") or "curl",
+        "command": cmd,
+        "category": entry.get("category") or "http_probe",
+        "tier": entry.get("tier") or "safe",
+        "assertion": assertion or {"min_output_bytes": 1},
+        "rationale": f"Deterministic WSTG map entry ({wid})"[:200],
+        "metadata": {"knowledge_source": "yaml", "wstg_id": entry.get("wstg_id")},
+    }
 
-    Matches the finding to its WSTG guidance, asks the RESOLVED LLM backend to
-    write a concrete command + machine-checkable assertion, then FAIL-SAFE
-    classifies the synthesized command (the model's own opinion cannot upgrade a
-    test into the safe lane). A safe candidate is persisted (enabled) and re-runs
-    through the scope-gated executor; an impactful candidate is returned for
-    approval and NOT persisted (the security_tests lane check needs a
-    pending_exploit_id). This never executes anything.
-    """
+
+async def _build_synth_spec(req, src):
+    """Build one candidate test spec for `src` (skill|rag|yaml|all). No persist.
+    Returns {ok, spec, source_used, matched_wstg, matched_exploitdb, error}."""
     import json as _json
     import scan_tools
     import test_synth
-    import db_utils as _db
-    guidance, matched, edb_used = "", None, None
-    try:
-        g = _json.loads(scan_tools.get_wstg_guidance(
-            issue_type=req.issue_type, cwe=req.cwe, name=req.name,
-            target=req.target, url=req.url))
-        guidance = g.get("guidance") or ""
-        matched = (g.get("entry") or {}).get("wstg_id") if g.get("matched") else None
-    except Exception:  # noqa: BLE001
-        pass
-    # ExploitDB writeup as additional guidance when a CVE/EDB id is supplied (or a
-    # CVE was passed in `cwe`). Most ExploitDB-derived tests are real exploits, so
-    # they will fail-safe classify impactful and stay approval-gated.
-    if req.cve or req.edb_id or (req.cwe and req.cwe.upper().startswith("CVE-")):
+    src = (src or "all").strip().lower()
+    if src not in ("skill", "rag", "yaml", "all"):
+        src = "all"
+    finding = {"issue_type": req.issue_type, "cwe": req.cve or req.cwe,
+               "name": req.name, "url": req.url, "target": req.target}
+    guidance, matched, edb_used, entry = "", None, None, None
+    if src in ("rag", "yaml", "all"):
+        try:
+            g = _json.loads(scan_tools.get_wstg_guidance(
+                issue_type=req.issue_type, cwe=req.cwe, name=req.name,
+                target=req.target, url=req.url))
+            guidance = g.get("guidance") or ""
+            if g.get("matched"):
+                entry = g.get("entry") or {}
+                matched = entry.get("wstg_id")
+        except Exception:  # noqa: BLE001
+            pass
+    if src in ("rag", "all") and (req.cve or req.edb_id
+                                  or (req.cwe and req.cwe.upper().startswith("CVE-"))):
         try:
             ed = _json.loads(scan_tools.get_exploitdb_guidance(
                 cve=req.cve or (req.cwe if (req.cwe or "").upper().startswith("CVE-") else None),
@@ -2798,9 +2815,39 @@ async def synthesize_test(req: SynthesizeTestRequest):
                             + (ed.get("guidance") or ""))[:8000]
         except Exception:  # noqa: BLE001
             pass
-    finding = {"issue_type": req.issue_type, "cwe": req.cve or req.cwe,
-               "name": req.name, "url": req.url, "target": req.target}
-    out = test_synth.synthesize(finding, guidance)
+    if src == "yaml":
+        spec = _yaml_spec(entry or {}, finding)
+        if not spec:
+            return {"ok": False, "source_used": src,
+                    "error": "no deterministic WSTG-map entry for this finding"}
+        out = {"ok": True, "spec": spec}
+    else:
+        out = test_synth.synthesize(
+            finding, ("" if src == "skill" else guidance),
+            apply_skill=(src in ("skill", "all")))
+    if not out.get("ok"):
+        return {"ok": False, "source_used": src,
+                "error": out.get("error") or "synthesis failed"}
+    spec = out["spec"]
+    spec.setdefault("metadata", {})["knowledge_source"] = src
+    try:
+        from common import vuln_skills as _vs
+        _vs.emit_selected(spec.get("metadata", {}).get("methodology_skill"),
+                          source="autogen", phase="synth", knowledge_source=src,
+                          target=req.target or req.url)
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "spec": spec, "source_used": src,
+            "matched_wstg": matched, "matched_exploitdb": edb_used}
+
+
+@app.post("/synthesize-test")
+async def synthesize_test(req: SynthesizeTestRequest):
+    """Build a custom security test for one web finding from the selected knowledge
+    source (skill|rag|yaml|all). Safe -> persisted (scope-gated executor); impactful
+    -> returned for approval. Never executes anything."""
+    import db_utils as _db
+    out = await _build_synth_spec(req, req.knowledge_source)
     if not out.get("ok"):
         raise HTTPException(502, out.get("error") or "synthesis failed")
     spec = out["spec"]
@@ -2811,12 +2858,61 @@ async def synthesize_test(req: SynthesizeTestRequest):
                 name=spec["name"], tier="safe", category=spec["category"],
                 target_ip=((req.target or "").split(":")[0] or None),
                 command=spec["command"], tool=spec["tool"],
-                assertion=spec["assertion"], created_by_session=req.session_id)
+                assertion=spec["assertion"], created_by_session=req.session_id,
+                metadata=spec.get("metadata"))
         except Exception as e:  # noqa: BLE001
             raise HTTPException(500, f"persist failed: {e}")
-    return {"ok": True, "spec": spec, "matched_wstg": matched,
-            "matched_exploitdb": edb_used, "persisted_id": persisted_id,
+    return {"ok": True, "spec": spec, "source_used": out["source_used"],
+            "matched_wstg": out.get("matched_wstg"),
+            "matched_exploitdb": out.get("matched_exploitdb"),
+            "persisted_id": persisted_id,
             "requires_approval": spec["tier"] == "impactful"}
+
+
+@app.post("/synthesize-test/compare")
+async def synthesize_test_compare(req: SynthesizeTestRequest):
+    """Build the SAME finding several ways (skill / rag / yaml by default) and return
+    them side by side under a shared comparison_group. Safe specs are persisted
+    (tagged) when persist=true; impactful are returned for approval."""
+    import uuid
+    import db_utils as _db
+    srcs = [x.strip().lower() for x in (req.sources or ["skill", "rag", "yaml"])
+            if isinstance(x, str) and x.strip().lower() in ("skill", "rag", "yaml", "all")]
+    if not srcs:
+        srcs = ["skill", "rag", "yaml"]
+    cg = str(uuid.uuid4())
+    by_source = {}
+    for s in srcs:
+        r = await _build_synth_spec(req, s)
+        if not r.get("ok"):
+            by_source[s] = {"ok": False, "error": r.get("error")}
+            continue
+        spec = r["spec"]
+        spec.setdefault("metadata", {})["comparison_group"] = cg
+        persisted_id = None
+        if req.persist and spec["tier"] == "safe":
+            try:
+                persisted_id = _db.create_security_test(
+                    name=spec["name"], tier="safe", category=spec["category"],
+                    target_ip=((req.target or "").split(":")[0] or None),
+                    command=spec["command"], tool=spec["tool"],
+                    assertion=spec["assertion"], created_by_session=req.session_id,
+                    metadata=spec.get("metadata"))
+            except Exception:  # noqa: BLE001
+                persisted_id = None
+        by_source[s] = {"ok": True, "spec": spec, "source_used": s,
+                        "matched_wstg": r.get("matched_wstg"),
+                        "matched_exploitdb": r.get("matched_exploitdb"),
+                        "persisted_id": persisted_id,
+                        "requires_approval": spec["tier"] == "impactful"}
+    try:
+        from common import vuln_skills as _vs
+        _vs.emit_selected(None, source="autogen", phase="compare",
+                          knowledge_source="+".join(srcs), comparison_group=cg,
+                          target=req.target or req.url)
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "comparison_group": cg, "by_source": by_source}
 
 
 @app.post("/pentest/cleanup")
@@ -3529,8 +3625,10 @@ async def approve_session_step(session_id: str, request: ApprovalRequest):
     if request.pending_exploit_id and request.pending_exploit_id not in ids:
         ids.append(request.pending_exploit_id)
 
+    queued = _queued_exploit_ids(session_uuid)
+
     if request.approved and not ids:
-        ids = _queued_exploit_ids(session_uuid)
+        ids = queued
         if not ids:
             # Fail loudly rather than resuming into a no-op the operator would
             # read as "approved and executed".
@@ -3538,6 +3636,25 @@ async def approve_session_step(session_id: str, request: ApprovalRequest):
                 status_code=400,
                 detail="approved=true but this session has no pending exploits to "
                        "execute. List candidates with GET /api/exploits/pending.")
+    elif request.approved and ids:
+        # Fail CLOSED on an id that is not a queued pending exploit for THIS
+        # session. Without this, an operator who pasted the session id from the
+        # approve URL (the only UUID the old message showed) sailed straight
+        # through to execute_approved_exploit and a confusing "Exploit not found".
+        # Reject it here, naming the ids that ARE valid, so the mistake is caught
+        # at the gate instead of deep in execution.
+        unknown = [i for i in ids if i not in set(queued)]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "One or more ids are not queued pending exploits for "
+                             "this session.",
+                    "unknown_ids": unknown,
+                    "hint": "Use an id from queued_exploit_ids below (NOT the "
+                            "session id from the URL), or omit ids to approve all.",
+                    "queued_exploit_ids": queued,
+                })
 
     session_logger.info(
         "[%s] Operator approval: approved=%s exploits=%s",

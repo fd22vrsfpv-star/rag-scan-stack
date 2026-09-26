@@ -4260,6 +4260,38 @@ def get_wstg_guidance(issue_type: str = None, cwe: str = None, name: str = None,
         return json.dumps({"matched": False, "error": str(e)})
 
 
+def get_vuln_methodology(issue_type: str = None, cwe: str = None,
+                         name: str = None, nuclei_tags: str = None) -> str:
+    """Load the exploitation methodology "skill" pack for a vulnerability CLASS by name.
+
+    Deterministic by-name lookup (NOT similarity search): given a finding's
+    type / CWE / name / nuclei tags, resolves the canonical vuln class and returns
+    its curated methodology — a terse `web_hint` (techniques, payload shapes,
+    success signals, filter bypasses) and a fuller `synth_methodology` (how to
+    PROVE impact). READ-ONLY; dispatches nothing. Use it to seed how you build or
+    refine an exploit/test for a web finding.
+
+    Args:
+        issue_type: finding type/category text (e.g. "SQL Injection", "sqli").
+        cwe: comma-separated CWE ids (e.g. "CWE-89").
+        name: finding name/title.
+        nuclei_tags: comma-separated nuclei tags (e.g. "xss,sqli").
+
+    Returns JSON: {matched, canonical, web_hint, synth_methodology}.
+    """
+    try:
+        from common import vuln_skills
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"matched": False, "error": f"loader unavailable: {e}"})
+    cwe_list = [c.strip() for c in (cwe or "").split(",") if c.strip()]
+    tag_list = [t.strip() for t in (nuclei_tags or "").split(",") if t.strip()]
+    m = vuln_skills.match(issue_type=issue_type, cwe=cwe_list or None,
+                          name=name, nuclei_tags=tag_list or None)
+    if not m:
+        return json.dumps({"matched": False})
+    return json.dumps({"matched": True, **m}, indent=2)
+
+
 def get_exploitdb_guidance(cve: str = None, query: str = None,
                            edb_id: str = None, limit: int = 8) -> str:
     """Read ExploitDB writeups relevant to a finding, to build a test from them.

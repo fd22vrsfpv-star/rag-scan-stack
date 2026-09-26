@@ -1600,6 +1600,7 @@ def create_security_test(
     pending_exploit_id: Optional[str] = None,
     created_by_session: Optional[str] = None,
     engagement_id: Optional[str] = None,
+    metadata: Optional[Dict] = None,
 ) -> str:
     """Insert one security_tests row; returns its id (str). Enforces the lane
     invariant up front so the DB CHECK is never the first to complain."""
@@ -1615,14 +1616,15 @@ def create_security_test(
                  (name, tier, category, target_ip, target_host, target_port,
                   target_service, command, tool, assertion, source_finding_source,
                   source_finding_id, attack_vector_id, pending_exploit_id,
-                  created_by_session, engagement_id)
+                  created_by_session, engagement_id, metadata)
                VALUES (%s,%s,%s,%s::inet,%s,%s,%s,%s,%s,%s,%s,%s::uuid,%s::uuid,
-                       %s::uuid,%s::uuid,%s::uuid)
+                       %s::uuid,%s::uuid,%s::uuid,%s)
                RETURNING id""",
             (name, tier, category, target_ip, target_host, target_port,
              target_service, command, tool, Json(assertion or {}),
              source_finding_source, source_finding_id, attack_vector_id,
-             pending_exploit_id, created_by_session, engagement_id),
+             pending_exploit_id, created_by_session, engagement_id,
+             Json(metadata or {})),
         )
         return str(cur.fetchone()[0])
 

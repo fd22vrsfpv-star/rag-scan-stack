@@ -11,6 +11,7 @@ from routers.health import router as health_router
 from routers.assets import router as assets_router
 from routers.findings import router as findings_router
 from routers.rag import router as rag_router
+from routers.skills import router as skills_router
 from routers.scans import router as scans_router
 from routers.exploits import router as exploits_router
 from routers.security_tests import router as security_tests_router
@@ -139,6 +140,7 @@ app.include_router(recon_agent_router)
 app.include_router(agents_router)
 app.include_router(news_router)
 app.include_router(chat_presets_router)
+app.include_router(skills_router)
 
 
 @app.websocket("/ws")

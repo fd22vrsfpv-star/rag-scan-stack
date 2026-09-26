@@ -261,6 +261,7 @@ services:
     volumes:
       - ./nmap_out:/app/nmap_out
       - ./etl:/app/etl:ro
+      - ./common:/app/common:ro    # /skills reuses common/vuln_skills.py
       - ${WORDLISTS_DIR:-./wordlists}:/wordlists
       - ./knowledge:/knowledge:ro
       # The canonical DDL, so POST /health/sql/apply-schema can apply the SAME
@@ -1113,6 +1114,7 @@ services:
     mem_limit: ${AUTOGEN_MEM_LIMIT:-6g}
     cpus: ${AUTOGEN_CPUS:-3.0}
     environment:
+      SYNTH_METHODOLOGY: ${SYNTH_METHODOLOGY:-1}
       SSL_CERTFILE: /certs/server.crt
       PYTHONHTTPSVERIFY: "0"
       SSL_KEYFILE: /certs/server.key
@@ -1479,6 +1481,7 @@ services:
     mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
     cpus: ${DEFAULT_CPUS:-2.0}
     environment:
+      WEB_METHODOLOGY: ${WEB_METHODOLOGY:-1}
       SSL_CERTFILE: /certs/server.crt
       PYTHONHTTPSVERIFY: "0"
       SSL_KEYFILE: /certs/server.key

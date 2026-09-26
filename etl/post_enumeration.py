@@ -1389,6 +1389,34 @@ def _propose_from_facts(cur, facts, context, rules, out, scope_rows=None):
             _record_firing(cur, rule_id, service)
             _observe(cur, rule_id, context, fact, command, rec_id)
 
+    # Observability: which vuln-class skills apply to these facts (enumeration) and
+    # to the recommendations just queued (scan_recommendation). Deduped per class.
+    try:
+        from common import vuln_skills as _vs
+        _sk: Dict[str, int] = {}
+        for _f in facts:
+            if not isinstance(_f, dict):
+                continue
+            _cid = _vs.resolve(issue_type=_f.get("issue_type"), name=_f.get("name"))
+            if _cid:
+                _sk[_cid] = _sk.get(_cid, 0) + 1
+        _eid = context.get("engagement_id")
+        _tgt = context.get("target")
+        for _cid, _n in _sk.items():
+            log.info("vuln-class skill '%s' applies (%d fact(s))", _cid, _n)
+            _emit_webhook("methodology_source_selected",
+                          {"skill": _cid, "knowledge_source": "skill",
+                           "phase": "enumeration", "engagement_id": _eid,
+                           "target": _tgt, "fact_count": _n})
+        if out.get("queued"):
+            for _cid in _sk:
+                _emit_webhook("methodology_source_selected",
+                              {"skill": _cid, "knowledge_source": "skill",
+                               "phase": "scan_recommendation", "engagement_id": _eid,
+                               "target": _tgt, "queued": out.get("queued")})
+    except Exception as e:  # noqa: BLE001
+        log.debug("skill selection hooks skipped: %s", e)
+
 
 def analyse_findings(*, target: str = "", engagement_id: Optional[str] = None,
                      limit: int = 200) -> Dict[str, Any]:

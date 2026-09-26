@@ -113,7 +113,7 @@ EXPECTED_TABLES=(
   checkpoints checkpoint_blobs checkpoint_writes checkpoint_migrations
   # TIER 8: Exploit management
   pending_exploits exploit_results exploit_chunks
-  lateral_movement credential_spray_attempts credential_spray_approvals password_policies platform_control security_tests security_test_runs
+  lateral_movement credential_spray_attempts credential_spray_approvals password_policies platform_control security_tests security_test_runs custom_vuln_skills
   exploit_approval_rules
   msf_modules active_listeners exploit_callbacks tool_executions
   # TIER 9: Webhooks
@@ -887,6 +887,19 @@ if [[ -n "$DASH" ]]; then
   else
     fail "certs/ca-bundle.crt missing — run scripts/generate-ca-bundle.sh (services set REQUESTS_CA_BUNDLE to it)"
   fi
+
+  # Vuln-class methodology "skills" feed the exploit-building prompts (web payload
+  # gen/refine + test synthesis) via common/vuln_skills.py reading this file off the
+  # /knowledge mount. If it is unreadable, methodology injection is a silent no-op.
+  for _svc in exploit-runner autogen-agents; do
+    if ct_cid "$_svc" >/dev/null 2>&1; then
+      if ct_exec "$_svc" test -r /knowledge/vuln_class_methodology.yaml 2>/dev/null; then
+        pass "$_svc can read knowledge/vuln_class_methodology.yaml"
+      else
+        fail "$_svc cannot read /knowledge/vuln_class_methodology.yaml — check the ./knowledge:/knowledge:ro mount; vuln-class methodology injection will be a silent no-op"
+      fi
+    fi
+  done
 
   # nmap_scanner resolves the SAME profile for its own empty-ports fallback, so
   # it needs the knowledge/ mount too. Without it the fallback degrades to the

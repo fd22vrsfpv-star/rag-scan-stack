@@ -1722,12 +1722,20 @@ def exploit_approval(state: PentestState) -> dict:
     # An operator shown a single id cannot tell what else was found, and the
     # others sit `pending` for ever with nothing pointing at them.
     queued = _pending_exploits_for_session(sid)
+    # Detailed rows so the dashboard can render a SELECT LIST (id + title +
+    # target), not a free-text box the operator fills with the wrong UUID.
+    queued_detail = [
+        {"id": rid, "title": title, "source": source,
+         "target": (f"{ip}:{port}" if port is not None else str(ip))}
+        for (rid, title, ip, port, source) in _queued_exploit_details(queued)
+    ]
     decision = interrupt({
         "kind": "exploit_approval",
         "session_id": str(state["session_id"]),
         "target": state.get("target", "")[:300],
         "candidate": (state.get("exploit_candidate") or "")[:2000],
         "queued_exploit_ids": queued,
+        "queued_exploits": queued_detail,
         "prompt": ("Approve execution of the queued exploit(s)? Reply via "
                    "POST /pentest/{session_id}/approve with "
                    '{"approved": true|false, "pending_exploit_ids": ["<uuid>", ...]}'
@@ -5003,16 +5011,69 @@ def _interim_report(sid: str, final: dict, target: str, task: str,
         _log.warning("[%s] interim report failed: %s", sid, e)
 
 
+def _queued_exploit_details(ids) -> list:
+    """(id, title, target_ip, target_port, source) for the given queued ids, in
+    the order given. Best-effort: rows the query cannot return are simply
+    omitted, so a lookup failure degrades to an empty select list, never a raise."""
+    ids = [str(i) for i in (ids or []) if i]
+    if not ids:
+        return []
+    try:
+        from db_utils import get_db
+        rows_by_id = {}
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id::text, exploit_title, target_ip, target_port, source "
+                "  FROM pending_exploits WHERE id = ANY(%s::uuid[])", (ids,))
+            for rid, title, ip, port, source in cur.fetchall():
+                rows_by_id[rid] = (rid, title, ip, port, source)
+        return [rows_by_id[i] for i in ids if i in rows_by_id]
+    except Exception as e:  # noqa: BLE001
+        _log.warning("queued exploit detail lookup failed: %s", e)
+        return []
+
+
 def _park_for_approval(sid: str, payload: dict) -> dict:
     """Record the pause so it is visible everywhere the operator looks: session
     status, a session message, session metadata and a webhook event. A blocked /
-    waiting item that looks identical to a running one reads as a hang."""
+    waiting item that looks identical to a running one reads as a hang.
+
+    The message lists the ACTUAL queued exploit ids (a select list), because the
+    only other UUID an operator can see is the session id in the approve URL —
+    pasting that as the pending_exploit_id is how an approval turned into
+    "Exploit not found". Real ids here, plus a fail-closed check at the endpoint,
+    are the two halves of that fix."""
+    # The interrupt payload already carries the queued ids; enrich them with a
+    # title/target so the operator picks a row, not a bare UUID.
+    queued = payload.get("queued_exploit_ids") or []
+    details = _queued_exploit_details(queued)
+    if details:
+        lines = []
+        for rid, title, ip, port, source in details:
+            tgt = f"{ip}:{port}" if port is not None else str(ip)
+            lines.append(f"  • {rid}\n      {title or source or 'exploit'} → {tgt}")
+        select_list = ("Queued exploit(s) awaiting your decision:\n"
+                       + "\n".join(lines) + "\n\n")
+        example_id = details[0][0]
+        approve_hint = (
+            f"Approve with: POST /pentest/{sid}/approve\n"
+            f'  one:   {{"approved": true, "pending_exploit_ids": ["{example_id}"]}}\n'
+            f'  all:   {{"approved": true}}   (omit ids to run every queued exploit)\n'
+            f'  deny:  {{"approved": false}}\n'
+            "NOTE: use an exploit id from the list above — NOT the session id in "
+            "the URL.")
+    else:
+        # No queued rows (or the lookup failed). Say so plainly rather than
+        # printing a <uuid> placeholder the operator would fill with the wrong id.
+        select_list = ("No queued exploit id was found for this session. Check "
+                       "GET /api/exploits/pending before approving.\n\n")
+        approve_hint = (f"Approve with: POST /pentest/{sid}/approve "
+                        '{"approved": true}  (runs everything this session queued)')
     _msg(sid, "Exploit",
          "⏸ AWAITING OPERATOR APPROVAL — the graph is checkpointed in Postgres "
          "and will resume from this exact point.\n\n"
          f"Candidate:\n{(payload.get('candidate') or '')[:1500]}\n\n"
-         f"Approve with: POST /pentest/{sid}/approve "
-         '{"approved": true, "pending_exploit_id": "<uuid>"}',
+         f"{select_list}{approve_hint}",
          role="system")
     try:
         update_agent_session(_sid(sid), status="awaiting_approval",
