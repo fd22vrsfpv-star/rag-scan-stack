@@ -4566,15 +4566,26 @@ def surface_approval(state: PentestState) -> dict:
     of exploit_approval)."""
     from langgraph.types import interrupt
     pending = state.get("pending_surface_tests") or []
+    # Surface the queued ids as a SELECT LIST (id + title + target), same as
+    # exploit_approval — otherwise the dashboard banner has nothing to populate a
+    # dropdown from and falls back to a free-text box, and the only UUID an
+    # operator can see is the session id in the approve URL (which then 404s as
+    # "Exploit not found").
+    queued_ids, queued_detail = _surface_queued_detail(
+        pending, state.get("surface_target", ""))
     decision = interrupt({
         "kind": "surface_test_approval",
         "session_id": str(state["session_id"]),
         "target": state.get("surface_target", "")[:300],
         "candidate": "\n".join(f"- {t['name']} (pending_exploit_id={t.get('pending_exploit_id')})"
                                for t in pending)[:2000],
+        "queued_exploit_ids": queued_ids,
+        "queued_exploits": queued_detail,
         "prompt": ("Approve execution of the queued impactful test(s)? Reply via "
                    "POST /pentest/{session_id}/approve with "
-                   '{"approved": true|false, "pending_exploit_id": "<uuid>"}'),
+                   '{"approved": true|false, "pending_exploit_ids": ["<uuid>", ...]}'
+                   " — omit the ids to approve everything queued, or pass a subset. "
+                   "Use an id from the list, NOT the session id in the URL."),
     })
     if isinstance(decision, dict):
         approved = bool(decision.get("approved"))
@@ -5031,6 +5042,35 @@ def _queued_exploit_details(ids) -> list:
     except Exception as e:  # noqa: BLE001
         _log.warning("queued exploit detail lookup failed: %s", e)
         return []
+
+
+def _surface_queued_detail(pending, fallback_target: str = ""):
+    """(queued_ids, queued_exploits) for a surface-test approval, for the dashboard
+    select list. `pending` is the list of pending_surface_tests dicts (each with a
+    `name` and a `pending_exploit_id`). Detail comes from the pending_exploits rows
+    when available; otherwise it falls back to the test's own name and the surface
+    target, so a DB miss still yields a usable, non-empty list (never a bare id)."""
+    pending = pending or []
+    queued_ids = [str(t.get("pending_exploit_id")) for t in pending
+                  if t.get("pending_exploit_id")]
+    detail = {rid: (title, ip, port, source)
+              for (rid, title, ip, port, source) in _queued_exploit_details(queued_ids)}
+    queued_exploits = []
+    for t in pending:
+        pid = t.get("pending_exploit_id")
+        if not pid:
+            continue
+        pid = str(pid)
+        if pid in detail:
+            title, ip, port, source = detail[pid]
+            tgt = f"{ip}:{port}" if port is not None else str(ip or "")
+            queued_exploits.append({"id": pid, "title": title or t.get("name"),
+                                    "target": tgt, "source": source})
+        else:
+            queued_exploits.append({"id": pid, "title": t.get("name"),
+                                    "target": fallback_target or "",
+                                    "source": "surface_test"})
+    return queued_ids, queued_exploits
 
 
 def _park_for_approval(sid: str, payload: dict) -> dict:
