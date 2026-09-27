@@ -5059,6 +5059,27 @@ def list_pending_exploits_tool(status: str = None, limit: int = 20) -> str:
         }, indent=2)
 
 
+def _exploit_runner_http_error(response) -> str:
+    """Build the tool result for a non-200 from the exploit-runner.
+
+    A 422 is a REQUEST-SHAPING (dispatch) error, not an attempted-and-failed
+    exploit: the request never reached the exploit logic. Flag it with
+    ``dispatch_error`` so callers/graders do not count it as a real miss
+    (OPEN_ITEMS: dispatch sends numeric args -> 422 -> exploit never runs).
+    """
+    err = {
+        "ok": False,
+        "error": f"Exploit runner returned HTTP {response.status_code}",
+        "detail": response.text[:500],
+    }
+    if response.status_code == 422:
+        err["dispatch_error"] = True
+        err["hint"] = ("The exploit-runner rejected the request shape (validation "
+                       "error) — the exploit was NOT executed. Do not record this as "
+                       "an attempted-and-failed exploit; fix the request and retry.")
+    return json.dumps(err, indent=2)
+
+
 def execute_approved_exploit(pending_exploit_id: str) -> str:
     """
     Execute an approved exploit via the exploit-runner service.
@@ -5155,11 +5176,7 @@ def execute_approved_exploit(pending_exploit_id: str) -> str:
                 )
 
                 if response.status_code != 200:
-                    return json.dumps({
-                        "ok": False,
-                        "error": f"Exploit runner returned HTTP {response.status_code}",
-                        "detail": response.text[:500]
-                    }, indent=2)
+                    return _exploit_runner_http_error(response)
 
                 result = response.json()
 
@@ -5184,18 +5201,22 @@ def execute_approved_exploit(pending_exploit_id: str) -> str:
                         "target_port": exploit.get("target_port", 0),
                         "lhost": params.get("lhost"),
                         "lport": params.get("lport", 4444),
-                        "extra_args": {k: v for k, v in params.items() if k not in ["lhost", "lport"]},
+                        # extra_args values MUST be strings: ScriptExecuteRequest
+                        # types them as Dict[str, str], so a numeric arg (e.g.
+                        # RPORT=443 as int) 422s before the exploit runs
+                        # (OPEN_ITEMS: dispatch int-args -> 422).
+                        "extra_args": {
+                            k: str(v)
+                            for k, v in params.items()
+                            if k not in ("lhost", "lport") and v is not None
+                        },
                         "pending_exploit_id": str(exploit_uuid)
                     },
                     timeout=300.0
                 )
 
                 if response.status_code != 200:
-                    return json.dumps({
-                        "ok": False,
-                        "error": f"Exploit runner returned HTTP {response.status_code}",
-                        "detail": response.text[:500]
-                    }, indent=2)
+                    return _exploit_runner_http_error(response)
 
                 result = response.json()
 
@@ -5217,11 +5238,7 @@ def execute_approved_exploit(pending_exploit_id: str) -> str:
                     timeout=300.0,
                 )
                 if response.status_code != 200:
-                    return json.dumps({
-                        "ok": False,
-                        "error": f"Exploit runner returned HTTP {response.status_code}",
-                        "detail": response.text[:500],
-                    }, indent=2)
+                    return _exploit_runner_http_error(response)
                 result = response.json()
                 return json.dumps({
                     "ok": True,
