@@ -48,24 +48,6 @@ are deliberately placed on the correct lane (they are general-purpose remote
 execution, so "safe read-only" is arguably wrong for them — that is the decision).
 **Enforced by:** not enforced
 
-### `drb_remote_codeexec` is declared in knowledge but not installed
-**Found:** 2026-09-21
-**Evidence:** `knowledge/service_access_methods.yaml:170` declares
-`msf: "exploit/linux/misc/drb_remote_codeexec"` and
-`scan_recommender/tool_kb.py:92` repeats it, but the module is not in this
-Metasploit install — it is one of the two ids named in
-`tests/test_msf_resolve.py` as the case the resolve gate exists to reject.
-This is the likely true origin of the "synthetic module ids queued as
-source=metasploit" rows: `exploit_watcher._queue_vector_exploit` reads the module
-straight from that catalogue and queues it without resolving.
-**Where:** `knowledge/service_access_methods.yaml:168-170`, `scan_recommender/tool_kb.py:92`.
-**Done when:** the module is installed in this Metasploit, or removed from both
-declarations so the DRb vector is not offered as available. Gating the writer
-alone silently drops the vector, which may not be the intent — that is why this
-is its own item.
-**Enforced by:** not enforced (`tests/test_declared_tools_are_installed.py` is the existing pattern for "declared thing must exist")
-
-
 ## Known gaps carried from earlier sessions
 
 ### Nothing measures whether retrieval improved
