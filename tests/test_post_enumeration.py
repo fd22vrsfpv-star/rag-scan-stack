@@ -203,7 +203,9 @@ def test_an_unreachable_protocol_queues_nothing():
     unrunnable is not."""
     src = _read(ENGINE)
     fn = function_source(src, "_wrap_remote")
-    assert 'if proto != "ssh":' in fn and "return None" in fn
+    # A protocol with no safe runner still returns None (queues nothing). The set
+    # of runnable protocols is the allow-list; anything outside it is unwrappable.
+    assert "_WRAP_PROTOCOLS" in fn and "return None" in fn
     enum = function_source(src, "_enumerate_post_access")
     assert "unwrappable" in enum, (
         "a step that could not be wrapped vanishes silently, which looks "
