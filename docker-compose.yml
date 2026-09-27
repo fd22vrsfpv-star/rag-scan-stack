@@ -179,6 +179,12 @@ services:
     build:
       context: .
       dockerfile: app/rag-api/Dockerfile
+      # Bake the current version into the image at BUILD time (IMAGE_BUILD_VERSION)
+      # so /health/quick can distinguish "built at" from the CREATE-time env
+      # BUILD_VERSION below. A container not recreated after a version bump then
+      # reports version_stale=true instead of silently mislabelling itself.
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-2026.04.17-1}
     # `docker compose watch` syncs edits into the running container, so a
     # code change takes effect without a rebuild. Baked images remain the
     # deploy artifact; this only changes the DEV loop, which is where
