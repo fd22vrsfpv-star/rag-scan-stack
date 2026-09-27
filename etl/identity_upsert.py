@@ -192,3 +192,53 @@ def bulk_upsert_identities(cur, items: List[dict], page_size: int = 200) -> int:
     execute_values(cur, _BULK_UPSERT_SQL, rows,
                    template=_BULK_VALUES_TEMPLATE, page_size=page_size)
     return len(rows)
+
+
+# ── engagement resolution ───────────────────────────────────────────────────
+# A single answer to "which engagement does this host belong to?", shared by
+# every identity writer and the NULL-engagement backfill so the question cannot
+# come to mean two different things in two places. Mirrors
+# exploit_runner.cred_cracker._resolve_engagement: an identity is COLLECTED
+# target data and MUST carry engagement_id (see CLAUDE.md "Engagement
+# attribution is mandatory"); leaving it NULL is what let enumerated / MSF
+# accounts appear under every engagement's Users page. Resolves from the host's
+# asset first, then its scope entry. Returns None when the host cannot be tied
+# to an engagement — the caller must NOT invent one (fail closed on attribution,
+# not fail open onto an arbitrary engagement).
+def resolve_engagement_for_host(cur, host):
+    """(engagement_id | None) for a host/IP, from its asset then scope entry."""
+    if not host:
+        return None
+    host = str(host).strip()
+    if not host:
+        return None
+
+    def _one(row):
+        if row is None:
+            return None
+        return row.get("engagement_id") if isinstance(row, dict) else row[0]
+
+    try:
+        # 1) the host's asset (matches an IP or a recorded hostname)
+        cur.execute(
+            "SELECT engagement_id FROM assets "
+            "WHERE (host(ip) = %s OR hostname = %s) AND engagement_id IS NOT NULL "
+            "LIMIT 1", (host, host))
+        eid = _one(cur.fetchone())
+        if eid:
+            return eid
+        # 2) the host's IP-typed scope entry (same lookup cred_cracker uses)
+        cur.execute(
+            "SELECT engagement_id FROM scope_targets "
+            "WHERE split_part(target, '/', 1) = %s AND target_type = 'ip' "
+            "  AND engagement_id IS NOT NULL "
+            "LIMIT 1", (host,))
+        eid = _one(cur.fetchone())
+        if eid:
+            return eid
+    except Exception:
+        # Resolution is best-effort; a failure must not break the write. The
+        # row stays NULL and the backfill can claim it once the asset/scope
+        # exists — never guess an engagement here.
+        pass
+    return None
