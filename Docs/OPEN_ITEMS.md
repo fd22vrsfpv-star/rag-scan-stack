@@ -183,36 +183,6 @@ re-dispatched through the existing scope-gated, `MAX_CONCURRENT_SCANS`-bounded
 approval path, gated behind an explicit policy flag (Tier 3).
 **Enforced by:** not enforced
 
-## Exploit classification
-
-### A langgraph session never drains pending credential recommendations
-**Found:** 2026-09-17, rewritten 2026-09-21 after audit — the original headline
-("hydra recommended but never auto-dispatched") is no longer true.
-**What changed:** credential testing IS dispatched deterministically now.
-`autogen_agents/langgraph_engine.py:901` fires
-`scan_tools.start_credential_check(...)` for the auth services found by
-`_discovered_auth_services()` (:996), which reads open `ports` directly rather
-than depending on the model noticing. `kb_coverage` counts hydra satisfied by a
-credential-check run (`scan_tools.py:701`), so the reported symptom —
-`recommended_but_never_run: [{scanner: hydra}]` — should not recur for a
-pre-approved auto_execute session.
-**Evidence of the RESIDUAL:** `grep scan_recommendations
-autogen_agents/langgraph_engine.py` shows only an INSERT (:2755) — there is no
-POST to `/api/scan-recommendations/run`. Pending rows therefore wait for the BFF
-loop (`dashboard/bff/services/recon_agent.py:1070`) or an operator; the session
-itself never drains them. Separately, `start_brutus` (wordlist attack) is still
-model-choice only — the deterministic block fires `start_credential_check` alone.
-**Where:** `autogen_agents/langgraph_engine.py` (the block at :901).
-**Done when:** either the session drains pending credential recommendations
-through the existing `dashboard/bff/routers/assets.py:1211 run_scan_recommendations`
-(which already routes hydra/medusa/ncrack to the brutus-runner, enforces priority
-order, the idempotency guard and `_scope_rows_for()`), or the divergence is
-documented so "recommended but not run" is visibly the BFF loop's job.
-**NOT in scope without a decision:** firing `start_brutus` unattended. A wordlist
-attack risks account lockout, so whether pre-approval alone may trigger it is an
-operator policy call, not a code default.
-**Enforced by:** `tests/test_credential_phase_reachable.py` (pins that the
-pre-approval check precedes SCAN_TOOLS_CREDENTIAL — keep that ordering)
 ## ZAP authenticated spider does not traverse the logged-in area
 - **Found:** 2026-09-19, proving the default-cred -> Auth Profile -> authenticated scan chain on demo.testfire.net.
 - **Evidence:** logs show `ZAP form-auth configured ... as user jsmith (id 10)` + `ZAP authenticated scan for http://demo.testfire.net/`, no errors. But `z.core.urls()` after the scan returns 14 URLs, ALL public (/, /doLogin, /images/*) — zero /bank/ authenticated pages. Credentials are valid (default_cred_check confirmed the login redirect).
