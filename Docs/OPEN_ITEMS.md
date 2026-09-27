@@ -81,23 +81,6 @@ is its own item.
 **Enforced by:** not enforced (`tests/test_declared_tools_are_installed.py` is the existing pattern for "declared thing must exist")
 
 
-### Generated curl commands carry a stray trailing quote and die in the shell
-**Found:** 2026-09-21 (by the parser agent, while reading real curl output)
-**Evidence:** 11 `tool_executions` rows with `tool='curl'` have empty output and
-`error` = `/bin/sh: 1: Syntax error: Unterminated quoted string`. The stored
-command shows the defect directly:
-`curl -sk http://192.168.1.150:80/doc/'` — a trailing apostrophe with no opener.
-These probes never reached the network; they died in `/bin/sh`.
-**Where:** whatever builds curl probe commands (not yet located — the rows carry
-no single distinguishing source, so start from the writers of `tool_executions`
-with `tool='curl'`).
-**Why it matters:** the runs are recorded as executed-and-fruitless. The new curl
-parser correctly reads them as a measured ZERO, which is honest but wrong about
-the target — nothing was ever asked of it.
-**Done when:** the generator quotes URLs correctly and no stored curl command has
-unbalanced quotes.
-**Enforced by:** not enforced
-
 ### pytest runs write into production tables
 **Update 2026-09-21:** the 16 polluted rows were DELETED along with the inflated
 counters. The SOURCE is untouched — a test can still write here — so the item
