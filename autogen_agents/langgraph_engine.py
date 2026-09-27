@@ -898,6 +898,14 @@ def scan(state: PentestState) -> dict:
         # skips it — so when credential testing is authorised, dispatch it here
         # on the auth services ALREADY known open (scope-gated + rate-bounded in
         # the tool body). Skip if the model already ran it.
+        #
+        # DIVERGENCE (recommended-but-not-run is INTENTIONAL): this fires
+        # credential CHECKING only (default/weak password probe). It does NOT
+        # fire start_brutus (wordlist attack — lockout risk, an operator policy
+        # call) and it does NOT drain pending scan_recommendations rows the
+        # session queues elsewhere (see _enumerate_post_access's INSERT). Those
+        # pending rows are dispatched by the BFF recon-agent loop or an operator,
+        # by design — "recommended but not run" is the BFF loop's job, not a gap.
         if creds_enabled and "start_credential_check" not in used:
             try:
                 _auth_svcs = _discovered_auth_services(target)
@@ -2801,6 +2809,26 @@ def _enumerate_post_access(sid, target: str) -> dict:
                                 {"protocol": protocol, "step": st["id"]})
                             continue
                         rendered["command"] = wrapped
+                        # DIVERGENCE (recommended-but-not-run is INTENTIONAL).
+                        #
+                        # This INSERT QUEUES a pending scan_recommendations row;
+                        # the langgraph session deliberately does NOT POST it to
+                        # /api/scan-recommendations/run or otherwise auto-dispatch
+                        # it from inside the graph. Draining pending rows is the
+                        # BFF recon-agent loop's job (dashboard/bff/services/
+                        # recon_agent.py, via dashboard/bff/routers/assets.py
+                        # run_scan_recommendations, which applies priority order,
+                        # the idempotency guard and _scope_rows_for()) — or an
+                        # operator acting on the queue. The session's own
+                        # credential CHECKING already fires deterministically
+                        # (start_credential_check in scan(), see the block near
+                        # the top of this module); what stays queue-only here are
+                        # post-access playbook steps and any wordlist/brute
+                        # (start_brutus) work. Unattended wordlist/brute dispatch
+                        # is withheld ON PURPOSE pending an operator policy call
+                        # (account-lockout risk), so "recommended but not run" is
+                        # the BFF loop's responsibility by design, not a silent
+                        # gap in the graph. DO NOT auto-POST these rows here.
                         cur.execute(
                             """
                             INSERT INTO scan_recommendations
