@@ -14,6 +14,15 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 # Copy application code AFTER deps — code changes don't re-trigger pip install
 COPY app/rag-api/ /app/
 
+# Bake a BUILD-TIME version stamp into the image so it reflects the code the
+# image actually contains, independent of the CREATE-TIME `BUILD_VERSION` env
+# (docker-compose environment block). A container that was NOT recreated after a
+# version bump keeps the OLD env value while running current code; comparing the
+# two in the health output makes that staleness visible. Passed via compose
+# build.args; defaults to "unknown" when built without the arg.
+ARG BUILD_VERSION=unknown
+ENV IMAGE_BUILD_VERSION=$BUILD_VERSION
+
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 
