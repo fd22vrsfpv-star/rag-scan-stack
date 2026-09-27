@@ -21,6 +21,11 @@ COPY agent_claims.py      /app/agent_claims.py
 COPY entrypoint.sh        /app/entrypoint.sh
 COPY requirements.txt /app/requirements.txt
 
+# Bake a build-time version stamp (see app/rag-api/Dockerfile) so a container
+# not recreated after a version bump reports IMAGE_BUILD_VERSION != BUILD_VERSION.
+ARG BUILD_VERSION=unknown
+ENV IMAGE_BUILD_VERSION=$BUILD_VERSION
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl build-essential wget iproute2  pkg-config libpq-dev perl git && \
     rm -rf /var/lib/apt/lists/*

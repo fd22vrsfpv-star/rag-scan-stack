@@ -13,6 +13,10 @@
 
    # Copy the llm_query.py script to the container
    COPY llm_query.py /app/llm_query.py
+   # Bake a build-time version stamp (see app/rag-api/Dockerfile) so a container
+   # not recreated after a version bump reports IMAGE_BUILD_VERSION != BUILD_VERSION.
+   ARG BUILD_VERSION=unknown
+   ENV IMAGE_BUILD_VERSION=$BUILD_VERSION
    # llm_settings now comes from the ./common bind mount as
    # `common.llm_settings` — one copy, not four. See common/llm_settings.py.
 

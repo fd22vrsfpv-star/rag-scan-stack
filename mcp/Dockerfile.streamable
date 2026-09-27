@@ -42,6 +42,11 @@ COPY scan-pipelines/ ./skills/scan-pipelines/
 COPY burp-integration/ ./skills/burp-integration/
 COPY zap-integration/ ./skills/zap-integration/
 
+# Bake a build-time version stamp (see app/rag-api/Dockerfile) so a container
+# not recreated after a version bump reports IMAGE_BUILD_VERSION != BUILD_VERSION.
+ARG BUILD_VERSION=unknown
+ENV IMAGE_BUILD_VERSION=$BUILD_VERSION
+
 # Expose ports: built-in=9016-9023, third-party=9030-9039
 EXPOSE 9016 9017 9018 9019 9020 9021 9022 9023 9030 9031 9032 9033 9034 9035 9036 9037 9038 9039
 
