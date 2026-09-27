@@ -40,19 +40,6 @@ deliberately does not mount `/var/run/docker.sock`.
 or these tests obtain the container's behaviour without `docker exec`.
 **Enforced by:** not enforced
 
-## Learned tool selection
-
-### Most services never produce a usable failure signature
-**Found:** 2026-09-11
-**Evidence:** telnet, mysql, postgres and vnc credential attempts return
-`failure_mode: "unknown"` with no error excerpt, so `error_signature()` falls
-back to the last output lines and the learner has little to distinguish.
-**Where:** `nmap_scanner/cred_checker.py::_classify_hydra_failure` returns
-`unknown` for anything it does not recognise, and the raw output is discarded.
-**Done when:** the raw stderr of a failed attempt reaches the audit, so the
-signature is computed from what the tool actually said.
-**Enforced by:** not enforced
-
 ## Data and deployment
 
 ### Post-access steps cannot run on the Kali route — `sshpass` is not a safe tool
