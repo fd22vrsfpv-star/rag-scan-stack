@@ -42,6 +42,12 @@ log = logging.getLogger("artifact_consumer")
 OLLAMA_BASE = (os.environ.get("OLLAMA_BASE_URL")
                or os.environ.get("OLLAMA_URL")
                or "http://ollama:11434").rstrip("/")
+if "llm_query" not in OLLAMA_BASE:
+    # See Docs/OPEN_ITEMS.md: this legacy fallback (there is no `ollama` container
+    # in the stack) silently bypasses the llm_query router and dials a host that
+    # does not resolve. Log it loudly at startup instead of failing later.
+    logging.warning("artifact_consumer OLLAMA_BASE=%s bypasses the llm_query "
+                    "router (:8002) — no task routing/fallback.", OLLAMA_BASE)
 # Resolution order ends at OLLAMA_MODEL, which .env already sets to a model the
 # operator actually has. The previous literal default (copied from a sibling
 # module) named "gemma4:26b", which is not installed here — a request for an

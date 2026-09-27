@@ -242,6 +242,15 @@ def ddg_search(query: str, max_results: int = 15, timeout: float = 10.0, proxy: 
 # ── LLM call helper with automatic metrics logging ──
 OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemma4:31b")
+if "llm_query" not in OLLAMA_BASE:
+    # The router (llm_query:8002) is where task routing + fallback live. A base
+    # that points elsewhere (the legacy host.docker.internal default, or a stray
+    # OLLAMA_URL) silently bypasses all of it and dials a host that may not even
+    # exist. Log it loudly at startup rather than failing mysteriously later
+    # (Docs/OPEN_ITEMS.md "OLLAMA_BASE falls back to a host that does not exist").
+    logging.warning(
+        "OLLAMA_BASE=%s does not point at the llm_query router (:8002) — task "
+        "routing and fallback are BYPASSED for direct Ollama calls.", OLLAMA_BASE)
 
 
 def llm_generate(prompt: str, caller: str, model: str = None, think: bool = False,
