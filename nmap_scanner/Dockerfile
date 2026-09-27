@@ -31,6 +31,10 @@ COPY nmap_scanner/nmap-api.py /app/nmap-api.py
 # fix stranded in it.
 COPY nmap_scanner/log_manager.py /app/log_manager.py
 COPY nmap_scanner/cred_checker.py /app/cred_checker.py
+# Bake a build-time version stamp (see app/rag-api/Dockerfile) so a container
+# not recreated after a version bump reports IMAGE_BUILD_VERSION != BUILD_VERSION.
+ARG BUILD_VERSION=unknown
+ENV IMAGE_BUILD_VERSION=$BUILD_VERSION
 # Install vulscan and vulners NSE scripts for vulnerability scanning
 # Clone vulscan repository
 RUN set -eux; \

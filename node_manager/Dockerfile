@@ -17,6 +17,11 @@ COPY node_manager/ad_executor.py /app/ad_executor.py
 COPY node_manager/ssh_manager.py /app/ssh_manager.py
 COPY osint_runner/service_enum_cli.py /app/service_enum_cli.py
 
+# Bake a build-time version stamp (see app/rag-api/Dockerfile) so a container
+# not recreated after a version bump reports IMAGE_BUILD_VERSION != BUILD_VERSION.
+ARG BUILD_VERSION=unknown
+ENV IMAGE_BUILD_VERSION=$BUILD_VERSION
+
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8027
 CMD ["uvicorn", "node_manager:app", "--host", "0.0.0.0", "--port", "8027"]
