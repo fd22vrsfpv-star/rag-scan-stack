@@ -376,6 +376,46 @@ def _failure_excerpt(output: str, fallback_line: str = "") -> str:
     return text[:180]
 
 
+# How much of a failed attempt's RAW tool output is carried to the audit.
+# Larger than EVIDENCE_CHARS / the 180-char signature excerpt on purpose: the
+# signature should be computed from what the tool ACTUALLY said, and
+# _classify_hydra_failure collapses everything it does not recognise to "unknown"
+# while _failure_excerpt keeps only ~180 salient chars — for telnet, mysql,
+# postgres and vnc that left the learner nothing to distinguish. Still bounded,
+# because this lands in a jsonb column that every listing endpoint reads (127MB of
+# stderr once made two pages unservable).
+RAW_STDERR_CHARS = 2000
+
+
+def _raw_failure_output(output: str, username: str = "", password: str = "",
+                        cap: int = RAW_STDERR_CHARS) -> str:
+    """The tool's own RAW output for a FAILED attempt, redacted and capped.
+
+    The open item ("most services never produce a usable failure signature")
+    traced to the raw output being discarded once _classify_hydra_failure returned
+    "unknown": only the coarse failure_mode label and a 180-char salient excerpt
+    survived, so telnet/mysql/postgres/vnc failures all hashed to the same
+    signature. This keeps the raw text in the audit record so error_signature() is
+    computed from what the tool actually said.
+
+    Best-effort and non-breaking: it NEVER raises into the credential-check flow.
+    The password is masked where a label or the `user:pass` separator identifies
+    it (the same control the evidence path uses), so capturing hydra's own output
+    does not re-expose the secret the UI deliberately hides.
+    """
+    try:
+        text = (output or "").strip()
+        if not text:
+            return ""
+        if username or password:
+            text = "\n".join(
+                _redact_secret(ln, username, password) for ln in text.splitlines())
+        return text[:cap]
+    except Exception as e:  # noqa: BLE001 — a completed run must not fail here
+        logger.debug(f"[cred_checker] _raw_failure_output failed: {e}")
+        return (output or "")[:cap]
+
+
 # Tuple type alias for the rich return shape -- (results, audit_dict).
 # Existing callers within this module are updated below; cred_checker.py
 # has no external callers (confirmed via repo-wide grep).
@@ -461,6 +501,10 @@ def _check_credentials_slotted(target, port, service, credentials, timeout):
             "success": False,
             "failure_mode": None,
             "error_excerpt": None,
+            # The tool's RAW output for a failed attempt, so the failure signature
+            # is computed from what the tool actually said rather than only the
+            # coarse failure_mode label (see _raw_failure_output).
+            "raw_stderr": None,
         }
         try:
             # Build hydra command
@@ -521,12 +565,23 @@ def _check_credentials_slotted(target, port, service, credentials, timeout):
                 mode, excerpt = _classify_hydra_failure(output)
                 attempt["failure_mode"] = mode
                 attempt["error_excerpt"] = excerpt
+                # Carry the RAW output through to the audit — especially for the
+                # "unknown" mode, where the classifier recognised nothing and the
+                # 180-char excerpt is all that otherwise survives. This is what the
+                # learner needs to tell telnet from mysql from postgres from vnc.
+                attempt["raw_stderr"] = _raw_failure_output(output, username, password)
                 if mode == "kex_mismatch":
                     kex_legacy_detected = True
 
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
             logger.warning(f"Hydra timeout for {username}@{target}:{port}")
             attempt["failure_mode"] = "timeout"
+            # Even a timeout can carry partial output the tool printed before it
+            # was killed; keep it best-effort so the signature has something.
+            parts = [getattr(e, "stdout", "") or "", getattr(e, "stderr", "") or ""]
+            partial = "".join(p for p in parts if isinstance(p, str))
+            if partial:
+                attempt["raw_stderr"] = _raw_failure_output(partial, username, password)
         except Exception as e:
             logger.error(f"Hydra error: {e}")
             attempt["failure_mode"] = "unknown"
@@ -840,7 +895,12 @@ def _method_error_text(m_audit: Dict[str, Any]) -> str:
     for a in m_audit.get("attempts", []):
         if a.get("success"):
             continue
-        if a.get("error_excerpt"):
+        # Prefer the RAW output: it is what the tool actually said, so a service
+        # the classifier collapsed to "unknown" still produces a distinguishing
+        # signature. Fall back to the salient excerpt, then the coarse label.
+        if a.get("raw_stderr"):
+            parts.append(str(a["raw_stderr"]))
+        elif a.get("error_excerpt"):
             parts.append(str(a["error_excerpt"]))
         elif a.get("failure_mode"):
             parts.append(f"attempt failed: {a['failure_mode']}")
