@@ -16,5 +16,9 @@ COPY nuclei/nuclei_runner.py /runner/nuclei_runner.py
 # fix stranded in it.
 COPY nuclei/log_manager.py /runner/log_manager.py
 COPY nuclei/protocol_config.py /runner/protocol_config.py
+# Bake a build-time version stamp (see app/rag-api/Dockerfile) so a container
+# not recreated after a version bump reports IMAGE_BUILD_VERSION != BUILD_VERSION.
+ARG BUILD_VERSION=unknown
+ENV IMAGE_BUILD_VERSION=$BUILD_VERSION
 EXPOSE 8011
 CMD ["python","-u","/runner/nuclei_runner.py","serve"]

@@ -19,6 +19,11 @@ RUN git clone --depth 1 https://github.com/ggerganov/llama.cpp /app/llama.cpp &&
 
 COPY . .
 
+# Bake a build-time version stamp (see app/rag-api/Dockerfile) so a container
+# not recreated after a version bump reports IMAGE_BUILD_VERSION != BUILD_VERSION.
+ARG BUILD_VERSION=unknown
+ENV IMAGE_BUILD_VERSION=$BUILD_VERSION
+
 EXPOSE 8025
 
 CMD ["uvicorn", "training_service:app", "--host", "0.0.0.0", "--port", "8025"]

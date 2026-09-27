@@ -39,5 +39,10 @@ COPY pd_runner/pd_runner.py     /runner/pd_runner.py
 # fix stranded in it.
 COPY pd_runner/log_manager.py   /runner/log_manager.py
 
+# Bake a build-time version stamp (see app/rag-api/Dockerfile) so a container
+# not recreated after a version bump reports IMAGE_BUILD_VERSION != BUILD_VERSION.
+ARG BUILD_VERSION=unknown
+ENV IMAGE_BUILD_VERSION=$BUILD_VERSION
+
 EXPOSE 8023
 CMD ["python", "-u", "/runner/pd_runner.py"]

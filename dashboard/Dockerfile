@@ -29,6 +29,11 @@ COPY bff/ /app/bff/
 # Copy built frontend
 COPY --from=frontend-build /build/dist /app/frontend/dist
 
+# Bake a build-time version stamp (see app/rag-api/Dockerfile) so a container
+# not recreated after a version bump reports IMAGE_BUILD_VERSION != BUILD_VERSION.
+ARG BUILD_VERSION=unknown
+ENV IMAGE_BUILD_VERSION=$BUILD_VERSION
+
 # Config
 COPY nginx.conf /etc/nginx/sites-enabled/default
 RUN sed -i 's|/run/nginx.pid|/tmp/nginx.pid|g' /etc/nginx/nginx.conf || true

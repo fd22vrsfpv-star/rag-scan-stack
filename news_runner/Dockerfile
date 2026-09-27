@@ -12,6 +12,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY news_runner/main.py .
 COPY news_runner/news_agent.py .
 
+# Bake a build-time version stamp (see app/rag-api/Dockerfile) so a container
+# not recreated after a version bump reports IMAGE_BUILD_VERSION != BUILD_VERSION.
+ARG BUILD_VERSION=unknown
+ENV IMAGE_BUILD_VERSION=$BUILD_VERSION
+
 EXPOSE 8028
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
