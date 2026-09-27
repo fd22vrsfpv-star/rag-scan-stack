@@ -135,17 +135,6 @@ fixed `_CLEANUP_TABLES` list that includes neither `tool_selection_learned` nor
 `pending_exploits` — and the stray `pytest_release` row is removed.
 **Enforced by:** not enforced
 
-
-### BUILD_VERSION labels go stale on containers that were not recreated
-**Found:** 2026-09-11
-**Evidence:** `BUILD_VERSION` is injected at container creation, so a service
-that was not recreated after a version bump reports the previous version while
-running current code. The UI reads it as the stack's version.
-**Where:** `docker-compose.yml` environment blocks; `scripts/update-version.sh`.
-**Done when:** the reported version comes from something that changes with the
-code, or the health output distinguishes "built at" from "running".
-**Enforced by:** not enforced
-
 ## Known gaps carried from earlier sessions
 
 ### Nothing measures whether retrieval improved
