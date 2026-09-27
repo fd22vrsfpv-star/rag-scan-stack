@@ -807,7 +807,8 @@ _BRUTE_TOOLS = {"hydra", "medusa", "ncrack", "crowbar",
 
 
 def propose_reruns(cur, catalogue=None, limit=100, dry_run=True,
-                   engagement_id=None, since_days=None, target=None):
+                   engagement_id=None, since_days=None, target=None,
+                   hold_for_review=True):
     """Queue one pending recommendation per (tool, target) worth re-running.
 
     This function does not dispatch: rows land `status='pending'`,
@@ -985,18 +986,29 @@ def propose_reruns(cur, catalogue=None, limit=100, dry_run=True,
     inserted = 0
     if not dry_run and proposals:
         from psycopg2.extras import Json
+        # Operator choice, not a code default (Docs/OPEN_ITEMS.md): re-runs land
+        # HELD for review ('review') by default so the recon-agent drain — which
+        # dispatches every 'pending' row regardless of source — does NOT auto-fire
+        # them. Passing hold_for_review=False is the explicit "queue for dispatch".
+        rec_status = "review" if hold_for_review else "pending"
         for p in proposals:
             cur.execute("""
                 INSERT INTO scan_recommendations
                     (ip, service, scanner, action, script, source, priority,
                      status, engagement_id, extra)
-                VALUES (%s,%s,%s,%s,%s,'post_review',%s,'pending',%s,%s)
+                VALUES (%s,%s,%s,%s,%s,'post_review',%s,%s,%s,%s)
                 ON CONFLICT (fingerprint) DO UPDATE
                    SET updated_at = now(),
-                       extra = scan_recommendations.extra || EXCLUDED.extra
+                       extra = scan_recommendations.extra || EXCLUDED.extra,
+                       -- Promote a HELD row to dispatch only. Never reset a row
+                       -- that already ran or is queued: completed/running/pending
+                       -- keep their status; only 'review' can move.
+                       status = CASE WHEN scan_recommendations.status = 'review'
+                                     THEN EXCLUDED.status
+                                     ELSE scan_recommendations.status END
                 RETURNING (xmax = 0) AS inserted
             """, (p["target"] or None, p["service"], p["tool"], p["action"],
-                  p["script"], 60, engagement_id,
+                  p["script"], 60, rec_status, engagement_id,
                   Json({"post_review_category": p["category"],
                         "remedy": p["remedy"], "evidence": p["evidence"],
                         "cause_fixed": p["cause_fixed"],
@@ -1022,7 +1034,8 @@ def propose_reruns(cur, catalogue=None, limit=100, dry_run=True,
 # ── orchestration ───────────────────────────────────────────────────────────
 
 def run_post_review(triggered_by="manual", since_days=None, target=None,
-                    queue_reruns=False, engagement_id=None, conn=None):
+                    queue_reruns=False, engagement_id=None, conn=None,
+                    dispatch_reruns=False):
     """Review executed work, store a report, and optionally queue the re-runs.
 
     Returns the report. Storage is best-effort in the sense that the review
@@ -1053,7 +1066,8 @@ def run_post_review(triggered_by="manual", since_days=None, target=None,
             reruns = propose_reruns(cur, catalogue=catalogue,
                                    dry_run=not queue_reruns,
                                    engagement_id=engagement_id,
-                                   since_days=since_days, target=target)
+                                   since_days=since_days, target=target,
+                                   hold_for_review=not dispatch_reruns)
 
             actionable = sum(g["count"] for g in executions["groups"]
                              if g["actionable"])
