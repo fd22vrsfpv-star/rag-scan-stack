@@ -3833,6 +3833,72 @@ def _load_owasp_param_tests() -> tuple:
     return ()
 
 
+# Per-host fragility decision cache (see common/target_fragility). A fragile
+# target (single-process/no-restart or a known-DoS build) is driven with a
+# NON-DESTRUCTIVE profile so a config-mutating request does not crash it and
+# foreclose the higher-value outcomes (OPEN_ITEMS: fragile targets fingerprinted
+# but not spared destructive actions).
+_FRAGILITY_CACHE: "dict[str, object]" = {}
+
+
+def _target_fragility(host: str):
+    """Fingerprint one host (Server header + nmap product/version) and classify
+    its fragility. Cached per host; records the decision (log + webhook) the first
+    time a host is classified fragile. Fail-open to 'normal' on any error."""
+    from common import target_fragility as _tf
+    if host in _FRAGILITY_CACHE:
+        return _FRAGILITY_CACHE[host]
+    server_header = None
+    product = None
+    version = None
+    openapi_title = None
+    try:
+        import psycopg2
+        from db_utils import get_db_dsn
+        with psycopg2.connect(get_db_dsn()) as conn, conn.cursor() as cur:
+            # Server header from the most recent DOM analysis for this host.
+            cur.execute(
+                """SELECT da.security_headers
+                     FROM dom_analysis da JOIN assets a ON da.asset_id = a.id
+                    WHERE regexp_replace(a.ip::text,'/[0-9]+$','') = %s
+                    ORDER BY da.created_at DESC NULLS LAST LIMIT 1""",
+                (host,))
+            r = cur.fetchone()
+            if r and r[0]:
+                hdrs = r[0] if isinstance(r[0], dict) else {}
+                for k, v in hdrs.items():
+                    if str(k).lower() == "server":
+                        server_header = str(v)
+                        break
+            # Product/version from any web-ish port on this host.
+            cur.execute(
+                """SELECT product, version FROM ports
+                    WHERE regexp_replace(ip::text,'/[0-9]+$','') = %s
+                      AND (product IS NOT NULL OR version IS NOT NULL)
+                    ORDER BY (product IS NOT NULL) DESC LIMIT 1""",
+                (host,))
+            r = cur.fetchone()
+            if r:
+                product, version = r[0], r[1]
+    except Exception:  # noqa: BLE001 — never block surface generation on this
+        pass
+    try:
+        frag = _tf.classify(server_header=server_header, openapi_title=openapi_title,
+                            version=version, product=product)
+    except Exception:  # noqa: BLE001
+        frag = None
+    _FRAGILITY_CACHE[host] = frag
+    if frag is not None and frag.fragile:
+        logger.warning("target %s classified FRAGILE (%s) -> non-destructive profile",
+                       host, "; ".join(frag.reasons))
+        try:
+            _emit("langgraph_target_fragility_classified", None,
+                  {"target": host, **frag.as_dict()})
+        except Exception:  # noqa: BLE001
+            pass
+    return frag
+
+
 def _owasp_param_tests(host: str, limit: int = 16) -> list:
     """Turn CRAWLED parameterized endpoints into OWASP WSTG app-layer tests —
     the IDOR / SQLi / XSS / LFI coverage a service+port-keyed recommender never
@@ -3860,6 +3926,14 @@ def _owasp_param_tests(host: str, limit: int = 16) -> list:
     if not _host_in_scope(host):
         return []
 
+    # Fragile targets (single-process/no-restart or a known-DoS build) get a
+    # NON-DESTRUCTIVE profile: skip config-mutating endpoints and a smaller
+    # surface budget, so we do not crash the app and foreclose admin/DB/RCE.
+    from common import target_fragility as _tf
+    frag = _target_fragility(host)
+    if frag is not None and frag.fragile:
+        limit = min(limit, _tf.FRAGILE_SURFACE_LIMIT)
+
     out, seen = [], set()
     for raw in urls:
         u = _up.urlparse(raw if "://" in str(raw) else f"http://{raw}")
@@ -3867,6 +3941,12 @@ def _owasp_param_tests(host: str, limit: int = 16) -> list:
             continue
         base = f"{u.scheme or 'http'}://{u.netloc}{u.path}"
         port = u.port or (443 if u.scheme == "https" else 80)
+        # On a fragile target, do NOT exercise a state-mutating endpoint
+        # (set_*/update_*/save/preset/config/...) — it can crash the app.
+        if frag is not None and _tf.should_gate(frag, method=None, path=u.path):
+            logger.info("skip mutating surface test on fragile target %s: %s",
+                        host, u.path)
+            continue
         for pname, pvals in _up.parse_qs(u.query).items():
             low = pname.lower()
             pval = (pvals or [""])[0]
