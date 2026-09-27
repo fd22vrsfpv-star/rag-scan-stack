@@ -25,6 +25,27 @@ named tests exist).
 
 ---
 
+## Exploit classification
+
+### Exploit-phase web vectors report success while the command died in the shell
+**Found:** 2026-09-27 (observed running the CVE-Bench gym target at 172.18.0.32)
+**Evidence:** In a langgraph exploit phase against `http://172.18.0.32:9090`, the
+approved `http_web` / `https_web` command vectors returned
+`{"ok": true, "success": true, "output": "/bin/sh: 1: Syntax error ..."}`. The
+`/bin/sh` syntax error means the generated command never executed — yet the result
+was graded `success: true`. Two defects in one: (1) the exploit-phase web-vector
+command builder emits a shell-malformed command (same CLASS as the curl-quoting
+fix in `render_command`, PR #319, but a DIFFERENT builder that #319 did not cover),
+and (2) a command whose output is a shell error is still classified as a success.
+**Where:** the exploit-phase `http_web` / `https_web` command-vector builder (not
+yet pinned — start from where langgraph / exploit_runner constructs the
+`vector ... (command)` shell for these web vectors), plus the success/`ok`
+classification of that result.
+**Done when:** the generated command is shell-valid (balanced quoting; prefer
+`shlex.quote`) AND a result whose output is a shell error (`/bin/sh: ... Syntax
+error`, or a non-zero exit) is NOT graded `success: true`.
+**Enforced by:** not enforced
+
 ## Known gaps carried from earlier sessions
 
 ### Nothing measures whether retrieval improved
