@@ -2154,8 +2154,15 @@ services:
     #
     # The check tests the thing that matters — is the SOCKS port accepting
     # connections — rather than whether a process exists.
+    #
+    # But an UNCONFIGURED tunnel (SSH_REMOTE_HOST empty) is not broken, it is
+    # unused: reporting it `unhealthy` is "cannot run" mislabelled as "failed"
+    # and it poisons `docker ps --filter health=unhealthy`. So the check exits 0
+    # ("nothing to do") when SSH_REMOTE_HOST is empty, and only probes the SOCKS
+    # port when a host IS configured — `unhealthy` is then reserved for a tunnel
+    # that is configured and not forwarding.
     healthcheck:
-      test: ["CMD-SHELL", "[ -n \"$${SSH_REMOTE_HOST}\" ] && nc -z 127.0.0.1 $${SSH_SOCKS_PORT:-1080} || exit 1"]
+      test: ["CMD-SHELL", "[ -z \"$${SSH_REMOTE_HOST}\" ] || nc -z 127.0.0.1 $${SSH_SOCKS_PORT:-1080}"]
       interval: 30s
       timeout: 5s
       retries: 3
