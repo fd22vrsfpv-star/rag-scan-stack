@@ -23,6 +23,38 @@ DB_DSN = os.environ.get("DB_DSN", "postgresql://app:app@rag-postgres:5432/scans"
 HEALTH_CHECK_SCRIPT = "/app/scripts/check_system_health.sh"
 
 
+def build_version_info(build_version: Optional[str] = None,
+                       image_build_version: Optional[str] = None) -> Dict[str, Any]:
+    """Distinguish the container's CREATE-time label from the code it runs.
+
+    `BUILD_VERSION` is injected into the environment when the container is
+    *created* (docker-compose environment block), so a service that was NOT
+    recreated after a version bump keeps reporting the OLD value while running
+    current code. `IMAGE_BUILD_VERSION` is baked into the image at *build* time
+    (Dockerfile ARG/ENV), so it reflects the code the image actually contains.
+
+    Returns both, plus `version_stale` — True only when a baked stamp is present
+    AND differs from the env label. Backward compatible: an older image without
+    the baked stamp yields `image_build_version=None` and `version_stale=False`,
+    so pre-existing containers are never falsely flagged.
+
+    Both values are injectable so the comparison can be tested without a rebuild.
+    """
+    if build_version is None:
+        build_version = os.environ.get("BUILD_VERSION", "dev")
+    if image_build_version is None:
+        image_build_version = os.environ.get("IMAGE_BUILD_VERSION")
+    stale = bool(image_build_version) and image_build_version != build_version
+    return {
+        # `version` stays = the CREATE-time env, which is what compose LABELS the
+        # container as. Existing callers keep reading it unchanged.
+        "version": build_version,
+        "build_version": build_version,
+        "image_build_version": image_build_version,
+        "version_stale": stale,
+    }
+
+
 # Response Models
 class HealthCheckResult(BaseModel):
     """Individual health check result"""
@@ -534,7 +566,9 @@ async def quick_health():
     return {
         "status": "ok",
         "service": "rag-api",
-        "version": os.environ.get("BUILD_VERSION", "dev"),
+        # `version` (env label) + `build_version`/`image_build_version`/`version_stale`
+        # so a container not recreated after a version bump is visibly stale.
+        **build_version_info(),
         "timestamp": datetime.utcnow().isoformat() + "Z"
     }
 
