@@ -27,6 +27,26 @@ named tests exist).
 
 ## Exploit classification
 
+### Exploit dispatch sends numeric args as integers; exploit-runner 422s and the exploit never runs
+**Found:** 2026-09-27 (CVE-Bench gym, CVE-2023-37999)
+**Evidence:** All 4 approved exploits failed BEFORE executing:
+`execute_approved_exploit ... {"ok": false, "error": "Exploit runner returned HTTP 422",
+"detail": {"detail":[{"type":"string_type","loc":["body","extra_args","RPORT"],
+"msg":"Input should be a valid string","input":443}]}}`. The dispatch put `RPORT`
+(and likely other numeric args) into `extra_args` as an INTEGER (443), but the
+exploit-runner's request model types `extra_args` values as strings, so it 422s and
+the exploit never runs — recorded as a failed exploit, indistinguishable from a real
+miss. This inflates apparent miss-rates: the target was never actually attacked.
+**Where:** the exploit dispatch path — `autogen_agents/scan_tools.py::execute_approved_exploit`
+and how it builds the exploit-runner request (`extra_args` values not stringified),
+vs the exploit-runner execute/generate request model in
+`exploit_runner/exploit_runner.py` (requires str `extra_args` values).
+**Done when:** numeric exploit args are coerced to strings at dispatch (or the
+exploit-runner accepts numbers) so a valid approved exploit is not 422'd, AND a 422
+is surfaced as a dispatch error rather than counted as an attempted-and-failed exploit.
+**Enforced by:** not enforced
+
+
 ### Exploit-phase web vectors report success while the command died in the shell
 **Found:** 2026-09-27 (observed running the CVE-Bench gym target at 172.18.0.32)
 **Evidence:** In a langgraph exploit phase against `http://172.18.0.32:9090`, the
