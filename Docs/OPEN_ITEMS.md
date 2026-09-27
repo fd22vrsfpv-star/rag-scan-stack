@@ -25,41 +25,6 @@ named tests exist).
 
 ---
 
-## LLM routing
-
-### The configured model is not the model that runs
-**Found:** 2026-09-22
-**Evidence:** Settings and `llm_query /healthz` both report
-`DeepSeek-V4-Flash` on `https://rt3ai.services.ai.azure.com/`. The router
-disagrees: `get_route()` resolves `default`, `extract`, `exploit_gen` and every
-unknown task to `azure:gpt-5-mini` via `route.default`, and only `news` to
-`ollama:qwen2.5:14b`. `AZURE_MODEL` is the last resort in
-`llm_query.py::_route_for` — it applies only with no caller model, no task AND
-no routing — so `DeepSeek-V4-Flash` is effectively unreachable through the
-router while being the value every status surface displays.
-**Where:** `llm_query/llm_query.py::_route_for`, `common/llm_settings.py::get_route`,
-and the `/healthz` + Settings → LLM readouts that report the global instead of
-the resolved route.
-**Done when:** the status surfaces report the RESOLVED route per task (or at
-least say the global is a fallback), so "which model is running" has one answer.
-**Enforced by:** not enforced
-
-### OLLAMA_BASE falls back to a host that does not exist
-**Found:** 2026-09-22
-**Evidence:** `app/rag-api/{vault_import_agent,artifact_consumer,cloud_triage_agent}.py`
-resolve `OLLAMA_BASE_URL` -> `OLLAMA_URL` -> `http://host.docker.internal:11434`.
-In the running rag-api container `OLLAMA_BASE_URL=http://llm_query:8002` (correct,
-the router) but `OLLAMA_URL=http://ollama:11434` is also set, and there is no
-`ollama` container in the stack (`docker ps` lists 30 containers, none named
-ollama). If the first variable were ever unset these four agents would leave the
-router silently — no task routing, no fallback, no Azure — and dial a host that
-does not resolve.
-**Where:** the `OLLAMA_BASE` resolution chain in those three modules (and
-`app/rag-api/api.py:243`, which defaults straight to host.docker.internal).
-**Done when:** the fallback chain cannot silently bypass the router — either the
-legacy names are dropped, or a non-router value is logged loudly at startup.
-**Enforced by:** not enforced
-
 ## Test coverage tiers
 
 ### ~35 tests need a docker socket the runner does not mount
@@ -75,20 +40,6 @@ deliberately does not mount `/var/run/docker.sock`.
 or these tests obtain the container's behaviour without `docker exec`.
 **Enforced by:** not enforced
 
-## Pipeline coverage
-
-### Only one HTTP port was discovered on a host serving several
-**Found:** 2026-09-11
-**Evidence:** `192.168.1.150` has 26 ports recorded and exactly one is
-identified as web (`80/http`), while the host serves several. The nmap sub-job
-for the wider range failed and the run still read as complete:
-`SELECT p.port, p.service FROM ports p JOIN assets a ON a.id=p.asset_id WHERE host(a.ip)='192.168.1.150'`
-returns 26 rows, of which the web-ish subset is `[(80, 'http')]`.
-**Where:** `nmap_scanner/nmap-api.py` sub-job handling.
-**Done when:** a failed sub-job is visible in the scan result rather than
-reducing the port list silently.
-**Enforced by:** not enforced
-
 ## Learned tool selection
 
 ### Most services never produce a usable failure signature
@@ -101,51 +52,6 @@ back to the last output lines and the learner has little to distinguish.
 **Done when:** the raw stderr of a failed attempt reaches the audit, so the
 signature is computed from what the tool actually said.
 **Enforced by:** not enforced
-
-## Post-execution review
-
-### Queued re-runs are auto-dispatched with no hold flag
-**Found:** 2026-09-11 (documented in `propose_reruns`' own docstring)
-**Evidence:** `dashboard/bff/services/recon_agent.py:117` selects
-`WHERE sr.status = 'pending'` with no filter on `source`, so post-review
-proposals are dispatched like any other recommendation. One gobuster proposal
-was dispatched 29 minutes after being queued and recorded `completed` with no
-row in `tool_executions`.
-**Where:** `dashboard/bff/services/recon_agent.py`.
-**Done when:** there is an operator-visible choice between "queue for review" and
-"queue for dispatch". Whether the current behaviour is right is an operator
-decision, not a code default.
-**Enforced by:** not enforced
-
-### Post-access steps needing sudo cannot elevate
-**Found:** 2026-09-12
-**Evidence:** The post-enumeration phase queued `sudo -l` from
-`ssh_methodology.md`, wrapped it for remote execution, and it reached the host —
-`Warning: Permanently added '192.168.1.150' (RSA)` then
-`[sudo] password for msfadmin:` on stderr, exit 1, no output. Transport,
-authentication and the recon-derived algorithm options all worked; only the
-elevation did not. `sudo -n` is unavailable on this 2008-vintage host
-(`illegal option -n`).
-**Where:** `autogen_agents/langgraph_engine.py::_wrap_remote`.
-**Done when:** a step that needs elevation can use the credential the platform
-already holds. Piping the password to `sudo -S` inside a nested single-quoted
-remote command is the obvious route and is quoting-fragile — a password
-containing a quote would break the command or worse — so it is stated here
-rather than done hastily.
-**Enforced by:** not enforced
-
-### Only ssh post-access steps can be reached
-**Found:** 2026-09-12
-**Evidence:** `_wrap_remote()` returns None for every protocol but ssh, so
-post-access steps for smb, mysql, postgresql and the rest are counted in
-`unwrappable` and queued for nothing. The playbooks contain 221 read-only steps
-across ten protocols; only ssh's can currently run.
-**Where:** `autogen_agents/langgraph_engine.py::_wrap_remote`.
-**Done when:** the wrapper covers the protocols whose tools are already
-allow-listed — `netexec smb -x`, `mysql -e`, `psql -c` all exist and are
-allowed.
-**Enforced by:** `tests/test_post_enumeration.py::test_an_unreachable_protocol_queues_nothing`
-(pins that an unwrappable protocol queues nothing rather than something broken)
 
 ## Data and deployment
 
@@ -365,8 +271,6 @@ by default (`scripts/provision-standard-node.sh` and `-safe.sh`), so newly
 provisioned nodes can host a relay. EXISTING nodes are unchanged — rt3_scan1 et al
 were provisioned before this and still need the sshd edit applied by hand before
 a relay will start. The refusal remains the correct behaviour until then.
-
-## LLM routing
 
 ## Access reconnection
 
