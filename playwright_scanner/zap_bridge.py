@@ -583,6 +583,59 @@ class ZAPBridge:
         except Exception as e:
             print(f"Error setting scan policy: {e}")
 
+    def configure_ascan_bounds(self, thread_per_host=None, host_per_scan=None,
+                               max_duration_min=None, max_rule_duration_min=None) -> Dict:
+        """Bound the ACTIVE scan so a full-rule authenticated scan does not spike
+        the ZAP JVM heap and — alongside the ajax spider's browsers — tip the host
+        into a "low on memory" event that SIGTERM-recycles the container mid-scan
+        (RestartCount grows, ExitCode 0), after which the /scan export never runs
+        and /bank findings=0. ZAP's default `thread_per_host` tracks the CPU count
+        (often high) and there is no scan-duration cap, so a whole-tree active scan
+        can run unbounded in both threads and wall time. Lower the concurrent
+        threads and cap the durations; every knob is env-overridable
+        (ZAP_ASCAN_THREADS / ZAP_ASCAN_HOST_PER_SCAN / ZAP_ASCAN_MAX_DURATION_MIN /
+        ZAP_ASCAN_MAX_RULE_DURATION_MIN) so it tunes without a rebuild. Defaults are
+        conservative and backward-compatible. Best-effort; returns what was set."""
+        def _env(name, default):
+            try:
+                return int(os.environ.get(name, default))
+            except Exception:  # noqa: BLE001
+                return default
+        thread_per_host = _env("ZAP_ASCAN_THREADS", 2) if thread_per_host is None else thread_per_host
+        host_per_scan = _env("ZAP_ASCAN_HOST_PER_SCAN", 1) if host_per_scan is None else host_per_scan
+        max_duration_min = _env("ZAP_ASCAN_MAX_DURATION_MIN", 20) if max_duration_min is None else max_duration_min
+        max_rule_duration_min = _env("ZAP_ASCAN_MAX_RULE_DURATION_MIN", 5) if max_rule_duration_min is None else max_rule_duration_min
+        out = {}
+        opts = {
+            "set_option_thread_per_host": int(thread_per_host),
+            "set_option_host_per_scan": int(host_per_scan),
+            "set_option_max_scan_duration_in_mins": int(max_duration_min),
+            "set_option_max_rule_duration_in_mins": int(max_rule_duration_min),
+        }
+        for method, val in opts.items():
+            try:
+                fn = getattr(self.zap.ascan, method, None)
+                if fn:
+                    fn(str(val))
+                    out[method] = val
+            except Exception as e:  # noqa: BLE001
+                out[method] = f"err:{str(e)[:60]}"
+        return out
+
+    def stop_ajax_spider(self) -> bool:
+        """Ensure the AJAX (browser) spider is NOT running before the active scan.
+        The real browsers it drives are the memory-heaviest part of a scan; leaving
+        them crawling DURING the full-rule active scan is what tips the host into
+        the low-memory event that recycles ZAP mid-scan. Idempotent / best-effort —
+        a no-op when the ajax spider never ran. Returns True if the stop was issued
+        without error."""
+        try:
+            self.zap.ajaxSpider.stop()
+            return True
+        except Exception as e:  # noqa: BLE001
+            print(f"Error stopping ZAP ajax spider: {e}")
+            return False
+
     def _active_scan_chunked(self, url: str, context_id=None, user_id=None,
                              chunk_size: int = 10) -> List[Dict]:
         """Active-scan the in-scope URLs in batches, flushing to disk between them.
@@ -895,6 +948,16 @@ class ZAPBridge:
 
         _chunk_alerts = None
         if do_active_scan:
+            # Cap the active-scan footprint BEFORE it starts. First guarantee the
+            # ajax spider is not still crawling (its browsers are the heaviest
+            # memory consumer and must not overlap the active scan), then bound the
+            # active scan's threads and duration so a full-rule authenticated scan
+            # does not spike the JVM heap and get the container OOM-recycled
+            # mid-scan (which left /bank findings=0 because the export never ran).
+            # Both are best-effort, env-tunable, and applied to the chunked and
+            # whole-tree paths alike.
+            self.stop_ajax_spider()
+            results['ascan_bounds'] = self.configure_ascan_bounds()
             if active_scan_chunk_size and active_scan_chunk_size > 0:
                 # CHUNKED active scan: scan the in-scope URLs in batches, collect
                 # each batch's alerts into Python, then delete the scanned nodes
@@ -910,9 +973,19 @@ class ZAPBridge:
                 results['active_scan_id'] = self.active_scan(
                     url, context_name=_ctx_name, user_id=user_id, context_id=context_id)
                 if results['active_scan_id']:
+                    # Keep the poll window aligned with the active scan's OWN
+                    # duration cap (ZAP_ASCAN_MAX_DURATION_MIN) plus a small buffer,
+                    # so we wait exactly as long as the scan can run and then export
+                    # — rather than a fixed 15 min that could abandon a still-running
+                    # scan or spin idle after it capped out.
+                    try:
+                        _cap_min = int(os.environ.get("ZAP_ASCAN_MAX_DURATION_MIN", 20))
+                    except Exception:  # noqa: BLE001
+                        _cap_min = 20
+                    _ascan_wait = max(300, _cap_min * 60 + 120)
                     results['active_scan_completed'] = self.wait_for_active_scan(
                         results['active_scan_id'],
-                        max_wait=900  # 15 minutes max for active scan
+                        max_wait=_ascan_wait
                     )
 
         results['alerts'] = (_chunk_alerts if _chunk_alerts is not None

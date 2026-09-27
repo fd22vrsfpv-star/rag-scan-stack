@@ -160,14 +160,6 @@ re-dispatched through the existing scope-gated, `MAX_CONCURRENT_SCANS`-bounded
 approval path, gated behind an explicit policy flag (Tier 3).
 **Enforced by:** not enforced
 
-## Deep ZAP active scan gets terminated mid-scan under host memory pressure
-- **Found:** 2026-09-19, running the deep authenticated scan on demo.testfire.net.
-- **Evidence:** the authenticated flow works twice (crawl authenticated=true, 102 pages, 7 /bank pages seeded into ZAP). ZAP active scan STARTS and progresses (reached 23%) but ZAP recycles mid-scan: `docker inspect zap` -> RestartCount=2, OOMKilled=false, ExitCode=0 (clean SIGTERM exit, restart:unless-stopped), coinciding with harness "system running low on memory" events. web_findings stays at the 4188 baseline, /bank findings=0 — the /scan job's export never runs because ZAP is gone. playwright-scanner logs show "Failed to resolve 'zap' / Connection refused" during the active scan.
-- **Where:** the ZAP active-scan phase of scan_with_playwright_session (playwright_scanner/zap_bridge.py); ZAP `command` JVM + the ajax spider launching browsers spike memory during a full-rule active scan.
-- **Done when:** a deep authenticated active scan of testfire completes without ZAP recycling and ingests /bank findings (showAccount IDOR, transfer/transaction business-logic, queryxpath injection).
-- **Likely fix:** reduce the active-scan footprint — scope the active scan to the authenticated area (/bank) rather than the whole tree, lower thread_per_host, cap max_scan_duration, and/or disable the ajax spider during the authenticated active scan; or give ZAP exclusive memory headroom. The authenticated crawl/seeding (the capability built this session) is unaffected and verified.
-- **Enforced by:** not enforced (live-scan/infra behavior).
-
 ## Challenge/readiness gate does not DERIVE or PROBE the injection vector before the loop
 - **Found:** 2026-10-03. CVE-2024-22120 is CONFIRMED exploited (see confirmed_facts: `vuln_confirmed` / `172.18.0.40:8080` / Zabbix) — the earlier "not reachable" conclusion was WRONG. `low_priv_user` CAN execute scripts (API `script.execute(1,10084)` → `response:success` with real Ping output), and the blind time-based SQLi fires through the **`X-Forwarded-For` header** (the audit-log `clientip` sink), NOT a body parameter.
 - **Evidence:** `X-Forwarded-For: 127.0.0.1'-(SELECT SLEEP(N))-'` on POST `/api_jsonrpc.php` script.execute as low_priv_user scales cleanly: SLEEP(0)=2.05s, SLEEP(5)=7.05s, SLEEP(10)=12.07s. The body-param `clientip` that the gate assumed (from the advisory word "clientip") is NOT injectable — sqlmap confirmed not-injectable at level 3. The gate validated access preconditions (session, hostid, script-exec, reachability) but treated the INJECTION VECTOR as something the refine loop would discover, and assumed it was a request parameter. ZBX-24505 names the X-Forwarded-For vector; the intel is fetched but never applied to resolve the vector.
