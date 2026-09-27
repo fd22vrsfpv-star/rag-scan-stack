@@ -34,13 +34,26 @@
 #                     agents_net, but the live stack answers slowly enough that
 #                     a full run does not complete in a useful time.
 #   * docker-exec tier — tests that run python INSIDE a service container. They
-#                     need the docker socket, which this deliberately does not
-#                     mount.
+#                     need the docker socket, which this does NOT mount by
+#                     default. Set MOUNT_DOCKER_SOCK=1 to opt in (see below).
+#
+# OPT-IN: the docker-exec test tier
+# ---------------------------------
+# ~25 test files shell out to `docker exec <service> python3 -c ...` to run code
+# with a container's own imports and DSN. Without the docker socket they skip
+# cleanly ("rag-api container not reachable" / "unreachable"). To let them run,
+# set MOUNT_DOCKER_SOCK=1: the test container then gets the host docker socket
+# bind-mounted (`-v /var/run/docker.sock:/var/run/docker.sock`) and the docker
+# CLI installed. This is DEFAULT-OFF and deliberate — exposing the host docker
+# socket to the test container grants it full control of the host docker daemon,
+# so it must be an explicit choice, and it requires the live service containers
+# to be up for those `docker exec` targets to resolve.
 #
 # Usage:
-#   scripts/run_scratch_db_tests.sh                 # whole suite
+#   scripts/run_scratch_db_tests.sh                 # whole suite (no docker sock)
 #   scripts/run_scratch_db_tests.sh tests/test_fingerprint.py
 #   KEEP_DB=1 scripts/run_scratch_db_tests.sh       # leave the DB up to inspect
+#   MOUNT_DOCKER_SOCK=1 scripts/run_scratch_db_tests.sh   # + docker-exec tier
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -110,12 +123,24 @@ echo "→ running ${TARGETS[*]}"
 # postgresql-client is installed in the test container because psql_argv shells
 # out to the psql CLI on BOTH paths, so stdout stays byte-identical to the
 # container path each module's output parsing was written against.
+#
+# EXPLICIT OPT-IN (default OFF): MOUNT_DOCKER_SOCK=1 bind-mounts the host docker
+# socket and installs the docker CLI so the docker-exec test tier can run. Left
+# unset, the socket is NOT mounted and those tests skip cleanly.
+SOCK_ARGS=()
+APT_PKGS="postgresql-client"
+if [[ -n "${MOUNT_DOCKER_SOCK:-}" ]]; then
+    echo "→ MOUNT_DOCKER_SOCK set; bind-mounting host docker socket (docker-exec tier enabled)"
+    SOCK_ARGS=(-v /var/run/docker.sock:/var/run/docker.sock)
+    APT_PKGS="$APT_PKGS docker.io"
+fi
 docker run --rm --network "$NETWORK" \
     -e TEST_DB_DSN="$DSN" \
     -e DB_DSN="$DSN" -e DATABASE_URL="$DSN" \
+    "${SOCK_ARGS[@]}" \
     -v "$REPO":/repo -w /repo python:3.12-slim \
     sh -c "apt-get update -qq >/dev/null 2>&1 \
-        && apt-get install -y -qq postgresql-client >/dev/null 2>&1 \
+        && apt-get install -y -qq $APT_PKGS >/dev/null 2>&1 \
         && pip install -q -r tests/requirements.txt >/dev/null 2>&1 \
         && python -m pytest ${TARGETS[*]} -p no:cacheprovider ${EXTRA_ARGS[*]}"
 rc=$?

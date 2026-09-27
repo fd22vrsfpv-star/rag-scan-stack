@@ -25,21 +25,6 @@ named tests exist).
 
 ---
 
-## Test coverage tiers
-
-### ~35 tests need a docker socket the runner does not mount
-**Found:** 2026-09-22
-**Evidence:** 25 test files shell out to `docker exec <service> python3 -c ...`
-to run code with the container's own imports and DSN. The test container has no
-docker socket, so they skip with "rag-api container not reachable" (22 sites),
-"rag-api container unreachable" (13 sites). `scripts/run_scratch_db_tests.sh`
-deliberately does not mount `/var/run/docker.sock`.
-**Where:** `tests/test_agent_flags.py`, `tests/test_customer_site_detection.py`,
-`tests/test_mark_customer_scope.py` and 22 further files.
-**Done when:** either the runner mounts the socket behind an explicit opt-in flag,
-or these tests obtain the container's behaviour without `docker exec`.
-**Enforced by:** not enforced
-
 ## Learned tool selection
 
 ### Most services never produce a usable failure signature
