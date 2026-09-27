@@ -527,6 +527,9 @@ def health():
                 ok=True, endpoint=AZURE_ENDPOINT,
                 models=[{"name": AZURE_MODEL, "backend": "azure"}],
                 running=[AZURE_MODEL],
+                detail=("AZURE_MODEL is the GLOBAL fallback, not necessarily the "
+                        "model each task runs — see /ollama/routes for the resolved "
+                        "route per task."),
             )
         except Exception as e:
             logger.error(f"Azure health check failed: {e}")
@@ -600,6 +603,49 @@ def ps():
     if LLM_BACKEND == "azure":
         return {"models": [{"name": AZURE_MODEL, "backend": "azure"}]}
     return _json_get(_endpoint("/ps"))
+
+@router.get("/routes")
+def routes():
+    """The RESOLVED model per task — the one answer to "which model actually runs".
+
+    /health (and the Settings LLM readout) report the GLOBAL backend/model, which
+    is only the last-resort fallback: the router sends `default`, `extract`,
+    `exploit_gen` etc. wherever `llm.route.<task>` points, so the global model can
+    be displayed while being unreachable. This endpoint resolves every task
+    through the same get_route() the callers use, and labels the global as the
+    fallback it is (Docs/OPEN_ITEMS.md "The configured model is not the model that
+    runs"). Never exposes api keys.
+    """
+    global_fallback = {"backend": LLM_BACKEND, "model": AZURE_MODEL}
+    try:
+        from common.llm_settings import get_route, LLM_TASK_NAMES, get_llm_settings as _g
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"routing table unavailable: {e}",
+                "global_fallback": global_fallback}
+    try:
+        s = _g() if _g else None
+    except Exception:  # noqa: BLE001
+        s = None
+    out = {}
+    for t in LLM_TASK_NAMES:
+        try:
+            r = get_route(t, s) or {}
+            fb = r.get("fallback") or None
+            out[t] = {
+                "backend": r.get("backend"), "model": r.get("model"),
+                "provider": r.get("provider"), "source": r.get("source"),
+                "fallback": ({"backend": fb.get("backend"), "model": fb.get("model"),
+                              "provider": fb.get("provider")} if isinstance(fb, dict) else None),
+            }
+        except Exception as e:  # noqa: BLE001
+            out[t] = {"error": str(e)}
+    return {"ok": True, "global_fallback": global_fallback,
+            "note": ("global_fallback applies ONLY to a task with no route; each "
+                     "task's own 'model' is what runs. 'source' shows where the "
+                     "route came from (route.<task> / agent_model / route.default "
+                     "/ global)."),
+            "routes": out}
+
 
 def _resolve_caller_provider_model(caller: str):
     """If `caller` is "provider:model" with a KNOWN provider prefix, resolve it to

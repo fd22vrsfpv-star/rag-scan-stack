@@ -37,6 +37,12 @@ OLLAMA_BASE = (
     or os.environ.get("OLLAMA_URL")
     or "http://host.docker.internal:11434"
 ).rstrip("/")
+if "llm_query" not in OLLAMA_BASE:
+    # See Docs/OPEN_ITEMS.md: the legacy OLLAMA_URL / host.docker.internal
+    # fallback silently bypasses the llm_query router (task routing + fallback)
+    # and can dial a host that does not exist. Surface it loudly at startup.
+    logging.warning("vault_import_agent OLLAMA_BASE=%s bypasses the llm_query "
+                    "router (:8002) — no task routing/fallback.", OLLAMA_BASE)
 
 # Default model — overridable via Settings → LLM Tuning → Agent Models.
 DEFAULT_MODEL = os.environ.get(
