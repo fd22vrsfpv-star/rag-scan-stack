@@ -35,9 +35,13 @@ try:
 except Exception as e:  # noqa: BLE001
     pytest.skip(f"common.vuln_skills not importable: {e}", allow_module_level=True)
 
-# The 8 web classes the payload generator/refiner will look up (must have a hint).
+# The web classes the payload generator/refiner will look up (must have a hint).
 WEB_CLASSES = {"xss", "sqli", "command_injection", "ssrf", "lfi",
-               "open_redirect", "csrf", "xxe"}
+               "open_redirect", "csrf", "xxe",
+               # Added 2026-09-26: classes the RAG corpus did not cover, surfaced
+               # by the scan recommendations + live findings.
+               "security_misconfiguration", "information_disclosure",
+               "insecure_session_cookie", "file_upload"}
 LOGIC_CLASSES = {"idor", "business_logic", "ssti"}
 
 
@@ -103,6 +107,18 @@ def test_canonical_ids_resolve_to_themselves():
     ({"issue_type": "XML External Entity"}, "xxe"),
     ({"name": "Broken Object Level Authorization"}, "idor"),
     ({"issue_type": "server-side template injection"}, "ssti"),
+    # New classes (2026-09-26) — pinned to the exact scanner finding names that
+    # were previously unmatched, so the aliases cannot silently regress.
+    ({"name": "Content Security Policy (CSP) Header Not Set"}, "security_misconfiguration"),
+    ({"name": "Missing Anti-clickjacking Header"}, "security_misconfiguration"),
+    ({"cwe": "CWE-693"}, "security_misconfiguration"),
+    ({"name": 'Server Leaks Version Information via "Server" HTTP Response Header Field'}, "information_disclosure"),
+    ({"name": "Information Disclosure - Suspicious Comments"}, "information_disclosure"),
+    ({"cwe": "CWE-200"}, "information_disclosure"),
+    ({"name": "Cookie without SameSite Attribute"}, "insecure_session_cookie"),
+    ({"name": "Session Management Response Identified"}, "insecure_session_cookie"),
+    ({"issue_type": "Insecure HTTP Method - PUT"}, "file_upload"),
+    ({"cwe": "CWE-434"}, "file_upload"),
 ])
 def test_representative_signals_resolve(signals, expected):
     assert vuln_skills.resolve(**signals) == expected
