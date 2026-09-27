@@ -4,6 +4,7 @@ Pytest configuration and shared fixtures for all tests.
 import os
 import shutil
 import sys
+import uuid
 from pathlib import Path
 from typing import Generator
 import pytest
@@ -265,6 +266,118 @@ def mock_db_connection():
 def db_dsn() -> str:
     """Return test database DSN from environment or default."""
     return os.getenv("TEST_DB_DSN", "postgresql://app:app@localhost:5432/test_scans")
+
+
+# ── Scratch-schema isolation for DB-writing tests ────────────────────────────
+#
+# A pytest run once left 16 `phase='__pytest_phase'` rows in the LIVE
+# `tool_selection_learned` table and an APPROVED `exploit/unix/misc/pytest_release`
+# row in the LIVE `pending_exploits` queue — a test writing straight into
+# production tables. The repo's well-behaved DB tests already wrap their writes in
+# `BEGIN … ROLLBACK` (see tests/test_asset_merge.py); this fixture is the other
+# safe pattern: a uniquely-named throwaway schema that unqualified CREATE/INSERT
+# statements resolve into, dropped on teardown, so nothing a test writes through
+# it can reach the `public` tables the running stack reads.
+#
+# SCOPE (be honest about the limit): a `search_path` only redirects UNQUALIFIED
+# names issued on THIS connection. It cannot redirect
+#   * writes made by a separate service over HTTP (that process owns its own
+#     connection to the live `public` schema), nor
+#   * code that hard-codes `public.<table>` (e.g. etl/tool_learning.py).
+# Those paths still need `BEGIN … ROLLBACK`, marker-scoped cleanup (see
+# `_MARKER_CLEANUP` below), or the whole stack pointed at a throwaway database.
+# This fixture isolates the self-contained direct-DB writers, which is where the
+# search_path mechanism actually holds.
+
+
+def _scratch_dsn() -> str:
+    """The DSN a scratch schema is created against, or '' when none is set."""
+    return os.environ.get("TEST_DB_DSN") or os.environ.get("DB_DSN") or ""
+
+
+def create_scratch_schema(conn) -> str:
+    """Create a uniquely-named schema and point `conn`'s search_path at it.
+
+    Commits, so the SET survives later transactions on the same connection (a
+    plain SET reverts on ROLLBACK; committing here makes it durable for the
+    session). Returns the schema name. Raises on failure — callers that must
+    skip cleanly should guard the call.
+    """
+    schema = f"pytest_scratch_{uuid.uuid4().hex[:12]}"
+    with conn.cursor() as cur:
+        cur.execute(f'CREATE SCHEMA "{schema}"')
+        # scratch first, public second: unqualified writes land in the scratch
+        # schema; shared functions/types in public stay readable.
+        cur.execute(f'SET search_path TO "{schema}", public')
+    conn.commit()
+    return schema
+
+
+def drop_scratch_schema(conn, schema: str) -> None:
+    """Drop a scratch schema (CASCADE) and restore search_path to public."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET search_path TO public")
+            cur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        conn.commit()
+    except Exception:
+        conn.rollback()
+
+
+class ScratchSchema:
+    """Thin handle over a connection bound to a throwaway schema.
+
+    `.conn` is the psycopg2 connection (search_path already set to the scratch
+    schema), `.name` the schema. `.execute()` runs one statement, commits, and
+    returns fetched rows (or None for non-SELECT).
+    """
+
+    def __init__(self, conn, name: str):
+        self.conn = conn
+        self.name = name
+
+    def execute(self, sql, params=None):
+        with self.conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall() if cur.description is not None else None
+            self.conn.commit()
+            return rows
+
+
+@pytest.fixture
+def scratch_schema():
+    """Yield a `ScratchSchema` whose connection writes into a throwaway schema.
+
+    DB-writing tests use it so their UNQUALIFIED writes never touch the live
+    `public` tables. Skips cleanly (never errors) when psycopg2 is absent, no
+    DSN is configured, or the database is unreachable — a skip says "cannot run
+    here", which is the correct outcome on an offline checkout.
+    """
+    try:
+        import psycopg2  # noqa: WPS433
+    except ImportError:
+        pytest.skip("psycopg2 not installed — cannot create a scratch schema")
+
+    dsn = _scratch_dsn()
+    if not dsn:
+        pytest.skip("no TEST_DB_DSN/DB_DSN — cannot create a scratch schema")
+
+    try:
+        conn = psycopg2.connect(dsn, connect_timeout=3)
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"database unreachable: {type(e).__name__}")
+
+    try:
+        schema = create_scratch_schema(conn)
+    except Exception as e:  # noqa: BLE001
+        conn.close()
+        pytest.skip(f"cannot create scratch schema: {type(e).__name__}")
+
+    try:
+        yield ScratchSchema(conn, schema)
+    finally:
+        drop_scratch_schema(conn, schema)
+        conn.close()
 
 
 # ---- Ollama/LLM Fixtures ----
