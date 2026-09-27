@@ -56,5 +56,10 @@ COPY osint_runner/osint_runner.py  /runner/osint_runner.py
 COPY osint_runner/log_manager.py   /runner/log_manager.py
 COPY osint_runner/service_enum.py  /runner/service_enum.py
 
+# Bake a build-time version stamp (see app/rag-api/Dockerfile) so a container
+# not recreated after a version bump reports IMAGE_BUILD_VERSION != BUILD_VERSION.
+ARG BUILD_VERSION=unknown
+ENV IMAGE_BUILD_VERSION=$BUILD_VERSION
+
 EXPOSE 8024
 CMD ["python", "-u", "/runner/osint_runner.py"]

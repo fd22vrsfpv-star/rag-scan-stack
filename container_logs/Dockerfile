@@ -16,6 +16,11 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY container_logs/container_logs.py /app/container_logs.py
 
+# Bake a build-time version stamp (see app/rag-api/Dockerfile) so a container
+# not recreated after a version bump reports IMAGE_BUILD_VERSION != BUILD_VERSION.
+ARG BUILD_VERSION=unknown
+ENV IMAGE_BUILD_VERSION=$BUILD_VERSION
+
 ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8018

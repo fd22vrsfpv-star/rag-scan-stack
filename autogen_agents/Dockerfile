@@ -20,6 +20,11 @@ COPY . .
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
+# Bake a build-time version stamp (see app/rag-api/Dockerfile) so a container
+# not recreated after a version bump reports IMAGE_BUILD_VERSION != BUILD_VERSION.
+ARG BUILD_VERSION=unknown
+ENV IMAGE_BUILD_VERSION=$BUILD_VERSION
+
 # Create necessary directories
 RUN mkdir -p /app/logs /app/cache
 

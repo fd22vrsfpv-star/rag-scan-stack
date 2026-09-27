@@ -295,6 +295,8 @@ services:
     build:
       context: .
       dockerfile: app/embedder/Dockerfile
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
     container_name: embedder
     restart: unless-stopped
     logging:
@@ -332,6 +334,8 @@ services:
     build:
       context: .
       dockerfile: app/embedder/Dockerfile.gpu
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
     container_name: embedder-gpu
     profiles: ["gpu"]
     restart: unless-stopped
@@ -438,6 +442,8 @@ services:
     build:
       context: .
       dockerfile: web_scanner/Dockerfile
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
     container_name: web-scanner
     restart: unless-stopped
     logging:
@@ -523,6 +529,8 @@ services:
     build:
       context: .
       dockerfile: ./nuclei/Dockerfile
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
     container_name: nuclei-runner
     restart: unless-stopped
     logging:
@@ -579,6 +587,8 @@ services:
     build:
       context: .
       dockerfile: osint_runner/Dockerfile
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
     # `docker compose watch` syncs edits into the running container, so a
     # code change takes effect without a rebuild. Baked images remain the
     # deploy artifact; this only changes the DEV loop, which is where
@@ -658,6 +668,8 @@ services:
     build:
       context: .
       dockerfile: pd_runner/Dockerfile
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
     # `docker compose watch` syncs edits into the running container, so a
     # code change takes effect without a rebuild. Baked images remain the
     # deploy artifact; this only changes the DEV loop, which is where
@@ -733,6 +745,8 @@ services:
     build:
       context: .
       dockerfile: news_runner/Dockerfile
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
     container_name: news-runner
     restart: unless-stopped
     logging:
@@ -789,6 +803,8 @@ services:
     build:
       context: .
       dockerfile: brutus_runner/Dockerfile
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
     container_name: brutus-runner
     restart: unless-stopped
     logging:
@@ -839,6 +855,8 @@ services:
     build:
       context: .
       dockerfile: nmap_scanner/Dockerfile
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
     container_name: nmap_scanner
     command: uvicorn nmap-api:app --host 0.0.0.0 --port 8012 --ssl-keyfile=/certs/server.key --ssl-certfile=/certs/server.crt
     restart: unless-stopped
@@ -912,6 +930,8 @@ services:
     build:
       context: ./scan_recommender
       dockerfile: Dockerfile
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
     container_name: scan-recommender
     restart: unless-stopped
     logging:
@@ -1019,6 +1039,8 @@ services:
     build:
       context: ./playwright_scanner
       dockerfile: Dockerfile
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
     container_name: playwright-scanner
     command: uvicorn playwright_scanner:app --host 0.0.0.0 --port 8014 --log-level info --ssl-keyfile=/certs/server.key --ssl-certfile=/certs/server.crt
     restart: unless-stopped
@@ -1091,6 +1113,8 @@ services:
     build:
       context: ./autogen_agents
       dockerfile: Dockerfile
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
     # `docker compose watch` syncs edits into the running container, so a
     # code change takes effect without a rebuild. Baked images remain the
     # deploy artifact; this only changes the DEV loop, which is where
@@ -1261,6 +1285,8 @@ services:
     build:
       context: ./mcp
       dockerfile: Dockerfile
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
     container_name: mcp-server
     restart: unless-stopped
     logging:
@@ -1305,6 +1331,8 @@ services:
     build:
       context: ./mcp
       dockerfile: Dockerfile.test
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
     container_name: mcp-test
     restart: unless-stopped
     logging:
@@ -1335,6 +1363,8 @@ services:
     build:
       context: ./mcp
       dockerfile: Dockerfile.streamable
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
     container_name: mcp-streamable
     restart: unless-stopped
     logging:
@@ -1476,6 +1506,8 @@ services:
     build:
       context: .
       dockerfile: exploit_runner/Dockerfile
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
     container_name: exploit-runner
     command: uvicorn exploit_runner:app --host 0.0.0.0 --port 8017 --ssl-keyfile=/certs/server.key --ssl-certfile=/certs/server.crt
     restart: unless-stopped
@@ -1551,6 +1583,8 @@ services:
     build:
       context: .
       dockerfile: container_logs/Dockerfile
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
     container_name: container-logs
     command: uvicorn container_logs:app --host 0.0.0.0 --port 8018 --ssl-keyfile=/certs/server.key --ssl-certfile=/certs/server.crt
     restart: unless-stopped
@@ -1598,6 +1632,8 @@ services:
     build:
       context: ./kali_listener
       dockerfile: Dockerfile
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
     container_name: kali-listener
     restart: unless-stopped
     logging:
@@ -1813,6 +1849,8 @@ services:
     build:
       context: ./grpo_trainer
       dockerfile: Dockerfile
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
     container_name: grpo-trainer
     profiles: ["optional"]
     restart: "no"
@@ -1856,6 +1894,8 @@ services:
       build:
         context: ./llm_query
         dockerfile: Dockerfile
+        args:
+          BUILD_VERSION: ${BUILD_VERSION:-dev}
       container_name: llm_query
       volumes:
         - ./common:/app/common:ro    # shared llm_settings resolver (one copy, see common/llm_settings.py)
@@ -2221,6 +2261,8 @@ services:
     build:
       context: .
       dockerfile: node_manager/Dockerfile
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
     # Sync to /app, matching the Dockerfile's flattening — host
     # node_manager/node_manager.py becomes /app/node_manager.py, which is what
     # actually gets imported.
@@ -2358,6 +2400,8 @@ services:
     build:
       context: ./dashboard
       dockerfile: Dockerfile
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
     # `docker compose watch` syncs edits into the running container, so a
     # code change takes effect without a rebuild. Baked images remain the
     # deploy artifact; this only changes the DEV loop, which is where

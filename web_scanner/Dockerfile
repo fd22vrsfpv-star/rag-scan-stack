@@ -31,5 +31,10 @@ RUN pip install --no-cache-dir -r /scanner/requirements.txt
 
 COPY web_scanner /scanner
 
+# Bake a build-time version stamp (see app/rag-api/Dockerfile) so a container
+# not recreated after a version bump reports IMAGE_BUILD_VERSION != BUILD_VERSION.
+ARG BUILD_VERSION=unknown
+ENV IMAGE_BUILD_VERSION=$BUILD_VERSION
+
 EXPOSE 8010
 CMD ["python","-u","/scanner/web_scan.py","serve"]

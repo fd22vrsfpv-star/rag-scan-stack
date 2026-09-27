@@ -46,5 +46,10 @@ COPY brutus_runner/brutus_runner.py /runner/brutus_runner.py
 # fix stranded in it.
 COPY brutus_runner/log_manager.py   /runner/log_manager.py
 
+# Bake a build-time version stamp (see app/rag-api/Dockerfile) so a container
+# not recreated after a version bump reports IMAGE_BUILD_VERSION != BUILD_VERSION.
+ARG BUILD_VERSION=unknown
+ENV IMAGE_BUILD_VERSION=$BUILD_VERSION
+
 EXPOSE 8025
 CMD ["python", "-u", "/runner/brutus_runner.py"]
