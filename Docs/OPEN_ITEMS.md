@@ -25,19 +25,6 @@ named tests exist).
 
 ---
 
-## Learned tool selection
-
-### Most services never produce a usable failure signature
-**Found:** 2026-09-11
-**Evidence:** telnet, mysql, postgres and vnc credential attempts return
-`failure_mode: "unknown"` with no error excerpt, so `error_signature()` falls
-back to the last output lines and the learner has little to distinguish.
-**Where:** `nmap_scanner/cred_checker.py::_classify_hydra_failure` returns
-`unknown` for anything it does not recognise, and the raw output is discarded.
-**Done when:** the raw stderr of a failed attempt reaches the audit, so the
-signature is computed from what the tool actually said.
-**Enforced by:** not enforced
-
 ## Data and deployment
 
 ### Post-access steps cannot run on the Kali route — `sshpass` is not a safe tool
@@ -78,58 +65,6 @@ alone silently drops the vector, which may not be the intent — that is why thi
 is its own item.
 **Enforced by:** not enforced (`tests/test_declared_tools_are_installed.py` is the existing pattern for "declared thing must exist")
 
-
-### Generated curl commands carry a stray trailing quote and die in the shell
-**Found:** 2026-09-21 (by the parser agent, while reading real curl output)
-**Evidence:** 11 `tool_executions` rows with `tool='curl'` have empty output and
-`error` = `/bin/sh: 1: Syntax error: Unterminated quoted string`. The stored
-command shows the defect directly:
-`curl -sk http://192.168.1.150:80/doc/'` — a trailing apostrophe with no opener.
-These probes never reached the network; they died in `/bin/sh`.
-**Where:** whatever builds curl probe commands (not yet located — the rows carry
-no single distinguishing source, so start from the writers of `tool_executions`
-with `tool='curl'`).
-**Why it matters:** the runs are recorded as executed-and-fruitless. The new curl
-parser correctly reads them as a measured ZERO, which is honest but wrong about
-the target — nothing was ever asked of it.
-**Done when:** the generator quotes URLs correctly and no stored curl command has
-unbalanced quotes.
-**Enforced by:** not enforced
-
-### pytest runs write into production tables
-**Update 2026-09-21:** the 16 polluted rows were DELETED along with the inflated
-counters. The SOURCE is untouched — a test can still write here — so the item
-stands on that alone.
-**Second table, found 2026-09-21 while re-typing exploit rows:**
-`pending_exploits` holds `exploit/unix/misc/pytest_release` ("vector pytest dup"),
-**status = 'approved'**, target `198.51.100.152/32`, engagement_id NULL, created
-2026-09-16. The module does not exist in Metasploit. Low risk in practice — the
-target is an RFC 5737 documentation address in no scope, so the fail-closed
-dispatch gate refuses it — but a test left an APPROVED row in the live exploit
-queue, which is the same defect with a sharper edge than a learning counter.
-**Found:** 2026-09-21
-**Evidence:** 16 of the 65 rows in `tool_selection_learned` carry
-`phase = '__pytest_phase'`. A test run persisted learned tool-selection state into
-the live table, and the phase-scoped reset endpoint
-(`POST /tool-selection/backfill {"reset": true, "phase": ...}`) will not clear
-them unless that phase is named explicitly.
-**Where:** whichever test writes `tool_selection_learned` without a rollback —
-`tests/conftest.py` cleans a fixed `_CLEANUP_TABLES` list that does not include it.
-**Done when:** tests cannot write to live tables — `tests/conftest.py` cleans a
-fixed `_CLEANUP_TABLES` list that includes neither `tool_selection_learned` nor
-`pending_exploits` — and the stray `pytest_release` row is removed.
-**Enforced by:** not enforced
-
-
-### BUILD_VERSION labels go stale on containers that were not recreated
-**Found:** 2026-09-11
-**Evidence:** `BUILD_VERSION` is injected at container creation, so a service
-that was not recreated after a version bump reports the previous version while
-running current code. The UI reads it as the stack's version.
-**Where:** `docker-compose.yml` environment blocks; `scripts/update-version.sh`.
-**Done when:** the reported version comes from something that changes with the
-code, or the health output distinguishes "built at" from "running".
-**Enforced by:** not enforced
 
 ## Known gaps carried from earlier sessions
 
@@ -311,23 +246,3 @@ pre-approval check precedes SCAN_TOOLS_CREDENTIAL — keep that ordering)
 - **Done when:** a deep authenticated active scan of testfire completes without ZAP recycling and ingests /bank findings (showAccount IDOR, transfer/transaction business-logic, queryxpath injection).
 - **Likely fix:** reduce the active-scan footprint — scope the active scan to the authenticated area (/bank) rather than the whole tree, lower thread_per_host, cap max_scan_duration, and/or disable the ajax spider during the authenticated active scan; or give ZAP exclusive memory headroom. The authenticated crawl/seeding (the capability built this session) is unaffected and verified.
 - **Enforced by:** not enforced (live-scan/infra behavior).
-
-
-## Engagement attribution
-
-### Collected-data writers are not audited for engagement population
-**Found:** 2026-09-25
-**Evidence:** `tests/test_engagement_attribution.py` proves each collected-data
-table HAS an `engagement_id`/`asset_id` column, but nothing proves the WRITERS
-populate it. `identities` had the column and a NULL-writing writer, and the test
-stayed green throughout. ~40 `etl/parse_*.py` modules INSERT collected-data rows;
-which of them leave engagement_id NULL is unaudited.
-**Where:** the `etl/parse_*.py` family and `app/rag-api` writers that INSERT into
-`credential_findings`, `web_findings`, `vulns`, `recon_findings`,
-`enumeration_observations`, `identities`.
-**Why it matters:** a column that exists but is never filled reads as "attributed"
-to the schema test while every row leaks across engagements and survives a purge.
-**Done when:** each collected-data writer either sets engagement_id (resolved from
-host/scope) or is a declared exception, checked by a test that executes the writer
-rather than inspecting the schema.
-**Enforced by:** not enforced
