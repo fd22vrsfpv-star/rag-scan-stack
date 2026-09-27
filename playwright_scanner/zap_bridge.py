@@ -259,6 +259,46 @@ class ZAPBridge:
             print(f"ZAP auth verification could not run: {e}")
             return None
 
+    def seed_authenticated_urls(
+        self,
+        seed_urls: Optional[List[str]] = None,
+        follow_redirects: bool = True,
+    ) -> int:
+        """Force each authenticated-crawl URL into ZAP's site tree BEFORE the spider.
+
+        The traditional ZAP spider seeds only from the (logged-out) base URL, which
+        for a login-gated app links to nothing under the authenticated area — so
+        `z.core.urls()` comes back with only public paths and the active scan never
+        touches /bank/*. The authenticated Playwright crawl already walked those
+        post-login pages; feeding each of them to `core.access_url` re-fetches it
+        through ZAP (under the forced-user session that `configure_authentication`
+        enabled), which puts the page AND its parsed child links into the site tree.
+        The subsequent spider/active scan then have the authenticated area to work
+        from and `z.core.urls()` contains /bank/main.jsp and friends.
+
+        Best-effort and fail-soft: a single bad seed (or a ZAP without access_url)
+        never aborts the scan. Returns the count of URLs successfully accessed.
+        De-duplicates and skips blanks so the count reflects real seeds.
+        """
+        seeded = 0
+        seen = set()
+        fr = "true" if follow_redirects else "false"
+        for u in (seed_urls or []):
+            if not u or not str(u).strip():
+                continue
+            u = str(u).strip()
+            if u in seen:
+                continue
+            seen.add(u)
+            try:
+                self.zap.core.access_url(url=u, followredirects=fr)
+                seeded += 1
+            except Exception as e:  # noqa: BLE001
+                print(f"ZAP seed access_url failed for {u}: {e}")
+        if seeded:
+            print(f"ZAP: seeded {seeded} authenticated URL(s) into the site tree")
+        return seeded
+
     def spider_url(
         self,
         url: str,
@@ -721,6 +761,7 @@ class ZAPBridge:
         active_scan_chunk_size: int = 0,
         second_auth: Optional[Dict] = None,
         do_access_control: bool = False,
+        seed_urls: Optional[List[str]] = None,
     ) -> Dict:
         """
         Full ZAP scan after Playwright has explored the site
@@ -730,6 +771,9 @@ class ZAPBridge:
             do_spider: Run spider
             do_active_scan: Run active scan
             context_name: Optional context name
+            seed_urls: Authenticated-crawl URLs (e.g. /bank/main.jsp) to force into
+                ZAP's site tree before the spider/active scan. Only seeded when the
+                login is confirmed authenticated. Fail-soft; backward-compatible.
 
         Returns:
             Dictionary with scan results
@@ -788,6 +832,18 @@ class ZAPBridge:
         if _sess_headers:
             results['session_headers_injected'] = self.apply_session_headers(_sess_headers)
             results['authenticated'] = True
+
+        # SEED the authenticated area BEFORE the spider. The traditional spider
+        # starts from the logged-out base URL, which links to nothing under the
+        # login gate, so /bank/* never enters the tree and the active scan misses
+        # every authenticated-only vuln. The Playwright authenticated crawl already
+        # walked those pages; feeding them to core.access_url (under the forced-user
+        # session) puts them + their links into z.core.urls() so the spider/active
+        # scan actually cover them. GATED on a CONFIRMED login (verify_authentication
+        # via results['authenticated']) — we do not seed a login-gated area unless
+        # ZAP is actually logged in, and seeding is fully fail-soft.
+        if seed_urls and results.get('authenticated'):
+            results['seeded_urls'] = self.seed_authenticated_urls(seed_urls)
 
         # Only reference the ZAP context if one was actually created (auth path).
         # Passing a context_name that was never created makes spider.scan/ascan
