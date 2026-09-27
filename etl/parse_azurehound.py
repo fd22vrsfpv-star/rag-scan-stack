@@ -63,7 +63,8 @@ def _load_records(path):
     return []
 
 
-def parse_azurehound(path: str, profile: str = "upload", job_id: str = None):
+def parse_azurehound(path: str, profile: str = "upload", job_id: str = None,
+                     engagement_id: str = None):
     stats = dict(records_seen=0, findings_inserted=0, identities_upserted=0,
                  skipped=0, errors=0, error_examples=[])
     records = _load_records(path)
@@ -137,12 +138,14 @@ def parse_azurehound(path: str, profile: str = "upload", job_id: str = None):
                     asset_id = None
                     cur.execute("""
                         INSERT INTO recon_findings
-                            (id, asset_id, source, finding_type, target, data, severity)
-                        VALUES (%s, %s, 'azurehound', %s, %s, %s, %s)
+                            (id, asset_id, source, finding_type, target, data,
+                             severity, engagement_id)
+                        VALUES (%s, %s, 'azurehound', %s, %s, %s, %s, %s)
                         ON CONFLICT DO NOTHING
                     """, (
                         str(uuid.uuid4()), asset_id,
                         finding_type, str(target)[:500], Json(data), severity,
+                        engagement_id,
                     ))
                     stats["findings_inserted"] += 1
 
@@ -166,6 +169,7 @@ def parse_azurehound(path: str, profile: str = "upload", job_id: str = None):
                                     status=status, is_guest=(user_type == "guest"),
                                     tenant_id=tenant_id or None,
                                     raw={"azurehound_user": props}, source="azurehound",
+                                    engagement_id=engagement_id,
                                 )
                         elif finding_type == "azure_service_principal":
                             sp_id = props.get("appId") or object_id
@@ -175,6 +179,7 @@ def parse_azurehound(path: str, profile: str = "upload", job_id: str = None):
                                     display_name=display_name, principal_type="service_principal",
                                     tenant_id=tenant_id or None,
                                     raw={"azurehound_sp": props}, source="azurehound",
+                                    engagement_id=engagement_id,
                                 )
                         elif finding_type == "azure_role_assignment":
                             ptype = str(props.get("principalType", "")).lower()
@@ -193,6 +198,7 @@ def parse_azurehound(path: str, profile: str = "upload", job_id: str = None):
                                     principal_type=principal_type, is_admin=is_admin,
                                     tenant_id=tenant_id or None,
                                     raw={"azurehound_role": props}, source="azurehound",
+                                    engagement_id=engagement_id,
                                 )
 
                         if ident_kwargs:

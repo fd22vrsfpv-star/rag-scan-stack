@@ -480,13 +480,31 @@ def import_enumerated_identities(cur, dry_run=True, target=None, limit=2000):
     inserted = updated = 0
     if not dry_run and planned:
         from psycopg2.extras import Json
+        try:
+            from etl.identity_upsert import (
+                resolve_engagement_for_host as _resolve_engagement_for_host)
+        except ImportError:  # container layouts that mount etl/ flat
+            from identity_upsert import (  # type: ignore
+                resolve_engagement_for_host as _resolve_engagement_for_host)
+        # Resolve each host to its engagement ONCE so an enumerated / MSF-dumped
+        # account is attributed (never NULL) and does not surface under every
+        # engagement's Users page. None stays NULL rather than guessing one.
+        _eng_cache: Dict[str, Optional[str]] = {}
+
+        def _eng_for(_host):
+            if _host not in _eng_cache:
+                _eng_cache[_host] = _resolve_engagement_for_host(cur, _host)
+            return _eng_cache[_host]
+
         for p in planned:
+            _eid = _eng_for(p["host"])
             cur.execute("""
                 INSERT INTO identities
                     (provider, identifier, display_name, principal_type,
-                     status, domain, sources, tags, first_seen, last_seen, raw)
+                     status, domain, sources, tags, first_seen, last_seen, raw,
+                     engagement_id)
                 VALUES (%s, %s, %s, 'user', 'unknown', %s, %s, %s,
-                        now(), now(), %s)
+                        now(), now(), %s, %s)
                 ON CONFLICT (provider, lower(identifier)) DO UPDATE
                    SET last_seen = now(),
                        updated_at = now(),
@@ -501,12 +519,16 @@ def import_enumerated_identities(cur, dry_run=True, target=None, limit=2000):
                        tags    = (SELECT array_agg(DISTINCT t ORDER BY t)
                                     FROM unnest(COALESCE(identities.tags,
                                                          ARRAY[]::text[])
-                                                || EXCLUDED.tags) t)
+                                                || EXCLUDED.tags) t),
+                       -- Fill a missing attribution without overwriting a good one.
+                       engagement_id = COALESCE(identities.engagement_id,
+                                                EXCLUDED.engagement_id)
                 RETURNING (xmax = 0) AS inserted
             """, (p["provider"], p["identifier"], p["display_name"], p["host"],
                   p["sources"], p["tags"],
                   Json({"host": p["host"], "discovered_by": p["sources"],
-                        "discovery": "smb_rpc_enumeration"})))
+                        "discovery": "smb_rpc_enumeration"}),
+                  _eid))
             got = cur.fetchone()
             if got is not None:
                 was_new = got["inserted"] if isinstance(got, dict) else got[0]

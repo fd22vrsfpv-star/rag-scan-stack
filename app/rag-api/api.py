@@ -4526,7 +4526,8 @@ def ingest_azurehound(
     path = _save_upload_to_tmp(file, tool="azurehound", job_id=job_id)
     try:
         from etl.parse_azurehound import parse_azurehound
-        stats = parse_azurehound(path, profile="api-upload", job_id=job_id)
+        stats = parse_azurehound(path, profile="api-upload", job_id=job_id,
+                                 engagement_id=_resolve_engagement_id())
         if background_tasks:
             background_tasks.add_task(_refresh_cloud_suggestions)
         return {"ok": True, "stats": stats}
