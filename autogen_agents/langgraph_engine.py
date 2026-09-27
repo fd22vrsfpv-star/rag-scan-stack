@@ -2339,28 +2339,71 @@ def _analyse_session_output(sid) -> dict:
 # {password} stays LITERAL — the recommendation carries credential_id and the
 # dispatcher resolves it in memory, so the secret never reaches the stored
 # command. Same contract as etl/credential_followups.py.
+# Protocols whose read-only post-access steps we can run through an allow-listed
+# tool. ssh via sshpass; smb via netexec -x; mysql via -e; postgres via psql -c.
+# A protocol NOT here returns None -> the caller records it "unwrappable" and
+# queues nothing (a real answer, better than queueing something that can't run).
+_WRAP_PROTOCOLS = ("ssh", "smb", "mysql", "postgresql", "postgres")
+
+
+def _wants_elevation(command: str) -> bool:
+    """A step that begins with `sudo` needs the held password fed to sudo -S."""
+    return (command or "").strip().startswith("sudo")
+
+
 def _wrap_remote(protocol: str, ip: str, port, command: str) -> Optional[str]:
-    """A locally-written playbook step, wrapped to run on the target."""
+    """A locally-written playbook step, wrapped to run on the target through the
+    protocol's allow-listed tool. `{username}`/`{password}` are placeholders the
+    dispatcher resolves — the secret is never stored in the command. Returns None
+    for a protocol we have no safe runner for."""
     proto = (protocol or "").strip().lower()
-    if proto != "ssh":
+    if proto not in _WRAP_PROTOCOLS:
         return None
-    opts = ["-oStrictHostKeyChecking=no", "-oConnectTimeout=10"]
-    try:
-        # Algorithm options derived from what recon measured about this host.
-        # Without them ssh refuses to negotiate with a legacy server at all,
-        # and every one of these steps fails before it runs.
-        from etl.target_capabilities import settings_for
-        opts = list(settings_for("ssh", ip, port=port)) + opts
-    except Exception:  # noqa: BLE001
-        pass
-    # stdin closed. `sudo -l` on the target prompts for a password, and over a
-    # non-interactive ssh channel that HANGS until the job times out rather than
-    # failing — the run reported `[sudo] password for msfadmin:` on stderr and
-    # nothing else after burning the whole timeout. Closing stdin makes anything
-    # that prompts fail immediately and say so, which is a result.
     safe = command.replace("'", "'\\''")
-    return (f"sshpass -p '{{password}}' ssh {' '.join(opts)} "
-            f"-p {port or 22} {{username}}@{ip} '{safe}' < /dev/null")
+
+    if proto == "ssh":
+        opts = ["-oStrictHostKeyChecking=no", "-oConnectTimeout=10"]
+        try:
+            # Algorithm options derived from what recon measured about this host.
+            # Without them ssh refuses to negotiate with a legacy server at all,
+            # and every one of these steps fails before it runs.
+            from etl.target_capabilities import settings_for
+            opts = list(settings_for("ssh", ip, port=port)) + opts
+        except Exception:  # noqa: BLE001
+            pass
+        head = (f"sshpass -p '{{password}}' ssh {' '.join(opts)} "
+                f"-p {port or 22} {{username}}@{ip}")
+        if _wants_elevation(command):
+            # Elevation: feed the credential the platform already holds to
+            # `sudo -S`, reading the password from the ssh channel's stdin rather
+            # than a tty. Drop a `-n` token (it fails on legacy sudo — the very
+            # host this was found on — and would refuse the password anyway) and
+            # force `-S -p ""`. `-p ""` uses double quotes so there is nothing to
+            # escape inside the single-quoted remote command; the password is
+            # interpolated exactly once more than the non-sudo case (into printf),
+            # no worse than the sshpass -p already present.
+            toks = [t for t in command.strip().split() if t != "-n"]
+            rest = " ".join(toks[1:])            # drop the leading 'sudo'
+            remote = ("sudo -S -p \"\" " + rest).replace("'", "'\\''")
+            return (f"printf '%s\\n' '{{password}}' | {head} '{remote}'")
+        # No elevation: close stdin so anything that unexpectedly prompts fails
+        # fast and says so, instead of hanging until the job times out.
+        return f"{head} '{safe}' < /dev/null"
+
+    if proto == "smb":
+        # netexec runs the command on the target over SMB (wmiexec/atexec).
+        return (f"netexec smb {ip} -u '{{username}}' -p '{{password}}' "
+                f"--port {port or 445} -x '{safe}'")
+
+    if proto == "mysql":
+        # mysql -e runs one statement. -p{password} takes NO space (a space means
+        # "prompt"); the dispatcher substitutes it directly after -p.
+        return (f"mysql -h {ip} -P {port or 3306} -u '{{username}}' "
+                f"-p'{{password}}' -N -e '{safe}'")
+
+    # postgresql / postgres
+    return (f"PGPASSWORD='{{password}}' psql -h {ip} -p {port or 5432} "
+            f"-U '{{username}}' -d postgres -tAc '{safe}'")
 
 
 # The read-only info-gathering commands most likely to yield actionable next

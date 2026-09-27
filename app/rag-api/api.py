@@ -22989,7 +22989,12 @@ def get_gap_schedule(engagement_id: str, _: bool = Depends(auth)):
 @app.post("/agent/post-review", tags=["Post Review"])
 def run_post_review_endpoint(
     queue_reruns: bool = Query(False, description="Insert the proposed re-runs "
-                               "as pending recommendations (never dispatches)"),
+                               "as recommendations. Held for review by default "
+                               "(status='review'); see dispatch_reruns."),
+    dispatch_reruns: bool = Query(False, description="Queue the re-runs for "
+                                  "DISPATCH (status='pending') instead of holding "
+                                  "them for review. The recon agent will then "
+                                  "auto-run them. Requires queue_reruns=true."),
     since_days: int = Query(None, ge=1, le=365),
     target: str = Query(None),
     engagement_id: str = Query(None),
@@ -23001,15 +23006,18 @@ def run_post_review_endpoint(
     that returns `{"queued": true}` would make the operator poll for the thing
     they just asked for. 1348 executions classify in about two seconds.
 
-    `queue_reruns=true` writes PENDING recommendations. It never dispatches;
-    a human still presses Run, and every proposed target passes the scope gate
-    first, with refusals reported rather than dropped.
+    `queue_reruns=true` writes recommendations HELD for review (status='review'),
+    which the recon-agent drain does NOT dispatch — a human still decides. Add
+    `dispatch_reruns=true` to queue them for dispatch (status='pending') instead;
+    that is the explicit operator choice, not a code default. Every proposed
+    target passes the scope gate first, with refusals reported rather than dropped.
     """
     from post_review_agent import run_post_review
     try:
         report = run_post_review(
             triggered_by="api", since_days=since_days, target=target,
-            queue_reruns=queue_reruns, engagement_id=engagement_id)
+            queue_reruns=queue_reruns, engagement_id=engagement_id,
+            dispatch_reruns=dispatch_reruns)
     except Exception as e:
         raise HTTPException(500, f"post review failed: {e}")
     return {"ok": True, **report}
