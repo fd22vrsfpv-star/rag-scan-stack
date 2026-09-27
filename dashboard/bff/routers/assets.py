@@ -1418,6 +1418,25 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
         "ssh-audit", "swaks", "mysqltuner", "rmg", "ajpycat",
     }
 
+    # Post-access wrapped remote-exec steps. `_wrap_remote()`
+    # (autogen_agents/langgraph_engine.py) queues a playbook post-access step as a
+    # command whose FIRST token — the value stored as `scanner` — is a
+    # general-purpose remote-execution tool: `sshpass`/`ssh` (ssh over sshpass),
+    # `netexec` (SMB wmiexec/atexec), `mysql -e`, `psql -c`. The command RUNS ON
+    # the target through that tool.
+    #
+    # DECISION (post-access lane alignment): these are dispatched via the
+    # tool-name-AGNOSTIC remote-node SSH path (`_dispatch_via_node`), and are
+    # DELIBERATELY NOT added to the kali-listener read-only allow-list
+    # (`_SAFE_READONLY_TOOLS` in kali_listener/listener_service.py). They are
+    # arbitrary remote code execution, not "safe read-only" scanners — putting
+    # them on the no-approval /tools/execute lane would silently turn that lane
+    # into an arbitrary-exec lane. The kali route (`/tools/execute`) name-gates on
+    # that allow-list and would (correctly) 400 them, so we must never fall back
+    # to it for these. If no node is selected we SKIP with a reason rather than
+    # 400 on kali.
+    POST_ACCESS_REMOTE_EXEC = {"ssh", "sshpass", "netexec", "mysql", "psql"}
+
     proxy_url = body.proxy
     use_kali = body.use_kali
     node_id = body.node_id
@@ -1514,6 +1533,31 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                     f"'{scanner}' is served by {hint} but is not in SCANNER_URLS — "
                     f"route it there rather than installing it on kali")
                 return result
+            # Post-access wrapped remote-exec steps (sshpass/ssh/netexec/mysql/psql)
+            # route via the NODE path ONLY — see POST_ACCESS_REMOTE_EXEC above.
+            # Checked BEFORE the kali branch so a set `use_kali` cannot send these
+            # to /tools/execute, where the read-only allow-list would 400 them.
+            # They are general-purpose remote code execution and are intentionally
+            # NOT on that allow-list; the node SSH path does not name-gate on the
+            # tool, so it is the correct lane. No node → skip with a reason.
+            if scanner in POST_ACCESS_REMOTE_EXEC:
+                if node_id:
+                    pf = await _preflight_tool("node", scanner, node_id)
+                    if not pf["ok"]:
+                        result["status"] = "skipped"
+                        result["detail"] = pf["detail"]
+                        await _emit_tool_webhook("tool_unavailable",
+                            {"tool": scanner, "executor": f"node:{node_id}", "ip": ip, "detail": pf["detail"]})
+                        return result
+                    return await _dispatch_via_node(rec, scanner, ip, node_id, result)
+                result["status"] = "skipped"
+                result["detail"] = (
+                    f"'{scanner}' is a post-access remote-exec step and runs via the "
+                    f"remote-node SSH path, not the kali read-only lane "
+                    f"(/tools/execute would refuse it — it is not a safe read-only "
+                    f"tool). Select a node to dispatch it.")
+                return result
+
             # Try Kali container for manual/CLI tools — preflight first.
             if use_kali and scanner not in ("metasploit",):
                 pf = await _preflight_tool("kali", scanner, None)
