@@ -25,29 +25,6 @@ named tests exist).
 
 ---
 
-## Data and deployment
-
-### Post-access steps cannot run on the Kali route — `sshpass` is not a safe tool
-**Found:** 2026-09-21
-**Evidence:** `_wrap_remote` builds `sshpass -p '{password}' ssh ...`
-(`autogen_agents/langgraph_engine.py:2353`) and the queued recommendation takes
-`scanner = command.split()[0]` = `sshpass` (`:2761`). The Kali dispatch route
-posts to `/tools/execute`, which gates on `get_safe_execution_tools()`.
-`_SAFE_READONLY_TOOLS` holds 44 tools and contains **neither `ssh` nor
-`sshpass`** (checked directly). So post-access steps 400 on that route and only
-run via the node path (`_dispatch_via_node`).
-**Where:** `kali_listener/listener_service.py::_SAFE_READONLY_TOOLS` vs
-`autogen_agents/langgraph_engine.py:2353,2761`.
-**Why it matters:** it is the mechanical reason the "sudo cannot elevate" and
-"only ssh steps reachable" items look like wrapper bugs — the wrapper is not the
-blocker, the lane is. Any fix to those items that does not address this will
-still 400.
-**Done when:** the post-access lane and the tool allow-list agree — either the
-steps dispatch by a route that does not gate on the tool name, or `ssh`/`sshpass`
-are deliberately placed on the correct lane (they are general-purpose remote
-execution, so "safe read-only" is arguably wrong for them — that is the decision).
-**Enforced by:** not enforced
-
 ## Known gaps carried from earlier sessions
 
 ### Nothing measures whether retrieval improved
