@@ -63,7 +63,7 @@ classes:
   command_injection:
     aliases: [command injection, os command injection, os-command-injection, rce,
               remote code execution, cmd_injection, code injection, deserialization,
-              insecure deserialization, file_upload, unrestricted file upload,
+              insecure deserialization,
               "CWE-77", "CWE-78", "CWE-94", "CWE-502", "nuclei:rce"]
     web_hint: >-
       Append a command with a shell separator: ; | & && || `cmd` $(cmd), and
@@ -256,3 +256,103 @@ classes:
       an echo of a unique marker via the engine. Proof = the computed value (49) or
       the engine object content in the response, not the literal payload. Stop at
       proof-of-evaluation; do not run OS commands or read secrets in the PoC.
+
+  security_misconfiguration:
+    aliases: [security misconfiguration, security-misconfiguration, missing security header,
+              missing security headers, header not set, header missing, header is missing,
+              content security policy, csp header, strict-transport-security, hsts,
+              x-content-type-options, x-frame-options, anti-clickjacking, clickjacking,
+              permissions policy, permissions-policy, site isolation, spectre,
+              "CWE-16", "CWE-693", "CWE-1021", "CWE-1275", "nuclei:misconfig",
+              "nuclei:http-missing-security-headers"]
+    web_hint: >-
+      Low-severity but chainable header/config gaps. Enumerate response headers and
+      flag absent/weak ones: Content-Security-Policy (XSS mitigation), Strict-
+      Transport-Security (TLS downgrade), X-Content-Type-Options: nosniff (MIME
+      sniffing), X-Frame-Options / CSP frame-ancestors (clickjacking),
+      Permissions-Policy. Also check dangerous methods (PUT/DELETE/TRACE) and
+      directory listing. Confirm by showing the header is missing/weak in the raw
+      response and naming the concrete attack it enables (no X-Frame-Options ->
+      framed clickjacking; no nosniff -> MIME confusion).
+    synth_methodology: >-
+      Do not report a missing header in isolation — tie it to the attack it permits.
+      Missing/weak CSP: show a reflected value a CSP would have blocked. Missing
+      X-Frame-Options/frame-ancestors: build a minimal <iframe> PoC page that frames
+      the target and show the sensitive UI renders inside it (clickjacking). Missing
+      HSTS: note the http:// downgrade path. Missing X-Content-Type-Options: show a
+      response served with a sniffable content type. Proof = the raw response headers
+      captured (grep for the absent header) PLUS the concrete demonstration (the
+      framing PoC, the sniffed type). Keep it non-destructive. Bundle related header
+      gaps on one host into ONE misconfiguration finding rather than one per header.
+
+  information_disclosure:
+    aliases: [information disclosure, info disclosure, information leak, sensitive data exposure,
+              server leaks, version information, version disclosure, x-powered-by,
+              suspicious comments, banner information leak, in page banner, banner leak,
+              base64 disclosure, verbose error, stack trace, "CWE-200", "CWE-209",
+              "CWE-497", "CWE-538", "nuclei:exposure", "nuclei:disclosure"]
+    web_hint: >-
+      Collect data the app should not reveal: server/framework versions (Server,
+      X-Powered-By), verbose errors/stack traces, source in HTML comments,
+      .git/.env/backup files, directory listings, internal IPs/paths, base64 blobs.
+      Trigger errors (bad input, wrong method, malformed value) to surface stack
+      traces. Confirm by capturing the exact leaked string and stating what it
+      enables: a version -> targeted CVE lookup; a path -> traversal target; a
+      comment -> hidden endpoint or credential.
+    synth_methodology: >-
+      Prove the disclosure AND its usefulness, not just presence. Capture the exact
+      leaked artifact from the response — the Server/X-Powered-By value, the
+      stack-trace lines, the HTML comment text, or a base64 blob decoded to something
+      meaningful — and show how it advances an attack: a precise version enables a
+      CVE match, a leaked absolute path seeds traversal, a comment reveals an
+      endpoint or credential. Proof = the quoted leaked content plus a one-line note
+      of the follow-on it enables. For exposed files (.git, backups, .env) fetch a
+      small confirming slice only, not the whole file. Non-destructive; do not
+      exfiltrate bulk data in the PoC.
+
+  insecure_session_cookie:
+    aliases: [insecure cookie, cookie without samesite, samesite attribute, cookie slack,
+              session cookie, session management, cookie without secure, secure flag,
+              httponly, http only, missing httponly, session fixation, "CWE-614",
+              "CWE-1004", "CWE-384", "CWE-1275", "nuclei:cookies"]
+    web_hint: >-
+      Inspect Set-Cookie on session/auth cookies for three flags: Secure (else sent
+      over http), HttpOnly (else readable by JS, so XSS steals it), SameSite (else
+      cross-site requests carry it, enabling CSRF). Also test session fixation: does
+      the session id change after login? Capture the raw Set-Cookie header. Confirm
+      by naming the concrete risk each missing flag enables (no HttpOnly + an XSS =
+      session theft; no SameSite = CSRF-able state change).
+    synth_methodology: >-
+      Tie the missing flag to an exploit, do not just note it. Capture the exact
+      Set-Cookie line for the auth/session cookie. Missing HttpOnly: show
+      document.cookie can read it (pair with any reflected XSS to demonstrate theft).
+      Missing SameSite: show a cross-site request carries the cookie (a CSRF PoC).
+      Missing Secure: note the cookie is transmitted on the http:// path. Session
+      fixation: capture the session id before and after login and show it is
+      unchanged, then that the pre-set id is now authenticated. Proof = the raw
+      cookie header plus the demonstration (JS read, cross-site send, or unchanged
+      id). Use a test account; never hijack a real user's live session.
+
+  file_upload:
+    aliases: [file upload, unrestricted file upload, arbitrary file upload, unrestricted upload,
+              malicious file upload, webshell, web shell, "insecure http method - put",
+              put method, webdav, "CWE-434", "nuclei:file-upload", "nuclei:fileupload"]
+    web_hint: >-
+      Find any upload path (multipart form, PUT/WebDAV, avatar/doc import). Test the
+      control layers in order: extension allowlist (try .php/.jsp/.aspx, then bypasses
+      .pHp, .php.jpg, double extension, .phtml), Content-Type spoof, and magic-byte
+      prefix (GIF89a header then code). For WebDAV, PUT a file and GET it back.
+      Success = the uploaded file is stored AND reachable at a path where the server
+      executes or serves it. Locate the stored path from the response or via content
+      discovery.
+    synth_methodology: >-
+      Prove the upload leads to code execution or stored content, safely. Upload a
+      BENIGN marker first (a .txt or image carrying a unique token) and retrieve it to
+      confirm storage plus a reachable URL. Then test whether an executable extension
+      is accepted: upload a harmless script that only echoes a unique token (e.g. PHP
+      that prints CANARY7f3), request it, and show the token is EXECUTED (dynamic
+      output), not served as text. For WebDAV, PUT the marker then GET it. Proof = the
+      token returned as executed output (proves an RCE-capable upload) or the file
+      retrievable at its URL (proves stored-file exposure). Do NOT upload a real
+      webshell or payload; the echo marker suffices. Remove what you upload when
+      possible.
