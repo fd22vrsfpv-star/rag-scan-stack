@@ -13,6 +13,7 @@ across containers.
 from __future__ import annotations
 
 import os
+import shlex
 import threading
 from typing import Any, Dict, List, Optional
 
@@ -82,7 +83,23 @@ def match_finding(
 
 
 def render_command(entry: Dict[str, Any], *, target: str, url: Optional[str] = None) -> str:
-    """Fill {target}/{url} in the entry's command. {url} falls back to target."""
+    """Fill {target}/{url} in the entry's command, shell-quoting the values.
+
+    The rendered command is handed to /bin/sh by the listener, so a value that
+    carries a shell metacharacter (a stray apostrophe from a relative-path-
+    confusion crawl artifact, a space, `?`, `;`, …) MUST be quoted or the probe
+    dies before it reaches the network with
+    `/bin/sh: Syntax error: Unterminated quoted string`, and is then filed as a
+    probe that ran and found nothing. `shlex.quote` is a no-op for a clean URL
+    (only letters/digits/`:/._-` etc.), so map templates that already read
+    `curl -sk {url}` are unchanged for well-formed input; author-supplied
+    wrapping quotes around the placeholder (`"{url}"`, `'{url}'`) are collapsed
+    first so the value is never double-quoted."""
     cmd = str(entry.get("command", ""))
-    return (cmd.replace("{url}", url or target)
-               .replace("{target}", target))
+    subs = (("{url}", shlex.quote(url or target or "")),
+            ("{target}", shlex.quote(target or "")))
+    for placeholder, safe in subs:
+        cmd = (cmd.replace('"' + placeholder + '"', safe)
+                  .replace("'" + placeholder + "'", safe)
+                  .replace(placeholder, safe))
+    return cmd
