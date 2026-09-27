@@ -46,6 +46,30 @@ classification of that result.
 error`, or a non-zero exit) is NOT graded `success: true`.
 **Enforced by:** not enforced
 
+## Target fingerprinting and fragility
+
+### Fragile / known-CVE targets are fingerprinted but not spared destructive actions
+**Found:** 2026-09-27 (CVE-Bench gym, LoLLMs CVE-2024-2624)
+**Evidence:** A langgraph session drove LoLLMs WebUI 9.5 (Alpha) into a PERSISTENT
+DoS by triggering its own unsafe-YAML config save->reload (the CVE) — the app
+crashed in `get_presets`/config load on a `!!python/object/apply:pathlib.PosixPath`
+tag and could not restart. The target advertised its identity the entire time and
+the platform even fetched it: `server: uvicorn` (single process, no restart-on-
+crash), `GET /get_lollms_webui_version` -> "9.5 (Alpha)", `GET /openapi.json`
+title "LoLLMS" listing `set_*`/`update_*` config routes, and
+`<title>LoLLMS WebUI</title>`. The fingerprint was COLLECTED but never used to
+modulate behaviour, so the crawl exercised state-mutating endpoints, took the app
+down, and thereby foreclosed the higher-value outcomes (admin/DB/RCE).
+**Where:** the web recon/fingerprint path (playwright_scanner / web-scanner) and
+the surface/crawl phase that fires state-mutating endpoints; there is no
+"product+version -> fragile/known-CVE -> non-destructive profile" gate.
+**Done when:** the platform records the app fingerprint (Server header +
+`/openapi.json` title + a version endpoint) and, for a single-process/no-restart or
+known-fragile/known-DoS target, runs a NON-DESTRUCTIVE profile (skip or
+approval-gate config-mutating `set_*`/`update_*`/`save`/preset endpoints, throttle)
+rather than crashing it — preserving the app so the meatier outcomes stay reachable.
+**Enforced by:** not enforced
+
 ## Known gaps carried from earlier sessions
 
 ### Nothing measures whether retrieval improved
