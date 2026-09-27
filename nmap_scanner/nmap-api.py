@@ -2816,6 +2816,28 @@ def _ingest_nmap_results(job_id: str, nmap_results: list) -> int:
     return n
 
 
+def _collect_failed_batches(phases: dict) -> list:
+    """Failed nmap sub-jobs (batches) across the scan phases, so a failure is
+    visible in the job result instead of silently shrinking the port list.
+
+    Each phase's `nmap_results` carries one entry per batch; a batch that raised
+    has an `error` key (and its `ports` were NOT service-detected). Returns a flat
+    list of {phase, target, ports, error} — empty when every batch succeeded.
+    """
+    out = []
+    for phase_name in ("phase2", "phase3"):
+        entry = (phases or {}).get(phase_name) or {}
+        for r in entry.get("nmap_results", []) or []:
+            if isinstance(r, dict) and r.get("error"):
+                out.append({
+                    "phase": phase_name,
+                    "target": r.get("target"),
+                    "ports": r.get("ports"),
+                    "error": r.get("error"),
+                })
+    return out
+
+
 def _run_full_scan_async(
     job_id: str,
     targets: List[str],
@@ -2916,18 +2938,27 @@ def _run_full_scan_async(
                 try:
                     validated_target = validate_scan_target(target, allow_private=True)
                     safe_target = _safe_name(validated_target)
-
-                    for batch_idx, batch_start in enumerate(range(0, len(quick_ports_found), 50)):
-                        batch_ports = quick_ports_found[batch_start:batch_start + 50]
+                except Exception as e:
+                    logging.error(f"[{job_id}] Nmap target invalid {target}: {e}")
+                    results.append({"target": target, "error": str(e)})
+                    continue
+                # One try PER BATCH: a failed batch drops only its own ports and is
+                # RECORDED (as an error entry), instead of aborting the remaining
+                # batches for this target and silently shrinking the port list.
+                for batch_idx, batch_start in enumerate(range(0, len(quick_ports_found), 50)):
+                    batch_ports = quick_ports_found[batch_start:batch_start + 50]
+                    try:
                         xml_path = run_nmap_batch(validated_target, batch_ports, batch_idx)
                         results.append({
                             "target": validated_target,
                             "ports": batch_ports,
                             "xml_path": xml_path
                         })
-                except Exception as e:
-                    logging.error(f"[{job_id}] Nmap batch failed for {target}: {e}")
-                    results.append({"target": target, "error": str(e)})
+                    except Exception as e:
+                        logging.error(f"[{job_id}] Nmap batch failed for {target} "
+                                      f"ports {batch_ports[0]}-{batch_ports[-1]}: {e}")
+                        results.append({"target": validated_target,
+                                        "ports": batch_ports, "error": str(e)[:300]})
             return results
 
         def run_full_masscan():
@@ -2986,9 +3017,11 @@ def _run_full_scan_async(
             phase2_nmap_results = run_nmap_on_ports()
             logging.info(f"[{job_id}] Phase 2: Skipping full masscan (full_ports is empty)")
 
+        _p2_failed = [r for r in (phase2_nmap_results or []) if isinstance(r, dict) and r.get("error")]
         result["phases"]["phase2"] = {
-            "status": "completed",
+            "status": "partial" if _p2_failed else "completed",
             "nmap_results": phase2_nmap_results,
+            "failed_batches": _p2_failed,
             "full_ports_found": sorted(full_ports_found),
             "masscan_output": phase2_masscan_path
         }
@@ -3007,22 +3040,30 @@ def _run_full_scan_async(
             for target in targets:
                 try:
                     validated_target = validate_scan_target(target, allow_private=True)
-
-                    for batch_idx, batch_start in enumerate(range(0, len(full_ports_found), 50)):
-                        batch_ports = full_ports_found[batch_start:batch_start + 50]
+                except Exception as e:
+                    logging.error(f"[{job_id}] Phase 3 target invalid {target}: {e}")
+                    phase3_results.append({"target": target, "error": str(e)})
+                    continue
+                for batch_idx, batch_start in enumerate(range(0, len(full_ports_found), 50)):
+                    batch_ports = full_ports_found[batch_start:batch_start + 50]
+                    try:
                         xml_path = run_nmap_batch(validated_target, batch_ports, batch_idx + 100)  # Offset batch index
                         phase3_results.append({
                             "target": validated_target,
                             "ports": batch_ports,
                             "xml_path": xml_path
                         })
-                except Exception as e:
-                    logging.error(f"[{job_id}] Phase 3 nmap failed for {target}: {e}")
-                    phase3_results.append({"target": target, "error": str(e)})
+                    except Exception as e:
+                        logging.error(f"[{job_id}] Phase 3 nmap batch failed for {target} "
+                                      f"ports {batch_ports[0]}-{batch_ports[-1]}: {e}")
+                        phase3_results.append({"target": validated_target,
+                                              "ports": batch_ports, "error": str(e)[:300]})
 
+            _p3_failed = [r for r in phase3_results if r.get("error")]
             result["phases"]["phase3"] = {
-                "status": "completed",
-                "nmap_results": phase3_results
+                "status": "partial" if _p3_failed else "completed",
+                "nmap_results": phase3_results,
+                "failed_batches": _p3_failed,
             }
         else:
             result["phases"]["phase3"] = {"status": "skipped", "reason": "No additional ports found"}
@@ -3098,7 +3139,12 @@ def _run_full_scan_async(
                 except Exception as e:
                     logging.error(f"[{job_id}] Failed to ingest SMB results: {e}")
 
-        # Success!
+        # A batch (sub-job) that failed dropped its ports from service detection.
+        # Surface that at the JOB level instead of reporting a clean "completed":
+        # the old behaviour let a failed nmap sub-job silently reduce the port list
+        # while the run still read as complete (see Docs/OPEN_ITEMS.md).
+        failed_batches = _collect_failed_batches(result["phases"])
+
         final_result = {
             "ok": True,
             "job_id": job_id,
@@ -3107,9 +3153,20 @@ def _run_full_scan_async(
             "ports": all_ports,
             "phases": result["phases"],
             "smb_vulns": result.get("smb_scan"),
+            "failed_batches": failed_batches,
+            "partial": bool(failed_batches),
         }
 
-        update_job_status(job_id, "completed", "done", f"Full scan complete. {len(all_ports)} ports discovered.", result=final_result)
+        if failed_batches:
+            _dropped = sorted({p for b in failed_batches for p in (b.get("ports") or [])})
+            update_job_status(
+                job_id, "partial", "done",
+                f"Full scan finished with {len(failed_batches)} failed nmap "
+                f"sub-job(s); service detection is incomplete for "
+                f"{len(_dropped)} port(s). {len(all_ports)} ports discovered.",
+                result=final_result)
+        else:
+            update_job_status(job_id, "completed", "done", f"Full scan complete. {len(all_ports)} ports discovered.", result=final_result)
 
         # Save session results with parsed findings
         session_files = []
