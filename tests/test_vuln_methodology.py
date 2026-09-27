@@ -41,7 +41,9 @@ WEB_CLASSES = {"xss", "sqli", "command_injection", "ssrf", "lfi",
                # Added 2026-09-26: classes the RAG corpus did not cover, surfaced
                # by the scan recommendations + live findings.
                "security_misconfiguration", "information_disclosure",
-               "insecure_session_cookie", "file_upload"}
+               "insecure_session_cookie", "file_upload",
+               # Added 2026-09-27: deserialization (moved off command_injection) + JWT.
+               "insecure_deserialization", "jwt"}
 LOGIC_CLASSES = {"idor", "business_logic", "ssti"}
 
 
@@ -119,6 +121,15 @@ def test_canonical_ids_resolve_to_themselves():
     ({"name": "Session Management Response Identified"}, "insecure_session_cookie"),
     ({"issue_type": "Insecure HTTP Method - PUT"}, "file_upload"),
     ({"cwe": "CWE-434"}, "file_upload"),
+    # New classes (2026-09-27): deserialization + JWT.
+    ({"issue_type": "Insecure Deserialization"}, "insecure_deserialization"),
+    ({"name": "Java deserialization of untrusted data"}, "insecure_deserialization"),
+    ({"cwe": "CWE-502"}, "insecure_deserialization"),           # moved off command_injection
+    ({"issue_type": "JSON Web Token"}, "jwt"),
+    ({"name": "JWT algorithm confusion (RS256 to HS256)"}, "jwt"),
+    ({"cwe": "CWE-347"}, "jwt"),
+    # Regression guard: command_injection no longer swallows deserialization.
+    ({"issue_type": "os-command-injection"}, "command_injection"),
 ])
 def test_representative_signals_resolve(signals, expected):
     assert vuln_skills.resolve(**signals) == expected

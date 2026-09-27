@@ -62,9 +62,8 @@ classes:
 
   command_injection:
     aliases: [command injection, os command injection, os-command-injection, rce,
-              remote code execution, cmd_injection, code injection, deserialization,
-              insecure deserialization,
-              "CWE-77", "CWE-78", "CWE-94", "CWE-502", "nuclei:rce"]
+              remote code execution, cmd_injection, code injection,
+              "CWE-77", "CWE-78", "CWE-94", "nuclei:rce"]
     web_hint: >-
       Append a command with a shell separator: ; | & && || `cmd` $(cmd), and
       newline %0a. Echo a unique marker: ;echo CANARY7f3 . Blind? Use time: ;sleep 5
@@ -356,3 +355,61 @@ classes:
       retrievable at its URL (proves stored-file exposure). Do NOT upload a real
       webshell or payload; the echo marker suffices. Remove what you upload when
       possible.
+
+  insecure_deserialization:
+    aliases: [insecure deserialization, deserialization, deserialisation,
+              object injection, php object injection, java deserialization,
+              ".net deserialization", untrusted deserialization, unsafe deserialization,
+              pickle, ysoserial, "CWE-502", "nuclei:deserialization"]
+    web_hint: >-
+      Untrusted data fed into a deserializer. Spot serialized blobs by their magic:
+      Java rO0AB (base64) or AC ED 00 05 (raw), PHP O:8:"...": / a:2:{, .NET
+      AAEAAAD///// , Python pickle \x80. Look in cookies, hidden fields, viewstate,
+      params, headers, message queues. Confirm the sink deserializes attacker input,
+      then escalate with ysoserial (Java: URLDNS, then CommonsCollections), phpggc
+      (PHP gadget chains), or a pickle __reduce__. Prove reachability with a
+      DNS/HTTP callback gadget BEFORE any RCE gadget.
+    synth_methodology: >-
+      Prove untrusted input reaches a deserializer, safely, before any RCE gadget.
+      1) Fingerprint the format from the blob's magic bytes (Java AC ED / rO0, PHP
+      O:/a:, .NET base64, pickle \x80) in a cookie/param/viewstate/header. 2) Prove
+      reachability with a NON-destructive out-of-band gadget: Java ysoserial URLDNS
+      or JRMPClient to a collaborator you control; PHP/pickle a payload that only
+      fires a DNS/HTTP callback. A hit on your listener proves the object was
+      deserialized. 3) Only if authorized, show control with a benign command gadget
+      that echoes a unique marker (e.g. ysoserial CommonsCollections1 'echo
+      CANARY7f3'), capturing the marker in the response or OOB. Proof = the DNS/HTTP
+      callback from the deserialized gadget, or the marker echoed back. Identify the
+      library + version to pick the right chain. Do NOT run destructive gadgets; the
+      callback alone proves exploitability.
+
+  jwt:
+    aliases: [jwt, json web token, jwt token, jws, jwt_none, "jwt none",
+              algorithm confusion, jwt signature, bearer token, "CWE-347", "CWE-345",
+              "nuclei:jwt"]
+    web_hint: >-
+      Decode the token (header.payload.signature, base64url) and run these in order:
+      (1) alg:none — set header alg to "none", drop the signature (keep the trailing
+      dot), resend; accepted = auth bypass. (2) Signature not verified — tamper a
+      payload claim (admin:true, sub) but keep the OLD signature; accepted = no
+      verification. (3) HS256 — crack the secret offline: hashcat -m 16500, or
+      jwt_tool -C. (4) kid/jku/jwk in the header — inject: kid path traversal/SQLi,
+      jku/jwk pointing at a key you host. (5) RS256 with the public key available —
+      algorithm confusion: re-sign as HS256 using the RSA public key as the HMAC
+      secret. jwt_tool automates all five.
+    synth_methodology: >-
+      Test JWT trust in this order, capturing the exact token before and after.
+      1) alg:none — rebuild the header as {"alg":"none","typ":"JWT"}, keep the
+      payload, drop the signature (leave the trailing dot); if accepted, forge an
+      elevated claim (role=admin / sub=another user) and prove it works on a
+      protected endpoint. 2) Signature-not-verified — flip a claim (sub/role/admin)
+      but keep the ORIGINAL signature; acceptance proves the signature is ignored.
+      3) HS256 weak secret — crack offline: hashcat -m 16500 <token> <wordlist> or
+      jwt_tool -C -d <wordlist>; a recovered secret lets you sign arbitrary tokens.
+      4) kid/jku/jwk header injection — if kid is present try path traversal to a
+      known file or SQLi; if jku/jwk is present host your own key and point the token
+      at it. 5) RS256->HS256 confusion — if the server verifies RS256 and its PUBLIC
+      key is available, sign a forged token with HS256 using the public key bytes as
+      the HMAC secret; acceptance proves confusion. Proof = a forged/tampered token
+      accepted at a protected endpoint (capture the 200 + the elevated action) or a
+      cracked secret. Use a test account; forge only your own elevation.
