@@ -266,6 +266,7 @@ services:
     ports: ["8000:8000"]
     volumes:
       - ./nmap_out:/app/nmap_out
+      - ./poc_logs:/app/poc_logs        # PoC-builder review trail (verbose logs; DB stores only the final)
       - ./etl:/app/etl:ro
       - ./common:/app/common:ro    # /skills reuses common/vuln_skills.py
       - ${WORDLISTS_DIR:-./wordlists}:/wordlists

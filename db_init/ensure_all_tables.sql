@@ -1448,6 +1448,26 @@ CREATE INDEX IF NOT EXISTS idx_security_tests_tier       ON public.security_test
 CREATE INDEX IF NOT EXISTS idx_security_tests_pending    ON public.security_tests(pending_exploit_id) WHERE pending_exploit_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_security_tests_enabled    ON public.security_tests(enabled) WHERE enabled;
 
+-- poc_synthesis_log: reviewable request/response trail for the CVE PoC-builder
+-- (research -> synthesize -> run -> refine). A person reads this to tweak prompts.
+CREATE TABLE IF NOT EXISTS public.poc_synthesis_log (
+    id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    cve                text,
+    target_ip          text,
+    security_test_id   uuid,
+    pending_exploit_id uuid,
+    iteration          integer NOT NULL DEFAULT 0,
+    phase              text,          -- research | synthesize | run | refine | result
+    prompt             text,
+    response           text,
+    run_output         text,
+    assertion_passed   boolean,
+    engagement_id      uuid,
+    created_at         timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_poc_log_cve ON public.poc_synthesis_log(cve, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_poc_log_test ON public.poc_synthesis_log(security_test_id);
+
 CREATE TABLE IF NOT EXISTS public.security_test_runs (
     id                   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     test_id              uuid NOT NULL REFERENCES public.security_tests(id) ON DELETE CASCADE,

@@ -223,3 +223,4 @@ exports/
 
 # promote-skills.sh backups of the vuln-class methodology pack
 knowledge/*.bak-*
+poc_logs/
