@@ -337,6 +337,9 @@ classes:
               malicious file upload, webshell, web shell, "insecure http method - put",
               put method, webdav, "CWE-434", "nuclei:file-upload", "nuclei:fileupload"]
     web_hint: >-
+      PRECONDITION: confirm a WRITE surface exists FIRST — an upload form, or
+      PUT/WebDAV (OPTIONS Allow: PUT, or a benign PUT returns 200/201). None -> do
+      NOT attempt an upload; it only floods.
       Find any upload path (multipart form, PUT/WebDAV, avatar/doc import). Test the
       control layers in order: extension allowlist (try .php/.jsp/.aspx, then bypasses
       .pHp, .php.jpg, double extension, .phtml), Content-Type spoof, and magic-byte
@@ -345,6 +348,9 @@ classes:
       executes or serves it. Locate the stored path from the response or via content
       discovery.
     synth_methodology: >-
+      PRECONDITION: prove a write surface exists before uploading — an upload form
+      (multipart) OR PUT/WebDAV (OPTIONS shows Allow: PUT, or a benign PUT then GET
+      round-trips). If neither, STOP: there is nowhere to upload.
       Prove the upload leads to code execution or stored content, safely. Upload a
       BENIGN marker first (a .txt or image carrying a unique token) and retrieve it to
       confirm storage plus a reachable URL. Then test whether an executable extension
@@ -442,3 +448,33 @@ classes:
       5) Respect account lockout and rate limits; throttle hard against fragile /
       single-process targets. 6) On a hit, store the credential in the Auth Profile
       and pivot to authenticated testing rather than continuing to brute.
+
+  technology_match:
+    aliases: [technology match, stack match, tech fingerprint, wrong stack,
+              product match, applicability, fingerprint gate, "php on python",
+              stack-specific exploit, "nuclei:tech"]
+    web_hint: >-
+      Before running any STACK-SPECIFIC exploit, confirm that stack is actually
+      present. Fingerprint first: Server / X-Powered-By headers, URL file extensions
+      (.php/.jsp/.aspx), session cookies (PHPSESSID/JSESSIONID/ASP.NET_SessionId),
+      CMS markers (meta generator, wp-content, /administrator), /openapi.json,
+      favicon hash. A PHP exploit needs PHP; a Tomcat/Struts/JBoss/WebLogic exploit
+      needs the Java stack; a WordPress/Joomla/Drupal module needs that CMS. If the
+      fingerprint does NOT match the exploit technology, DO NOT run it — it cannot
+      work and only adds noise/DoS risk (e.g. a php_cgi RCE against a Python/uvicorn
+      app is a no-op flood).
+    synth_methodology: >-
+      Match the exploit to the observed stack before dispatch. 1) FINGERPRINT: read
+      Server and X-Powered-By headers, URL file extensions (.php/.jsp/.aspx/.do),
+      session cookies (PHPSESSID/JSESSIONID/ASP.NET_SessionId), CMS markers (meta
+      generator, wp-content, /administrator, Drupal.settings), /openapi.json and
+      favicon hash. 2) DERIVE the stack: language (PHP/Java/.NET/Python/Node), server
+      (Apache/nginx/IIS/Tomcat/uvicorn) and product/CMS. 3) GATE: only queue an
+      exploit whose technology matches — a PHP exploit (php_cgi, LFI-to-RCE) requires
+      PHP; a Tomcat/Struts/JBoss/WebLogic module requires the Java stack; a
+      wp_/joomla/drupal module requires that CMS; an IIS/ASP.NET module requires
+      .NET. 4) If the fingerprint does NOT match, STOP — the exploit cannot succeed
+      on the wrong stack, wastes the run, and can DoS a fragile app. 5) When the
+      stack is unknown, prefer stack-agnostic checks (generic nuclei, content
+      discovery) and finish fingerprinting before committing to a stack-specific
+      exploit.
