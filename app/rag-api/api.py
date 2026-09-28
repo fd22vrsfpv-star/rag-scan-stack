@@ -2412,6 +2412,21 @@ def _emit_ingest_event(source: str, stats: dict = None):
         emit_webhook("ingest_completed", source, {"stats": stats or {}})
     except Exception:
         pass  # Non-critical — dashboard will still poll
+    # Detection -> exploit bridge: promote scanner-confirmed CVEs into
+    # software_known_cve follow-ups so they FLAG in the Software tab (and can drive
+    # the exploit pipeline) as soon as results land. Idempotent; CVE-producing
+    # scanners only.
+    if source in ("nuclei", "zap", "nessus", "vulnx", "web", "tool-output", "playwright"):
+        try:
+            from etl.cve_exploit_bridge import promote_scanner_cves
+            _bid = _validate_engagement_uuid(_resolve_engagement_id())
+            with get_db() as _c, _c.cursor() as _cur:
+                _r = promote_scanner_cves(_cur, _bid); _c.commit()
+            if _r.get("created"):
+                logging.info("cve bridge: flagged %s scanner-confirmed CVE(s) after %s ingest",
+                             _r["created"], source)
+        except Exception as _e:  # noqa: BLE001
+            logging.debug("cve bridge on %s ingest failed: %s", source, _e)
     # Generic output-vs-findings reconciliation for EVERY scan type. The parser
     # already reported records it could not ingest (errors / non-dedup skips);
     # surface that instead of letting it pass silently — dedup and scope filters
@@ -12428,6 +12443,26 @@ def set_zap_auth_crawl_settings(body: ZapAuthCrawlSettings, authorized: bool = D
         for k in updates:
             _SETTING_CACHE.pop(k, None)
     return {"ok": True, "updated": updates}
+
+
+@app.post("/software/bridge-scanner-cves", tags=["Assets"])
+def bridge_scanner_cves(authorized: bool = Depends(auth)):
+    """Detection -> exploit bridge: promote scanner-confirmed CVEs (nuclei/ZAP
+    web_findings + nmap-vuln/nuclei vulns) into `software_known_cve` follow-ups so
+    they FLAG in the Software tab and drive the exploit pipeline. Scoped to the
+    active engagement. Idempotent."""
+    from etl.cve_exploit_bridge import promote_scanner_cves
+    eid = _validate_engagement_uuid(_resolve_engagement_id())
+    with get_db() as conn, conn.cursor() as cur:
+        result = promote_scanner_cves(cur, eid)
+        conn.commit()
+    try:
+        emit_webhook("scanner_cves_bridged", "software", {
+            "engagement_id": eid, "scanned": result["scanned"],
+            "created": result["created"]})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, **result}
 
 
 @app.get("/software/research-cache", tags=["Assets"])
