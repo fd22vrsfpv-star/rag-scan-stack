@@ -12609,6 +12609,21 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
     tgt = f"http://{ip}:{port}"
     details = _fetch_cve_details(cve)
     _poc_trace(run_id, "research", response=json.dumps(details))
+    # Proactive precondition detection: if the target exposes CSRF tokens/nonces,
+    # FLAG it now and hand the token to the synthesizer so the first-draft uses it.
+    pre_guidance = ""
+    try:
+        pc = _fetch_preconditions(ip, port)
+        if pc.get("tokens") or pc.get("cookies"):
+            _poc_trace(run_id, "precondition", response=json.dumps(pc))
+            _flag_precondition(cve, ip, pc, eid)
+            pre_guidance = (f"The target enforces an anti-CSRF precondition. Live tokens: "
+                            f"{pc['tokens']}; cookies: {pc['cookies']}. Fetch the token "
+                            f"in-session (curl -c jar) and send it + the cookie in the "
+                            f"exploit (see the csrf_nonce methodology).")
+    except Exception:  # noqa: BLE001
+        pass
+    guidance_extra = (guidance_extra + " " + pre_guidance).strip()
     prompt = (f"AUTHORIZED lab pentest. Build a proof-of-concept for {cve} on {tgt} "
               f"({product or ''} {version or ''}).\n"
               f"CVE description: {details.get('description') or '(none)'}\n"
@@ -12621,7 +12636,7 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
               f"with grep/sed, keep the cookie) then use it — chain curl calls with ; and shell "
               f"vars. No prose.")
     command = None
-    assertion = {"expect_regex": r"(?i)(uid=|root:|flag\{|vulnerable|HTTP/1\.[01] 200)"}
+    assertion = {"expect_regex": r"(?i)(uid=|root:|flag\{|administrator|vulnerable|\bsuccess[\"\x27]?\s*[:=]\s*true)"}
     rationale = ""
     for _ in range(2):
         try:
@@ -12706,6 +12721,34 @@ def _fetch_preconditions(ip, port, timeout=8):
     return {"tokens": sorted(tokens)[:8], "cookies": sorted(cookies)[:5], "base": base}
 
 
+def _flag_precondition(cve, ip, pc, eid):
+    """Flag (Follow-Ups + webhook) that a target enforces an anti-CSRF/nonce/session
+    precondition, so it is VISIBLE (not just handled inline). Points at the csrf_nonce
+    skill. Idempotent."""
+    try:
+        import uuid as _u
+        title = f"Anti-CSRF/nonce precondition on {ip} (gates {cve} PoC)"
+        reason = (f"{cve} exploitation on {ip} is gated by a CSRF nonce/token/session. "
+                  f"Fetched live: tokens={pc.get('tokens')} cookies={pc.get('cookies')}. "
+                  f"Handle per the csrf_nonce skill: fetch the token in-session, then replay.")
+        meta = {"cve": cve, "tokens": pc.get("tokens"), "cookies": pc.get("cookies"),
+                "skill": "csrf_nonce"}
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""INSERT INTO follow_up_items
+                (id, finding_source, title, target, severity, reason, rule_id, confidence, tags, metadata)
+                VALUES (%s,'poc_builder',%s,%s,'medium',%s,'auth_precondition_required',0.9,%s,%s)
+                ON CONFLICT (title, COALESCE(target,''), COALESCE(rule_id,'')) DO NOTHING""",
+                (str(_u.uuid4()), title, ip, reason,
+                 ["csrf", "nonce", "precondition", "poc_builder"], Json(meta)))
+            conn.commit()
+        emit_webhook("precondition_detected", "poc",
+                     {"cve": cve, "target": ip, "skill": "csrf_nonce",
+                      "tokens_found": len(pc.get("tokens") or []),
+                      "cookies_found": len(pc.get("cookies") or [])})
+    except Exception as e:  # noqa: BLE001
+        logging.debug("flag precondition failed: %s", e)
+
+
 def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale="",
                     product=None, version=None, max_iters=3):
     """Increment 2: run the PoC against the target; on failure, refine via the LLM,
@@ -12736,6 +12779,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         if _poc_needs_precondition(output):
             pc = _fetch_preconditions(ip, port)
             _poc_trace(run_id, "precondition", iteration=it, response=json.dumps(pc))
+            _flag_precondition(cve, ip, pc, eid)  # surface it in Follow-Ups
             if pc.get("tokens") or pc.get("cookies"):
                 precond = (f"\nThe target enforces a PRECONDITION. Fetched live from the "
                            f"site: tokens={pc['tokens']} cookies={pc['cookies']}. Use these "
