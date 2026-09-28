@@ -478,3 +478,33 @@ classes:
       stack is unknown, prefer stack-agnostic checks (generic nuclei, content
       discovery) and finish fingerprinting before committing to a stack-specific
       exploit.
+
+  cve_applicability:
+    aliases: [cve applicability, version match, exploit applicability, vulnerable
+              version, patch level, backport, backported patch, banner reliability,
+              "version check", spoofed banner, "nuclei:cve"]
+    web_hint: >-
+      Do NOT fire a version-specific CVE exploit on a version STRING alone — banners
+      lie: they can be spoofed, hidden, or BACKPORT-patched (Debian/RHEL fix the bug
+      while keeping the old version number). Treat the version as a HINT, then CONFIRM
+      the flaw behaviorally with a SAFE check before the destructive exploit: a
+      detection-only scanner (auxiliary/scanner/smb/smb_ms17_010 tests the flaw not
+      the version; the bluekeep check action), a nuclei CVE template, or a benign PoC
+      (a TLS heartbeat read for Heartbleed, a harmless Shellshock echo). Use version
+      RANGES, not exact equality. No safe confirmation -> do not run the exploit.
+    synth_methodology: >-
+      Confirm applicability by BEHAVIOR, not by an exact version string. 1) Treat the
+      reported product/version as a HINT only — banners can be spoofed, suppressed, or
+      BACKPORT-patched (Debian/RHEL/Ubuntu fix a CVE while keeping the old version
+      number), so exact-version matching both over- and under-fires. 2) Run a
+      NON-DESTRUCTIVE detection FIRST: a check-only scanner
+      (auxiliary/scanner/smb/smb_ms17_010 tests the actual MS17-010 flaw; the
+      cve_2019_0708_bluekeep check; an SSL heartbleed scanner reads a benign
+      heartbeat; a Shellshock probe echoes a unique token via CGI) or a nuclei CVE
+      template. 3) Only when the safe check CONFIRMS the condition do you queue the
+      destructive exploit (eternalblue, bluekeep RCE, payload). 4) Use version RANGES
+      (>= a.b, < fixed) with the vendor advisory; distro backports make "version <
+      fixed" necessary but NOT sufficient. 5) If no safe confirmation is possible and
+      the version is the only signal, DO NOT fire a destructive or DoS-prone exploit
+      on that alone — record it unconfirmed and move on. 6) The behavioral
+      confirmation, not the banner, is what authorizes the exploit.
