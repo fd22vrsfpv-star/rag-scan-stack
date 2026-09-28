@@ -508,3 +508,32 @@ classes:
       the version is the only signal, DO NOT fire a destructive or DoS-prone exploit
       on that alone — record it unconfirmed and move on. 6) The behavioral
       confirmation, not the banner, is what authorizes the exploit.
+
+  csrf_nonce:
+    aliases: [csrf, nonce, "csrf token", "anti-csrf", "_wpnonce", "wp nonce",
+              "authenticity_token", "_token", "xsrf", "csrf-token", "invalid nonce",
+              "invalid security", "security token", "precondition token"]
+    web_hint: >-
+      Many actions are gated by an anti-CSRF token/nonce: WordPress _wpnonce, Laravel
+      _token, Rails authenticity_token, a <meta name="csrf-token">, or a JSON nonce
+      field. A request failing with "invalid nonce" / "CSRF" / 403 / "invalid
+      security" means the token is REQUIRED. Do NOT guess it. FETCH it first: GET the
+      page that renders the action (the form / admin / login page) INTO A COOKIE JAR,
+      extract the token (name=..._token value="...", "nonce":"...", <meta
+      csrf-token content="...">), then replay the request WITH that token AND the
+      captured session cookie. Nonces are usually single-use and session-bound, so
+      fetch and use in the SAME session (curl -c jar to save, -b jar to send).
+    synth_methodology: >-
+      Handle the anti-CSRF precondition deterministically. 1) DETECT: a 403 / "invalid
+      nonce" / "CSRF token mismatch" / "invalid security" response means a token is
+      required. 2) FETCH in-session: curl -s -c /tmp/cj "<page rendering the action>"
+      then extract the token — WordPress: grep -oE '"nonce":"[a-f0-9]+"' or name="_wpnonce"
+      value="..."; Rails/Laravel: name="authenticity_token"/"_token" value="..." or
+      <meta name="csrf-token" content="...">. 3) REPLAY: send the exploit with -b /tmp/cj
+      (same session) and the token in the body/header the app expects (_wpnonce=,
+      X-CSRF-Token:, authenticity_token=). 4) Chain it in ONE command:
+      NONCE=$(curl -s -c /tmp/cj "$BASE/<page>" | grep -oE '<token pattern>' | head -1 | ...);
+      curl -s -b /tmp/cj -X POST "$BASE/<action>" -d "...&_wpnonce=$NONCE". 5) If it still
+      fails, the token may need an AUTHENTICATED session — capture the cookie after a
+      login (or a public nonce endpoint) first. Prove success by the action's effect
+      (user created, setting changed), not a 200 alone.
