@@ -281,6 +281,7 @@ CRITICAL_TABLES=(
     "platform_control"
     "security_tests"
     "security_test_runs"
+    "poc_synthesis_log"
     "wstg_manual_reviews"
     "exploit_chunks"
     "scan_tool_feedback"
