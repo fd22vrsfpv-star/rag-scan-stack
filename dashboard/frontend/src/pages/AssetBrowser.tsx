@@ -2,7 +2,7 @@ import { useState, useMemo, useEffect, Fragment } from 'react'
 import { Link } from 'react-router-dom'
 import { useQueryClient, useQuery } from '@tanstack/react-query'
 import PageHelp from '@/components/PageHelp'
-import { useAssets, useAssetPorts, useAssetVulns, usePortRecommendations, useSubdomains, useDeleteAssets, useDeleteSubdomains, useAssetCredentials, useAllCredentials, useUpdateCredentialStatus, useCreateCredential, useDeleteCredential, usePurgeDomain, usePurgePattern, useDetectedSoftware, useBulkDismissSoftware, useCveTuning, useUpdateCveTuning, useSearchsploit, getDdgSearchUrls, useResearchCache, useVulnxFindings, useAssetAccess, useRefreshAccess, useReviewAccess, useAccessSummary, usePendingExploitCounts, useAssetPortAdvice, useAssetEnumeration,
+import { useAssets, useAssetPorts, useAssetVulns, usePortRecommendations, useSubdomains, useDeleteAssets, useDeleteSubdomains, useAssetCredentials, useAllCredentials, useUpdateCredentialStatus, useCreateCredential, useDeleteCredential, usePurgeDomain, usePurgePattern, useDetectedSoftware, useBulkDismissSoftware, useCveTuning, useUpdateCveTuning, useSearchsploit, getDdgSearchUrls, useResearchCache, useVulnxFindings, useResolveExploit, useAssetAccess, useRefreshAccess, useReviewAccess, useAccessSummary, usePendingExploitCounts, useAssetPortAdvice, useAssetEnumeration,
   type ObtainedAccess, type DdgSearchResponse, type EnumHighlight, type EnumCredential, type EnumLoot, type EnumLoginAttempt, type EnumListeningPort } from '@/api/assets'
 import { apiFetch } from '@/api/client'
 import { useTargetedReconLookup, useTargetedReconExecute } from '@/api/targeted-recon'
@@ -1205,6 +1205,8 @@ export default function AssetBrowser() {
   const [softwareSort, setSoftwareSort] = useState<'hostname' | 'product' | 'version' | 'cve-count'>('hostname')
   const [showBulkDismiss, setShowBulkDismiss] = useState(false)
   const [exploitLookup, setExploitLookup] = useState<{ product: string; version: string; cveFlags?: any[] } | null>(null)
+  const resolveExploit = useResolveExploit()
+  const [resolveMsg, setResolveMsg] = useState<Record<string, string>>({})
   const [selectedProducts, setSelectedProducts] = useState<Set<string>>(new Set())
   const [showCveTuning, setShowCveTuning] = useState(false)
   const { data: cveTuningData } = useCveTuning()
@@ -2223,6 +2225,28 @@ export default function AssetBrowser() {
                                                   {cid} <ExternalLink className="h-2 w-2" />
                                                 </a>
                                               ))}
+                                              {cveMatch.slice(0, 2).map((cid: string) => {
+                                                const rk = `${sw.ip}:${cid}`
+                                                return (
+                                                  <span key={`r-${cid}`} className="inline-flex items-center">
+                                                    <button
+                                                      onClick={() => {
+                                                        setResolveMsg(m => ({ ...m, [rk]: 'resolving…' }))
+                                                        resolveExploit.mutate(
+                                                          { cve: cid, ip: sw.ip, port: sw.port ?? undefined, product: sw.product, version: sw.version || undefined },
+                                                          {
+                                                            onSuccess: (r) => setResolveMsg(m => ({ ...m, [rk]: r.method === 'none' ? 'no exploit found' : `→ ${r.method} queued` })),
+                                                            onError: () => setResolveMsg(m => ({ ...m, [rk]: 'failed' })),
+                                                          },
+                                                        )
+                                                      }}
+                                                      className="ml-0.5 mr-1 px-1 py-0.5 rounded border border-primary/40 text-primary hover:bg-primary/10 text-[9px] whitespace-nowrap"
+                                                      title="Resolve a targeted exploit (Metasploit → ExploitDB → synthesize) and queue it for approval"
+                                                    >⚡ Resolve</button>
+                                                    {resolveMsg[rk] && <span className="text-[9px] text-muted-foreground mr-1">{resolveMsg[rk]}</span>}
+                                                  </span>
+                                                )
+                                              })}
                                               {edbMatch.slice(0, 1).map((eid: string) => (
                                                 <a key={eid} href={`https://www.exploit-db.com/exploits/${eid.replace('EDB-','')}`} target="_blank" rel="noopener noreferrer"
                                                   className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded border border-orange-500/40 text-orange-400 hover:bg-orange-500/10 mr-1">
