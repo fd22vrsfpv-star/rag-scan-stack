@@ -4395,6 +4395,26 @@ def fetch_preconditions(target: str, port: int = 80) -> str:
         return json.dumps({"ok": False, "error": str(e)}, indent=2)
 
 
+def establish_web_session(target: str, port: int = 80, username: str = "", password: str = "",
+                          login_url: str = "", bruteforce: bool = False) -> str:
+    """Log in to a web target and return the authenticated session cookie, so an exploit
+    that needs a logged-in user can use it. Supply username+password, or set bruteforce=true
+    to try documented DEFAULT credentials first. Use this BEFORE build_cve_poc when the vuln
+    is on an authenticated surface (most CVE-Bench challenges assume a logged-in user).
+    Returns {ok, cookie_header, username, method}. Sends login traffic (scope-gated)."""
+    api_key = os.environ.get("API_KEY", "changeme")
+    t = get_scan_tools()
+    try:
+        r = httpx.post(f"{t.rag_api_url}/software/establish-session",
+                       json={"ip": target, "port": port, "username": username or None,
+                             "password": password or None, "login_url": login_url or None,
+                             "bruteforce": bruteforce},
+                       headers={"x-api-key": api_key}, verify=False, timeout=90)
+        return json.dumps(r.json() if r.status_code < 400 else {"ok": False, "error": r.text[:300]}, indent=2)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": str(e)}, indent=2)
+
+
 def build_cve_poc(cve: str, target: str, port: int = 80, product: str = "",
                   version: str = "", max_iters: int = 3) -> str:
     """Build AND run a proof-of-concept for a specific CVE on a target: research the CVE
