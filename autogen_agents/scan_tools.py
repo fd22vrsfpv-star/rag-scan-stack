@@ -5157,19 +5157,53 @@ def execute_approved_exploit(pending_exploit_id: str) -> str:
                 else:
                     module_type = "exploit"
 
+                msf_options = {
+                    "RHOSTS": str(exploit["target_ip"]),
+                    "RPORT": exploit.get("target_port", 0),
+                    "LHOST": params.get("lhost", ""),
+                    "LPORT": params.get("lport", 4444),
+                    **{k: v for k, v in params.items() if k not in ["module_type", "module_path", "lhost", "lport"]}
+                }
+                # Fragile target -> non-destructive profile: throttle scan/brute
+                # aggressiveness to 50%% so an approved scanner/login module does
+                # not flood a single-process app into a DoS. A credential brute
+                # against a no-restart uvicorn app (e.g. LoLLMs) is exactly how the
+                # surface run took the target down (OPEN_ITEMS #332, throttle half).
+                try:
+                    from common import target_fragility as _tf
+                    _tp = exploit.get("target_port")
+                    _frag = _tf.probe_and_classify(
+                        str(exploit["target_ip"]),
+                        ports=[_tp] if _tp else None)
+                    if _frag is not None and _frag.fragile:
+                        _bruteish = any(x in (module_name or "").lower()
+                                        for x in ("login", "scanner", "brute"))
+                        _thr = msf_options.get("THREADS")
+                        if _thr is not None:
+                            msf_options["THREADS"] = _tf.throttle(_thr, True)
+                        elif _bruteish:
+                            msf_options["THREADS"] = 1  # gentlest default
+                        if _bruteish:
+                            msf_options["BRUTEFORCE_SPEED"] = _tf.throttle(
+                                msf_options.get("BRUTEFORCE_SPEED", 5), True)
+                        logger.warning(
+                            "fragile target %s: throttled MSF %s to 50%% "
+                            "(THREADS=%s BRUTEFORCE_SPEED=%s) [%s]",
+                            exploit["target_ip"], module_name,
+                            msf_options.get("THREADS"),
+                            msf_options.get("BRUTEFORCE_SPEED"),
+                            "; ".join(_frag.reasons))
+                except Exception as _fe:  # noqa: BLE001 — never block a dispatch
+                    logger.debug("fragility throttle skipped for %s: %s",
+                                 exploit.get("target_ip"), _fe)
+
                 # Call the MSF execution endpoint
                 response = httpx.post(
                     f"{exploit_runner_url}/execute/msf",
                     json={
                         "module_type": module_type,
                         "module_name": module_name,
-                        "options": {
-                            "RHOSTS": str(exploit["target_ip"]),
-                            "RPORT": exploit.get("target_port", 0),
-                            "LHOST": params.get("lhost", ""),
-                            "LPORT": params.get("lport", 4444),
-                            **{k: v for k, v in params.items() if k not in ["module_type", "module_path", "lhost", "lport"]}
-                        },
+                        "options": msf_options,
                         "pending_exploit_id": str(exploit_uuid)
                     },
                     timeout=300.0
