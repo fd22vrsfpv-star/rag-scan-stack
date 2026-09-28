@@ -175,7 +175,13 @@ services:
       - module: auxiliary/scanner/http/files_dir
         purpose: interesting file scanner
       - module: auxiliary/scanner/http/http_login
-        purpose: HTTP login brute force
+        purpose: >-
+          HTTP login brute force — ONLY when an auth surface exists (a login/password
+          form, an HTTP 401 + WWW-Authenticate header, or a known login endpoint
+          /login,/signin,/admin). If the target requires NO login, DO NOT run it:
+          brute-forcing a non-existent login is wasted and floods (can DoS) a
+          single-process app.
+        precondition: auth_surface_present
       - module: auxiliary/scanner/http/robots_txt
         purpose: robots.txt parser
     nuclei_tags: ["http", "cve", "misconfig", "exposure", "default-login", "tech", "xss", "sqli", "lfi", "rfi", "ssrf"]

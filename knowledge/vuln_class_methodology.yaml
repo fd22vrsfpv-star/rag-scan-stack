@@ -413,3 +413,32 @@ classes:
       the HMAC secret; acceptance proves confusion. Proof = a forged/tampered token
       accepted at a protected endpoint (capture the 200 + the elevated action) or a
       cracked secret. Use a test account; forge only your own elevation.
+
+  credential_access:
+    aliases: [credential access, credential brute force, login brute force,
+              brute force login, password spray, credential stuffing, default credentials,
+              http_login, hydra, ncrack, medusa, patator, "auth attack",
+              "authentication attack", "nuclei:default-login"]
+    web_hint: >-
+      Before ANY credential attack (http_login/hydra/ncrack/brute), CONFIRM an auth
+      surface exists: (a) a login/password form (<input type=password>), (b) an HTTP
+      401 with a WWW-Authenticate header (Basic/Digest/NTLM), or (c) a known login
+      endpoint (/login,/signin,/admin,/auth). NO auth surface -> do NOT brute-force:
+      there is no login to attack, it wastes the run and floods (can DoS) a
+      single-process app. When auth IS present: match the tool to the auth TYPE
+      (basic vs form vs token), enumerate valid usernames first, try default/known
+      creds before a wordlist, and respect lockout + rate limits.
+    synth_methodology: >-
+      Gate credential brute-force on EVIDENCE, in order. 1) PROVE an auth surface
+      first: fetch the target and look for (a) a form containing <input
+      type="password">, (b) an HTTP 401 response carrying a WWW-Authenticate header
+      (Basic/Digest/NTLM), or (c) a login endpoint (/login,/signin,/admin,/auth). If
+      NONE are present, STOP — there is no login here; queuing http_login/hydra is
+      wasted and can DoS a single-process server (e.g. uvicorn with no restart).
+      2) If auth exists, identify its TYPE (HTTP Basic/Digest vs an HTML form vs a
+      token/JSON endpoint) and pick the matching module/tool. 3) Enumerate valid
+      usernames where possible (error-message or timing differences) to shrink the
+      search space. 4) Try DEFAULT and product-known credentials BEFORE any wordlist.
+      5) Respect account lockout and rate limits; throttle hard against fragile /
+      single-process targets. 6) On a hit, store the credential in the Auth Profile
+      and pivot to authenticated testing rather than continuing to brute.
