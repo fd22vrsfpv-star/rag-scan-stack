@@ -470,6 +470,8 @@ services:
         purpose: "Samba username map script RCE (CVE-2007-2447) - CRITICAL for Samba 3.0.20-3.0.25rc3"
       - module: exploit/windows/smb/ms17_010_eternalblue
         purpose: EternalBlue (MS17-010)
+        precondition: >-
+          behavioral_confirmation_required — confirm with auxiliary/scanner/smb/smb_ms17_010 (tests the flaw, not the SMB version) BEFORE firing; port/version alone is insufficient and eternalblue risks BSOD/DoS (see cve_applicability skill)
       - module: exploit/windows/smb/ms08_067_netapi
         purpose: MS08-067 NetAPI
       - module: exploit/linux/samba/is_known_pipename
@@ -514,6 +516,8 @@ services:
         purpose: BlueKeep vulnerability check
       - module: exploit/windows/rdp/cve_2019_0708_bluekeep_rce
         purpose: BlueKeep RCE
+        precondition: >-
+          behavioral_confirmation_required — run the auxiliary/scanner/rdp/cve_2019_0708_bluekeep CHECK first; version alone is unreliable and this RCE risks BSOD/DoS (see cve_applicability skill)
     nuclei_tags: ["rdp", "network", "cve", "windows"]
     common_vulns:
       - "CVE-2019-0708 BlueKeep"
