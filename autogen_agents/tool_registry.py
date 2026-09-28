@@ -100,14 +100,25 @@ TOOL_SPECS: List[ToolSpec] = [
         func=scan_tools.fetch_preconditions,
     ),
     ToolSpec(
+        name="research_exploit",
+        description=(
+            "Research the reference PoC for a CVE and break down WHAT THE EXPLOIT "
+            "CONSISTS OF: pulls the Metasploit module, ExploitDB PoC text and NVD refs, "
+            "then extracts the preconditions, endpoint, method, params, payload, success "
+            "signal and a seed command. Read-only (no traffic to the target). Call this "
+            "BEFORE build_cve_poc so synthesis works from real material, not a guess."
+        ),
+        func=scan_tools.research_exploit,
+    ),
+    ToolSpec(
         name="build_cve_poc",
         description=(
             "Build AND run a proof-of-concept for a specific scanner-confirmed CVE that "
-            "has no ready Metasploit/ExploitDB module: it researches the CVE (NVD), "
-            "synthesizes a PoC (command+assertion) from the real vuln mechanism, then "
-            "runs-and-refines it (auto nonce/CSRF precondition fetch) up to max_iters. A "
-            "converged PoC is saved as a reusable security_test. Returns success, "
-            "iterations, security_test_id and the per-run log path. Approval-gated."
+            "has no ready Metasploit/ExploitDB module: it FIRST researches reference "
+            "exploit material (research_exploit), synthesizes a PoC (command+assertion), "
+            "then runs-and-refines it (auto nonce/CSRF precondition fetch) up to "
+            "max_iters. A converged PoC is saved as a reusable security_test. Returns "
+            "success, iterations, security_test_id and the per-run log path. Approval-gated."
         ),
         func=scan_tools.build_cve_poc,
     ),

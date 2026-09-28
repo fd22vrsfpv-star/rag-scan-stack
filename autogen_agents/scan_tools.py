@@ -4415,6 +4415,26 @@ def build_cve_poc(cve: str, target: str, port: int = 80, product: str = "",
         return json.dumps({"ok": False, "error": str(e)}, indent=2)
 
 
+def research_exploit(cve: str, target: str = "", port: int = 80, product: str = "",
+                     version: str = "") -> str:
+    """Research the reference PoC for a CVE and break down WHAT THE EXPLOIT CONSISTS OF —
+    pulls the Metasploit module, ExploitDB PoC text and NVD refs, then has the LLM extract
+    the preconditions, endpoint, method, params, payload, success signal, and a seed
+    command to reproduce it. Read-only (searches existing corpora; no traffic to the
+    target). Use this BEFORE build_cve_poc so synthesis has real material, not a guess.
+    Returns {analysis, sources, reference_poc}."""
+    api_key = os.environ.get("API_KEY", "changeme")
+    t = get_scan_tools()
+    try:
+        r = httpx.post(f"{t.rag_api_url}/exploit-store/research",
+                       json={"cve": cve, "ip": target or None, "port": port,
+                             "product": product, "version": version},
+                       headers={"x-api-key": api_key}, verify=False, timeout=120)
+        return json.dumps(r.json() if r.status_code < 400 else {"ok": False, "error": r.text[:300]}, indent=2)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": str(e)}, indent=2)
+
+
 def get_attack_vectors(limit: int = 15, min_risk: float = 0.0) -> str:
     """
     Get the prioritized attack vector map: findings mapped to MITRE ATT&CK
