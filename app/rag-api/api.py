@@ -12465,6 +12465,111 @@ def bridge_scanner_cves(authorized: bool = Depends(auth)):
     return {"ok": True, **result}
 
 
+class ResolveExploitBody(BaseModel):
+    cve: str
+    ip: str
+    port: Optional[int] = None
+    product: Optional[str] = None
+    version: Optional[str] = None
+
+
+@app.post("/software/resolve-exploit", tags=["Assets"])
+def resolve_exploit_for_cve_endpoint(body: ResolveExploitBody, authorized: bool = Depends(auth)):
+    """Detection -> exploit resolver (phase 2): for a scanner-confirmed CVE, find a
+    targeted exploit in order Metasploit -> ExploitDB -> synthesize, and queue it as
+    a pending_exploit (approval-gated). Returns {method, pending_exploit_id}."""
+    import requests as _rq, uuid as _uuid
+    from etl.cve_exploit_resolver import resolve_exploit_for_cve
+    cve = (body.cve or "").strip().upper()
+    if not cve.startswith("CVE-"):
+        raise HTTPException(400, "cve must be a CVE id")
+    eid = _validate_engagement_uuid(_resolve_engagement_id())
+
+    def _msf():
+        r = _rq.get(f"{EXPLOIT_RUNNER_URL}/msf/search", params={"cve": cve, "limit": 1},
+                    headers={"x-api-key": API_KEY}, verify=False, timeout=45)
+        res = (r.json() or {}).get("results") if r.ok else None
+        return res[0] if res else None
+
+    def _edb():
+        r = _rq.get(f"{EXPLOIT_RUNNER_URL}/exploitdb/search", params={"cve": cve, "limit": 1},
+                    headers={"x-api-key": API_KEY}, verify=False, timeout=45)
+        res = (r.json() or {}).get("results") if r.ok else None
+        return res[0] if res else None
+
+    def _synth():
+        prod = f"{body.product or ''} {body.version or ''}".strip() or "the service"
+        tgt = f"http://{body.ip}:{body.port or 80}"
+        prompt = (f"Write ONE safe shell command (prefer curl) that tests whether {cve} "
+                  f"is exploitable on {prod} at {tgt}. No MSF/ExploitDB module exists, so "
+                  f"synthesise a minimal proof-of-concept probe. Output ONLY the command.")
+        try:
+            res = llm_generate(prompt, caller="cve_synth")
+            text = res.get("response", "") if isinstance(res, dict) else str(res or "")
+            for line in text.strip().splitlines():
+                line = line.strip().strip("`").strip()
+                low = line.lower()
+                if line and not low.startswith(("here", "the ", "this ", "note", "#", "```")):
+                    return {"command": line}
+            return None
+        except Exception:  # noqa: BLE001
+            return None
+
+    resolution = resolve_exploit_for_cve(cve, _msf, _edb, _synth)
+    method = resolution["method"]
+    ex = resolution["exploit"] or {}
+    if method == "none":
+        return {"ok": True, "method": "none", "pending_exploit_id": None,
+                "message": "no MSF/ExploitDB module and synthesis produced nothing"}
+
+    port = body.port or 80
+    # shape the pending_exploit per method
+    if method == "metasploit":
+        module = ex.get("module") or ex.get("name")
+        source, exploit_id, edb_id = "metasploit", module, None
+        title = f"{cve} via MSF {module}"
+        cmd = f"use {module}; set RHOSTS {body.ip}; set RPORT {port}"
+        params = {"module_path": module}
+    elif method == "exploitdb":
+        edb_id = str(ex.get("edb_id") or ex.get("id") or "")
+        source, exploit_id = "exploitdb", edb_id
+        title = f"{cve} via ExploitDB EDB-{edb_id}: {ex.get('title','')[:80]}"
+        cmd = ""
+        params = {"edb_id": edb_id}
+    else:  # synth
+        source, exploit_id, edb_id = "command", cve, None
+        title = f"{cve} synthesised PoC (no MSF/EDB module)"
+        cmd = ex.get("command", "")
+        params = {"vector_id": cve, "synthesized": True, "success": {"expect_regex": "(?i)(uid=|root|flag|vulnerable)"}}
+
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id FROM assets WHERE host(ip)::text = %s AND (engagement_id = %s::uuid OR %s IS NULL) LIMIT 1",
+                    (body.ip, eid, eid))
+        row = cur.fetchone()
+        asset_id = row[0] if row else None
+        reason = f"Scanner-confirmed {cve} resolved to a {method} exploit (detection->exploit bridge)."
+        meta = {"cve": cve, "resolver_method": method, "scanner_confirmed": True,
+                "synthesized": method == "synth", "product": body.product,
+                "version": body.version}
+        pid = str(_uuid.uuid4())
+        cur.execute("""
+            INSERT INTO pending_exploits
+            (id, source, exploit_id, exploit_title, exploit_type, target_ip, target_port,
+             target_service, target_version, customized_command, parameters,
+             match_confidence, match_reasoning, status, requested_by, metadata,
+             asset_id, engagement_id, edb_id)
+            VALUES (%s,%s,%s,%s,'rce',%s,%s,%s,%s,%s,%s,%s,%s,'pending','cve_resolver',%s,%s,%s,%s)
+        """, (pid, source, exploit_id, title, body.ip, port, body.product, body.version,
+              cmd, Json(params), 0.9, reason, Json(meta), asset_id, eid, edb_id))
+        conn.commit()
+    try:
+        emit_webhook("cve_exploit_resolved", "software",
+                     {"cve": cve, "method": method, "target": body.ip, "pending_exploit_id": pid})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "method": method, "pending_exploit_id": pid, "exploit": ex}
+
+
 @app.get("/software/research-cache", tags=["Assets"])
 def get_research_cache(
     product: str = Query(...),
