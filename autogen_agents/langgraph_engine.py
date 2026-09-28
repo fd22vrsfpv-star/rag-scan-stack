@@ -114,7 +114,7 @@ EXPLOIT_PLAN_TOOLS = {
     "match_vuln_to_exploits", "query_exploitdb", "search_msf_modules",
     "customize_exploit", "list_pending_exploits", "get_exploit_approval_status",
     "queue_exploit_for_approval", "search_knowledge_base", "fetch_preconditions",
-    "build_cve_poc",
+    "research_exploit", "build_cve_poc",
 }
 
 _RECON_SYSTEM = (
