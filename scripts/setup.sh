@@ -1333,8 +1333,8 @@ REPORT_DIR=/reports
 # ==========================================
 
 NUCLEI_SEVERITY=medium,high,critical
-NUCLEI_CONCURRENCY=50
-NUCLEI_RATELIMIT=150
+NUCLEI_CONCURRENCY=100
+NUCLEI_RATELIMIT=300
 NUCLEI_TIMEOUT=10
 NUCLEI_RETRIES=1
 NUCLEI_AUTO_UPDATE=1
@@ -1458,6 +1458,9 @@ PIPELINE_POLL_INTERVAL=5
 # with RAG_API_MEM_LIMIT, AUTOGEN_MEM_LIMIT, EMBEDDER_MEM_LIMIT, VAULT_MEM_LIMIT etc.
 DEFAULT_MEM_LIMIT=4g
 DEFAULT_CPUS=2.0
+# nuclei-runner runs several -c100 nuclei processes; give it a dedicated higher cap.
+NUCLEI_MEM_LIMIT=8g
+NUCLEI_CPUS=3.0
 
 # ==========================================
 # DB CONNECTION POOL (rag-api)
