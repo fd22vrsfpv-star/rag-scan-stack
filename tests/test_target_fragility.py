@@ -86,3 +86,32 @@ def test_as_dict_carries_fingerprint():
     assert d["fragile"] is True
     assert d["fingerprint"]["server_header"] == "uvicorn"
     assert d["fingerprint"]["openapi_title"] == "LoLLMS"
+
+
+# --- Source-analysis guards on the langgraph integration --------------------
+# These catch the two defects the live retest found: a bare `logger` reference
+# (the module's logger is `_log`) would NameError only when the fragile/skip path
+# executes; ast checks the whole module without importing its heavy deps.
+import ast
+import os
+
+_LG = os.path.join(os.path.dirname(__file__), "..", "autogen_agents", "langgraph_engine.py")
+
+
+def test_langgraph_uses_defined_logger_not_bare_logger():
+    """langgraph_engine defines `_log`, never `logger`. A bare `logger.<call>`
+    passes ast.parse and import but NameErrors when that line runs — which is
+    exactly how the fragile-target skip path crashed in the retest."""
+    tree = ast.parse(open(_LG).read())
+    assert not any(
+        isinstance(n, ast.Name) and n.id == "logger"
+        for n in ast.walk(tree)
+    ), "langgraph_engine references undefined `logger` (use `_log`)"
+
+
+def test_fragility_helpers_present():
+    src = open(_LG).read()
+    assert "def _target_fragility(" in src
+    assert "def _probe_fingerprint(" in src
+    # the ports read must join assets (ports has no `ip` column)
+    assert "FROM ports p JOIN assets a" in src, "ports query must join through assets"
