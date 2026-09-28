@@ -1518,6 +1518,30 @@ CREATE INDEX IF NOT EXISTS ix_exploit_store_kind ON public.exploit_store(kind);
 CREATE INDEX IF NOT EXISTS ix_exploit_store_eng ON public.exploit_store(engagement_id);
 CREATE INDEX IF NOT EXISTS ix_exploit_store_updated ON public.exploit_store(updated_at DESC);
 
+-- exploit_store_versions: point-in-time snapshots / operator-customized variants of an
+-- exploit_store entry, so multiple versions (auto-built + hand-customized) are kept and
+-- any can be restored. An edit auto-snapshots the prior state; the operator can also save
+-- a labeled variant explicitly.
+CREATE TABLE IF NOT EXISTS public.exploit_store_versions (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    exploit_id    uuid NOT NULL REFERENCES public.exploit_store(id) ON DELETE CASCADE,
+    version       integer NOT NULL,
+    label         text,
+    name          text,
+    command       text,
+    assertion     jsonb,
+    python_code   text,
+    http_request  text,
+    rationale     text,
+    verified      boolean DEFAULT false,
+    llm_model     text,
+    metadata      jsonb DEFAULT '{}'::jsonb,
+    created_by    text,
+    created_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_exploit_versions_parent ON public.exploit_store_versions(exploit_id, version DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_exploit_versions_num ON public.exploit_store_versions(exploit_id, version);
+
 CREATE TABLE IF NOT EXISTS public.security_test_runs (
     id                   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     test_id              uuid NOT NULL REFERENCES public.security_tests(id) ON DELETE CASCADE,

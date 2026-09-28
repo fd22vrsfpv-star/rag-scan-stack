@@ -12605,6 +12605,27 @@ def _fetch_cve_details(cve):
     return details
 
 
+def _new_poc_metrics():
+    return {"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+            "llm_seconds": 0.0, "target_runs": 0, "run_seconds": 0.0, "model": None}
+
+
+def _acc_llm_metrics(metrics, res):
+    """Accumulate one llm_generate result into a metrics dict (tokens + latency + model)."""
+    if metrics is None or not isinstance(res, dict):
+        return
+    pt = int(res.get("prompt_tokens") or 0)
+    ct = int(res.get("eval_count") or 0)
+    tt = int(res.get("total_tokens") or (pt + ct))
+    metrics["llm_calls"] += 1
+    metrics["prompt_tokens"] += pt
+    metrics["completion_tokens"] += ct
+    metrics["total_tokens"] += tt
+    metrics["llm_seconds"] += round(float(res.get("latency_ms") or 0) / 1000.0, 3)
+    if res.get("model"):
+        metrics["model"] = res["model"]
+
+
 def _poc_canary():
     """A unique, regex-safe sentinel the PoC must CAUSE to appear as a direct effect of
     the exploit (a created admin username, a written/echoed marker, a reflected value).
@@ -12714,12 +12735,14 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
     # Default assertion IS the anchor: proof requires the injected canary.
     assertion = {"expect_regex": canary, "canary": canary, "cve_anchored": True}
     rationale = ""; llm_model = None
+    metrics = _new_poc_metrics()
     for _ in range(2):
         try:
             res = llm_generate(prompt, caller="cve_poc_synth")
             text = res.get("response", "") if isinstance(res, dict) else str(res or "")
             if isinstance(res, dict) and res.get("model"):
                 llm_model = res["model"]
+            _acc_llm_metrics(metrics, res)
         except Exception:  # noqa: BLE001
             text = ""
         _poc_trace(run_id, "synthesize", prompt=prompt, response=text, llm_model=llm_model)
@@ -12740,7 +12763,8 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
         synth_kind = "deterministic_probe"
     return {"command": command, "assertion": assertion, "rationale": rationale,
             "synth_kind": synth_kind, "run_id": run_id, "canary": canary,
-            "origin_family": _poc_target_family(command), "llm_model": llm_model}
+            "origin_family": _poc_target_family(command), "llm_model": llm_model,
+            "metrics": metrics}
 
 
 def _poc_assertion_passes(assertion, output, exit_code=None):
@@ -12840,7 +12864,7 @@ def _flag_precondition(cve, ip, pc, eid):
 
 def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale="",
                     product=None, version=None, max_iters=3, canary=None,
-                    origin_family=None, llm_model=None):
+                    origin_family=None, llm_model=None, metrics=None):
     """Increment 2: run the PoC against the target; on failure, refine via the LLM,
     re-run — up to max_iters. Verbose trail -> filesystem.
 
@@ -12860,6 +12884,8 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
     listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
     _vt = int(os.environ.get("VECTOR_RUN_TIMEOUT", "600"))
     built_at = _t.strftime("%Y-%m-%dT%H:%M:%S%z")
+    if metrics is None:
+        metrics = _new_poc_metrics()
 
     def _reanchor(rx):
         d = {"expect_regex": rx}
@@ -12876,6 +12902,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             drifted = True
             _poc_trace(run_id, "drift", iteration=it,
                        response=f"command target {fam} != CVE endpoint {orig}")
+        _r0 = _t.time()
         try:
             lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
                           json={"command": command, "target": str(ip), "port": port, "timeout": _vt},
@@ -12885,6 +12912,8 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             ec = d.get("exit_code") if isinstance(d, dict) else None
         except Exception as e:  # noqa: BLE001
             output = f"listener error: {e}"; ec = None
+        metrics["target_runs"] += 1
+        metrics["run_seconds"] = round(metrics["run_seconds"] + (_t.time() - _r0), 3)
         success = _poc_assertion_passes(assertion, output, ec)
         _poc_trace(run_id, "run", iteration=it, run_output=output, assertion_passed=success,
                    extra={"target_family": list(fam), "drifted": drifted})
@@ -12926,6 +12955,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             rtext = res.get("response", "") if isinstance(res, dict) else str(res or "")
             if isinstance(res, dict) and res.get("model"):
                 llm_model = res["model"]
+            _acc_llm_metrics(metrics, res)
         except Exception:  # noqa: BLE001
             rtext = ""
         _poc_trace(run_id, "refine", iteration=it, prompt=rprompt, response=rtext, llm_model=llm_model)
@@ -12957,10 +12987,12 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
     off_target = bool(success and not verified)
     security_test_id = None
     log_path = _poc_run_file(run_id)
+    metrics["iterations"] = iters
     meta = {"cve": cve, "poc_builder": True, "converged": verified, "verified": verified,
             "anchored": anchored, "drifted": drifted, "off_target": off_target,
             "reflection": reflection, "canary": canary, "iterations": iters, "log": log_path,
-            "llm_model": llm_model, "built_at": built_at, "product": product, "version": version}
+            "llm_model": llm_model, "built_at": built_at, "product": product, "version": version,
+            "metrics": metrics}
     if verified:
         # Only a CVE-ANCHORED converged PoC is stored in the DB as a reusable security_test.
         try:
@@ -12983,7 +13015,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
     return {"ok": True, "success": success, "verified": verified, "off_target": off_target,
             "drifted": drifted, "anchored": anchored, "reflection": reflection, "canary": canary,
             "iterations": iters, "final_command": command, "final_assertion": assertion,
-            "llm_model": llm_model, "built_at": built_at,
+            "llm_model": llm_model, "built_at": built_at, "metrics": metrics,
             "security_test_id": security_test_id, "log_path": log_path}
 
 
@@ -13047,13 +13079,59 @@ def fetch_preconditions_endpoint(body: FetchPreconditionsBody, authorized: bool 
     return {"ok": True, **pc}
 
 
+def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3):
+    """The full automatic-creation loop: research -> synthesize -> run-and-refine ->
+    anchor/reflection verify -> auto-save into the Exploit Store (with Python + Burp HTTP
+    artifacts). Shared by the /software/build-poc endpoint AND the detection->exploit
+    resolver's no-public-exploit fallback. Returns the result dict incl. exploit_store_id.
+    Caller is responsible for the authorization (grant) check."""
+    import time as _t
+    _t0 = _t.time()
+    run_id = f"{cve}_{ip}_{int(_t.time())}"
+    built = _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=run_id)
+    result = _run_refine_poc(cve, ip, port, built["command"], built["assertion"], eid,
+                             run_id, rationale=built.get("rationale", ""),
+                             product=product, version=version, max_iters=max_iters,
+                             canary=built.get("canary"), origin_family=built.get("origin_family"),
+                             llm_model=built.get("llm_model"), metrics=built.get("metrics"))
+    _metrics = result.get("metrics") or {}
+    _metrics["build_seconds"] = round(_t.time() - _t0, 1)
+    # A verified PoC is saved verified; an off-target/unverified run is saved too so the
+    # operator can inspect/edit it, but flagged verified=false.
+    store_id = None
+    try:
+        if result.get("final_command"):
+            store_id = _save_exploit_store(
+                name=f"PoC {cve} on {ip}" + (" (verified)" if result.get("verified") else " (unverified)"),
+                cve=cve, kind="web", target_host=ip, target_port=port,
+                product=product, version=version, command=result.get("final_command"),
+                assertion=result.get("final_assertion"), rationale=built.get("rationale", ""),
+                verified=bool(result.get("verified")), source="cve_poc_builder",
+                security_test_id=result.get("security_test_id"), poc_log_path=result.get("log_path"),
+                llm_model=result.get("llm_model"), built_at=result.get("built_at"), eid=eid,
+                metadata={"off_target": result.get("off_target"), "drifted": result.get("drifted"),
+                          "reflection": result.get("reflection"), "iterations": result.get("iterations"),
+                          "metrics": _metrics})
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        emit_webhook("cve_poc_built", "software",
+                     {"cve": cve, "target": ip, "success": result.get("success"),
+                      "verified": result.get("verified"), "off_target": result.get("off_target"),
+                      "drifted": result.get("drifted"), "llm_model": result.get("llm_model"),
+                      "iterations": result.get("iterations"), "exploit_store_id": store_id,
+                      "security_test_id": result.get("security_test_id")})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"synth_kind": built["synth_kind"], "exploit_store_id": store_id, **result}
+
+
 @app.post("/software/build-poc", tags=["Assets"])
 def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     """PoC-builder: research -> synthesize -> run-and-refine. Invoking this authorizes
     the ENTIRE loop (scope-gated traffic every iteration). The verbose prompt/response/
     output trail is written to POC_LOG_DIR/<run_id>.jsonl for review; the DB stores only
     a small index row, and a security_test ONLY if the PoC converges."""
-    import time as _t
     eid = _validate_engagement_uuid(_resolve_engagement_id())
     cve = (body.cve or "").strip().upper()
     if not cve.startswith("CVE-"):
@@ -13065,41 +13143,8 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     elif not _poc_grant_active(body.ip, body.port, eid):
         raise HTTPException(403, "PoC building is not released for this endpoint. An operator "
                                  "must release it (grant) first; it stays granted until revoked.")
-    run_id = f"{cve}_{body.ip}_{int(_t.time())}"
-    built = _synthesize_cve_poc(cve, body.ip, body.port, body.product, body.version, eid, run_id=run_id)
-    result = _run_refine_poc(cve, body.ip, body.port, built["command"], built["assertion"], eid,
-                             run_id, rationale=built.get("rationale", ""),
-                             product=body.product, version=body.version, max_iters=body.max_iters,
-                             canary=built.get("canary"), origin_family=built.get("origin_family"),
-                             llm_model=built.get("llm_model"))
-    # Auto-save into the Exploit Store (with Python + Burp-ready HTTP artifacts). A
-    # verified PoC is saved verified; an off-target/unverified run is saved too so the
-    # operator can inspect/edit it, but flagged verified=false.
-    store_id = None
-    try:
-        if result.get("final_command"):
-            store_id = _save_exploit_store(
-                name=f"PoC {cve} on {body.ip}" + (" (verified)" if result.get("verified") else " (unverified)"),
-                cve=cve, kind="web", target_host=body.ip, target_port=body.port,
-                product=body.product, version=body.version, command=result.get("final_command"),
-                assertion=result.get("final_assertion"), rationale=built.get("rationale", ""),
-                verified=bool(result.get("verified")), source="cve_poc_builder",
-                security_test_id=result.get("security_test_id"), poc_log_path=result.get("log_path"),
-                llm_model=result.get("llm_model"), built_at=result.get("built_at"), eid=eid,
-                metadata={"off_target": result.get("off_target"), "drifted": result.get("drifted"),
-                          "reflection": result.get("reflection"), "iterations": result.get("iterations")})
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        emit_webhook("cve_poc_built", "software",
-                     {"cve": cve, "target": body.ip, "success": result.get("success"),
-                      "verified": result.get("verified"), "off_target": result.get("off_target"),
-                      "drifted": result.get("drifted"), "llm_model": result.get("llm_model"),
-                      "iterations": result.get("iterations"), "exploit_store_id": store_id,
-                      "security_test_id": result.get("security_test_id")})
-    except Exception:  # noqa: BLE001
-        pass
-    return {"ok": True, "cve": cve, "synth_kind": built["synth_kind"], "exploit_store_id": store_id, **result}
+    core = _build_poc_core(cve, body.ip, body.port, body.product, body.version, eid, body.max_iters)
+    return {"ok": True, "cve": cve, **core}
 
 
 class PocGrantBody(BaseModel):
@@ -13167,7 +13212,38 @@ def _ensure_exploit_store():
             engagement_id uuid, metadata jsonb DEFAULT '{}'::jsonb, created_by text,
             created_at timestamptz NOT NULL DEFAULT now(),
             updated_at timestamptz NOT NULL DEFAULT now())""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS public.exploit_store_versions (
+            id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+            exploit_id uuid NOT NULL REFERENCES public.exploit_store(id) ON DELETE CASCADE,
+            version integer NOT NULL, label text, name text, command text, assertion jsonb,
+            python_code text, http_request text, rationale text, verified boolean DEFAULT false,
+            llm_model text, metadata jsonb DEFAULT '{}'::jsonb, created_by text,
+            created_at timestamptz NOT NULL DEFAULT now())""")
+        cur.execute("""CREATE UNIQUE INDEX IF NOT EXISTS ux_exploit_versions_num
+                       ON public.exploit_store_versions(exploit_id, version)""")
         conn.commit()
+
+
+def _snapshot_exploit_version(cur, row, label, created_by="operator"):
+    """Insert a snapshot of the entry's editable fields as the next version number.
+    `row` is a dict of the current exploit_store row. Cursor-agnostic (works with a
+    RealDictCursor or a plain cursor). Returns (version, version_id)."""
+    def _one(r):  # first value regardless of dict/tuple cursor
+        if r is None:
+            return None
+        return next(iter(r.values())) if isinstance(r, dict) else r[0]
+    cur.execute("SELECT COALESCE(MAX(version), 0) + 1 AS nextver FROM exploit_store_versions WHERE exploit_id = %s",
+                (row["id"],))
+    ver = _one(cur.fetchone())
+    cur.execute("""INSERT INTO exploit_store_versions
+        (exploit_id, version, label, name, command, assertion, python_code, http_request,
+         rationale, verified, llm_model, metadata, created_by)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+        (row["id"], ver, label, row.get("name"), row.get("command"),
+         Json(row.get("assertion") or {}), row.get("python_code"), row.get("http_request"),
+         row.get("rationale"), row.get("verified"), row.get("llm_model"),
+         Json(row.get("metadata") or {}), created_by))
+    return ver, str(_one(cur.fetchone()))
 
 
 def _exploit_store_artifacts(kind, command, name, cve, rationale, assertion):
@@ -13356,6 +13432,12 @@ def update_exploit_store(exploit_id: str, body: ExploitStoreUpdateBody,
                 fields.append("http_request = %s"); args.append(art["http_request"])
         if not fields:
             return dict(cur_row)
+        # Auto-snapshot the PRIOR state so every edit keeps a restorable version.
+        try:
+            _snapshot_exploit_version(cur, dict(cur_row), label="auto (pre-edit)",
+                                      created_by=(body.dict().get("created_by") or "operator"))
+        except Exception as e:  # noqa: BLE001
+            logging.debug("version snapshot failed: %s", e)
         fields.append("updated_at = now()")
         args.append(exploit_id)
         cur.execute(f"UPDATE exploit_store SET {', '.join(fields)} WHERE id = %s RETURNING *", args)
@@ -13563,6 +13645,125 @@ def import_poc_to_store(body: ExploitFromPocBody, authorized: bool = Depends(aut
     return get_exploit_store(new_id, authorized)
 
 
+@app.post("/exploit-store/{exploit_id}/send-to-burp", tags=["Exploit Store"])
+def send_exploit_to_burp(exploit_id: str, authorized: bool = Depends(auth)):
+    """Queue this exploit's raw HTTP request into the Burp Follow-Up Queue (what the Burp
+    extension imports into Repeater). Uses the stored Burp-ready request; generates it from
+    the command if missing. This is the one-click 'Send to Burp' for the Exploit Store."""
+    _ensure_exploit_store()
+    eid = _validate_engagement_uuid(_resolve_engagement_id())
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM exploit_store WHERE id = %s", (exploit_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "exploit not found")
+    from common import exploit_artifacts as _ea
+    req = row["http_request"]
+    # Regenerate when missing OR a stale fallback comment (e.g. saved before a parser fix).
+    if (not req or req.lstrip().startswith("#")) and row["command"]:
+        req = _ea.curl_to_http_request(row["command"])
+    if not req or req.lstrip().startswith("#"):
+        raise HTTPException(400, "no HTTP request available to send (entry has no web command)")
+    parsed = _ea.parse_curl(row["command"] or "")
+    method = parsed.get("method") or (req.split(" ", 1)[0] if req else "GET")
+    url = parsed.get("url") or ""
+    if not url and row["target_host"]:
+        url = f"http://{row['target_host']}:{row['target_port'] or 80}/"
+    title = f"PoC {row['cve'] or ''} {row['name']}".strip()
+    cves = [row["cve"]] if row["cve"] else []
+    meta = {"exploit_store_id": exploit_id, "source": "exploit_store",
+            "verified": row["verified"], "llm_model": row["llm_model"]}
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("""INSERT INTO burp_followup_queue
+            (follow_up_id, title, url, target, severity, finding_source, method,
+             request_raw, description, cves, metadata, status)
+            VALUES (NULL,%s,%s,%s,'high','exploit_store',%s,%s,%s,%s,%s::jsonb,'pending')
+            RETURNING id""",
+            (title, url, row["target_host"], method, req,
+             row["rationale"] or "", cves, json.dumps(meta, default=str)))
+        qid = str(cur.fetchone()[0]); conn.commit()
+    try:
+        emit_webhook("exploit_store_sent_to_burp", "exploit_store",
+                     {"id": exploit_id, "queue_id": qid, "cve": row["cve"], "target": row["target_host"]})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "queue_id": qid, "method": method, "url": url}
+
+
+class SaveVersionBody(BaseModel):
+    label: Optional[str] = None
+
+
+@app.get("/exploit-store/{exploit_id}/versions", tags=["Exploit Store"])
+def list_exploit_versions(exploit_id: str, authorized: bool = Depends(auth)):
+    """List saved versions/variants of an exploit (newest first)."""
+    _ensure_exploit_store()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""SELECT id, version, label, name, verified, llm_model, created_by, created_at,
+                              (python_code IS NOT NULL) AS has_python, (http_request IS NOT NULL) AS has_http
+                       FROM exploit_store_versions WHERE exploit_id = %s
+                       ORDER BY version DESC""", (exploit_id,))
+        return {"versions": [dict(r) for r in cur.fetchall()]}
+
+
+@app.get("/exploit-store/{exploit_id}/versions/{version}", tags=["Exploit Store"])
+def get_exploit_version(exploit_id: str, version: int, authorized: bool = Depends(auth)):
+    """Full detail of one stored version."""
+    _ensure_exploit_store()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM exploit_store_versions WHERE exploit_id = %s AND version = %s",
+                    (exploit_id, version))
+        r = cur.fetchone()
+        if not r:
+            raise HTTPException(404, "version not found")
+        return dict(r)
+
+
+@app.post("/exploit-store/{exploit_id}/versions", tags=["Exploit Store"])
+def save_exploit_version(exploit_id: str, body: SaveVersionBody, authorized: bool = Depends(auth)):
+    """Snapshot the CURRENT state of an exploit as a new (optionally labeled) version —
+    e.g. to keep a hand-customized variant alongside the auto-built one."""
+    _ensure_exploit_store()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM exploit_store WHERE id = %s", (exploit_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "exploit not found")
+        ver, vid = _snapshot_exploit_version(cur, dict(row), label=(body.label or "manual snapshot"))
+        conn.commit()
+    return {"ok": True, "version": ver, "version_id": vid}
+
+
+@app.post("/exploit-store/{exploit_id}/restore/{version}", tags=["Exploit Store"])
+def restore_exploit_version(exploit_id: str, version: int, authorized: bool = Depends(auth)):
+    """Restore a stored version into the main entry. The current state is snapshotted
+    first (so a restore is itself reversible)."""
+    _ensure_exploit_store()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM exploit_store WHERE id = %s", (exploit_id,))
+        cur_row = cur.fetchone()
+        if not cur_row:
+            raise HTTPException(404, "exploit not found")
+        cur.execute("SELECT * FROM exploit_store_versions WHERE exploit_id = %s AND version = %s",
+                    (exploit_id, version))
+        v = cur.fetchone()
+        if not v:
+            raise HTTPException(404, "version not found")
+        _snapshot_exploit_version(cur, dict(cur_row), label=f"auto (pre-restore of v{version})")
+        cur.execute("""UPDATE exploit_store SET name=%s, command=%s, assertion=%s, python_code=%s,
+                       http_request=%s, rationale=%s, verified=%s, llm_model=%s, updated_at=now()
+                       WHERE id=%s RETURNING *""",
+                    (v["name"], v["command"], Json(v["assertion"] or {}), v["python_code"],
+                     v["http_request"], v["rationale"], v["verified"], v["llm_model"], exploit_id))
+        row = cur.fetchone(); conn.commit()
+    try:
+        emit_webhook("exploit_store_version_restored", "exploit_store",
+                     {"id": exploit_id, "restored_version": version})
+    except Exception:  # noqa: BLE001
+        pass
+    return dict(row)
+
+
 def _resolve_and_queue_exploit(cve, ip, port, product, version, eid, dedupe=True):
     """Resolve a targeted exploit for a scanner-confirmed CVE (Metasploit ->
     ExploitDB -> synthesize) and queue it as an approval-gated pending_exploit.
@@ -13594,8 +13795,22 @@ def _resolve_and_queue_exploit(cve, ip, port, product, version, eid, dedupe=True
         return res[0] if res else None
 
     def _synth():
-        # Increment 1: research the CVE + synthesize a real PoC and persist it as a
-        # security_test (the run-and-refine loop is Increment 2 via /software/build-poc).
+        # No public MSF/ExploitDB module -> AUTOMATIC CREATION. If the endpoint is
+        # released (grant active), run the FULL build loop (research -> synthesize ->
+        # run-refine -> anchor/reflection verify -> save to Exploit Store) so a working,
+        # verified PoC is produced automatically. Fail-closed: with no grant we fall back
+        # to a first-draft (Increment 1) queued for approval, and note that releasing the
+        # endpoint enables auto-creation.
+        if _poc_grant_active(ip, port, eid):
+            core = _build_poc_core(cve, ip, port, product, version, eid)
+            if core.get("final_command"):
+                return {"command": core.get("final_command"),
+                        "assertion": core.get("final_assertion"),
+                        "rationale": "", "synth_kind": core.get("synth_kind"),
+                        "run_id": None, "auto_created": True,
+                        "verified": core.get("verified"),
+                        "exploit_store_id": core.get("exploit_store_id")}
+            return None
         return _synthesize_cve_poc(cve, ip, port, product, version, eid)
 
     resolution = resolve_exploit_for_cve(cve, _msf, _edb, _synth)
@@ -13619,11 +13834,16 @@ def _resolve_and_queue_exploit(cve, ip, port, product, version, eid, dedupe=True
         params = {"edb_id": edb_id}
     else:  # synth
         source, exploit_id, edb_id = "command", cve, None
-        title = f"{cve} synthesised PoC (no MSF/EDB module)"
+        auto = ex.get("auto_created")
+        vfd = " [verified]" if ex.get("verified") else ""
+        title = (f"{cve} auto-created PoC (no MSF/EDB module){vfd}" if auto
+                 else f"{cve} synthesised PoC (no MSF/EDB module)")
         cmd = ex.get("command", "")
-        # A converged PoC (security_test) is only stored by the build-poc loop; the
-        # queued candidate carries the first-draft command + assertion for approval.
+        # When auto-created via the full loop, the command/assertion are the refined
+        # (and possibly verified) ones and the PoC is already in the Exploit Store.
         params = {"vector_id": cve, "synthesized": True, "run_id": ex.get("run_id"),
+                  "auto_created": bool(auto), "verified": bool(ex.get("verified")),
+                  "exploit_store_id": ex.get("exploit_store_id"),
                   "success": ex.get("assertion") or {"expect_regex": "(?i)(uid=|root|flag|vulnerable)"}}
 
     with get_db() as conn, conn.cursor() as cur:
@@ -13633,7 +13853,10 @@ def _resolve_and_queue_exploit(cve, ip, port, product, version, eid, dedupe=True
         asset_id = row[0] if row else None
         reason = f"Scanner-confirmed {cve} resolved to a {method} exploit (detection->exploit bridge)."
         meta = {"cve": cve, "resolver_method": method, "scanner_confirmed": True,
-                "synthesized": method == "synth", "product": product, "version": version}
+                "synthesized": method == "synth", "product": product, "version": version,
+                "auto_created": bool(ex.get("auto_created")),
+                "verified": bool(ex.get("verified")),
+                "exploit_store_id": ex.get("exploit_store_id")}
         pid = str(_uuid.uuid4())
         cur.execute("""
             INSERT INTO pending_exploits
