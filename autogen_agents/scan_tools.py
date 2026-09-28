@@ -4378,6 +4378,43 @@ def get_tool_recommendations(service: str = None, port: int = None) -> str:
     return json.dumps(result, indent=2)
 
 
+def fetch_preconditions(target: str, port: int = 80) -> str:
+    """Fetch a live anti-CSRF nonce/token + session cookie from a web target so you can
+    use it in an exploit. Use when a request fails with 'invalid nonce'/'CSRF'/403/
+    'invalid security', or proactively before a state-changing POST. Returns
+    {tokens:[name=value,...], cookies:[...], base}. Tokens are single-use + session-
+    bound — use them in the SAME request flow (see the csrf_nonce methodology)."""
+    api_key = os.environ.get("API_KEY", "changeme")
+    t = get_scan_tools()
+    try:
+        r = httpx.post(f"{t.rag_api_url}/software/fetch-preconditions",
+                       json={"ip": target, "port": port},
+                       headers={"x-api-key": api_key}, verify=False, timeout=30)
+        return json.dumps(r.json() if r.status_code < 400 else {"ok": False, "error": r.text[:300]}, indent=2)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": str(e)}, indent=2)
+
+
+def build_cve_poc(cve: str, target: str, port: int = 80, product: str = "",
+                  version: str = "", max_iters: int = 3) -> str:
+    """Build AND run a proof-of-concept for a specific CVE on a target: research the CVE
+    (NVD), synthesize a PoC (command+assertion) from the real vuln mechanism, then
+    run-and-refine it (with automatic nonce/CSRF precondition fetch) up to max_iters. A
+    converged PoC is saved as a security_test. Returns {success, iterations,
+    security_test_id, final_command, log_path}. Use for a scanner-confirmed CVE with no
+    ready MSF/ExploitDB module."""
+    api_key = os.environ.get("API_KEY", "changeme")
+    t = get_scan_tools()
+    try:
+        r = httpx.post(f"{t.rag_api_url}/software/build-poc",
+                       json={"cve": cve, "ip": target, "port": port, "product": product,
+                             "version": version, "max_iters": max_iters},
+                       headers={"x-api-key": api_key}, verify=False, timeout=300)
+        return json.dumps(r.json() if r.status_code < 400 else {"ok": False, "error": r.text[:300]}, indent=2)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": str(e)}, indent=2)
+
+
 def get_attack_vectors(limit: int = 15, min_risk: float = 0.0) -> str:
     """
     Get the prioritized attack vector map: findings mapped to MITRE ATT&CK

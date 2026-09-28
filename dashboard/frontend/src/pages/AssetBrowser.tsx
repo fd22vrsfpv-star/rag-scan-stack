@@ -2,7 +2,7 @@ import { useState, useMemo, useEffect, Fragment } from 'react'
 import { Link } from 'react-router-dom'
 import { useQueryClient, useQuery } from '@tanstack/react-query'
 import PageHelp from '@/components/PageHelp'
-import { useAssets, useAssetPorts, useAssetVulns, usePortRecommendations, useSubdomains, useDeleteAssets, useDeleteSubdomains, useAssetCredentials, useAllCredentials, useUpdateCredentialStatus, useCreateCredential, useDeleteCredential, usePurgeDomain, usePurgePattern, useDetectedSoftware, useBulkDismissSoftware, useCveTuning, useUpdateCveTuning, useSearchsploit, getDdgSearchUrls, useResearchCache, useVulnxFindings, useResolveExploit, useAssetAccess, useRefreshAccess, useReviewAccess, useAccessSummary, usePendingExploitCounts, useAssetPortAdvice, useAssetEnumeration,
+import { useAssets, useAssetPorts, useAssetVulns, usePortRecommendations, useSubdomains, useDeleteAssets, useDeleteSubdomains, useAssetCredentials, useAllCredentials, useUpdateCredentialStatus, useCreateCredential, useDeleteCredential, usePurgeDomain, usePurgePattern, useDetectedSoftware, useBulkDismissSoftware, useCveTuning, useUpdateCveTuning, useSearchsploit, getDdgSearchUrls, useResearchCache, useVulnxFindings, useResolveExploit, useBuildPoc, useAssetAccess, useRefreshAccess, useReviewAccess, useAccessSummary, usePendingExploitCounts, useAssetPortAdvice, useAssetEnumeration,
   type ObtainedAccess, type DdgSearchResponse, type EnumHighlight, type EnumCredential, type EnumLoot, type EnumLoginAttempt, type EnumListeningPort } from '@/api/assets'
 import { apiFetch } from '@/api/client'
 import { useTargetedReconLookup, useTargetedReconExecute } from '@/api/targeted-recon'
@@ -1207,6 +1207,8 @@ export default function AssetBrowser() {
   const [exploitLookup, setExploitLookup] = useState<{ product: string; version: string; cveFlags?: any[] } | null>(null)
   const resolveExploit = useResolveExploit()
   const [resolveMsg, setResolveMsg] = useState<Record<string, string>>({})
+  const buildPoc = useBuildPoc()
+  const [pocMsg, setPocMsg] = useState<Record<string, string>>({})
   const [selectedProducts, setSelectedProducts] = useState<Set<string>>(new Set())
   const [showCveTuning, setShowCveTuning] = useState(false)
   const { data: cveTuningData } = useCveTuning()
@@ -2244,6 +2246,21 @@ export default function AssetBrowser() {
                                                       title="Resolve a targeted exploit (Metasploit → ExploitDB → synthesize) and queue it for approval"
                                                     >⚡ Resolve</button>
                                                     {resolveMsg[rk] && <span className="text-[9px] text-muted-foreground mr-1">{resolveMsg[rk]}</span>}
+                                                    <button
+                                                      onClick={() => {
+                                                        setPocMsg(m => ({ ...m, [rk]: 'building… (may take a minute)' }))
+                                                        buildPoc.mutate(
+                                                          { cve: cid, ip: sw.ip, port: sw.port ?? undefined, product: sw.product, version: sw.version || undefined, max_iters: 3, release: true },
+                                                          {
+                                                            onSuccess: (r) => setPocMsg(m => ({ ...m, [rk]: r.success ? `✓ PoC converged (${r.iterations} it)` : `no converge (${r.iterations} it) — see log` })),
+                                                            onError: () => setPocMsg(m => ({ ...m, [rk]: 'build failed' })),
+                                                          },
+                                                        )
+                                                      }}
+                                                      className="ml-0.5 mr-1 px-1 py-0.5 rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 text-[9px] whitespace-nowrap"
+                                                      title="Build & run a PoC for this CVE (research → synthesize → run-and-refine, auto nonce fetch). Approval-gated; may take a minute."
+                                                    >🔨 Build PoC</button>
+                                                    {pocMsg[rk] && <span className="text-[9px] text-muted-foreground mr-1">{pocMsg[rk]}</span>}
                                                   </span>
                                                 )
                                               })}

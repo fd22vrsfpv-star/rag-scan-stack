@@ -1448,6 +1448,22 @@ CREATE INDEX IF NOT EXISTS idx_security_tests_tier       ON public.security_test
 CREATE INDEX IF NOT EXISTS idx_security_tests_pending    ON public.security_tests(pending_exploit_id) WHERE pending_exploit_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_security_tests_enabled    ON public.security_tests(enabled) WHERE enabled;
 
+-- poc_grants: a per-endpoint operator authorization for PoC building, revocable at
+-- any time. It is a FAIL-CLOSED gate: the PoC-builder is refused for an endpoint
+-- unless the operator has an active grant here, and revoking (active=false) or
+-- deleting the row immediately stops it. Scoped to one endpoint (ip or ip:port).
+CREATE TABLE IF NOT EXISTS public.poc_grants (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    target        text NOT NULL,        -- ip or ip:port the operator released
+    engagement_id uuid,
+    active        boolean NOT NULL DEFAULT true,
+    granted_by    text,
+    note          text,
+    granted_at    timestamptz NOT NULL DEFAULT now(),
+    revoked_at    timestamptz
+);
+CREATE INDEX IF NOT EXISTS ix_poc_grants_target ON public.poc_grants(target) WHERE active;
+
 -- poc_synthesis_log: reviewable request/response trail for the CVE PoC-builder
 -- (research -> synthesize -> run -> refine). A person reads this to tweak prompts.
 CREATE TABLE IF NOT EXISTS public.poc_synthesis_log (
