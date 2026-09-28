@@ -12836,6 +12836,40 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             "security_test_id": security_test_id, "log_path": log_path}
 
 
+def _poc_target_key(ip, port):
+    return f"{ip}:{port}" if port else str(ip)
+
+
+def _poc_grant_active(ip, port, eid=None):
+    """True if the operator has an ACTIVE (un-revoked) PoC grant for this endpoint.
+    Fail-closed: any error or no row -> False. A grant on the bare ip covers its ports."""
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""SELECT 1 FROM poc_grants
+                            WHERE active AND target IN (%s, %s)
+                              AND (engagement_id = %s::uuid OR engagement_id IS NULL OR %s IS NULL)
+                            LIMIT 1""",
+                        (str(ip), _poc_target_key(ip, port), eid, eid))
+            return cur.fetchone() is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _grant_poc(ip, port, eid, granted_by="operator", note=""):
+    """Record/refresh the operator's per-endpoint PoC grant (revocable)."""
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            tgt = _poc_target_key(ip, port)
+            cur.execute("""UPDATE poc_grants SET active=true, revoked_at=NULL, granted_by=%s,
+                           note=%s, granted_at=now() WHERE target=%s""", (granted_by, note, tgt))
+            if cur.rowcount == 0:
+                cur.execute("""INSERT INTO poc_grants (target, engagement_id, granted_by, note)
+                               VALUES (%s,%s,%s,%s)""", (tgt, eid, granted_by, note))
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("grant_poc failed: %s", e)
+
+
 class BuildPocBody(BaseModel):
     cve: str
     ip: str
@@ -12843,6 +12877,23 @@ class BuildPocBody(BaseModel):
     product: Optional[str] = None
     version: Optional[str] = None
     max_iters: int = 3
+    # release=true is the operator authorizing this endpoint for PoC building — a
+    # STANDING grant that persists until revoked/stopped. Agent-initiated builds leave
+    # it false, so they run ONLY where a grant already exists (fail-closed).
+    release: bool = False
+
+
+class FetchPreconditionsBody(BaseModel):
+    ip: str
+    port: Optional[int] = None
+
+
+@app.post("/software/fetch-preconditions", tags=["Assets"])
+def fetch_preconditions_endpoint(body: FetchPreconditionsBody, authorized: bool = Depends(auth)):
+    """Runnable skill: fetch a live anti-CSRF nonce/token + session cookie from a web
+    target so an exploit/PoC can use them. Returns {tokens, cookies, base}."""
+    pc = _fetch_preconditions(body.ip, body.port)
+    return {"ok": True, **pc}
 
 
 @app.post("/software/build-poc", tags=["Assets"])
@@ -12856,6 +12907,13 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     cve = (body.cve or "").strip().upper()
     if not cve.startswith("CVE-"):
         raise HTTPException(400, "cve must be a CVE id")
+    # Fail-closed authorization: an operator "release" grants this endpoint (standing,
+    # revocable); otherwise a grant must already exist. No grant -> refuse.
+    if body.release:
+        _grant_poc(body.ip, body.port, eid, granted_by="operator", note=f"released via build-poc for {cve}")
+    elif not _poc_grant_active(body.ip, body.port, eid):
+        raise HTTPException(403, "PoC building is not released for this endpoint. An operator "
+                                 "must release it (grant) first; it stays granted until revoked.")
     run_id = f"{cve}_{body.ip}_{int(_t.time())}"
     built = _synthesize_cve_poc(cve, body.ip, body.port, body.product, body.version, eid, run_id=run_id)
     result = _run_refine_poc(cve, body.ip, body.port, built["command"], built["assertion"], eid,
@@ -12871,6 +12929,49 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     return {"ok": True, "cve": cve, "synth_kind": built["synth_kind"], **result}
 
 
+class PocGrantBody(BaseModel):
+    ip: str
+    port: Optional[int] = None
+    note: Optional[str] = ""
+
+
+@app.get("/software/poc-grants", tags=["Assets"])
+def list_poc_grants(authorized: bool = Depends(auth)):
+    """List endpoints released for PoC building (active grants)."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""SELECT id, target, engagement_id, active, granted_by, note,
+                              granted_at, revoked_at FROM poc_grants
+                        WHERE active ORDER BY granted_at DESC""")
+        return {"grants": [dict(r) for r in cur.fetchall()]}
+
+
+@app.post("/software/poc-grants", tags=["Assets"])
+def grant_poc_endpoint(body: PocGrantBody, authorized: bool = Depends(auth)):
+    """Release (grant) an endpoint for PoC building — standing until revoked/stopped."""
+    eid = _validate_engagement_uuid(_resolve_engagement_id())
+    _grant_poc(body.ip, body.port, eid, granted_by="operator", note=body.note or "")
+    try:
+        emit_webhook("poc_grant_released", "software",
+                     {"target": _poc_target_key(body.ip, body.port), "engagement_id": eid})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "target": _poc_target_key(body.ip, body.port), "active": True}
+
+
+@app.delete("/software/poc-grants", tags=["Assets"])
+def revoke_poc_endpoint(ip: str, port: Optional[int] = None, authorized: bool = Depends(auth)):
+    """Revoke/stop an endpoint's PoC grant — the PoC-builder is refused for it again."""
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("""UPDATE poc_grants SET active=false, revoked_at=now()
+                        WHERE target IN (%s, %s) AND active""",
+                    (str(ip), _poc_target_key(ip, port)))
+        n = cur.rowcount
+        conn.commit()
+    try:
+        emit_webhook("poc_grant_revoked", "software", {"target": _poc_target_key(ip, port), "revoked": n})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "revoked": n}
 
 
 
