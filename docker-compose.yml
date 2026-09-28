@@ -538,8 +538,8 @@ services:
       options:
         max-size: "50m"
         max-file: "5"
-    mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
-    cpus: ${DEFAULT_CPUS:-2.0}
+    mem_limit: ${NUCLEI_MEM_LIMIT:-8g}
+    cpus: ${NUCLEI_CPUS:-3.0}
     environment:
       SSL_CERTFILE: /certs/server.crt
       PYTHONHTTPSVERIFY: "0"
@@ -559,8 +559,8 @@ services:
       SCHEME_HINT: ${SCHEME_HINT:-auto}
       NUCLEI_TEMPLATES: /opt/nuclei-templates
       NUCLEI_SEVERITY: ${NUCLEI_SEVERITY:-medium,high,critical}
-      NUCLEI_CONCURRENCY: ${NUCLEI_CONCURRENCY:-50}
-      NUCLEI_RATELIMIT: ${NUCLEI_RATELIMIT:-150}
+      NUCLEI_CONCURRENCY: ${NUCLEI_CONCURRENCY:-100}
+      NUCLEI_RATELIMIT: ${NUCLEI_RATELIMIT:-300}
       NUCLEI_TIMEOUT: ${NUCLEI_TIMEOUT:-10}
       NUCLEI_RETRIES: ${NUCLEI_RETRIES:-1}
       NUCLEI_AUTO_UPDATE: ${NUCLEI_AUTO_UPDATE:-1}
