@@ -89,6 +89,29 @@ TOOL_SPECS: List[ToolSpec] = [
         func=scan_tools.get_wstg_guidance,
     ),
     ToolSpec(
+        name="fetch_preconditions",
+        description=(
+            "Fetch a live anti-CSRF nonce/token + session cookie from a web target so "
+            "you can use it in an exploit. Call this when a request fails with 'invalid "
+            "nonce' / 'CSRF' / 403 / 'invalid security', or proactively before a "
+            "state-changing POST. Returns tokens (name=value) + cookies; they are "
+            "single-use and session-bound, so use them in the same request flow."
+        ),
+        func=scan_tools.fetch_preconditions,
+    ),
+    ToolSpec(
+        name="build_cve_poc",
+        description=(
+            "Build AND run a proof-of-concept for a specific scanner-confirmed CVE that "
+            "has no ready Metasploit/ExploitDB module: it researches the CVE (NVD), "
+            "synthesizes a PoC (command+assertion) from the real vuln mechanism, then "
+            "runs-and-refines it (auto nonce/CSRF precondition fetch) up to max_iters. A "
+            "converged PoC is saved as a reusable security_test. Returns success, "
+            "iterations, security_test_id and the per-run log path. Approval-gated."
+        ),
+        func=scan_tools.build_cve_poc,
+    ),
+    ToolSpec(
         name="get_vuln_methodology",
         description=(
             "Load the exploitation methodology skill pack for a vulnerability "

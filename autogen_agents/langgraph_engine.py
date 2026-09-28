@@ -104,7 +104,7 @@ SCAN_TOOLS_DISPATCH = {
 SCAN_TOOLS_CREDENTIAL = {"start_credential_check", "start_brutus"}
 
 ANALYZE_TOOLS = _READ_ONLY | {"match_vuln_to_exploits", "search_msf_modules",
-                              "get_tool_recommendations"}
+                              "get_tool_recommendations", "fetch_preconditions"}
 
 # Exploit PLANNING is read-only + the queue-for-approval call, which only writes
 # a pending_exploits row. Execution is a separate node, reached only after the
@@ -113,7 +113,8 @@ EXPLOIT_PLAN_TOOLS = {
     "query_vulnerabilities", "query_open_ports", "query_assets",
     "match_vuln_to_exploits", "query_exploitdb", "search_msf_modules",
     "customize_exploit", "list_pending_exploits", "get_exploit_approval_status",
-    "queue_exploit_for_approval", "search_knowledge_base",
+    "queue_exploit_for_approval", "search_knowledge_base", "fetch_preconditions",
+    "build_cve_poc",
 }
 
 _RECON_SYSTEM = (

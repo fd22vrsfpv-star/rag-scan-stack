@@ -285,6 +285,66 @@ async def bulk_dismiss_software(request: Request):
         return safe_json(resp)
 
 
+@router.get("/api/software/poc-grants")
+async def list_poc_grants():
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=30) as c:
+        resp = await c.get(f"{s.rag_api_url}/software/poc-grants",
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
+@router.post("/api/software/poc-grants")
+async def grant_poc(request: Request):
+    s = get_settings()
+    body = await request.json()
+    async with httpx.AsyncClient(timeout=30) as c:
+        resp = await c.post(f"{s.rag_api_url}/software/poc-grants", json=body,
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
+@router.delete("/api/software/poc-grants")
+async def revoke_poc(ip: str, port: int = None):
+    s = get_settings()
+    params = {"ip": ip}
+    if port is not None:
+        params["port"] = port
+    async with httpx.AsyncClient(timeout=30) as c:
+        resp = await c.request("DELETE", f"{s.rag_api_url}/software/poc-grants", params=params,
+                               headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
+@router.post("/api/software/build-poc")
+async def build_poc(request: Request):
+    """Run the CVE PoC-builder (research -> synthesize -> run-and-refine). Long-running
+    (NVD + LLM + live runs), so a generous timeout. Invoking it authorizes the loop."""
+    s = get_settings()
+    body = await request.json()
+    async with httpx.AsyncClient(timeout=300) as c:
+        resp = await c.post(f"{s.rag_api_url}/software/build-poc", json=body,
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            from fastapi import HTTPException
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.post("/api/software/fetch-preconditions")
+async def fetch_preconditions(request: Request):
+    """Fetch a live anti-CSRF nonce/token + session cookie from a target."""
+    s = get_settings()
+    body = await request.json()
+    async with httpx.AsyncClient(timeout=45) as c:
+        resp = await c.post(f"{s.rag_api_url}/software/fetch-preconditions", json=body,
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            from fastapi import HTTPException
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
 @router.post("/api/software/resolve-exploit")
 async def resolve_exploit(request: Request):
     """Resolve a targeted exploit for a CVE (MSF -> ExploitDB -> synthesize) and

@@ -877,6 +877,21 @@ export interface BulkDismissParams {
   engagement_id?: string
 }
 
+export function useBuildPoc() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (params: { cve: string; ip: string; port?: number; product?: string; version?: string; max_iters?: number; release?: boolean }) =>
+      apiFetch<{ ok: boolean; success: boolean; iterations: number; security_test_id: string | null; final_command?: string; log_path?: string }>(
+        '/software/build-poc',
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params) },
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['detected-software'] })
+      qc.invalidateQueries({ queryKey: ['security-tests'] })
+    },
+  })
+}
+
 export function useResolveExploit() {
   const qc = useQueryClient()
   return useMutation({
