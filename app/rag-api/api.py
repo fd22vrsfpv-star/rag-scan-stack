@@ -12881,6 +12881,132 @@ def _fetch_preconditions(ip, port, timeout=8):
     return {"tokens": sorted(tokens)[:8], "cookies": sorted(cookies)[:5], "base": base}
 
 
+_LOGIN_PATH_CANDIDATES = ("/wp-login.php", "/login", "/user/login", "/admin/login",
+                          "/administrator/", "/admin", "/index.php?page=login",
+                          "/accounts/login/", "/auth/login", "/signin", "/")
+
+
+def _establish_web_session(ip, port, username, password, login_url=None, timeout=12):
+    """Log in to a web app with supplied creds and return the authenticated session
+    cookie(s), so an exploit that needs auth can use them. Reuses auth_autopopulate's
+    login-form detection and fetches a live CSRF token. Returns
+    {ok, cookies:[name=value], cookie_header, login_url, note}."""
+    import httpx as _hx, re as _re
+    try:
+        import auth_autopopulate as _ap
+    except Exception:  # noqa: BLE001
+        _ap = None
+    if _ap is None:
+        return {"ok": False, "cookies": [], "cookie_header": "", "login_url": None,
+                "note": "auth_autopopulate unavailable"}
+    from urllib.parse import urlsplit as _usplit
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    cands = [login_url] if login_url else list(_LOGIN_PATH_CANDIDATES)
+    # Domain-AGNOSTIC cookie jar (name->value). Apps behind a vhost (WordPress
+    # siteurl=target) set cookies for a host we don't call by name, so httpx's domain-scoped
+    # jar would never send them back and the login is rejected ("cookies blocked"). We track
+    # cookies by name and forward them explicitly.
+    jar = {}
+
+    def _absorb(resp):
+        for k, v in resp.headers.multi_items():
+            if k.lower() == "set-cookie":
+                nv = v.split(";", 1)[0]
+                if "=" in nv:
+                    n, val = nv.split("=", 1)
+                    if val.strip():
+                        jar[n.strip()] = val.strip()
+
+    def _ck_header():
+        return "; ".join(f"{k}={v}" for k, v in jar.items())
+
+    with _hx.Client(verify=False, follow_redirects=False, timeout=timeout) as cli:
+        for pth in cands:
+            if not pth:
+                continue
+            url = pth if pth.startswith("http") else base + pth
+            try:
+                r = cli.get(url, headers=({"Cookie": _ck_header()} if jar else {}), follow_redirects=True)
+            except Exception:  # noqa: BLE001
+                continue
+            _absorb(r)
+            html = r.text or ""
+            prof = _ap.synthesize_profile(html, str(r.url))
+            if not prof:
+                continue
+            csrf_val = ""
+            form = _ap.parse_login_form(html) or {}
+            cf = form.get("csrf_field")
+            if cf:
+                m = _re.search(r'name=["\']' + _re.escape(cf) + r'["\'][^>]*value=["\']([^"\']+)',
+                               html, _re.I) or \
+                    _re.search(r'value=["\']([^"\']+)["\'][^>]*name=["\']' + _re.escape(cf), html, _re.I)
+                csrf_val = m.group(1) if m else ""
+            body = (prof["login_data"].replace("{%username%}", username)
+                    .replace("{%password%}", password).replace("{%csrf%}", csrf_val))
+            _sp = _usplit(prof["login_url"])
+            post_url = base + (_sp.path or "/") + (("?" + _sp.query) if _sp.query else "")
+            hdrs = {"Content-Type": "application/x-www-form-urlencoded"}
+            app_host = _sp.netloc
+            if app_host and app_host != f"{ip}:{port or 80}":
+                hdrs["Host"] = app_host           # satisfy a vhost-configured app
+            if jar:
+                hdrs["Cookie"] = _ck_header()      # forward the test/session cookie
+            try:
+                pr = cli.post(post_url, content=body, headers=hdrs)
+            except Exception:  # noqa: BLE001
+                continue
+            _absorb(pr)
+            cookies = [f"{k}={v}" for k, v in jar.items()]
+            # A real login sets an AUTH cookie (not just a test/session-setup cookie) and
+            # usually 30x-redirects. Judge success on that, not on any cookie.
+            auth_hint = any(any(k in n.lower() for k in
+                            ("logged_in", "sess", "auth", "token", "sid", "remember"))
+                            for n in jar)
+            low = (pr.text or "").lower()
+            failed = any(x in low for x in ("incorrect", "invalid", "denied", "try again",
+                                            "not registered", "wrong ", "cookies are blocked",
+                                            "authentication failed"))
+            ok = (auth_hint or 300 <= pr.status_code < 400) and not failed
+            return {"ok": ok, "cookies": cookies, "cookie_header": _ck_header(),
+                    "login_url": post_url, "note": ("logged in" if ok else "login attempted (unverified)")}
+    return {"ok": False, "cookies": [], "cookie_header": "", "login_url": None, "note": "no login form found"}
+
+
+def _establish_session_for_build(ip, port, auth, eid=None):
+    """Get an authenticated session for the build. SUPPLIED creds -> log in directly.
+    bruteforce=true and no password -> reuse default_cred_check to find a documented default
+    credential, then log in with it. Returns {ok, cookie_header, username, method, note}."""
+    auth = auth or {}
+    username, password = auth.get("username"), auth.get("password")
+    login_url = auth.get("login_url")
+    if username and password:
+        s = _establish_web_session(ip, port, username, password, login_url=login_url)
+        return {**s, "username": username, "method": "supplied"}
+    if auth.get("bruteforce"):
+        try:
+            try:
+                from etl.default_cred_check import run_default_cred_check
+            except ImportError:
+                from default_cred_check import run_default_cred_check
+            scheme = "https" if int(port or 80) in (443, 8443) else "http"
+            lp = login_url or f"{scheme}://{ip}:{port or 80}/"
+            with get_db() as conn, conn.cursor() as cur:
+                res = run_default_cred_check(cur, str(ip), lp, engagement_id=eid, force=True)
+                conn.commit()
+            u = res.get("username"); p = res.get("password") or res.get("secret") or password
+            if res.get("ok") and u and p:
+                s = _establish_web_session(ip, port, u, p, login_url=login_url)
+                return {**s, "username": u, "method": "bruteforce"}
+            return {"ok": False, "cookie_header": "", "username": u, "method": "bruteforce",
+                    "note": res.get("reason") or "no default credential found"}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "cookie_header": "", "username": None, "method": "bruteforce",
+                    "note": f"{type(e).__name__}: {e}"[:150]}
+    return {"ok": False, "cookie_header": "", "username": None, "method": "none", "note": "no creds"}
+
+
 def _flag_precondition(cve, ip, pc, eid):
     """Flag (Follow-Ups + webhook) that a target enforces an anti-CSRF/nonce/session
     precondition, so it is VISIBLE (not just handled inline). Points at the csrf_nonce
@@ -13112,6 +13238,13 @@ class BuildPocBody(BaseModel):
     # it false, so they run ONLY where a grant already exists (fail-closed).
     release: bool = False
     model: Optional[str] = None   # a local ollama model runs locally; else cloud/routed
+    # Auth: many targets need a logged-in session. Supply creds (or bruteforce=true to
+    # obtain them via default-credential checks) and the builder establishes a session and
+    # bakes the cookie into the exploit.
+    username: Optional[str] = None
+    password: Optional[str] = None
+    login_url: Optional[str] = None
+    bruteforce: bool = False
 
 
 class FetchPreconditionsBody(BaseModel):
@@ -13127,7 +13260,35 @@ def fetch_preconditions_endpoint(body: FetchPreconditionsBody, authorized: bool 
     return {"ok": True, **pc}
 
 
-def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=True, model=None):
+class EstablishSessionBody(BaseModel):
+    ip: str
+    port: Optional[int] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    login_url: Optional[str] = None
+    bruteforce: bool = False
+
+
+@app.post("/software/establish-session", tags=["Assets"])
+def establish_session_endpoint(body: EstablishSessionBody, authorized: bool = Depends(auth)):
+    """Runnable skill: log in to a web target and return the authenticated session cookie,
+    so an exploit that needs auth can use it. Supply creds, or bruteforce=true to try
+    documented default credentials first. Sends traffic (login attempts) — scope applies."""
+    eid = _validate_engagement_uuid(_resolve_engagement_id())
+    auth = {"username": body.username, "password": body.password,
+            "login_url": body.login_url, "bruteforce": body.bruteforce}
+    s = _establish_session_for_build(body.ip, body.port, auth, eid)
+    try:
+        emit_webhook("web_session_established", "software",
+                     {"target": body.ip, "ok": s.get("ok"), "method": s.get("method"),
+                      "user": s.get("username")})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": s.get("ok", False), **s}
+
+
+def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=True, model=None,
+                    auth=None):
     """The full automatic-creation loop: RESEARCH (pull reference PoC material) -> synthesize
     -> run-and-refine -> anchor/reflection verify -> auto-save into the Exploit Store (with
     Python + Burp HTTP artifacts). Shared by the /software/build-poc endpoint AND the
@@ -13137,8 +13298,21 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
     import time as _t
     _t0 = _t.time()
     run_id = f"{cve}_{ip}_{int(_t.time())}"
+    # Auth: establish a logged-in session (supplied creds, or brute-force default creds) so
+    # an authenticated attack surface is reachable, and hand the cookie to synth.
+    auth_guidance = ""; session_info = None
+    if auth and (auth.get("username") or auth.get("bruteforce")):
+        try:
+            session_info = _establish_session_for_build(ip, port, auth, eid)
+            ch = (session_info or {}).get("cookie_header")
+            if ch:
+                auth_guidance = (f"AUTH: an authenticated session exists — send this cookie in "
+                                 f"EVERY exploit request: Cookie: {ch}. (user "
+                                 f"{session_info.get('username')}). ")
+        except Exception as e:  # noqa: BLE001
+            logging.debug("build auth step failed: %s", e)
     # Automatic reference-PoC research: feed concrete public-exploit material into synth.
-    guidance = ""; research_out = None
+    guidance = auth_guidance; research_out = None
     if research:
         try:
             research_out = _research_exploit(cve, ip, port, product, version, eid, model=model)
@@ -13159,7 +13333,7 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
             if ref:
                 parts.append("Public ExploitDB PoC (adapt the request/payload to the target):\n"
                              + str(ref)[:3500])
-            guidance = " ".join(parts)
+            guidance = (auth_guidance + " " + " ".join(parts)).strip()
         except Exception as e:  # noqa: BLE001
             logging.debug("build research step failed: %s", e)
     built = _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=run_id,
@@ -13201,7 +13375,10 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
                       "security_test_id": result.get("security_test_id")})
     except Exception:  # noqa: BLE001
         pass
-    return {"synth_kind": built["synth_kind"], "exploit_store_id": store_id, **result}
+    return {"synth_kind": built["synth_kind"], "exploit_store_id": store_id,
+            "authenticated": bool(session_info and session_info.get("ok")),
+            "auth_user": (session_info or {}).get("username"),
+            "auth_method": (session_info or {}).get("method"), **result}
 
 
 @app.post("/software/build-poc", tags=["Assets"])
@@ -13221,8 +13398,12 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     elif not _poc_grant_active(body.ip, body.port, eid):
         raise HTTPException(403, "PoC building is not released for this endpoint. An operator "
                                  "must release it (grant) first; it stays granted until revoked.")
+    auth = None
+    if body.username or body.password or body.bruteforce:
+        auth = {"username": body.username, "password": body.password,
+                "login_url": body.login_url, "bruteforce": body.bruteforce}
     core = _build_poc_core(cve, body.ip, body.port, body.product, body.version, eid,
-                           body.max_iters, model=body.model)
+                           body.max_iters, model=body.model, auth=auth)
     return {"ok": True, "cve": cve, **core}
 
 

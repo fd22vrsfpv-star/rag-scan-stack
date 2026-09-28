@@ -345,6 +345,20 @@ async def fetch_preconditions(request: Request):
         return safe_json(resp)
 
 
+@router.post("/api/software/establish-session")
+async def establish_session(request: Request):
+    """Log in to a web target (supplied creds or default-cred brute force) -> session cookie."""
+    s = get_settings()
+    body = await request.json()
+    async with httpx.AsyncClient(timeout=100) as c:
+        resp = await c.post(f"{s.rag_api_url}/software/establish-session", json=body,
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            from fastapi import HTTPException
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
 @router.post("/api/software/resolve-exploit")
 async def resolve_exploit(request: Request):
     """Resolve a targeted exploit for a CVE (MSF -> ExploitDB -> synthesize) and
