@@ -12480,6 +12480,293 @@ class ResolveExploitBody(BaseModel):
     version: Optional[str] = None
 
 
+# ==========================================================================
+# CVE PoC-builder: research -> synthesize -> run-and-refine.
+# The VERBOSE trail (every prompt/response/run output) is written to the
+# FILESYSTEM (POC_LOG_DIR/<run_id>.jsonl) so a person can review/tune it without
+# bloating the DB (an uncapped LLM-text column is a latent outage). The DB keeps
+# only a small index row per run, and a security_test is stored ONLY when the PoC
+# CONVERGES (the final successful item). One approval (invoking /software/build-poc)
+# authorizes the ENTIRE loop.
+# ==========================================================================
+_POC_LOG_DIR = os.environ.get("POC_LOG_DIR", "/app/poc_logs")
+
+
+def _poc_run_file(run_id):
+    import os as _os
+    try:
+        _os.makedirs(_POC_LOG_DIR, exist_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+    safe = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in str(run_id))
+    return _os.path.join(_POC_LOG_DIR, f"{safe}.jsonl")
+
+
+def _poc_trace(run_id, phase, iteration=0, prompt=None, response=None,
+               run_output=None, assertion_passed=None):
+    """Append one verbose entry to the run's filesystem log (reviewable JSONL)."""
+    import json as _j, time as _t
+    entry = {"ts": _t.strftime("%Y-%m-%dT%H:%M:%S"), "phase": phase, "iteration": iteration,
+             "prompt": prompt, "response": response, "run_output": run_output,
+             "assertion_passed": assertion_passed}
+    try:
+        with open(_poc_run_file(run_id), "a") as f:
+            f.write(_j.dumps(entry) + "\n")
+    except Exception as e:  # noqa: BLE001
+        logging.debug("poc_trace write failed: %s", e)
+
+
+def _poc_index(cve, target_ip, run_id, log_path, success, iterations, security_test_id, eid):
+    """One small DB row per run (pointer to the filesystem trail) — no prompts in the DB."""
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS public.poc_synthesis_log (
+                id uuid PRIMARY KEY DEFAULT gen_random_uuid(), cve text, target_ip text,
+                security_test_id uuid, pending_exploit_id uuid, iteration integer NOT NULL DEFAULT 0,
+                phase text, prompt text, response text, run_output text, assertion_passed boolean,
+                engagement_id uuid, created_at timestamptz NOT NULL DEFAULT now())""")
+            cur.execute("""INSERT INTO poc_synthesis_log
+                (cve, target_ip, security_test_id, iteration, phase, response, assertion_passed, engagement_id)
+                VALUES (%s,%s,%s,%s,'index',%s,%s,%s)""",
+                (cve, target_ip, security_test_id, iterations, log_path, success, eid))
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("poc_index failed: %s", e)
+
+
+def _poc_extract_json(text):
+    import json as _j, re as _re
+    if not text:
+        return None
+    m = _re.search(r"\{.*\}", text, _re.S)
+    if not m:
+        return None
+    try:
+        return _j.loads(m.group(0))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _fetch_cve_details(cve):
+    """NVD lookup by cveId (cached in software_research_cache). {cve, description, refs, cvss}."""
+    cve = (cve or "").strip().upper()
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("SELECT results FROM software_research_cache WHERE LOWER(product)=LOWER(%s) AND source='nvd_cve'", (cve,))
+            r = cur.fetchone()
+            if r and r[0]:
+                return r[0]
+    except Exception:  # noqa: BLE001
+        pass
+    import requests as _rq
+    details = {"cve": cve, "description": "", "refs": [], "cvss": None}
+    try:
+        key = os.environ.get("NVD_API_KEY", "")
+        if not key:
+            try:
+                with get_db() as conn, conn.cursor() as cur:
+                    cur.execute("SELECT value FROM app_settings WHERE key='nvd_api_key'")
+                    rr = cur.fetchone(); key = rr[0] if rr else ""
+            except Exception:  # noqa: BLE001
+                pass
+        h = {"apiKey": key} if key else {}
+        resp = _rq.get("https://services.nvd.nist.gov/rest/json/cves/2.0",
+                       params={"cveId": cve}, headers=h, timeout=20)
+        if resp.ok:
+            vulns = (resp.json() or {}).get("vulnerabilities") or []
+            if vulns:
+                c = vulns[0].get("cve", {})
+                descs = c.get("descriptions") or []
+                details["description"] = next((d.get("value") for d in descs if d.get("lang") == "en"), "")
+                details["refs"] = [x.get("url") for x in (c.get("references") or [])][:6]
+                metrics = c.get("metrics") or {}
+                for mk in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+                    if metrics.get(mk):
+                        details["cvss"] = metrics[mk][0].get("cvssData", {}).get("baseScore")
+                        break
+    except Exception as e:  # noqa: BLE001
+        logging.debug("nvd fetch failed for %s: %s", cve, e)
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""INSERT INTO software_research_cache (product,version,source,results,cve_ids)
+                VALUES (%s,'','nvd_cve',%s,%s)
+                ON CONFLICT (LOWER(product),LOWER(version),source)
+                DO UPDATE SET results=EXCLUDED.results, updated_at=now()""",
+                (cve, Json(details), [cve]))
+            conn.commit()
+    except Exception:  # noqa: BLE001
+        pass
+    return details
+
+
+def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guidance_extra=""):
+    """Increment 1: research the CVE + synthesize a first-draft PoC (command+assertion).
+    Writes research+synth to the filesystem trail. Does NOT persist a security_test
+    (only a converged PoC is stored, by _run_refine_poc). Always returns a dict."""
+    cve = (cve or "").strip().upper()
+    port = port or 80
+    run_id = run_id or f"{cve}_{ip}_{int(__import__('time').time())}"
+    tgt = f"http://{ip}:{port}"
+    details = _fetch_cve_details(cve)
+    _poc_trace(run_id, "research", response=json.dumps(details))
+    prompt = (f"AUTHORIZED lab pentest. Build a proof-of-concept for {cve} on {tgt} "
+              f"({product or ''} {version or ''}).\n"
+              f"CVE description: {details.get('description') or '(none)'}\n"
+              f"References: {', '.join(details.get('refs') or [])}\n{guidance_extra}\n"
+              f"Return ONE JSON object only: {{\"command\": \"<single shell command, prefer "
+              f"curl, that TRIGGERS/PROVES the vulnerability against {tgt}>\", \"assertion\": "
+              f"{{\"expect_regex\": \"<regex matching proof-of-success in the output>\"}}, "
+              f"\"rationale\": \"<why this proves {cve}>\"}}. No prose.")
+    command = None
+    assertion = {"expect_regex": r"(?i)(uid=|root:|flag\{|vulnerable|HTTP/1\.[01] 200)"}
+    rationale = ""
+    for _ in range(2):
+        try:
+            res = llm_generate(prompt, caller="cve_poc_synth")
+            text = res.get("response", "") if isinstance(res, dict) else str(res or "")
+        except Exception:  # noqa: BLE001
+            text = ""
+        _poc_trace(run_id, "synthesize", prompt=prompt, response=text)
+        obj = _poc_extract_json(text)
+        if obj and obj.get("command"):
+            command = str(obj["command"]).strip()
+            if isinstance(obj.get("assertion"), dict) and obj["assertion"]:
+                assertion = obj["assertion"]
+            rationale = str(obj.get("rationale", ""))[:500]
+            break
+    synth_kind = "llm_poc"
+    if not command:
+        command = f"curl -sSi -m 15 {tgt}/"
+        synth_kind = "deterministic_probe"
+    return {"command": command, "assertion": assertion, "rationale": rationale,
+            "synth_kind": synth_kind, "run_id": run_id}
+
+
+def _poc_assertion_passes(assertion, output, exit_code=None):
+    import re as _re
+    a = assertion or {}
+    out = output or ""
+    low = out.lower()
+    if any(m in low for m in ("/bin/sh:", "syntax error", "command not found")):
+        return False
+    rx = a.get("expect_regex")
+    if rx:
+        try:
+            return bool(_re.search(rx, out, _re.I))
+        except Exception:  # noqa: BLE001
+            return bool(out.strip())
+    if a.get("expect_shell"):
+        return bool(_re.search(r"uid=\d+|gid=\d+|root@", out))
+    return bool(out.strip()) and exit_code in (None, 0)
+
+
+def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale="",
+                    product=None, version=None, max_iters=3):
+    """Increment 2: run the PoC against the target; on failure, refine via the LLM,
+    re-run — up to max_iters. Verbose trail -> filesystem. A security_test is stored
+    ONLY if it CONVERGES (the final successful item). One caller approval covers all
+    iterations. Returns {success, iterations, final_command, security_test_id, log_path}."""
+    import httpx as _hx, time as _t
+    port = port or 80
+    listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    _vt = int(os.environ.get("VECTOR_RUN_TIMEOUT", "600"))
+    success = False; iters = 0
+    for it in range(1, max(1, max_iters) + 1):
+        iters = it
+        try:
+            lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
+                          json={"command": command, "target": str(ip), "port": port, "timeout": _vt},
+                          headers={"x-api-key": API_KEY}, verify=False, timeout=_vt + 60)
+            d = lr.json() if lr.status_code < 400 else {}
+            output = d.get("output", "") or lr.text
+            ec = d.get("exit_code") if isinstance(d, dict) else None
+        except Exception as e:  # noqa: BLE001
+            output = f"listener error: {e}"; ec = None
+        success = _poc_assertion_passes(assertion, output, ec)
+        _poc_trace(run_id, "run", iteration=it, run_output=output, assertion_passed=success)
+        if success or it >= max_iters:
+            break
+        rprompt = (f"AUTHORIZED lab pentest. The PoC for {cve} on http://{ip}:{port} did NOT "
+                   f"succeed.\nCommand: {command}\nOutput:\n{(output or '')[:1500]}\n"
+                   f"Fix the command so it triggers/proves the vulnerability. Return ONE JSON "
+                   f"object only: {{\"command\": \"<better command>\", \"assertion\": "
+                   f"{{\"expect_regex\": \"<regex>\"}}}}. No prose.")
+        try:
+            res = llm_generate(rprompt, caller="cve_poc_refine")
+            rtext = res.get("response", "") if isinstance(res, dict) else str(res or "")
+        except Exception:  # noqa: BLE001
+            rtext = ""
+        _poc_trace(run_id, "refine", iteration=it, prompt=rprompt, response=rtext)
+        obj = _poc_extract_json(rtext)
+        if not obj or not obj.get("command"):
+            break
+        command = str(obj["command"]).strip()
+        if isinstance(obj.get("assertion"), dict) and obj["assertion"]:
+            assertion = obj["assertion"]
+
+    security_test_id = None
+    log_path = _poc_run_file(run_id)
+    if success:
+        # Only the CONVERGED PoC is stored in the DB, as a reusable security_test.
+        try:
+            with get_db() as conn, conn.cursor() as cur:
+                cur.execute("""INSERT INTO security_tests
+                    (name, description, tier, category, target_host, target_port, command, tool,
+                     assertion, source_finding_source, engagement_id, metadata)
+                    VALUES (%s,%s,'safe','cve_poc',%s,%s,%s,%s,%s,'cve_poc_builder',%s,%s) RETURNING id""",
+                    (f"PoC {cve} on {ip} (converged)", rationale, ip, port, command,
+                     (command.split(' ', 1)[0] if command else 'curl'), Json(assertion), eid,
+                     Json({"cve": cve, "poc_builder": True, "converged": True,
+                           "iterations": iters, "log": log_path,
+                           "product": product, "version": version})))
+                security_test_id = str(cur.fetchone()[0]); conn.commit()
+        except Exception as e:  # noqa: BLE001
+            logging.warning("store converged PoC failed: %s", e)
+    _poc_trace(run_id, "result", iteration=iters, assertion_passed=success,
+               response=f"success={success} security_test_id={security_test_id}")
+    _poc_index(cve, ip, run_id, log_path, success, iters, security_test_id, eid)
+    return {"ok": True, "success": success, "iterations": iters, "final_command": command,
+            "security_test_id": security_test_id, "log_path": log_path}
+
+
+class BuildPocBody(BaseModel):
+    cve: str
+    ip: str
+    port: Optional[int] = None
+    product: Optional[str] = None
+    version: Optional[str] = None
+    max_iters: int = 3
+
+
+@app.post("/software/build-poc", tags=["Assets"])
+def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
+    """PoC-builder: research -> synthesize -> run-and-refine. Invoking this authorizes
+    the ENTIRE loop (scope-gated traffic every iteration). The verbose prompt/response/
+    output trail is written to POC_LOG_DIR/<run_id>.jsonl for review; the DB stores only
+    a small index row, and a security_test ONLY if the PoC converges."""
+    import time as _t
+    eid = _validate_engagement_uuid(_resolve_engagement_id())
+    cve = (body.cve or "").strip().upper()
+    if not cve.startswith("CVE-"):
+        raise HTTPException(400, "cve must be a CVE id")
+    run_id = f"{cve}_{body.ip}_{int(_t.time())}"
+    built = _synthesize_cve_poc(cve, body.ip, body.port, body.product, body.version, eid, run_id=run_id)
+    result = _run_refine_poc(cve, body.ip, body.port, built["command"], built["assertion"], eid,
+                             run_id, rationale=built.get("rationale", ""),
+                             product=body.product, version=body.version, max_iters=body.max_iters)
+    try:
+        emit_webhook("cve_poc_built", "software",
+                     {"cve": cve, "target": body.ip, "success": result.get("success"),
+                      "iterations": result.get("iterations"),
+                      "security_test_id": result.get("security_test_id")})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "cve": cve, "synth_kind": built["synth_kind"], **result}
+
+
+
+
+
 def _resolve_and_queue_exploit(cve, ip, port, product, version, eid, dedupe=True):
     """Resolve a targeted exploit for a scanner-confirmed CVE (Metasploit ->
     ExploitDB -> synthesize) and queue it as an approval-gated pending_exploit.
@@ -12511,27 +12798,9 @@ def _resolve_and_queue_exploit(cve, ip, port, product, version, eid, dedupe=True
         return res[0] if res else None
 
     def _synth():
-        prod = f"{product or ''} {version or ''}".strip() or "the service"
-        tgt = f"http://{ip}:{port}"
-        prompt = (f"You are assisting an AUTHORIZED penetration test of a lab target. "
-                  f"No Metasploit or ExploitDB module exists for {cve}, so provide a "
-                  f"single NON-DESTRUCTIVE shell command (prefer curl) that checks "
-                  f"whether the host at {tgt} shows the condition associated with {cve} "
-                  f"on {prod}. Output ONLY the command line, no prose or backticks.")
-        _TOOLS = ("curl", "wget", "nc", "ncat", "python", "python3", "bash", "sh",
-                  "nmap", "sqlmap", "nuclei", "openssl", "ffuf", "gobuster", "ssh", "ftp")
-        for _ in range(2):
-            try:
-                res = llm_generate(prompt, caller="cve_synth")
-                text = res.get("response", "") if isinstance(res, dict) else str(res or "")
-                for raw in text.splitlines():
-                    line = raw.strip().strip("`").strip()
-                    first = line.split(" ", 1)[0].lower() if line else ""
-                    if first in _TOOLS and ("http" in line or "-" in line or first in ("nmap", "nc", "ssh", "ftp")):
-                        return {"command": line, "synth_kind": "llm"}
-            except Exception:  # noqa: BLE001
-                pass
-        return {"command": f"curl -sSi -m 15 {tgt}/", "synth_kind": "deterministic_probe"}
+        # Increment 1: research the CVE + synthesize a real PoC and persist it as a
+        # security_test (the run-and-refine loop is Increment 2 via /software/build-poc).
+        return _synthesize_cve_poc(cve, ip, port, product, version, eid)
 
     resolution = resolve_exploit_for_cve(cve, _msf, _edb, _synth)
     method = resolution["method"]
@@ -12556,7 +12825,10 @@ def _resolve_and_queue_exploit(cve, ip, port, product, version, eid, dedupe=True
         source, exploit_id, edb_id = "command", cve, None
         title = f"{cve} synthesised PoC (no MSF/EDB module)"
         cmd = ex.get("command", "")
-        params = {"vector_id": cve, "synthesized": True, "success": {"expect_regex": "(?i)(uid=|root|flag|vulnerable)"}}
+        # A converged PoC (security_test) is only stored by the build-poc loop; the
+        # queued candidate carries the first-draft command + assertion for approval.
+        params = {"vector_id": cve, "synthesized": True, "run_id": ex.get("run_id"),
+                  "success": ex.get("assertion") or {"expect_regex": "(?i)(uid=|root|flag|vulnerable)"}}
 
     with get_db() as conn, conn.cursor() as cur:
         cur.execute("SELECT id FROM assets WHERE host(ip)::text = %s AND (engagement_id = %s::uuid OR %s IS NULL) LIMIT 1",
