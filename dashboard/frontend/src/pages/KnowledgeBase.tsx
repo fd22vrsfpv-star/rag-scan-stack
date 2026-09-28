@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { cn } from '@/lib/utils'
 import PageHelp from '@/components/PageHelp'
 import { useIngestPlaybooks, useServiceDocs } from '@/api/rag'
@@ -34,6 +34,8 @@ import {
 import { useSkills, useAddSkill, useDeleteSkill } from '@/api/skills'
 import { useEngagements } from '@/api/engagements'
 import { useUIStore } from '@/stores/ui'
+import ServicePrompts from '@/pages/ServicePrompts'
+import KbOverrides from '@/pages/KbOverrides'
 
 /**
  * "Training data" panel — Layer 3 of the RAG feedback loop.
@@ -1265,6 +1267,9 @@ export default function KnowledgeBase() {
   const [selected, setSelected] = useState<string | null>(null)
   const [showAdd, setShowAdd] = useState(false)
   const [search, setSearch] = useState('')
+  const KB_TABS = [['services','Services'],['flows','Flows'],['skills','Skills'],['prompts','Service Prompts'],['overrides','KB Overrides'],['learning','Learning']] as const
+  const [tab, setTab] = useState<string>(() => { try { return localStorage.getItem('kb.tab') || 'services' } catch { return 'services' } })
+  useEffect(() => { try { localStorage.setItem('kb.tab', tab) } catch { /* ignore */ } }, [tab])
 
   const ingestPlaybooks = useIngestPlaybooks()
   const { data: serviceDocs } = useServiceDocs()
@@ -1328,6 +1333,22 @@ export default function KnowledgeBase() {
           runs the exact resolution the AI uses — it shows the real injected text, not an approximation.
         </p>
       </PageHelp>
+      <div className="flex gap-1 border-b border-border flex-wrap">
+        {KB_TABS.map(([t, label]) => (
+          <button
+            key={t}
+            onClick={() => setTab(t)}
+            className={cn(
+              'px-3 py-1.5 text-sm border-b-2 transition-colors',
+              tab === t ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground',
+            )}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'services' && (<>
       {/* Corpus import + indexed-training summary. Playbook ingest previously
           required calling scan-recommender directly; it is proxied now. */}
       <div className="bg-card border border-border rounded-lg p-3 flex items-center gap-3 flex-wrap">
@@ -1385,10 +1406,6 @@ export default function KnowledgeBase() {
       {selected && <ServiceDetail name={selected} onClose={() => setSelected(null)} />}
 
       <AskKnowledgeBase />
-      <FlowsPanel />
-      <SkillsPanel />
-      <TrainingDataPanel />
-      <RetrievalQualityPanel />
 
       <div className="bg-card border border-border rounded-lg overflow-hidden">
         {isLoading ? (
@@ -1437,6 +1454,13 @@ export default function KnowledgeBase() {
       <p className="text-xs text-muted-foreground">
         {data?.count ?? 0} services loaded from YAML knowledge base + database overrides
       </p>
+      </>)}
+
+      {tab === 'flows' && <FlowsPanel />}
+      {tab === 'skills' && <SkillsPanel />}
+      {tab === 'prompts' && <ServicePrompts />}
+      {tab === 'overrides' && <KbOverrides />}
+      {tab === 'learning' && (<><TrainingDataPanel /><RetrievalQualityPanel /></>)}
     </div>
   )
 }
