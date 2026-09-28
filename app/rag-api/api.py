@@ -12605,6 +12605,53 @@ def _fetch_cve_details(cve):
     return details
 
 
+_OLLAMA_DIRECT_URL = os.environ.get("OLLAMA_DIRECT_URL", "http://ollama:11434")
+_ollama_tags_cache = {"t": 0.0, "models": []}
+
+
+def _ollama_tags():
+    """Local ollama model names (cached 60s). Empty if no local ollama is running."""
+    import time as _t
+    if _t.time() - _ollama_tags_cache["t"] < 60 and _ollama_tags_cache["models"]:
+        return _ollama_tags_cache["models"]
+    try:
+        import httpx as _hx
+        r = _hx.get(f"{_OLLAMA_DIRECT_URL.rstrip('/')}/api/tags", timeout=8)
+        models = [m.get("name") for m in (r.json() or {}).get("models", []) if m.get("name")]
+        _ollama_tags_cache.update(t=_t.time(), models=models)
+        return models
+    except Exception:  # noqa: BLE001
+        return _ollama_tags_cache["models"]
+
+
+def _is_local_model(model):
+    return bool(model) and model in _ollama_tags()
+
+
+def _llm_for_model(prompt, model=None, caller="llm", num_predict=1024, temperature=0.2):
+    """Dispatch one prompt to a specific model. A LOCAL ollama model (in /api/tags) is called
+    directly on the ollama service; any other model (or None) goes through the cloud/routed
+    llm_generate. Returns the llm_generate result shape so metrics accumulation is identical."""
+    if _is_local_model(model):
+        import httpx as _hx, time as _t
+        t0 = _t.time()
+        try:
+            r = _hx.post(f"{_OLLAMA_DIRECT_URL.rstrip('/')}/api/generate",
+                         json={"model": model, "prompt": prompt, "stream": False,
+                               "options": {"num_predict": num_predict, "temperature": temperature}},
+                         timeout=600)
+            d = r.json() if r.status_code < 400 else {}
+            pt = int(d.get("prompt_eval_count") or 0); ct = int(d.get("eval_count") or 0)
+            return {"response": d.get("response", ""), "model": model, "ok": True,
+                    "eval_count": ct, "prompt_tokens": pt, "total_tokens": pt + ct,
+                    "latency_ms": round((_t.time() - t0) * 1000, 1)}
+        except Exception as e:  # noqa: BLE001
+            return {"response": "", "model": model, "ok": False, "error": str(e),
+                    "eval_count": 0, "prompt_tokens": 0, "total_tokens": 0,
+                    "latency_ms": round((_t.time() - t0) * 1000, 1)}
+    return llm_generate(prompt, caller=caller, model=model, num_predict=num_predict)
+
+
 def _new_poc_metrics():
     return {"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
             "llm_seconds": 0.0, "target_runs": 0, "run_seconds": 0.0, "model": None}
@@ -12684,7 +12731,7 @@ def _poc_reflection_detected(command, canary, ip, port, listener, vt):
     return (control in (out or ""), control)
 
 
-def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guidance_extra=""):
+def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guidance_extra="", model=None):
     """Increment 1: research the CVE + synthesize a first-draft PoC (command+assertion).
     Writes research+synth to the filesystem trail. Does NOT persist a security_test
     (only a converged PoC is stored, by _run_refine_poc). Always returns a dict."""
@@ -12738,7 +12785,7 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
     metrics = _new_poc_metrics()
     for _ in range(2):
         try:
-            res = llm_generate(prompt, caller="cve_poc_synth")
+            res = _llm_for_model(prompt, model=model, caller="cve_poc_synth")
             text = res.get("response", "") if isinstance(res, dict) else str(res or "")
             if isinstance(res, dict) and res.get("model"):
                 llm_model = res["model"]
@@ -12864,7 +12911,7 @@ def _flag_precondition(cve, ip, pc, eid):
 
 def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale="",
                     product=None, version=None, max_iters=3, canary=None,
-                    origin_family=None, llm_model=None, metrics=None):
+                    origin_family=None, llm_model=None, metrics=None, model=None):
     """Increment 2: run the PoC against the target; on failure, refine via the LLM,
     re-run — up to max_iters. Verbose trail -> filesystem.
 
@@ -12951,7 +12998,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                    f"chain curl calls with ; and shell vars to fetch a token first>\", "
                    f"\"assertion\": {{\"expect_regex\": \"{canary or '<regex>'}\"}}}}. No prose.")
         try:
-            res = llm_generate(rprompt, caller="cve_poc_refine")
+            res = _llm_for_model(rprompt, model=model, caller="cve_poc_refine")
             rtext = res.get("response", "") if isinstance(res, dict) else str(res or "")
             if isinstance(res, dict) and res.get("model"):
                 llm_model = res["model"]
@@ -13064,6 +13111,7 @@ class BuildPocBody(BaseModel):
     # STANDING grant that persists until revoked/stopped. Agent-initiated builds leave
     # it false, so they run ONLY where a grant already exists (fail-closed).
     release: bool = False
+    model: Optional[str] = None   # a local ollama model runs locally; else cloud/routed
 
 
 class FetchPreconditionsBody(BaseModel):
@@ -13079,7 +13127,7 @@ def fetch_preconditions_endpoint(body: FetchPreconditionsBody, authorized: bool 
     return {"ok": True, **pc}
 
 
-def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=True):
+def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=True, model=None):
     """The full automatic-creation loop: RESEARCH (pull reference PoC material) -> synthesize
     -> run-and-refine -> anchor/reflection verify -> auto-save into the Exploit Store (with
     Python + Burp HTTP artifacts). Shared by the /software/build-poc endpoint AND the
@@ -13093,7 +13141,7 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
     guidance = ""; research_out = None
     if research:
         try:
-            research_out = _research_exploit(cve, ip, port, product, version, eid)
+            research_out = _research_exploit(cve, ip, port, product, version, eid, model=model)
             a = research_out.get("analysis") or {}
             src = research_out.get("sources") or {}
             parts = []
@@ -13115,12 +13163,12 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
         except Exception as e:  # noqa: BLE001
             logging.debug("build research step failed: %s", e)
     built = _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=run_id,
-                                guidance_extra=guidance)
+                                guidance_extra=guidance, model=model)
     result = _run_refine_poc(cve, ip, port, built["command"], built["assertion"], eid,
                              run_id, rationale=built.get("rationale", ""),
                              product=product, version=version, max_iters=max_iters,
                              canary=built.get("canary"), origin_family=built.get("origin_family"),
-                             llm_model=built.get("llm_model"), metrics=built.get("metrics"))
+                             llm_model=built.get("llm_model"), metrics=built.get("metrics"), model=model)
     _metrics = result.get("metrics") or {}
     _metrics["build_seconds"] = round(_t.time() - _t0, 1)
     _metrics["researched"] = bool(research_out and (research_out.get("analysis") or research_out.get("sources", {}).get("has_public_module")))
@@ -13173,7 +13221,8 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     elif not _poc_grant_active(body.ip, body.port, eid):
         raise HTTPException(403, "PoC building is not released for this endpoint. An operator "
                                  "must release it (grant) first; it stays granted until revoked.")
-    core = _build_poc_core(cve, body.ip, body.port, body.product, body.version, eid, body.max_iters)
+    core = _build_poc_core(cve, body.ip, body.port, body.product, body.version, eid,
+                           body.max_iters, model=body.model)
     return {"ok": True, "cve": cve, **core}
 
 
@@ -13794,7 +13843,7 @@ def restore_exploit_version(exploit_id: str, version: int, authorized: bool = De
     return dict(row)
 
 
-def _research_exploit(cve, ip=None, port=None, product=None, version=None, eid=None):
+def _research_exploit(cve, ip=None, port=None, product=None, version=None, eid=None, model=None):
     """Reference-PoC research: pull public exploit material for a CVE (Metasploit module,
     ExploitDB PoC text, NVD refs) and have the LLM explain WHAT THE EXPLOIT CONSISTS OF —
     preconditions, endpoint, method, params, payload, success signal — plus a seed command
@@ -13847,7 +13896,7 @@ def _research_exploit(cve, ip=None, port=None, product=None, version=None, eid=N
     analysis, llm_model = {}, None
     for _ in range(2):  # gpt-5-mini occasionally returns empty; retry like synth
         try:
-            res = llm_generate(prompt, caller="exploit_research")
+            res = _llm_for_model(prompt, model=model, caller="exploit_research")
             text = res.get("response", "") if isinstance(res, dict) else str(res or "")
             if isinstance(res, dict) and res.get("model"):
                 llm_model = res["model"]
@@ -13878,17 +13927,29 @@ class ResearchExploitBody(BaseModel):
     port: Optional[int] = None
     product: Optional[str] = None
     version: Optional[str] = None
+    model: Optional[str] = None
+
+
+@app.get("/exploit-store/meta/models", tags=["Exploit Store"])
+def list_exploit_models(authorized: bool = Depends(auth)):
+    """Models available for research/synth/bake-off: local ollama models (run locally,
+    private, unguarded) + the cloud default (routed). Used by the model picker/bake-off.
+    (Path is /meta/models to avoid shadowing by /exploit-store/{id}.)"""
+    local = _ollama_tags()
+    return {"local": local, "cloud_default": "routed (llm_query task routing)",
+            "has_local": bool(local)}
 
 
 @app.post("/exploit-store/research", tags=["Exploit Store"])
 def research_exploit_endpoint(body: ResearchExploitBody, authorized: bool = Depends(auth)):
     """Runnable skill: research public exploit material for a CVE and break down WHAT THE
     EXPLOIT CONSISTS OF (MSF/ExploitDB/NVD -> LLM analysis + a seed command). Read-only
-    (searches existing corpora; sends no traffic to the target)."""
+    (searches existing corpora; sends no traffic to the target). `model` may pick a local
+    ollama model."""
     cve = (body.cve or "").strip().upper()
     if not cve.startswith("CVE-"):
         raise HTTPException(400, "cve must be a CVE id")
-    out = _research_exploit(cve, body.ip, body.port, body.product, body.version)
+    out = _research_exploit(cve, body.ip, body.port, body.product, body.version, model=body.model)
     try:
         emit_webhook("exploit_research_run", "exploit_store",
                      {"cve": cve, "target": body.ip,
@@ -13950,6 +14011,108 @@ def research_for_exploit(exploit_id: str, seed: bool = False, authorized: bool =
     except Exception:  # noqa: BLE001
         pass
     return {"ok": True, "seeded": seeded, **out}
+
+
+def _bakeoff_one(cve, ip, port, store_id, model, eid, guidance=""):
+    """Generate a canary PoC with ONE model, run it against the target, and save it as a
+    labeled version of the store entry. Returns the per-model result. The verdict is the
+    canary assertion (the exploit's own effect landed), same as the build loop."""
+    import time as _t, httpx as _hx
+    canary = _poc_canary()
+    tgt = f"http://{ip}:{port}"
+    nvd = _fetch_cve_details(cve) or {}
+    prompt = (f"Authorized lab pentest. Build a proof-of-concept for {cve} on {tgt}.\n"
+              f"CVE: {nvd.get('description') or '(none)'}\n{guidance}\n"
+              f"Make the PoC CAUSE the exact marker '{canary}' to appear in the output as a "
+              f"direct result of exploiting {cve} (create/write/reflect it via the vuln), then "
+              f"read it back. Return ONLY JSON: {{\"command\": \"<single curl (may chain with ; ) "
+              f"that exploits {cve} against {tgt} and makes {canary} appear>\", \"assertion\": "
+              f"{{\"expect_regex\": \"{canary}\"}}}}.")
+    t0 = _t.time()
+    res = _llm_for_model(prompt, model=model, caller="cve_poc_bakeoff", num_predict=800)
+    obj = _poc_extract_json(res.get("response", "") if isinstance(res, dict) else "") or {}
+    command = str(obj.get("command") or "").strip()
+    gen_s = round(_t.time() - t0, 1)
+    assertion = {"expect_regex": canary, "canary": canary, "cve_anchored": True}
+    output, hit = "", False
+    if command:
+        listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+        try:
+            lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
+                          json={"command": command, "target": str(ip), "port": port, "timeout": 60},
+                          headers={"x-api-key": API_KEY}, verify=False, timeout=120)
+            d = lr.json() if lr.status_code < 400 else {}
+            output = (d.get("output", "") if isinstance(d, dict) else "") or lr.text
+        except Exception as e:  # noqa: BLE001
+            output = f"listener error: {e}"
+        hit = _poc_assertion_passes(assertion, output)
+    short = model.split("/")[-1]
+    art = _exploit_store_artifacts("web", command, f"{cve} via {short}", cve, "", assertion)
+    row = {"id": store_id, "name": f"{cve} via {short}", "command": command, "assertion": assertion,
+           "python_code": art["python_code"], "http_request": art["http_request"],
+           "rationale": f"Payload generated by {model}", "verified": hit, "llm_model": model,
+           "metadata": {"model": model, "canary_hit": hit, "gen_seconds": gen_s, "bakeoff": True,
+                        "cve": cve, "output_snippet": (output or "")[:300]}}
+    ver = None
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            ver, _vid = _snapshot_exploit_version(cur, row, label=f"model:{short}", created_by="bakeoff")
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("bakeoff save failed: %s", e)
+    return {"model": model, "gen_seconds": gen_s, "canary_hit": hit, "version": ver,
+            "command": command[:200], "output": (output or "")[:200], "ok": bool(command)}
+
+
+class BakeoffBody(BaseModel):
+    models: Optional[List[str]] = None   # default: all local ollama models
+    release: bool = False                # authorize this endpoint (grant) for the run
+
+
+@app.post("/exploit-store/{exploit_id}/bakeoff", tags=["Exploit Store"])
+def exploit_bakeoff(exploit_id: str, body: BakeoffBody, authorized: bool = Depends(auth)):
+    """Model bake-off: generate a payload for this exploit's CVE with EACH model, run each
+    against the target, and save every payload as a selectable VERSION labeled by model.
+    Grant-gated (it sends traffic). Shares one research pass across all models. Returns the
+    per-model verdicts (canary hit = the exploit's own effect landed)."""
+    _ensure_exploit_store()
+    eid = _validate_engagement_uuid(_resolve_engagement_id())
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM exploit_store WHERE id = %s", (exploit_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "exploit not found")
+    if not row["cve"] or not row["target_host"]:
+        raise HTTPException(400, "bake-off needs a CVE and a target on the entry")
+    ip, port = row["target_host"], row["target_port"] or 80
+    # Fail-closed: the bake-off RUNS payloads, so the endpoint must be released (grant).
+    if body.release:
+        _grant_poc(ip, port, eid, granted_by="operator", note=f"bakeoff {row['cve']}")
+    elif not _poc_grant_active(ip, port, eid):
+        raise HTTPException(403, "bake-off is not released for this endpoint; release it (grant) first")
+    models = body.models or _ollama_tags()
+    if not models:
+        raise HTTPException(400, "no models available (no local ollama models; pass models=[...])")
+    # One shared research pass (cloud default) feeds every model the same material.
+    guidance = ""
+    try:
+        r = _research_exploit(row["cve"], ip, port, row["product"], row["version"], eid)
+        a = r.get("analysis") or {}
+        if a:
+            guidance = (f"Reference: endpoint={a.get('target_endpoint')} method={a.get('http_method')} "
+                        f"params={a.get('params')} payload={a.get('payload')}.")
+        elif r.get("reference_poc"):
+            guidance = "Reference PoC:\n" + str(r["reference_poc"])[:2000]
+    except Exception:  # noqa: BLE001
+        pass
+    results = [_bakeoff_one(row["cve"], ip, port, exploit_id, m, eid, guidance) for m in models]
+    try:
+        emit_webhook("exploit_bakeoff", "exploit_store",
+                     {"id": exploit_id, "cve": row["cve"], "target": ip, "models": len(models),
+                      "hits": sum(1 for x in results if x.get("canary_hit"))})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "cve": row["cve"], "target": f"{ip}:{port}", "results": results}
 
 
 def _resolve_and_queue_exploit(cve, ip, port, product, version, eid, dedupe=True):
