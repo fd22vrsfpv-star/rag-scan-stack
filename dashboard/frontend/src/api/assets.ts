@@ -877,6 +877,21 @@ export interface BulkDismissParams {
   engagement_id?: string
 }
 
+export function useResolveExploit() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (params: { cve: string; ip: string; port?: number; product?: string; version?: string }) =>
+      apiFetch<{ ok: boolean; method: string; pending_exploit_id: string | null; message?: string }>(
+        '/software/resolve-exploit',
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params) },
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['detected-software'] })
+      qc.invalidateQueries({ queryKey: ['pending-exploit-counts'] })
+    },
+  })
+}
+
 export function useBulkDismissSoftware() {
   const qc = useQueryClient()
   return useMutation({
