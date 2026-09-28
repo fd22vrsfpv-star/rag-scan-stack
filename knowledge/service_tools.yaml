@@ -108,10 +108,14 @@ services:
         purpose: SSH version detection
       - module: auxiliary/scanner/ssh/ssh_login
         purpose: SSH login brute force
+        precondition: >-
+          auth_surface_present — service must present auth; enumerate usernames + try default/known creds before a wordlist, respect lockout (see credential_access skill)
       - module: auxiliary/scanner/ssh/ssh_enumusers
         purpose: SSH user enumeration
       - module: auxiliary/scanner/ssh/ssh_login_pubkey
         purpose: SSH public key authentication test
+        precondition: >-
+          auth_surface_present — service must present auth; enumerate usernames + try default/known creds before a wordlist, respect lockout (see credential_access skill)
     nuclei_tags: ["ssh", "network", "default-login", "cve"]
     common_vulns:
       - "CVE-2018-15473: OpenSSH User Enumeration (< 7.7)"
@@ -266,6 +270,8 @@ services:
         purpose: FTP version detection
       - module: auxiliary/scanner/ftp/ftp_login
         purpose: FTP login brute force
+        precondition: >-
+          auth_surface_present — service must present auth; enumerate usernames + try default/known creds before a wordlist, respect lockout (see credential_access skill)
       - module: auxiliary/scanner/ftp/anonymous
         purpose: anonymous FTP access check
       - module: exploit/unix/ftp/vsftpd_234_backdoor
@@ -305,12 +311,18 @@ services:
         purpose: MySQL version detection
       - module: auxiliary/scanner/mysql/mysql_login
         purpose: MySQL login brute force
+        precondition: >-
+          auth_surface_present — service must present auth; enumerate usernames + try default/known creds before a wordlist, respect lockout (see credential_access skill)
       - module: auxiliary/admin/mysql/mysql_enum
         purpose: MySQL enumeration
       - module: auxiliary/scanner/mysql/mysql_hashdump
         purpose: MySQL hash dump
+        precondition: >-
+          valid_credentials_held — post-auth: do NOT run without a working credential already obtained
       - module: exploit/multi/mysql/mysql_udf_payload
         purpose: MySQL UDF code execution
+        precondition: >-
+          valid_credentials_held — post-auth: do NOT run without a working credential already obtained
     nuclei_tags: ["mysql", "database", "default-login", "cve"]
     common_vulns:
       - "Empty root password"
@@ -373,12 +385,18 @@ services:
         purpose: MSSQL discovery
       - module: auxiliary/scanner/mssql/mssql_login
         purpose: MSSQL login brute force
+        precondition: >-
+          auth_surface_present — service must present auth; enumerate usernames + try default/known creds before a wordlist, respect lockout (see credential_access skill)
       - module: auxiliary/admin/mssql/mssql_enum
         purpose: MSSQL enumeration
       - module: exploit/windows/mssql/mssql_payload
         purpose: MSSQL code execution
+        precondition: >-
+          valid_credentials_held — post-auth: do NOT run without a working credential already obtained
       - module: auxiliary/admin/mssql/mssql_exec
         purpose: xp_cmdshell execution
+        precondition: >-
+          valid_credentials_held — post-auth: do NOT run without a working credential already obtained
     nuclei_tags: ["mssql", "database", "default-login", "cve"]
     common_vulns:
       - "xp_cmdshell enabled"
@@ -446,6 +464,8 @@ services:
         purpose: SMB user enumeration
       - module: auxiliary/scanner/smb/smb_login
         purpose: SMB login brute force
+        precondition: >-
+          auth_surface_present — service must present auth; enumerate usernames + try default/known creds before a wordlist, respect lockout (see credential_access skill)
       - module: exploit/multi/samba/usermap_script
         purpose: "Samba username map script RCE (CVE-2007-2447) - CRITICAL for Samba 3.0.20-3.0.25rc3"
       - module: exploit/windows/smb/ms17_010_eternalblue
