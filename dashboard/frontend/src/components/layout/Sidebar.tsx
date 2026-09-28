@@ -92,9 +92,9 @@ const NAV_GROUPS: NavEntry[] = [
     id: 'system', icon: Settings, label: 'System',
     children: [
       { to: '/maintenance', icon: Wrench, label: 'Maintenance' },
+      // Service Prompts + KB Overrides are consolidated into the Knowledge Base
+      // page as tabs; the standalone routes still exist for deep links.
       { to: '/knowledge', icon: BookOpen, label: 'Knowledge Base' },
-      { to: '/service-prompts', icon: MessageSquare, label: 'Service Prompts' },
-      { to: '/settings/kb-overrides', icon: Wrench, label: 'KB Overrides' },
       { to: '/settings', icon: Settings, label: 'Settings' },
       { to: '/sync', icon: RefreshCw, label: 'Sync' },
       { to: '/about', icon: Info, label: 'About' },

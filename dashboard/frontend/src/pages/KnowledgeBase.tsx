@@ -1225,6 +1225,34 @@ function SkillsPanel() {
         Curated per-class methodology fed to the exploit builders. Shipped packs are
         read-only; add or override a class in the DB overlay — no code change, embeds into RAG.
       </p>
+
+      {/* Always-visible skill list (previously hidden behind the Add/manage toggle). */}
+      <div className="space-y-2 text-xs">
+        <div>
+          <p className="text-muted-foreground mb-1">Custom (overlay) - {Object.keys(custom).length}</p>
+          {Object.keys(custom).length === 0 ? (
+            <p className="text-muted-foreground">none yet - use Add / manage to create one.</p>
+          ) : (
+            <div className="flex flex-wrap gap-1">
+              {Object.keys(custom).sort().map(id => (
+                <span key={id} className="inline-flex items-center gap-1 font-mono bg-muted border border-border rounded px-1.5 py-0.5">
+                  {id}
+                  <button onClick={() => del.mutate(id)} title="delete overlay skill" className="text-red-400">x</button>
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+        <div>
+          <p className="text-muted-foreground mb-1">Shipped (read-only) - {Object.keys(yaml).length}</p>
+          <div className="flex flex-wrap gap-1">
+            {Object.keys(yaml).sort().map(id => (
+              <span key={id} className="font-mono bg-muted/60 border border-border rounded px-1.5 py-0.5">{id}</span>
+            ))}
+          </div>
+        </div>
+      </div>
+
       {open && (
         <div className="space-y-2">
           <div className="grid grid-cols-2 gap-2">
@@ -1241,20 +1269,7 @@ function SkillsPanel() {
             {add.isPending ? 'Saving\u2026' : 'Add / update skill'}
           </button>
           {add.isError && <p className="text-xs text-red-400">{String((add.error as Error)?.message || 'save failed')}</p>}
-          <div className="text-xs">
-            <p className="text-muted-foreground mt-2 mb-1">Custom (overlay):</p>
-            {Object.keys(custom).length === 0 ? <p className="text-muted-foreground">none yet</p> : (
-              <ul className="space-y-1">
-                {Object.keys(custom).sort().map(id => (
-                  <li key={id} className="flex items-center justify-between border border-border rounded px-2 py-1">
-                    <span className="font-mono">{id}</span>
-                    <button onClick={() => del.mutate(id)} className="text-red-400 text-[11px]">delete</button>
-                  </li>
-                ))}
-              </ul>
-            )}
-            <p className="text-muted-foreground mt-2 mb-1">Shipped (read-only): <span className="font-mono">{Object.keys(yaml).sort().join(', ')}</span></p>
-          </div>
+
         </div>
       )}
     </div>
@@ -1283,6 +1298,22 @@ export default function KnowledgeBase() {
 
   return (
     <div className="space-y-4">
+      <div className="flex gap-1 border-b border-border flex-wrap">
+        {KB_TABS.map(([t, label]) => (
+          <button
+            key={t}
+            onClick={() => setTab(t)}
+            className={cn(
+              'px-3 py-1.5 text-sm border-b-2 transition-colors',
+              tab === t ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground',
+            )}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'services' && (
       <PageHelp id="knowledge-base" title="How to add knowledge, and how the AI uses it">
         <p>
           Four ways in, from broadest to most specific. They stack — a general playbook
@@ -1333,20 +1364,7 @@ export default function KnowledgeBase() {
           runs the exact resolution the AI uses — it shows the real injected text, not an approximation.
         </p>
       </PageHelp>
-      <div className="flex gap-1 border-b border-border flex-wrap">
-        {KB_TABS.map(([t, label]) => (
-          <button
-            key={t}
-            onClick={() => setTab(t)}
-            className={cn(
-              'px-3 py-1.5 text-sm border-b-2 transition-colors',
-              tab === t ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground',
-            )}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
+      )}
 
       {tab === 'services' && (<>
       {/* Corpus import + indexed-training summary. Playbook ingest previously
