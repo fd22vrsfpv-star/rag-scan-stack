@@ -3841,7 +3841,49 @@ def _load_owasp_param_tests() -> tuple:
 _FRAGILITY_CACHE: "dict[str, object]" = {}
 
 
-def _target_fragility(host: str):
+def _probe_fingerprint(host: str, ports=None):
+    """Best-effort, scope-gated live fingerprint of a web host: returns
+    (server_header, openapi_title, version). A crash-prone app advertises its
+    identity — Server header, /openapi.json title, a version endpoint — so read
+    it directly when recon has not stored it. Never raises; short timeouts."""
+    import httpx as _httpx
+    cand = list(ports) if ports else [9090, 8080, 80, 8000, 443, 8443]
+    server_header = openapi_title = version = None
+    for port in cand:
+        scheme = "https" if int(port) in (443, 8443) else "http"
+        base = f"{scheme}://{host}:{port}"
+        try:
+            r = _httpx.get(base + "/", timeout=6, verify=False,
+                           follow_redirects=True)
+            server_header = r.headers.get("server") or server_header
+        except Exception:  # noqa: BLE001
+            continue  # port not answering as web — try the next
+        # openapi title (+ its version)
+        try:
+            oj = _httpx.get(base + "/openapi.json", timeout=6, verify=False)
+            if oj.status_code == 200:
+                info = (oj.json() or {}).get("info", {}) or {}
+                openapi_title = info.get("title") or openapi_title
+                version = version or info.get("version")
+        except Exception:  # noqa: BLE001
+            pass
+        # a version endpoint (best-effort; catches pre-release build strings)
+        for vp in ("/version", "/api/version", "/get_lollms_webui_version"):
+            try:
+                vr = _httpx.get(base + vp, timeout=5, verify=False)
+                if vr.status_code == 200:
+                    txt = (vr.text or "").strip().strip('"')[:60]
+                    if txt and len(txt) < 60:
+                        version = txt
+                        break
+            except Exception:  # noqa: BLE001
+                pass
+        if server_header:
+            break  # got a live web port — stop probing further ports
+    return server_header, openapi_title, version
+
+
+def _target_fragility(host: str, ports=None):
     """Fingerprint one host (Server header + nmap product/version) and classify
     its fragility. Cached per host; records the decision (log + webhook) the first
     time a host is classified fragile. Fail-open to 'normal' on any error."""
@@ -3870,18 +3912,40 @@ def _target_fragility(host: str):
                     if str(k).lower() == "server":
                         server_header = str(v)
                         break
-            # Product/version from any web-ish port on this host.
+            # Product/version from any web-ish port on this host. ports is
+            # asset_id-keyed (no `ip` column) — join through assets.
             cur.execute(
-                """SELECT product, version FROM ports
-                    WHERE regexp_replace(ip::text,'/[0-9]+$','') = %s
-                      AND (product IS NOT NULL OR version IS NOT NULL)
-                    ORDER BY (product IS NOT NULL) DESC LIMIT 1""",
+                """SELECT p.product, p.version
+                     FROM ports p JOIN assets a ON p.asset_id = a.id
+                    WHERE regexp_replace(a.ip::text,'/[0-9]+$','') = %s
+                      AND (p.product IS NOT NULL OR p.version IS NOT NULL)
+                    ORDER BY (p.product IS NOT NULL) DESC LIMIT 1""",
                 (host,))
             r = cur.fetchone()
             if r:
                 product, version = r[0], r[1]
+            # Open web ports (to steer a live probe if stored signals are thin).
+            if not ports:
+                try:
+                    cur.execute(
+                        """SELECT p.port FROM ports p JOIN assets a ON p.asset_id = a.id
+                            WHERE regexp_replace(a.ip::text,'/[0-9]+$','') = %s
+                              AND COALESCE(p.is_open, true) LIMIT 12""",
+                        (host,))
+                    ports = [row[0] for row in cur.fetchall() if row[0]]
+                except Exception:  # noqa: BLE001
+                    ports = None
     except Exception:  # noqa: BLE001 — never block surface generation on this
         pass
+    # When recon has not persisted the fingerprint yet, probe it live (cheap,
+    # scope-gated) — this both feeds the classifier and RECORDS the fingerprint
+    # (Server header + /openapi.json title + a version endpoint) per the item's
+    # "done when". A crash-prone target advertises its identity; read it.
+    if not server_header and _host_in_scope(host):
+        sh, ot, ver = _probe_fingerprint(host, ports)
+        server_header = server_header or sh
+        openapi_title = openapi_title or ot
+        version = version or ver
     try:
         frag = _tf.classify(server_header=server_header, openapi_title=openapi_title,
                             version=version, product=product)
@@ -3889,7 +3953,7 @@ def _target_fragility(host: str):
         frag = None
     _FRAGILITY_CACHE[host] = frag
     if frag is not None and frag.fragile:
-        logger.warning("target %s classified FRAGILE (%s) -> non-destructive profile",
+        _log.warning("target %s classified FRAGILE (%s) -> non-destructive profile",
                        host, "; ".join(frag.reasons))
         try:
             _emit("langgraph_target_fragility_classified", None,
@@ -3944,7 +4008,7 @@ def _owasp_param_tests(host: str, limit: int = 16) -> list:
         # On a fragile target, do NOT exercise a state-mutating endpoint
         # (set_*/update_*/save/preset/config/...) — it can crash the app.
         if frag is not None and _tf.should_gate(frag, method=None, path=u.path):
-            logger.info("skip mutating surface test on fragile target %s: %s",
+            _log.info("skip mutating surface test on fragile target %s: %s",
                         host, u.path)
             continue
         for pname, pvals in _up.parse_qs(u.query).items():
