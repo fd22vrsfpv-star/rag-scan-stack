@@ -115,3 +115,25 @@ def test_fragility_helpers_present():
     assert "def _probe_fingerprint(" in src
     # the ports read must join assets (ports has no `ip` column)
     assert "FROM ports p JOIN assets a" in src, "ports query must join through assets"
+
+
+def test_throttle_halves_for_fragile():
+    assert tf.throttle(10, True) == 5
+    assert tf.throttle(3, True) == 2      # round(1.5) -> 2
+    assert tf.throttle(1, True) == 1      # never below 1
+    assert tf.throttle(0, True) == 1      # a scan is never throttled to zero
+
+
+def test_throttle_noop_when_not_fragile():
+    assert tf.throttle(10, False) == 10
+    assert tf.throttle(50, False) == 50
+
+
+def test_throttle_passthrough_non_int():
+    assert tf.throttle("auto", True) == "auto"
+    assert tf.throttle(None, True) is None
+
+
+def test_probe_and_classify_exists_and_failsafe():
+    f = tf.probe_and_classify("203.0.113.253", ports=[9], timeout=0.2)
+    assert f.fragile is False
