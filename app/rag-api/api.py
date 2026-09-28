@@ -293,6 +293,7 @@ def llm_generate(prompt: str, caller: str, model: str = None, think: bool = Fals
             result["tokens_per_sec"] = round(result["eval_count"] / (eval_dur / 1e9), 1) if eval_dur else 0
             result["prompt_tokens"] = data.get("prompt_eval_count", 0)
             result["ok"] = True
+            result["model"] = model
             logger.info("[llm:%s] %s: %d tokens, %.1f tok/s, %dms",
                         caller, model, result["eval_count"], result["tokens_per_sec"], latency_ms)
         else:
@@ -12503,12 +12504,17 @@ def _poc_run_file(run_id):
 
 
 def _poc_trace(run_id, phase, iteration=0, prompt=None, response=None,
-               run_output=None, assertion_passed=None):
-    """Append one verbose entry to the run's filesystem log (reviewable JSONL)."""
+               run_output=None, assertion_passed=None, llm_model=None, extra=None):
+    """Append one verbose entry to the run's filesystem log (reviewable JSONL). Records the
+    wall-clock time and (for LLM phases) which model answered, so a reviewer can see when
+    each step ran and which LLM produced it."""
     import json as _j, time as _t
-    entry = {"ts": _t.strftime("%Y-%m-%dT%H:%M:%S"), "phase": phase, "iteration": iteration,
+    entry = {"ts": _t.strftime("%Y-%m-%dT%H:%M:%S%z") or _t.strftime("%Y-%m-%dT%H:%M:%S"),
+             "epoch": round(_t.time(), 3), "phase": phase, "iteration": iteration,
              "prompt": prompt, "response": response, "run_output": run_output,
-             "assertion_passed": assertion_passed}
+             "assertion_passed": assertion_passed, "llm_model": llm_model}
+    if extra:
+        entry.update(extra)
     try:
         with open(_poc_run_file(run_id), "a") as f:
             f.write(_j.dumps(entry) + "\n")
@@ -12599,6 +12605,64 @@ def _fetch_cve_details(cve):
     return details
 
 
+def _poc_canary():
+    """A unique, regex-safe sentinel the PoC must CAUSE to appear as a direct effect of
+    the exploit (a created admin username, a written/echoed marker, a reflected value).
+    Anchoring the assertion to this proves the EXPLOIT'S OWN ACTION took effect, not a
+    pre-existing state (e.g. an admin that was already there)."""
+    import secrets as _s
+    return "POCz" + _s.token_hex(5)  # e.g. POCz1a2b3c4d5e — [A-Za-z0-9], regex-safe
+
+
+def _poc_target_family(command):
+    """Extract the (host, first-path-segment) an HTTP command targets, so drift OFF the
+    CVE's endpoint onto an easier/adjacent finding can be detected. Best-effort: reads the
+    first URL in the shell string. Returns (host, seg) or ('', '')."""
+    import re as _re
+    m = _re.search(r"https?://([^/\s'\"]+)(/[^\s'\"?]*)?", command or "")
+    if not m:
+        return ("", "")
+    host = (m.group(1) or "").lower()
+    path = (m.group(2) or "/")
+    seg = "/" + (path.lstrip("/").split("/", 1)[0] if path.strip("/") else "")
+    return (host, seg)
+
+
+def _poc_assertion_is_anchored(assertion, canary):
+    """True only if the assertion is CVE-EFFECT-anchored: it requires the injected canary
+    (proof the exploit's own action landed) rather than a generic pattern that a
+    pre-existing/adjacent state could satisfy. A generic default assertion is NOT anchored."""
+    if not canary:
+        return False
+    a = assertion or {}
+    if a.get("cve_anchored") and a.get("canary") == canary:
+        return True
+    rx = a.get("expect_regex") or ""
+    return canary in rx
+
+
+def _poc_reflection_detected(command, canary, ip, port, listener, vt):
+    """Guard against REFLECTION masquerading as the exploit's effect. When the canary is
+    sent in the request (e.g. as a Host header) a vulnerable-looking "match" can just be
+    the server echoing our input back — not a real side-effect of the CVE. We re-issue the
+    command with the canary swapped for a fresh control token; if the server also reflects
+    THAT token, the proof was reflection, not the exploit. Returns (reflected, control)."""
+    import httpx as _hx, secrets as _s
+    if not (canary and command and canary in command):
+        return (False, None)   # canary not in the request -> its presence in output is a real effect
+    control = "CTRLz" + _s.token_hex(5)
+    probe_cmd = command.replace(canary, control)
+    try:
+        lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
+                      json={"command": probe_cmd, "target": str(ip), "port": port, "timeout": vt},
+                      headers={"x-api-key": API_KEY}, verify=False, timeout=vt + 60)
+        d = lr.json() if lr.status_code < 400 else {}
+        out = (d.get("output", "") if isinstance(d, dict) else "") or lr.text
+    except Exception:  # noqa: BLE001
+        return (False, control)   # can't prove reflection -> do not downgrade on error
+    return (control in (out or ""), control)
+
+
 def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guidance_extra=""):
     """Increment 1: research the CVE + synthesize a first-draft PoC (command+assertion).
     Writes research+synth to the filesystem trail. Does NOT persist a security_test
@@ -12624,32 +12688,50 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
     except Exception:  # noqa: BLE001
         pass
     guidance_extra = (guidance_extra + " " + pre_guidance).strip()
+    # CVE-anchored assertion: the PoC must CAUSE this unique marker to appear as a direct
+    # effect of the exploit, so "success" proves the CVE's real effect (an admin the
+    # exploit CREATED, a value it WROTE/REFLECTED) — not a pre-existing/adjacent state.
+    canary = _poc_canary()
     prompt = (f"AUTHORIZED lab pentest. Build a proof-of-concept for {cve} on {tgt} "
               f"({product or ''} {version or ''}).\n"
               f"CVE description: {details.get('description') or '(none)'}\n"
               f"References: {', '.join(details.get('refs') or [])}\n{guidance_extra}\n"
+              f"CRITICAL — anchor the proof to THIS exploit's effect, not pre-existing state. "
+              f"Make the PoC CAUSE the exact marker '{canary}' to appear as a DIRECT RESULT of "
+              f"exploiting {cve} (e.g. create an admin/user NAMED {canary}, write/echo/reflect "
+              f"{canary} via the vulnerability, or set a field to {canary}), then read it back "
+              f"so it shows in the output. Do NOT match a value that could already exist. STAY "
+              f"ON {cve}'s specific vulnerability — do not pivot to an easier/adjacent finding "
+              f"(e.g. generic user enumeration).\n"
               f"Return ONE JSON object only: {{\"command\": \"<single shell command, prefer "
-              f"curl, that TRIGGERS/PROVES the vulnerability against {tgt}>\", \"assertion\": "
-              f"{{\"expect_regex\": \"<regex matching proof-of-success in the output>\"}}, "
-              f"\"rationale\": \"<why this proves {cve}>\"}}. If the vuln needs a CSRF "
-              f"nonce/token or session, FETCH it inline first (GET the page, extract the token "
-              f"with grep/sed, keep the cookie) then use it — chain curl calls with ; and shell "
-              f"vars. No prose.")
+              f"curl, that EXPLOITS {cve} against {tgt} and makes '{canary}' appear in output>\", "
+              f"\"assertion\": {{\"expect_regex\": \"{canary}\"}}, "
+              f"\"rationale\": \"<why this proves {cve}, and how the exploit injects {canary}>\"}}. "
+              f"If the vuln needs a CSRF nonce/token or session, FETCH it inline first (GET the "
+              f"page, extract the token with grep/sed, keep the cookie) then use it — chain curl "
+              f"calls with ; and shell vars. No prose.")
     command = None
-    assertion = {"expect_regex": r"(?i)(uid=|root:|flag\{|administrator|vulnerable|\bsuccess[\"\x27]?\s*[:=]\s*true)"}
-    rationale = ""
+    # Default assertion IS the anchor: proof requires the injected canary.
+    assertion = {"expect_regex": canary, "canary": canary, "cve_anchored": True}
+    rationale = ""; llm_model = None
     for _ in range(2):
         try:
             res = llm_generate(prompt, caller="cve_poc_synth")
             text = res.get("response", "") if isinstance(res, dict) else str(res or "")
+            if isinstance(res, dict) and res.get("model"):
+                llm_model = res["model"]
         except Exception:  # noqa: BLE001
             text = ""
-        _poc_trace(run_id, "synthesize", prompt=prompt, response=text)
+        _poc_trace(run_id, "synthesize", prompt=prompt, response=text, llm_model=llm_model)
         obj = _poc_extract_json(text)
         if obj and obj.get("command"):
             command = str(obj["command"]).strip()
-            if isinstance(obj.get("assertion"), dict) and obj["assertion"]:
-                assertion = obj["assertion"]
+            # Keep the anchor unless the LLM's own assertion also requires the canary.
+            la = obj.get("assertion")
+            if isinstance(la, dict) and la.get("expect_regex") and canary in la["expect_regex"]:
+                assertion = {"expect_regex": la["expect_regex"], "canary": canary, "cve_anchored": True}
+            elif isinstance(la, dict) and la.get("expect_regex"):
+                assertion["expect_regex_hint"] = la["expect_regex"]  # non-anchored suggestion, not used to verify
             rationale = str(obj.get("rationale", ""))[:500]
             break
     synth_kind = "llm_poc"
@@ -12657,7 +12739,8 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
         command = f"curl -sSi -m 15 {tgt}/"
         synth_kind = "deterministic_probe"
     return {"command": command, "assertion": assertion, "rationale": rationale,
-            "synth_kind": synth_kind, "run_id": run_id}
+            "synth_kind": synth_kind, "run_id": run_id, "canary": canary,
+            "origin_family": _poc_target_family(command), "llm_model": llm_model}
 
 
 def _poc_assertion_passes(assertion, output, exit_code=None):
@@ -12666,6 +12749,12 @@ def _poc_assertion_passes(assertion, output, exit_code=None):
     out = output or ""
     low = out.lower()
     if any(m in low for m in ("/bin/sh:", "syntax error", "command not found")):
+        return False
+    # CVE-anchor: when the assertion carries a canary, the exploit's own injected marker
+    # MUST be present in the output. This is what makes "success" mean the CVE's effect
+    # (the exploit created/wrote this) rather than a value that could pre-exist.
+    canary = a.get("canary")
+    if canary and canary not in out:
         return False
     rx = a.get("expect_regex")
     if rx:
@@ -12750,18 +12839,43 @@ def _flag_precondition(cve, ip, pc, eid):
 
 
 def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale="",
-                    product=None, version=None, max_iters=3):
+                    product=None, version=None, max_iters=3, canary=None,
+                    origin_family=None, llm_model=None):
     """Increment 2: run the PoC against the target; on failure, refine via the LLM,
-    re-run — up to max_iters. Verbose trail -> filesystem. A security_test is stored
-    ONLY if it CONVERGES (the final successful item). One caller approval covers all
-    iterations. Returns {success, iterations, final_command, security_test_id, log_path}."""
+    re-run — up to max_iters. Verbose trail -> filesystem.
+
+    Two guards keep "success" honest about the CVE:
+      * CVE-ANCHOR — a converged PoC is only stored as a PROVEN test when its assertion
+        is anchored to the injected canary (`_poc_assertion_is_anchored`), i.e. success
+        reflects the exploit's OWN effect, not pre-existing/adjacent state. A run that
+        merely matches a generic pattern is returned success=True, verified=False and is
+        NOT stored as a proven PoC.
+      * ANTI-DRIFT — each refined command's target (host+path) is compared to the CVE's
+        original endpoint; a pivot onto a different endpoint is recorded as drift and the
+        refine prompt is told to stay on the CVE.
+
+    One caller approval covers all iterations. Returns success/verified/drifted + ids."""
     import httpx as _hx, time as _t
     port = port or 80
     listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
     _vt = int(os.environ.get("VECTOR_RUN_TIMEOUT", "600"))
-    success = False; iters = 0
+    built_at = _t.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+    def _reanchor(rx):
+        d = {"expect_regex": rx}
+        if canary:
+            d["canary"] = canary; d["cve_anchored"] = True  # force canary presence in output
+        return d
+
+    orig = tuple(origin_family or _poc_target_family(command))
+    success = False; iters = 0; drifted = False; output = ""
     for it in range(1, max(1, max_iters) + 1):
         iters = it
+        fam = _poc_target_family(command)
+        if orig and orig[1] and fam[1] and fam[1] != orig[1]:
+            drifted = True
+            _poc_trace(run_id, "drift", iteration=it,
+                       response=f"command target {fam} != CVE endpoint {orig}")
         try:
             lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
                           json={"command": command, "target": str(ip), "port": port, "timeout": _vt},
@@ -12772,7 +12886,8 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         except Exception as e:  # noqa: BLE001
             output = f"listener error: {e}"; ec = None
         success = _poc_assertion_passes(assertion, output, ec)
-        _poc_trace(run_id, "run", iteration=it, run_output=output, assertion_passed=success)
+        _poc_trace(run_id, "run", iteration=it, run_output=output, assertion_passed=success,
+                   extra={"target_family": list(fam), "drifted": drifted})
         if success or it >= max_iters:
             break
         precond = ""
@@ -12792,47 +12907,83 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                            "Make the command FETCH it inline first (GET the relevant page, "
                            "extract the token, capture the cookie), THEN use both in the "
                            "exploit request.")
+        anchor_note = ""
+        if canary:
+            anchor_note = (f"\nSTAY ON {cve}'s specific vulnerability — do NOT pivot to a "
+                           f"different endpoint or an easier/adjacent finding (e.g. generic "
+                           f"user enumeration). The proof MUST be the marker '{canary}' that "
+                           f"YOUR exploit injects (create/write/reflect it via {cve}), then "
+                           f"read it back. Do not match a value that could already exist. Keep "
+                           f"the exploit aimed at {orig[1] or 'the vulnerable endpoint'}.")
         rprompt = (f"AUTHORIZED lab pentest. The PoC for {cve} on http://{ip}:{port} did NOT "
-                   f"succeed.\nCommand: {command}\nOutput:\n{(output or '')[:1500]}{precond}\n"
-                   f"Fix the command so it triggers/proves the vulnerability. Return ONE JSON "
-                   f"object only: {{\"command\": \"<better command, may chain curl calls with "
-                   f"; and shell vars to fetch a token first>\", \"assertion\": "
-                   f"{{\"expect_regex\": \"<regex>\"}}}}. No prose.")
+                   f"succeed.\nCommand: {command}\nOutput:\n{(output or '')[:1500]}{precond}"
+                   f"{anchor_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
+                   f"appear. Return ONE JSON object only: {{\"command\": \"<better command, may "
+                   f"chain curl calls with ; and shell vars to fetch a token first>\", "
+                   f"\"assertion\": {{\"expect_regex\": \"{canary or '<regex>'}\"}}}}. No prose.")
         try:
             res = llm_generate(rprompt, caller="cve_poc_refine")
             rtext = res.get("response", "") if isinstance(res, dict) else str(res or "")
+            if isinstance(res, dict) and res.get("model"):
+                llm_model = res["model"]
         except Exception:  # noqa: BLE001
             rtext = ""
-        _poc_trace(run_id, "refine", iteration=it, prompt=rprompt, response=rtext)
+        _poc_trace(run_id, "refine", iteration=it, prompt=rprompt, response=rtext, llm_model=llm_model)
         obj = _poc_extract_json(rtext)
         if not obj or not obj.get("command"):
             break
         command = str(obj["command"]).strip()
-        if isinstance(obj.get("assertion"), dict) and obj["assertion"]:
-            assertion = obj["assertion"]
+        la = obj.get("assertion")
+        if isinstance(la, dict) and la.get("expect_regex"):
+            assertion = _reanchor(la["expect_regex"])  # re-anchor: canary stays load-bearing
 
+    anchored = _poc_assertion_is_anchored(assertion, canary)
+    # VERIFIED = the assertion passed AND it was anchored to the exploit's own effect.
+    # A generic-pattern pass is success-but-unverified and is NOT stored as a proven PoC.
+    verified = bool(success and anchored)
+    reflection = False
+    # Reflection guard: if the proof would be verified but the canary was sent in the
+    # request, confirm it is not mere reflection (server echoing our input). A reflected
+    # control token downgrades the verdict — the "effect" was our own input coming back.
+    if verified and canary and canary in (command or ""):
+        try:
+            reflection, ctrl = _poc_reflection_detected(command, canary, ip, port, listener, _vt)
+            _poc_trace(run_id, "reflection_check", iteration=iters,
+                       response=f"reflected={reflection} control={ctrl}")
+        except Exception:  # noqa: BLE001
+            reflection = False
+        if reflection:
+            verified = False
+    off_target = bool(success and not verified)
     security_test_id = None
     log_path = _poc_run_file(run_id)
-    if success:
-        # Only the CONVERGED PoC is stored in the DB, as a reusable security_test.
+    meta = {"cve": cve, "poc_builder": True, "converged": verified, "verified": verified,
+            "anchored": anchored, "drifted": drifted, "off_target": off_target,
+            "reflection": reflection, "canary": canary, "iterations": iters, "log": log_path,
+            "llm_model": llm_model, "built_at": built_at, "product": product, "version": version}
+    if verified:
+        # Only a CVE-ANCHORED converged PoC is stored in the DB as a reusable security_test.
         try:
             with get_db() as conn, conn.cursor() as cur:
                 cur.execute("""INSERT INTO security_tests
                     (name, description, tier, category, target_host, target_port, command, tool,
                      assertion, source_finding_source, engagement_id, metadata)
                     VALUES (%s,%s,'safe','cve_poc',%s,%s,%s,%s,%s,'cve_poc_builder',%s,%s) RETURNING id""",
-                    (f"PoC {cve} on {ip} (converged)", rationale, ip, port, command,
+                    (f"PoC {cve} on {ip} (verified)", rationale, ip, port, command,
                      (command.split(' ', 1)[0] if command else 'curl'), Json(assertion), eid,
-                     Json({"cve": cve, "poc_builder": True, "converged": True,
-                           "iterations": iters, "log": log_path,
-                           "product": product, "version": version})))
+                     Json(meta)))
                 security_test_id = str(cur.fetchone()[0]); conn.commit()
         except Exception as e:  # noqa: BLE001
             logging.warning("store converged PoC failed: %s", e)
-    _poc_trace(run_id, "result", iteration=iters, assertion_passed=success,
-               response=f"success={success} security_test_id={security_test_id}")
-    _poc_index(cve, ip, run_id, log_path, success, iters, security_test_id, eid)
-    return {"ok": True, "success": success, "iterations": iters, "final_command": command,
+    _poc_trace(run_id, "result", iteration=iters, assertion_passed=success, llm_model=llm_model,
+               extra={"verified": verified, "off_target": off_target, "drifted": drifted},
+               response=(f"success={success} verified={verified} off_target={off_target} "
+                         f"drifted={drifted} security_test_id={security_test_id}"))
+    _poc_index(cve, ip, run_id, log_path, verified, iters, security_test_id, eid)
+    return {"ok": True, "success": success, "verified": verified, "off_target": off_target,
+            "drifted": drifted, "anchored": anchored, "reflection": reflection, "canary": canary,
+            "iterations": iters, "final_command": command, "final_assertion": assertion,
+            "llm_model": llm_model, "built_at": built_at,
             "security_test_id": security_test_id, "log_path": log_path}
 
 
@@ -12918,15 +13069,37 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     built = _synthesize_cve_poc(cve, body.ip, body.port, body.product, body.version, eid, run_id=run_id)
     result = _run_refine_poc(cve, body.ip, body.port, built["command"], built["assertion"], eid,
                              run_id, rationale=built.get("rationale", ""),
-                             product=body.product, version=body.version, max_iters=body.max_iters)
+                             product=body.product, version=body.version, max_iters=body.max_iters,
+                             canary=built.get("canary"), origin_family=built.get("origin_family"),
+                             llm_model=built.get("llm_model"))
+    # Auto-save into the Exploit Store (with Python + Burp-ready HTTP artifacts). A
+    # verified PoC is saved verified; an off-target/unverified run is saved too so the
+    # operator can inspect/edit it, but flagged verified=false.
+    store_id = None
+    try:
+        if result.get("final_command"):
+            store_id = _save_exploit_store(
+                name=f"PoC {cve} on {body.ip}" + (" (verified)" if result.get("verified") else " (unverified)"),
+                cve=cve, kind="web", target_host=body.ip, target_port=body.port,
+                product=body.product, version=body.version, command=result.get("final_command"),
+                assertion=result.get("final_assertion"), rationale=built.get("rationale", ""),
+                verified=bool(result.get("verified")), source="cve_poc_builder",
+                security_test_id=result.get("security_test_id"), poc_log_path=result.get("log_path"),
+                llm_model=result.get("llm_model"), built_at=result.get("built_at"), eid=eid,
+                metadata={"off_target": result.get("off_target"), "drifted": result.get("drifted"),
+                          "reflection": result.get("reflection"), "iterations": result.get("iterations")})
+    except Exception:  # noqa: BLE001
+        pass
     try:
         emit_webhook("cve_poc_built", "software",
                      {"cve": cve, "target": body.ip, "success": result.get("success"),
-                      "iterations": result.get("iterations"),
+                      "verified": result.get("verified"), "off_target": result.get("off_target"),
+                      "drifted": result.get("drifted"), "llm_model": result.get("llm_model"),
+                      "iterations": result.get("iterations"), "exploit_store_id": store_id,
                       "security_test_id": result.get("security_test_id")})
     except Exception:  # noqa: BLE001
         pass
-    return {"ok": True, "cve": cve, "synth_kind": built["synth_kind"], **result}
+    return {"ok": True, "cve": cve, "synth_kind": built["synth_kind"], "exploit_store_id": store_id, **result}
 
 
 class PocGrantBody(BaseModel):
@@ -12973,6 +13146,421 @@ def revoke_poc_endpoint(ip: str, port: Optional[int] = None, authorized: bool = 
         pass
     return {"ok": True, "revoked": n}
 
+
+# ─── Exploit Store ────────────────────────────────────────────────────────────
+# A first-class, editable library of PoCs/exploits. A converged PoC-builder result is
+# saved here automatically; operators can also add/edit entries by hand. For WEB findings
+# each entry carries BOTH a portable Python script AND a Burp-ready raw HTTP request
+# (generated from the PoC command by common/exploit_artifacts). Entries are downloadable
+# and can be pushed to an SSH remote node for execution there. Bonus provenance: the LLM
+# that produced it and the build timestamp are stored per entry.
+
+def _ensure_exploit_store():
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS public.exploit_store (
+            id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+            name text NOT NULL, cve text, kind text NOT NULL DEFAULT 'cve_poc',
+            target_host text, target_port integer, product text, version text,
+            command text, assertion jsonb, python_code text, http_request text,
+            rationale text, verified boolean DEFAULT false, source text DEFAULT 'exploit_store',
+            security_test_id uuid, poc_log_path text, llm_model text, built_at timestamptz,
+            engagement_id uuid, metadata jsonb DEFAULT '{}'::jsonb, created_by text,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            updated_at timestamptz NOT NULL DEFAULT now())""")
+        conn.commit()
+
+
+def _exploit_store_artifacts(kind, command, name, cve, rationale, assertion):
+    """Generate {python_code, http_request} for a web/curl PoC (best-effort, never raises)."""
+    if not command:
+        return {"python_code": None, "http_request": None}
+    try:
+        from common import exploit_artifacts as _ea
+        art = _ea.web_exploit_artifacts(command, name=name or "poc", cve=cve or "",
+                                        rationale=rationale or "", assertion=assertion or {})
+        return {"python_code": art.get("python_code"), "http_request": art.get("http_request")}
+    except Exception as e:  # noqa: BLE001
+        logging.debug("exploit artifact gen failed: %s", e)
+        return {"python_code": None, "http_request": None}
+
+
+def _save_exploit_store(name, cve=None, kind="cve_poc", target_host=None, target_port=None,
+                        product=None, version=None, command=None, assertion=None,
+                        rationale=None, verified=False, source="exploit_store",
+                        security_test_id=None, poc_log_path=None, llm_model=None,
+                        built_at=None, eid=None, metadata=None, created_by="operator",
+                        python_code=None, http_request=None):
+    """Insert one exploit-store entry. Auto-generates the Python + raw-HTTP artifacts from
+    the command when they are not supplied (web/curl PoCs). Returns the new id (or None)."""
+    _ensure_exploit_store()
+    if (python_code is None or http_request is None) and command:
+        art = _exploit_store_artifacts(kind, command, name, cve, rationale, assertion)
+        python_code = python_code or art["python_code"]
+        http_request = http_request or art["http_request"]
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""INSERT INTO exploit_store
+                (name, cve, kind, target_host, target_port, product, version, command, assertion,
+                 python_code, http_request, rationale, verified, source, security_test_id,
+                 poc_log_path, llm_model, built_at, engagement_id, metadata, created_by)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (name, cve, kind, target_host, target_port, product, version, command,
+                 Json(assertion or {}), python_code, http_request, rationale, verified, source,
+                 security_test_id, poc_log_path, llm_model, built_at, eid,
+                 Json(metadata or {}), created_by))
+            new_id = str(cur.fetchone()[0]); conn.commit()
+        try:
+            emit_webhook("exploit_store_saved", "exploit_store",
+                         {"id": new_id, "cve": cve, "kind": kind, "verified": verified,
+                          "target": target_host, "engagement_id": eid})
+        except Exception:  # noqa: BLE001
+            pass
+        return new_id
+    except Exception as e:  # noqa: BLE001
+        logging.warning("save exploit_store failed: %s", e)
+        return None
+
+
+class ExploitStoreBody(BaseModel):
+    name: str
+    cve: Optional[str] = None
+    kind: str = "manual"                 # cve_poc | web | manual
+    target_host: Optional[str] = None
+    target_port: Optional[int] = None
+    product: Optional[str] = None
+    version: Optional[str] = None
+    command: Optional[str] = None
+    assertion: Optional[dict] = None
+    rationale: Optional[str] = None
+    python_code: Optional[str] = None    # supply to override the generated one
+    http_request: Optional[str] = None
+    metadata: Optional[dict] = None
+
+
+class ExploitStoreUpdateBody(BaseModel):
+    name: Optional[str] = None
+    cve: Optional[str] = None
+    kind: Optional[str] = None
+    target_host: Optional[str] = None
+    target_port: Optional[int] = None
+    product: Optional[str] = None
+    version: Optional[str] = None
+    command: Optional[str] = None
+    assertion: Optional[dict] = None
+    rationale: Optional[str] = None
+    python_code: Optional[str] = None
+    http_request: Optional[str] = None
+    verified: Optional[bool] = None
+    metadata: Optional[dict] = None
+    regenerate: bool = False             # re-derive python/http from the (edited) command
+
+
+class ExploitPushBody(BaseModel):
+    node_id: str
+    dest_dir: Optional[str] = None       # default ~ on the node
+    filename: Optional[str] = None
+
+
+@app.get("/exploit-store", tags=["Exploit Store"])
+def list_exploit_store(cve: Optional[str] = None, kind: Optional[str] = None,
+                       verified: Optional[bool] = None, limit: int = 200,
+                       authorized: bool = Depends(auth)):
+    """List saved exploits (Exploit Store). Filter by cve/kind/verified."""
+    _ensure_exploit_store()
+    where, args = [], []
+    if cve:
+        where.append("cve = %s"); args.append(cve.strip().upper())
+    if kind:
+        where.append("kind = %s"); args.append(kind)
+    if verified is not None:
+        where.append("verified = %s"); args.append(verified)
+    sql = ("SELECT id, name, cve, kind, target_host, target_port, product, version, "
+           "verified, source, security_test_id, llm_model, built_at, engagement_id, "
+           "created_by, created_at, updated_at, "
+           "(python_code IS NOT NULL) AS has_python, (http_request IS NOT NULL) AS has_http "
+           "FROM exploit_store")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY updated_at DESC LIMIT %s"; args.append(max(1, min(1000, limit)))
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, args)
+        return {"exploits": [dict(r) for r in cur.fetchall()]}
+
+
+@app.get("/exploit-store/{exploit_id}", tags=["Exploit Store"])
+def get_exploit_store(exploit_id: str, authorized: bool = Depends(auth)):
+    """Full detail for one saved exploit (command, assertion, python, http request)."""
+    _ensure_exploit_store()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM exploit_store WHERE id = %s", (exploit_id,))
+        r = cur.fetchone()
+        if not r:
+            raise HTTPException(404, "exploit not found")
+        return dict(r)
+
+
+@app.post("/exploit-store", tags=["Exploit Store"])
+def create_exploit_store(body: ExploitStoreBody, authorized: bool = Depends(auth)):
+    """Save a new exploit. For web/curl PoCs, the Python script + Burp raw HTTP request
+    are generated from `command` automatically (unless supplied)."""
+    eid = _validate_engagement_uuid(_resolve_engagement_id())
+    new_id = _save_exploit_store(
+        name=body.name, cve=(body.cve or None), kind=body.kind, target_host=body.target_host,
+        target_port=body.target_port, product=body.product, version=body.version,
+        command=body.command, assertion=body.assertion, rationale=body.rationale,
+        source="manual", eid=eid, metadata=body.metadata, python_code=body.python_code,
+        http_request=body.http_request)
+    if not new_id:
+        raise HTTPException(500, "could not save exploit")
+    return get_exploit_store(new_id, authorized)
+
+
+@app.put("/exploit-store/{exploit_id}", tags=["Exploit Store"])
+def update_exploit_store(exploit_id: str, body: ExploitStoreUpdateBody,
+                         authorized: bool = Depends(auth)):
+    """Edit a saved exploit. `regenerate=true` (or editing the command) re-derives the
+    Python + HTTP artifacts from the command."""
+    _ensure_exploit_store()
+    fields, args = [], []
+    data = body.dict(exclude_unset=True)
+    data.pop("regenerate", None)
+    # regenerate artifacts if asked, or if the command changed and artifacts weren't given
+    regen = body.regenerate or ("command" in data and "python_code" not in data
+                                and "http_request" not in data)
+    for k in ("name", "cve", "kind", "target_host", "target_port", "product", "version",
+              "command", "rationale", "python_code", "http_request", "verified"):
+        if k in data:
+            val = data[k]
+            if k == "cve" and val:
+                val = str(val).strip().upper()
+            fields.append(f"{k} = %s"); args.append(val)
+    if "assertion" in data:
+        fields.append("assertion = %s"); args.append(Json(data["assertion"] or {}))
+    if "metadata" in data:
+        fields.append("metadata = %s"); args.append(Json(data["metadata"] or {}))
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM exploit_store WHERE id = %s", (exploit_id,))
+        cur_row = cur.fetchone()
+        if not cur_row:
+            raise HTTPException(404, "exploit not found")
+        if regen:
+            cmd = data.get("command", cur_row["command"])
+            nm = data.get("name", cur_row["name"])
+            cve_v = (data.get("cve") or cur_row["cve"])
+            rat = data.get("rationale", cur_row["rationale"])
+            asrt = data.get("assertion", cur_row["assertion"])
+            art = _exploit_store_artifacts(cur_row["kind"], cmd, nm, cve_v, rat, asrt)
+            if art["python_code"] is not None:
+                fields.append("python_code = %s"); args.append(art["python_code"])
+            if art["http_request"] is not None:
+                fields.append("http_request = %s"); args.append(art["http_request"])
+        if not fields:
+            return dict(cur_row)
+        fields.append("updated_at = now()")
+        args.append(exploit_id)
+        cur.execute(f"UPDATE exploit_store SET {', '.join(fields)} WHERE id = %s RETURNING *", args)
+        row = cur.fetchone(); conn.commit()
+    try:
+        emit_webhook("exploit_store_updated", "exploit_store", {"id": exploit_id})
+    except Exception:  # noqa: BLE001
+        pass
+    return dict(row)
+
+
+@app.delete("/exploit-store/{exploit_id}", tags=["Exploit Store"])
+def delete_exploit_store(exploit_id: str, authorized: bool = Depends(auth)):
+    """Delete a saved exploit."""
+    _ensure_exploit_store()
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM exploit_store WHERE id = %s", (exploit_id,))
+        n = cur.rowcount; conn.commit()
+    if not n:
+        raise HTTPException(404, "exploit not found")
+    return {"ok": True, "deleted": n}
+
+
+@app.post("/exploit-store/{exploit_id}/generate", tags=["Exploit Store"])
+def regenerate_exploit_artifacts(exploit_id: str, authorized: bool = Depends(auth)):
+    """(Re)generate the Python script + Burp raw HTTP request from the stored command."""
+    _ensure_exploit_store()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM exploit_store WHERE id = %s", (exploit_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "exploit not found")
+        if not row["command"]:
+            raise HTTPException(400, "entry has no command to generate from")
+        art = _exploit_store_artifacts(row["kind"], row["command"], row["name"], row["cve"],
+                                       row["rationale"], row["assertion"])
+        cur.execute("""UPDATE exploit_store SET python_code=%s, http_request=%s, updated_at=now()
+                        WHERE id=%s RETURNING *""",
+                    (art["python_code"], art["http_request"], exploit_id))
+        out = cur.fetchone(); conn.commit()
+    return dict(out)
+
+
+@app.get("/exploit-store/{exploit_id}/download", tags=["Exploit Store"])
+def download_exploit(exploit_id: str, fmt: str = "python", authorized: bool = Depends(auth)):
+    """Download an artifact as a file: fmt=python | http | curl | json."""
+    import re as _re
+    _ensure_exploit_store()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM exploit_store WHERE id = %s", (exploit_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "exploit not found")
+    safe = _re.sub(r"[^A-Za-z0-9_.-]+", "_", (row["cve"] or row["name"] or "exploit"))
+    if fmt == "python":
+        content = row["python_code"] or ""
+        if not content and row["command"]:
+            content = _exploit_store_artifacts(row["kind"], row["command"], row["name"],
+                                               row["cve"], row["rationale"], row["assertion"])["python_code"] or ""
+        media, fn = "text/x-python", f"{safe}_poc.py"
+    elif fmt == "http":
+        content = row["http_request"] or ""
+        if not content and row["command"]:
+            from common import exploit_artifacts as _ea
+            content = _ea.curl_to_http_request(row["command"])
+        media, fn = "text/plain", f"{safe}_request.http"
+    elif fmt == "curl":
+        content, media, fn = (row["command"] or ""), "text/plain", f"{safe}.sh"
+    elif fmt == "json":
+        content = json.dumps({k: (str(v) if isinstance(v, (uuid.UUID,)) else v)
+                              for k, v in dict(row).items()
+                              if k not in ("engagement_id",)}, default=str, indent=2)
+        media, fn = "application/json", f"{safe}.json"
+    else:
+        raise HTTPException(400, "fmt must be python|http|curl|json")
+    return Response(content=content, media_type=media,
+                    headers={"Content-Disposition": f'attachment; filename="{fn}"'})
+
+
+@app.post("/exploit-store/{exploit_id}/push", tags=["Exploit Store"])
+def push_exploit_to_node(exploit_id: str, body: ExploitPushBody, authorized: bool = Depends(auth)):
+    """Push the Python PoC to an SSH remote node so it can be run there. Requires the node
+    to be node_type='ssh' with connection info in metadata ({ssh_user, ssh_host|external_ip,
+    ssh_key}). Non-SSH node types (sliver/chisel C2) are not supported by this path."""
+    import re as _re
+    _ensure_exploit_store()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM exploit_store WHERE id = %s", (exploit_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "exploit not found")
+        cur.execute("""SELECT id, name, node_type, external_ip, internal_ip, metadata
+                        FROM remote_nodes WHERE id = %s::uuid""", (body.node_id,))
+        node = cur.fetchone()
+    if not node:
+        raise HTTPException(404, "node not found")
+    if node["node_type"] != "ssh":
+        raise HTTPException(400, f"push supports ssh nodes only (node is {node['node_type']}); "
+                                 f"download the artifact and deliver via your C2 instead")
+    code = row["python_code"] or ""
+    if not code and row["command"]:
+        code = _exploit_store_artifacts(row["kind"], row["command"], row["name"], row["cve"],
+                                        row["rationale"], row["assertion"])["python_code"] or ""
+    if not code:
+        raise HTTPException(400, "entry has no Python artifact to push")
+    meta = node.get("metadata") or {}
+    ssh_user = meta.get("ssh_user") or "root"
+    ssh_host = meta.get("ssh_host") or str(node.get("external_ip") or node.get("internal_ip") or "")
+    ssh_key = meta.get("ssh_key")     # filename under ssh-keys/
+    if not ssh_host:
+        raise HTTPException(400, "node has no reachable ssh_host/external_ip in metadata")
+    dest_dir = (body.dest_dir or meta.get("dest_dir") or "~").rstrip("/")
+    fn = body.filename or f"{_re.sub(r'[^A-Za-z0-9_.-]+','_', row['cve'] or row['name'] or 'exploit')}_poc.py"
+    result = _push_python_over_ssh(code, ssh_user, ssh_host, ssh_key, dest_dir, fn)
+    try:
+        emit_webhook("exploit_store_pushed", "exploit_store",
+                     {"id": exploit_id, "node_id": body.node_id, "ok": result.get("ok"),
+                      "dest": result.get("dest")})
+    except Exception:  # noqa: BLE001
+        pass
+    if not result.get("ok"):
+        raise HTTPException(502, f"push failed: {result.get('error')}")
+    return {"ok": True, "node": node["name"], **result}
+
+
+def _push_python_over_ssh(code, user, host, key_file, dest_dir, filename):
+    """Best-effort scp of the Python PoC to an ssh node. Uses ssh-keys/<key_file> when
+    given. Never trusts host key blindly for prod, but this is an authorized-lab helper."""
+    import subprocess, tempfile, os as _os
+    key_path = None
+    if key_file:
+        for cand in (key_file, _os.path.join("ssh-keys", key_file),
+                     _os.path.join("/app/ssh-keys", key_file)):
+            if _os.path.exists(cand):
+                key_path = cand; break
+    tf = None
+    try:
+        tf = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
+        tf.write(code); tf.close()
+        dest = f"{dest_dir}/{filename}"
+        scp = ["scp", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=15",
+               "-o", "BatchMode=yes"]
+        if key_path:
+            scp += ["-i", key_path]
+        scp += [tf.name, f"{user}@{host}:{dest}"]
+        p = subprocess.run(scp, capture_output=True, text=True, timeout=60)
+        if p.returncode != 0:
+            return {"ok": False, "error": (p.stderr or p.stdout or "scp failed")[:500]}
+        return {"ok": True, "dest": dest, "host": host}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    finally:
+        try:
+            if tf:
+                _os.unlink(tf.name)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class ExploitFromPocBody(BaseModel):
+    security_test_id: Optional[str] = None
+    # or import directly from a build-poc result:
+    cve: Optional[str] = None
+    command: Optional[str] = None
+    assertion: Optional[dict] = None
+    target_host: Optional[str] = None
+    target_port: Optional[int] = None
+    rationale: Optional[str] = None
+    llm_model: Optional[str] = None
+    poc_log_path: Optional[str] = None
+    verified: bool = False
+    kind: str = "web"
+
+
+@app.post("/exploit-store/from-poc", tags=["Exploit Store"])
+def import_poc_to_store(body: ExploitFromPocBody, authorized: bool = Depends(auth)):
+    """Import a converged PoC into the Exploit Store — from a stored security_test id, or
+    directly from a build-poc result. Generates the Python + Burp HTTP artifacts."""
+    eid = _validate_engagement_uuid(_resolve_engagement_id())
+    st = None
+    if body.security_test_id:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM security_tests WHERE id = %s", (body.security_test_id,))
+            st = cur.fetchone()
+        if not st:
+            raise HTTPException(404, "security_test not found")
+    cve = (body.cve or (st and st.get("metadata", {}).get("cve")) or "").strip().upper() or None
+    command = body.command or (st and st.get("command"))
+    if not command:
+        raise HTTPException(400, "no command to import")
+    assertion = body.assertion or (st and st.get("assertion")) or {}
+    md = (st and st.get("metadata")) or {}
+    new_id = _save_exploit_store(
+        name=(st["name"] if st else f"PoC {cve or 'exploit'}"),
+        cve=cve, kind=body.kind,
+        target_host=body.target_host or (st and st.get("target_host")),
+        target_port=body.target_port or (st and st.get("target_port")),
+        command=command, assertion=assertion, rationale=body.rationale or (st and st.get("description")),
+        verified=bool(body.verified or md.get("verified")), source="cve_poc_builder",
+        security_test_id=body.security_test_id, poc_log_path=body.poc_log_path or md.get("log"),
+        llm_model=body.llm_model or md.get("llm_model"), built_at=md.get("built_at"),
+        eid=eid, metadata=md)
+    if not new_id:
+        raise HTTPException(500, "could not import PoC")
+    return get_exploit_store(new_id, authorized)
 
 
 def _resolve_and_queue_exploit(cve, ip, port, product, version, eid, dedupe=True):

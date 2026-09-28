@@ -283,6 +283,7 @@ CRITICAL_TABLES=(
     "security_test_runs"
     "poc_synthesis_log"
     "poc_grants"
+    "exploit_store"
     "wstg_manual_reviews"
     "exploit_chunks"
     "scan_tool_feedback"
