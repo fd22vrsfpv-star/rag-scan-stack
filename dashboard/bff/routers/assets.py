@@ -285,6 +285,24 @@ async def bulk_dismiss_software(request: Request):
         return safe_json(resp)
 
 
+@router.post("/api/software/resolve-exploit")
+async def resolve_exploit(request: Request):
+    """Resolve a targeted exploit for a CVE (MSF -> ExploitDB -> synthesize) and
+    queue it for approval. Longer timeout: it calls MSF, searchsploit and an LLM."""
+    s = get_settings()
+    body = await request.json()
+    async with httpx.AsyncClient(timeout=120) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/software/resolve-exploit",
+            json=body,
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            from fastapi import HTTPException
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
 @router.get("/api/software/searchsploit")
 async def software_searchsploit(product: str, version: str = "", target_version: str = "", analyze: bool = False, limit: int = 20):
     s = get_settings()
