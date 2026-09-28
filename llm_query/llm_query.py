@@ -711,11 +711,39 @@ def _route_for(task: Optional[str], explicit_model: Optional[str]):
                 "source": "global", "fallback": None}
 
 
+def _usage_from(backend: str, data: Dict[str, Any]) -> Dict[str, int]:
+    """Normalize token usage from a provider response to
+    {prompt_tokens, completion_tokens, total_tokens} (only the keys present).
+    Azure/OpenAI: data['usage']; Anthropic: data['usage'] (input/output_tokens);
+    Ollama/vLLM: top-level prompt_eval_count/eval_count. So callers get token
+    counts regardless of backend (they were dropped before, logging 0 tokens)."""
+    b = (backend or "").lower()
+    data = data or {}
+    u = data.get("usage") or {}
+    if b in ("azure", "openai"):
+        pt, ct, tt = u.get("prompt_tokens"), u.get("completion_tokens"), u.get("total_tokens")
+    elif b == "anthropic":
+        pt, ct = u.get("input_tokens"), u.get("output_tokens")
+        tt = (pt or 0) + (ct or 0) if (pt is not None or ct is not None) else None
+    else:  # ollama / vllm
+        pt, ct = data.get("prompt_eval_count"), data.get("eval_count")
+        tt = (pt or 0) + (ct or 0) if (pt is not None or ct is not None) else None
+    out: Dict[str, int] = {}
+    if pt is not None:
+        out["prompt_tokens"] = pt
+    if ct is not None:
+        out["completion_tokens"] = ct
+    if tt is not None:
+        out["total_tokens"] = tt
+    return out
+
+
 def _generate_text(backend: str, model: str, prompt: str,
                    options: Optional[Dict[str, Any]],
                    endpoint: Optional[str] = None,
-                   api_key: Optional[str] = None) -> str:
-    """One prompt -> text, on an EXPLICITLY named backend and model.
+                   api_key: Optional[str] = None):
+    """One prompt -> (text, usage), on an EXPLICITLY named backend and model.
+    `usage` is a normalized token-count dict (possibly empty).
 
     Separate from generate() so a route can send a request to a backend other
     than the globally-selected one -- that is what makes "news on a local
@@ -738,7 +766,7 @@ def _generate_text(backend: str, model: str, prompt: str,
         # Azure resources can be used side by side.
         data = _azure_json_post(_azure_chat_url(model, endpoint), payload,
                                 api_key)
-        return data["choices"][0]["message"]["content"]
+        return data["choices"][0]["message"]["content"], _usage_from("azure", data)
 
     if backend == "openai":
         payload = {"model": model,
@@ -747,14 +775,14 @@ def _generate_text(backend: str, model: str, prompt: str,
         if temp is not None:
             payload["temperature"] = temp
         data = _openai_json_post(_openai_chat_url(endpoint), payload, api_key)
-        return data["choices"][0]["message"]["content"]
+        return data["choices"][0]["message"]["content"], _usage_from("openai", data)
 
     if backend == "anthropic":
         data = _anthropic_json_post({
             "model": model, "max_tokens": 2048,
             "messages": [{"role": "user", "content": prompt}],
         })
-        return _anthropic_extract_text(data)
+        return _anthropic_extract_text(data), _usage_from("anthropic", data)
 
     # ollama / vllm — the native /api/generate shape. The provider's endpoint
     # wins, which is how "news on a local ollama" works while the global
@@ -772,7 +800,8 @@ def _generate_text(backend: str, model: str, prompt: str,
     try:
         r = _post_with_429_retry(url, body, {"Content-Type": "application/json"})
         r.raise_for_status()
-        return r.json().get("response", "")
+        j = r.json()
+        return j.get("response", ""), _usage_from(backend or "ollama", j)
     except requests.HTTPError as e:
         raise _http_error_from_requests(e)
     except requests.RequestException as e:
@@ -796,9 +825,9 @@ def _generate_routed(route: Dict[str, Any], prompt: str,
     """
     primary = (route.get("backend"), route.get("model"))
     try:
-        text = _generate_text(primary[0], primary[1], prompt, options,
-                              route.get("endpoint"), route.get("api_key"))
-        return text, primary, False
+        text, usage = _generate_text(primary[0], primary[1], prompt, options,
+                                     route.get("endpoint"), route.get("api_key"))
+        return text, primary, False, usage
     except HTTPException as e:
         fb = route.get("fallback")
         if e.status_code != 429 or not fb:
@@ -815,9 +844,9 @@ def _generate_routed(route: Dict[str, Any], prompt: str,
             "429 exhausted on %s/%s:%s for task=%s — failing over to %s/%s:%s",
             route.get("provider"), primary[0], primary[1], route.get("task"),
             fb.get("provider"), fb["backend"], fb["model"])
-        text = _generate_text(fb["backend"], fb["model"], prompt, options,
-                              fb.get("endpoint"), fb.get("api_key"))
-        return text, (fb["backend"], fb["model"]), True
+        text, usage = _generate_text(fb["backend"], fb["model"], prompt, options,
+                                     fb.get("endpoint"), fb.get("api_key"))
+        return text, (fb["backend"], fb["model"]), True, usage
 
 
 @router.post("/generate")
@@ -834,7 +863,7 @@ def generate(req: GenerateRequest):
     # per-backend branches below only ever use the GLOBAL backend, so a
     # cross-provider model must not fall through to them and hit the wrong host.
     if (req.task or route.get("endpoint")) and not req.stream:
-        text, used, failed_over = _generate_routed(route, req.prompt, req.options)
+        text, used, failed_over, usage = _generate_routed(route, req.prompt, req.options)
         return JSONResponse(content={
             "model": used[1], "response": text, "done": True,
             # Diagnostics: which route answered, and whether the primary was
@@ -846,6 +875,12 @@ def generate(req: GenerateRequest):
             "task": req.task,
             "route_source": route.get("source"),
             "failed_over": failed_over,
+            # Token usage, normalized across backends. Exposed BOTH as `usage`
+            # and as top-level eval_count/prompt_eval_count so ollama-shaped
+            # readers (rag-api llm_generate) capture tokens with no change.
+            "usage": usage or {},
+            "eval_count": (usage or {}).get("completion_tokens", 0),
+            "prompt_eval_count": (usage or {}).get("prompt_tokens", 0),
         })
 
     if LLM_BACKEND == "azure":
