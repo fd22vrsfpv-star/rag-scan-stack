@@ -34,6 +34,7 @@ from typing import List, Optional
 FRAGILE_MAX_MUTATING_TESTS = 0        # do not fire mutating endpoints unattended
 FRAGILE_SURFACE_LIMIT = 8             # cap surface tests on a fragile target
 FRAGILE_THROTTLE_SECONDS = 2.0        # inter-request delay hint for crawlers
+FRAGILE_THROTTLE_FACTOR = 0.5         # run scans/brute-force at 50% aggressiveness
 
 
 # Products/builds known to crash the whole process on a config-mutating request
@@ -174,3 +175,50 @@ def should_gate(fragility: Optional[Fragility],
     if not fragility or not fragility.fragile:
         return False
     return is_mutating_path(path) or is_mutating_method(method)
+
+
+def throttle(value, fragile: bool = True, factor: float = FRAGILE_THROTTLE_FACTOR):
+    """Scale a scan-aggressiveness knob (THREADS, concurrency, rate) down for a
+    fragile target. Returns an int >= 1 (never throttles a scan to zero). When
+    not fragile, returns the value unchanged."""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return value
+    if not fragile:
+        return v
+    return max(1, int(round(v * factor)))
+
+
+def probe_and_classify(host: str, ports=None, timeout: float = 6.0):
+    """Live-probe a web host (Server header + /openapi.json title + a version
+    endpoint) and classify its fragility — a self-contained path for services that
+    do not have langgraph's DB-first _target_fragility. Best-effort; on any error
+    returns a non-fragile decision. Requires httpx."""
+    try:
+        import httpx as _httpx
+    except Exception:  # noqa: BLE001
+        return Fragility(fragile=False)
+    cand = list(ports) if ports else [9090, 8080, 80, 8000, 443, 8443]
+    server_header = openapi_title = version = None
+    for port in cand:
+        scheme = "https" if int(port) in (443, 8443) else "http"
+        base = f"{scheme}://{host}:{port}"
+        try:
+            r = _httpx.get(base + "/", timeout=timeout, verify=False,
+                           follow_redirects=True)
+            server_header = r.headers.get("server") or server_header
+        except Exception:  # noqa: BLE001
+            continue
+        try:
+            oj = _httpx.get(base + "/openapi.json", timeout=timeout, verify=False)
+            if oj.status_code == 200:
+                info = (oj.json() or {}).get("info", {}) or {}
+                openapi_title = info.get("title") or openapi_title
+                version = version or info.get("version")
+        except Exception:  # noqa: BLE001
+            pass
+        if server_header:
+            break
+    return classify(server_header=server_header, openapi_title=openapi_title,
+                    version=version)
