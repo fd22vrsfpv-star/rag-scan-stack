@@ -3,6 +3,7 @@ Database utilities for Autogen agent sessions
 """
 
 import os
+import logging
 import uuid
 from contextlib import contextmanager
 from typing import Optional, Dict, List
@@ -1054,6 +1055,25 @@ def create_pending_exploit(
         Pending exploit UUID
     """
     match_confidence = normalize_confidence(match_confidence)
+    # Deterministic APPLICABILITY gate (the enforcement backstop for the RAG-first
+    # preconditions): block a provably-inapplicable exploit — a credential brute
+    # with no auth surface, a PHP exploit on a non-PHP stack, a webshell upload with
+    # no PUT surface — by queuing it as 'rejected' with a reason (labelled, not
+    # dropped) so it is not presented as runnable. Fails OPEN on any uncertainty.
+    _status = "pending"
+    _rej = None
+    try:
+        from common import exploit_applicability as _ea
+        _ok, _reason = _ea.check(source, exploit_id, exploit_type,
+                                 target_ip, target_port, customized_command or "")
+        if not _ok:
+            _status = "rejected"
+            _rej = f"not applicable: {_reason}"
+            logging.getLogger("db_utils").warning(
+                "applicability gate BLOCKED %s vs %s:%s — %s",
+                exploit_id, target_ip, target_port, _reason)
+    except Exception as _ge:  # noqa: BLE001 — never block queuing on the gate
+        logging.getLogger("db_utils").debug("applicability gate skipped: %s", _ge)
     with get_db() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -1061,18 +1081,38 @@ def create_pending_exploit(
             (source, exploit_id, exploit_title, target_ip, target_port,
              target_service, target_version, exploit_type, customized_command,
              parameters, match_confidence, match_reasoning, asset_id, port_id,
-             session_id, requested_by, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending')
+             session_id, requested_by, status, rejection_reason)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (source, exploit_id, exploit_title, target_ip, target_port,
              target_service, target_version, exploit_type, customized_command,
              Json(parameters or {}), match_confidence, match_reasoning,
-             asset_id, port_id, session_id, requested_by)
+             asset_id, port_id, session_id, requested_by, _status, _rej)
         )
         pending_id = cur.fetchone()[0]
         conn.commit()
+        if _rej:
+            _emit_applicability_block(exploit_id, target_ip, target_port, _rej,
+                                      session_id)
         return pending_id
+
+
+def _emit_applicability_block(exploit_id, target_ip, target_port, reason, session_id):
+    """Best-effort webhook so a blocked (inapplicable) exploit reaches the timeline."""
+    try:
+        import os, httpx
+        rag = os.environ.get("RAG_API_URL", "https://rag-api:8000")
+        key = os.environ.get("API_KEY", "changeme")
+        httpx.post(f"{rag}/webhooks/emit",
+                   json={"event_type": "exploit_blocked_inapplicable",
+                         "source": "applicability-gate",
+                         "data": {"exploit_id": exploit_id, "target": target_ip,
+                                  "port": target_port, "reason": reason,
+                                  "session_id": str(session_id) if session_id else None}},
+                   headers={"x-api-key": key}, verify=False, timeout=8)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def get_pending_exploit(exploit_id: uuid.UUID) -> Optional[Dict]:
