@@ -68,3 +68,37 @@ def test_assertion_regex_match():
 def test_assertion_nonzero_exit_no_regex():
     assert _poc_assertion_passes({}, "some output", 3) is False
     assert _poc_assertion_passes({}, "some output", 0) is True
+
+
+# --- precondition detection (nonce/CSRF/session) drives the refine fetch ---
+_POC_PRECOND_SIGNALS = ("nonce", "csrf", "xsrf", "token", "unauthorized", "forbidden",
+                        "403", "invalid security", "login required", "authentication",
+                        "permission", "not allowed", "missing", "expired", "denied")
+
+
+def _poc_needs_precondition(output):
+    low = (output or "").lower()
+    return any(s in low for s in _POC_PRECOND_SIGNALS)
+
+
+def test_precondition_detected_on_nonce_error():
+    assert _poc_needs_precondition("Error: invalid nonce") is True
+    assert _poc_needs_precondition("HTTP/1.1 403 Forbidden") is True
+    assert _poc_needs_precondition("CSRF token mismatch") is True
+
+
+def test_precondition_not_detected_on_clean_output():
+    assert _poc_needs_precondition("User Administrator created; uid=0") is False
+
+
+def test_precondition_quote_class_regex_compiles():
+    # the fetch regexes are built with chr(34)/chr(39) quote classes — make sure the
+    # pattern shape compiles (the bug that broke the module was a literal quote in a
+    # raw string)
+    import re
+    Q = "[" + chr(34) + chr(39) + "]"
+    NQ = "[^" + chr(34) + chr(39) + "]"
+    pat = r"name=" + Q + "(" + NQ + r"*(?:nonce|token)" + NQ + r"*)" + Q + r"[^>]*value=" + Q + "(" + NQ + r"+)" + Q
+    rx = re.compile(pat, re.I)
+    m = rx.search('<input name="_wpnonce" value="abc123">')
+    assert m and m.group(2) == "abc123"
