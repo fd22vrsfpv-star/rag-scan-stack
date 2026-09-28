@@ -1484,6 +1484,40 @@ CREATE TABLE IF NOT EXISTS public.poc_synthesis_log (
 CREATE INDEX IF NOT EXISTS ix_poc_log_cve ON public.poc_synthesis_log(cve, created_at DESC);
 CREATE INDEX IF NOT EXISTS ix_poc_log_test ON public.poc_synthesis_log(security_test_id);
 
+-- exploit_store: a first-class, editable library of PoCs/exploits. Converged PoC-builder
+-- results are saved here; operators also add/edit by hand. Web entries carry BOTH a
+-- portable Python script and a Burp-ready raw HTTP request. Collected data -> engagement.
+CREATE TABLE IF NOT EXISTS public.exploit_store (
+    id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    name              text NOT NULL,
+    cve               text,
+    kind              text NOT NULL DEFAULT 'cve_poc',   -- cve_poc | web | manual
+    target_host       text,
+    target_port       integer,
+    product           text,
+    version           text,
+    command           text,                              -- the shell/curl PoC
+    assertion         jsonb,
+    python_code       text,                              -- generated portable Python PoC
+    http_request      text,                              -- raw HTTP request (Burp Repeater)
+    rationale         text,
+    verified          boolean DEFAULT false,             -- CVE-anchored proof converged
+    source            text DEFAULT 'exploit_store',      -- cve_poc_builder | manual | web_finding
+    security_test_id  uuid,
+    poc_log_path      text,
+    llm_model         text,                              -- which LLM produced it (provenance)
+    built_at          timestamptz,                       -- when it was built (provenance)
+    engagement_id     uuid,
+    metadata          jsonb DEFAULT '{}'::jsonb,
+    created_by        text,
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    updated_at        timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_exploit_store_cve ON public.exploit_store(cve);
+CREATE INDEX IF NOT EXISTS ix_exploit_store_kind ON public.exploit_store(kind);
+CREATE INDEX IF NOT EXISTS ix_exploit_store_eng ON public.exploit_store(engagement_id);
+CREATE INDEX IF NOT EXISTS ix_exploit_store_updated ON public.exploit_store(updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS public.security_test_runs (
     id                   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     test_id              uuid NOT NULL REFERENCES public.security_tests(id) ON DELETE CASCADE,
