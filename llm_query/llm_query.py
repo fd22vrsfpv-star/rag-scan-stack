@@ -22,6 +22,10 @@ logger = logging.getLogger("llm-query")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
 DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:14b")
 REQUEST_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", "120"))
+# Completion budget for chat backends. 2048 was too low for REASONING models (e.g.
+# gpt-5-mini): reasoning tokens ate the budget and the visible output came back EMPTY on
+# complex structured prompts (exploit research/synth). Env-tunable so it is not re-hardcoded.
+MAX_COMPLETION_TOKENS = int(os.environ.get("LLM_MAX_COMPLETION_TOKENS", "8192"))
 
 LLM_BACKEND = os.environ.get("LLM_BACKEND", "ollama").lower()
 AZURE_ENDPOINT = os.environ.get("AZURE_ENDPOINT", "")
@@ -756,7 +760,7 @@ def _generate_text(backend: str, model: str, prompt: str,
     if backend == "azure":
         payload: Dict[str, Any] = {
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 2048, "model": model,
+            "max_tokens": MAX_COMPLETION_TOKENS, "model": model,
         }
         if temp is not None:
             payload["temperature"] = temp
@@ -771,7 +775,7 @@ def _generate_text(backend: str, model: str, prompt: str,
     if backend == "openai":
         payload = {"model": model,
                    "messages": [{"role": "user", "content": prompt}],
-                   "max_tokens": 2048}
+                   "max_tokens": MAX_COMPLETION_TOKENS}
         if temp is not None:
             payload["temperature"] = temp
         data = _openai_json_post(_openai_chat_url(endpoint), payload, api_key)
@@ -779,7 +783,7 @@ def _generate_text(backend: str, model: str, prompt: str,
 
     if backend == "anthropic":
         data = _anthropic_json_post({
-            "model": model, "max_tokens": 2048,
+            "model": model, "max_tokens": MAX_COMPLETION_TOKENS,
             "messages": [{"role": "user", "content": prompt}],
         })
         return _anthropic_extract_text(data), _usage_from("anthropic", data)
@@ -893,7 +897,7 @@ def generate(req: GenerateRequest):
         model = _caller_model(req.model) or AZURE_MODEL
         payload: Dict[str, Any] = {
             "messages": [{"role": "user", "content": req.prompt}],
-            "max_tokens": 2048,
+            "max_tokens": MAX_COMPLETION_TOKENS,
         }
         if req.options:
             if "temperature" in req.options:
@@ -911,7 +915,7 @@ def generate(req: GenerateRequest):
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": req.prompt}],
-            "max_tokens": 2048,
+            "max_tokens": MAX_COMPLETION_TOKENS,
         }
         if req.options:
             if "temperature" in req.options:
@@ -924,7 +928,7 @@ def generate(req: GenerateRequest):
         model = ANTHROPIC_MODEL
         payload = {
             "model": model,
-            "max_tokens": 2048,
+            "max_tokens": MAX_COMPLETION_TOKENS,
             "messages": [{"role": "user", "content": req.prompt}],
         }
         data = _anthropic_json_post(payload)
@@ -1001,7 +1005,7 @@ def chat(req: ChatRequest):
         model = _caller_model(req.model) or AZURE_MODEL
         payload: Dict[str, Any] = {
             "messages": [m.dict() for m in req.messages],
-            "max_tokens": 2048,
+            "max_tokens": MAX_COMPLETION_TOKENS,
         }
         if req.options:
             if "temperature" in req.options:
@@ -1023,7 +1027,7 @@ def chat(req: ChatRequest):
         payload = {
             "model": model,
             "messages": [m.dict() for m in req.messages],
-            "max_tokens": 2048,
+            "max_tokens": MAX_COMPLETION_TOKENS,
         }
         if req.options:
             if "temperature" in req.options:
@@ -1044,7 +1048,7 @@ def chat(req: ChatRequest):
         filtered = [m for m in msgs if m.get("role") != "system"]
         payload: Dict[str, Any] = {
             "model": model,
-            "max_tokens": 2048,
+            "max_tokens": MAX_COMPLETION_TOKENS,
             "messages": filtered,
         }
         if system_parts:
