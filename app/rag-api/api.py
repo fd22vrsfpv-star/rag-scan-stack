@@ -3583,6 +3583,76 @@ class ToolOutputRequest(BaseModel):
     source: Optional[str] = None
 
 
+# ── Enumeration self-improvement (scan-side learning) ──────────────────────────────
+# Every ingested tool output is scanned for common shapes (URLs, CVE ids, versions, hashes,
+# emails, tokens, banners). When a shape is present that the existing extractors clearly
+# didn't structure into findings, propose a learned overlay so the NEXT ingest already knows.
+_ENUMERATION_PATTERNS = [
+    ("cve_id",         r"CVE-\d{4}-\d{4,7}"),
+    ("url",            r"https?://[^\s\"\'<>,;]+"),
+    ("ipv4",           r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
+    ("email",          r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
+    ("md5_hex",        r"\b[a-fA-F0-9]{32}\b"),
+    ("sha1_hex",       r"\b[a-fA-F0-9]{40}\b"),
+    ("sha256_hex",     r"\b[a-fA-F0-9]{64}\b"),
+    ("bcrypt",         r"\$2[ayb]\$\d+\$[A-Za-z0-9./]{50,}"),
+    ("jwt",            r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
+    ("bearer_token",   r"Bearer\s+[A-Za-z0-9._~+/-]{20,}"),
+    ("aws_key",        r"AKIA[0-9A-Z]{16}"),
+    ("private_key",    r"-----BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----"),
+    ("api_key_kv",     r"(?:api[_-]?key|apikey|secret|token)\s*[:=]\s*[\"\'][A-Za-z0-9._-]{16,}[\"\']"),
+    ("version_tag",    r"[Vv]ersion[:\s]+\d+\.\d+(?:\.\d+)?"),
+    ("banner_server",  r"^Server:\s*[^\r\n]+"),
+    ("banner_powered", r"^X-Powered-By:\s*[^\r\n]+"),
+    ("sql_error",      r"SQL syntax|You have an error in your SQL|ORA-\d+|PostgreSQL query failed"),
+    ("stack_trace",    r"Traceback \(most recent call last\)|at [A-Za-z0-9.]+\([A-Za-z0-9.]+:\d+\)"),
+]
+
+
+def _enumeration_learn_scan(tool, output, target=None, eid=None):
+    """Scan raw tool output for common shapes and propose a learned enumeration overlay
+    per NEW (tool, pattern_name) combo. Idempotent (unique on kind, name). Skips shapes the
+    existing extractors clearly caught (best-effort: we mark it 'gap' regardless and rely on
+    de-duplication + operator review). Returns a summary."""
+    import re as _re
+    if not output or not tool:
+        return {"scanned": False, "reason": "empty"}
+    o = output[:20000]        # cap: never learn from more than 20KB per ingest
+    proposals = []
+    for name, pat in _ENUMERATION_PATTERNS:
+        try:
+            hits = _re.findall(pat, o, _re.M)
+        except Exception:  # noqa: BLE001
+            continue
+        if not hits:
+            continue
+        overlay_name = "%s_via_%s" % (name, _re.sub(r"[^A-Za-z0-9_]+", "_", str(tool))[:24])
+        entry = {"pattern_name": name, "regex": pat, "tool": str(tool),
+                 "sample_captures": [str(h)[:120] for h in hits[:3]]}
+        evidence = {"tool": tool, "target": target, "hit_count": len(hits),
+                    "output_snippet": o[:600]}
+        r = _learning_propose("enumeration_extractor", overlay_name, entry,
+                              evidence=evidence, auto_apply=True, eid=eid, source="scan")
+        proposals.append({"pattern_name": name, "applied": r.get("applied"),
+                          "id": r.get("id"), "hits": len(hits)})
+    return {"scanned": True, "proposals": proposals}
+
+
+class EnumerationScanBody(BaseModel):
+    tool: str
+    output: str
+    target: Optional[str] = None
+
+
+@app.post("/skills/enumeration-scan", tags=["Skills"])
+def enumeration_learn_endpoint(body: EnumerationScanBody, authorized: bool = Depends(auth)):
+    """Run the enumeration self-learning scanner on a tool output snippet — proposes learned
+    overlays for every common shape found (idempotent). Useful for backfilling from raw
+    artifacts or for testing the scanner on a known-tricky output."""
+    eid = _validate_engagement_uuid(_resolve_engagement_id())
+    return _enumeration_learn_scan(body.tool, body.output, target=body.target, eid=eid)
+
+
 @app.post("/ingest/tool-output", tags=["Ingest"])
 def ingest_tool_output(req: ToolOutputRequest, authorized: bool = Depends(auth)):
     """
@@ -3614,7 +3684,16 @@ def ingest_tool_output(req: ToolOutputRequest, authorized: bool = Depends(auth))
         job_id=req.job_id,
         engagement_id=req.engagement_id,
     )
-    return {"ok": True, "stats": stats}
+    # Scan-time self-improvement: every ingest is a learning opportunity — scan the raw
+    # output for common shapes (URLs, CVE ids, hashes, tokens, banners, SQL errors) and
+    # propose learned overlays for anything the existing extractors haven't handled.
+    # Best-effort; never fails the ingest.
+    try:
+        learn = _enumeration_learn_scan(req.tool_name, req.stdout, target=req.target,
+                                        eid=req.engagement_id)
+    except Exception as e:  # noqa: BLE001
+        learn = {"scanned": False, "reason": str(e)[:80]}
+    return {"ok": True, "stats": stats, "learn": learn}
 
 
 # ── Raw artifact store ────────────────────────────────────────────────────
