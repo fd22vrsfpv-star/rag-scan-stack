@@ -22,10 +22,16 @@ from typing import Any, Dict, List, Optional
 
 _MAP_PATH = os.environ.get(
     "VULN_METHODOLOGY_PATH", "/knowledge/vuln_class_methodology.yaml")
+# Post-exploitation ("loot") for web vulns — the GATED weaponization of a CONFIRMED
+# exploit, kept separate from the read-only "prove" methodology above.
+_POSTEX_PATH = os.environ.get(
+    "VULN_POSTEX_PATH", "/knowledge/postex_web.yaml")
 
 _lock = threading.Lock()
 _cache: Optional[Dict[str, Any]] = None
 _cache_mtime: float = 0.0
+_postex_cache: Optional[Dict[str, Any]] = None
+_postex_mtime: float = 0.0
 
 _log = logging.getLogger("vuln_skills")
 
@@ -231,6 +237,59 @@ def synth_block(guidance: str, finding: Dict[str, Any],
         return block + (guidance or "")
     except Exception:
         return guidance
+
+
+def load_postex_pack() -> Dict[str, Any]:
+    """Load + cache postex_web.yaml (weaponization of a CONFIRMED web exploit). Same
+    shape/robustness as load_pack. Empty stub if absent/malformed."""
+    global _postex_cache, _postex_mtime
+    with _lock:
+        try:
+            mtime = os.path.getmtime(_POSTEX_PATH)
+        except OSError:
+            return {"version": 0, "classes": {}}
+        if _postex_cache is None or mtime != _postex_mtime:
+            try:
+                import yaml
+                with open(_POSTEX_PATH, encoding="utf-8") as fh:
+                    data = yaml.safe_load(fh) or {}
+            except Exception:  # noqa: BLE001
+                return {"version": 0, "classes": {}}
+            if not isinstance(data.get("classes"), dict):
+                data["classes"] = {}
+            _postex_cache, _postex_mtime = data, mtime
+        return _postex_cache
+
+
+def postex_for(issue_type: Optional[str] = None, cwe: Optional[Any] = None,
+               name: Optional[str] = None,
+               finding: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """Weaponization skill entry for a finding's vuln class, or None. GATED/impactful —
+    use only AFTER the primitive is confirmed, in the follow-on lane, never to prove."""
+    if isinstance(finding, dict):
+        issue_type = issue_type or finding.get("issue_type") or finding.get("finding_type")
+        cwe = cwe or finding.get("cwe")
+        name = name or finding.get("name")
+    m = match(issue_type=issue_type, cwe=cwe, name=name)
+    if not m:
+        return None
+    entry = load_postex_pack().get("classes", {}).get(m["canonical"])
+    if not entry:
+        return None
+    return {"canonical": m["canonical"], **entry}
+
+
+def postex_block(finding: Dict[str, Any]) -> str:
+    """The weaponization skill text for a confirmed finding's class, or '' if none."""
+    try:
+        p = postex_for(finding=finding if isinstance(finding, dict) else {})
+        if not p or not p.get("weaponize"):
+            return ""
+        return (f"=== Post-exploitation ({p['canonical']}) — GATED (impactful) ===\n"
+                f"Objective: {p.get('objective', '')}\n{p['weaponize']}\n"
+                f"Proof: {p.get('proof', '')}\n")
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def list_classes() -> List[Dict[str, str]]:
