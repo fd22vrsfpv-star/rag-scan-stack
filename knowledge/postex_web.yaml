@@ -78,6 +78,25 @@ error_analysis:
     tweak: Output looks HEX / a hash — unhex() it, or if it's a password hash that IS the loot (hand it to cracking).
   - match: limit|only .* row|1 row in set|single row
     tweak: Only one row came back — use group_concat()/string_agg() (or LIMIT/OFFSET paging) to get all rows at once.
+  truncation_signals:
+  - id: mysql_xpath_dotdotdot
+    match: xpath syntax error:\s*'~[^~'<]{1,32}?\.\.\.'
+    captures: the value up to the '...' inside the XPATH error's quoted string
+    action: Call the sqli_autopage primitive with expr = the same SQL you just ran (wrap it in parens if needed). The harness pages substring(<expr>,N,32) chunks until it gets a shorter chunk, and returns
+      the full concatenated string.
+    note: MySQL's XPATH parser echoes ~32 chars then appends '...' — that '...' IS the truncation signal. Do not try to 'get more' with a bigger regex; auto-page.
+  - id: extractvalue_dotdotdot
+    match: xpath syntax error:\s*["']~[^~'<"]{1,128}?\.\.\.["']
+    captures: the value up to the '...' (extractvalue caps at ~128 chars)
+    action: Call sqli_autopage; extractvalue tolerates ~128 chars per chunk (use chunk=128).
+  - id: mysql_data_truncated
+    match: warning:\s*data (truncated|too long)
+    captures: MySQL's explicit truncation warning
+    action: The DB engine itself declared the value was cut off — page it deterministically with sqli_autopage.
+  - id: closing_tilde_present_but_32_chars
+    match: ~[^~<'\s]{32}~
+    captures: an exactly-32-char delimited value (highly likely truncated by an error-based cap)
+    action: Even with a closing ~, an exactly-32-char value is almost always truncated. Auto-page to confirm.
 collection:
   methodology: 'Collect systematically, in order, reusing the CORRECTED working payload and changing ONLY the subquery: (1) enumerate TABLES, (2) HUNT for tables/columns that look like SECRETS (users/user/account/admin/credential/secret/token/api_key
     columns matching pass/pwd/hash/secret/token/key/api), (3) enumerate COLUMNS of each target table, (4) get ROW COUNT, (5) DUMP the rows (group_concat, PAGE long values with substring (<expr>,N,32) —
@@ -171,6 +190,25 @@ collection:
     - cvv
     - private_key
     - api_secret
+  volume_gate:
+    purpose: A verified count + size ESTIMATE MUST come before a dump — we do not want to pull terabytes of data by accident. This is enforced by the harness (_postex_check_volume) using these thresholds;
+      the skill sets the policy.
+    default_max_rows: 1000
+    hard_max_rows: 10000
+    warn_bytes: 1048576
+    hard_max_bytes: 10485760
+    default_row_bytes_estimate: 200
+    policy:
+      no_count: REFUSE the data stage until row_counts returns a real integer
+      over_default_max_rows: apply LIMIT default_max_rows automatically (record the truncation in facts) and continue
+      over_hard_max_rows: REFUSE the dump entirely and record the count — the operator must raise the cap explicitly per run
+      over_warn_bytes: warn in facts + apply LIMIT
+      over_hard_max_bytes: REFUSE the dump entirely
+    count_subquery_templates:
+      mysql: SELECT COUNT(*) FROM `<TABLE>`
+      postgres: SELECT COUNT(*) FROM "<TABLE>"
+      sqlite: SELECT COUNT(*) FROM <TABLE>
+    sample_subquery_template: SELECT length(concat_ws(',', <COLS>)) FROM `<TABLE>` LIMIT 1
 primitives:
   purpose: Small composable POST-EX skills that CHAIN together. Each is a deterministic harness helper the collect agent invokes by name — the LLM supplies only SQL or a column list, never a curl (which
     is where most exploitation errors come from).
