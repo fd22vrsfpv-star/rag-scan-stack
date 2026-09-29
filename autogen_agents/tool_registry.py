@@ -147,6 +147,19 @@ TOOL_SPECS: List[ToolSpec] = [
         func=scan_tools.get_vuln_methodology,
     ),
     ToolSpec(
+        name="get_web_postex",
+        description=(
+            "Load the POST-EXPLOITATION ('loot') skill for a CONFIRMED web vuln "
+            "class — how to WEAPONIZE it to reach the objective: dump the DB / read "
+            "the secret table (sqli), read the target file (lfi/xxe), drop+exec a "
+            "webshell (file_upload/command_injection/ssti), reach the internal "
+            "target (ssrf), read another principal's data (idor). GATED and "
+            "IMPACTFUL — use ONLY after the primitive is proven, in the approval/ "
+            "follow-on lane, never to prove. Proof is REAL extracted data."
+        ),
+        func=scan_tools.get_web_postex,
+    ),
+    ToolSpec(
         name="get_exploitdb_guidance",
         description=(
             "Read ExploitDB writeups/PoCs relevant to a finding, to build a test "
