@@ -179,6 +179,27 @@ def test_volume_gate_deterministic_check():
     assert check(50000)["allow"] is False                                   # hard cap
 
 
+
+def test_primitive_families_declared():
+    """The primitives are organized into FAMILIES per vuln class — this is the pattern for
+    ALL enumeration + post-ex skills going forward."""
+    d = yaml.safe_load(open(POSTEX))
+    prims = d.get("primitives") or {}
+    assert set(prims.get("families", [])) >= {"sqli", "lfi", "file_upload", "command_injection",
+                                              "ssti", "xxe", "idor", "ssrf"}
+    # Every primitive (except metadata keys) MUST declare its family + a status
+    shipped, planned = [], []
+    for name, entry in prims.items():
+        if name in ("purpose", "families") or not isinstance(entry, dict):
+            continue
+        assert entry.get("family"), f"{name} missing family"
+        assert entry.get("status") in ("shipped", "planned"), f"{name} missing status"
+        (shipped if entry["status"] == "shipped" else planned).append(name)
+    # sqli family has at least 3 shipped primitives; other families declared even if planned
+    sqli_shipped = [n for n in shipped if prims[n]["family"] == "sqli"]
+    assert len(sqli_shipped) >= 3
+
+
 if __name__ == "__main__":
     fns = [f for f in dict(globals()) if f.startswith("test_")]
     for f in fns:
