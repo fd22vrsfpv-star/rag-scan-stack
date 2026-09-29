@@ -358,6 +358,19 @@ def _render_postex_web(data: Dict[str, Any]) -> List[Doc]:
             docs.append((f"Collection stage: {st['stage']}",
                          f"Stage '{st['stage']}' — {st.get('goal', '')}. Subquery: "
                          f"{st.get('subquery', '')}".strip()))
+    # Truncation signals — first-class post-analysis signals that drive auto-page.
+    for row in (ea.get("truncation_signals") or []):
+        if isinstance(row, dict) and row.get("action"):
+            docs.append((f"Post-analysis: truncation signal {row.get('id', '')}",
+                         f"When output matches `{row.get('match', '')}`, "
+                         f"{row.get('action', '')}. Captures: {row.get('captures', '')}"))
+    # Volume gate — the "don't pull terabytes" safety policy.
+    vg = coll.get("volume_gate") or {}
+    if vg.get("purpose"):
+        docs.append(("Post-ex volume gate (safety policy)",
+                     f"{vg['purpose']} Defaults: max_rows={vg.get('default_max_rows')}, "
+                     f"hard_max_rows={vg.get('hard_max_rows')}, warn_bytes={vg.get('warn_bytes')}, "
+                     f"hard_max_bytes={vg.get('hard_max_bytes')}. Policy: {vg.get('policy', {})}"))
     # Composable POST-EX PRIMITIVES — the small chainable skills the collect agent invokes.
     prims = data.get("primitives") or {}
     if prims.get("purpose"):
