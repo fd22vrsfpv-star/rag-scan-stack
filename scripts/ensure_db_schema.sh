@@ -285,6 +285,7 @@ CRITICAL_TABLES=(
     "poc_grants"
     "exploit_store"
     "exploit_store_versions"
+    "learned_postex_overlays"
     "wstg_manual_reviews"
     "exploit_chunks"
     "scan_tool_feedback"
