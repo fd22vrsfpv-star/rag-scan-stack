@@ -279,6 +279,14 @@ def postex_for(issue_type: Optional[str] = None, cwe: Optional[Any] = None,
     return {"canonical": m["canonical"], **entry}
 
 
+def postex_collection() -> Dict[str, Any]:
+    """The staged data-collection skill from postex_web.yaml: {methodology, plan:[{stage,
+    goal, subquery, ...}]}. The Phase-2 collect agent walks `plan` in order (tables ->
+    columns -> row_counts -> data). Empty if absent."""
+    c = load_postex_pack().get("collection")
+    return c if isinstance(c, dict) else {}
+
+
 def postex_error_analysis() -> Dict[str, Any]:
     """The class-agnostic error-analysis / correction skill from postex_web.yaml:
     {methodology, error_fixes:[{match,fix}], tweaks:[{match,tweak}]}. Empty if absent.

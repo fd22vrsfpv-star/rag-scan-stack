@@ -348,6 +348,16 @@ def _render_postex_web(data: Dict[str, Any]) -> List[Doc]:
         if isinstance(row, dict) and row.get("tweak"):
             docs.append((f"Exploit output tweak: {row['tweak'][:60]}",
                          f"When the output matches `{row.get('match', '')}`, improve it: {row['tweak']}"))
+    # The staged data-collection methodology (tables -> columns -> row counts -> data).
+    coll = data.get("collection") or {}
+    if coll.get("methodology"):
+        docs.append(("Web data-collection methodology (staged)",
+                     f"After correcting a web exploit, collect data in stages: {coll['methodology']}"))
+    for st in (coll.get("plan") or []):
+        if isinstance(st, dict) and st.get("stage"):
+            docs.append((f"Collection stage: {st['stage']}",
+                         f"Stage '{st['stage']}' — {st.get('goal', '')}. Subquery: "
+                         f"{st.get('subquery', '')}".strip()))
     return docs
 
 
