@@ -14337,6 +14337,8 @@ class BuildPocBody(BaseModel):
                                 # what's found to synth; catches shape/params synth would miss.
     recon_source: Optional[str] = "basic"    # 'basic' (self-fetch, ~2s) | 'zap' (spider, ~90s)
                                              # | 'both' (basic + zap) | 'zap-active' (spider+ascan, ~3-5min)
+    hint: Optional[str] = None               # per-run operator guidance (highest priority; prepended
+                                             # ahead of recon/research/auth in synth guidance).
     # release=true is the operator authorizing this endpoint for PoC building — a
     # STANDING grant that persists until revoked/stopped. Agent-initiated builds leave
     # it false, so they run ONLY where a grant already exists (fail-closed).
@@ -14389,6 +14391,80 @@ def establish_session_endpoint(body: EstablishSessionBody, authorized: bool = De
     except Exception:  # noqa: BLE001
         pass
     return {"ok": s.get("ok", False), **s}
+
+
+def _scout_open_ports(ip, primary_port, timeout=1.2):
+    """Fast TCP-connect scan of a common web/admin/db port list, plus an HTTP GET on any
+    port that answers. Returns a short guidance string naming alternate open ports and
+    a per-port banner/title. Empty when nothing else answers (or the target's down).
+    Rationale: some challenges expose the app on a non-default port, or expose a
+    SIDE-CHANNEL port (evaluator sink, admin UI, metrics) the exploit must reach —
+    e.g. CVE-Bench requires POSTing extracted data to target:9091/upload."""
+    import socket as _sk, httpx as _hx, re as _re, concurrent.futures as _cf
+    if not ip:
+        return ""
+    # Common ports we care about for pentest recon. Keep it tight — this is a fast probe,
+    # not a full scan. Ordered by frequency for readability of results.
+    common = [80, 443, 8000, 8001, 8006, 8008, 8080, 8081, 8088, 8443, 8888,
+              9000, 9001, 9080, 9090, 9091, 9092, 9093, 9200, 3000, 3306, 5000,
+              5432, 6379, 7000, 7001, 7474, 8009, 8500, 11211, 15672, 27017]
+    try:
+        primary = int(primary_port or 0)
+    except Exception:  # noqa: BLE001
+        primary = 0
+    if primary and primary not in common:
+        common = [primary] + common
+    open_ports = []
+    def _probe(port):
+        try:
+            with _sk.create_connection((ip, port), timeout=timeout):
+                return port
+        except Exception:  # noqa: BLE001
+            return None
+    with _cf.ThreadPoolExecutor(max_workers=16) as ex:
+        for r in ex.map(_probe, common):
+            if r:
+                open_ports.append(r)
+    if not open_ports:
+        return ""
+    # HTTP banner grab on each open port; a POST-only endpoint may 405 but we still learn.
+    banners = {}
+    def _banner(port):
+        for scheme in ("http", "https") if port in (443, 8443) else ("http",):
+            try:
+                with _hx.Client(verify=False, follow_redirects=False, timeout=3) as cli:
+                    r = cli.get(f"{scheme}://{ip}:{port}/")
+                    title = ""
+                    m = _re.search(r"<title[^>]*>([^<]{1,80})</title>", r.text or "", _re.I | _re.S)
+                    if m:
+                        title = m.group(1).strip()
+                    srv = (r.headers.get("server") or "")[:40]
+                    ct = (r.headers.get("content-type") or "").split(";")[0][:32]
+                    parts = [f"HTTP {r.status_code}"]
+                    if srv: parts.append(f"Server={srv}")
+                    if ct:  parts.append(f"CT={ct}")
+                    if title: parts.append(f'title="{title[:60]}"')
+                    return (port, " ".join(parts))
+            except Exception:  # noqa: BLE001
+                continue
+        return (port, "no HTTP")
+    with _cf.ThreadPoolExecutor(max_workers=8) as ex:
+        for port, b in ex.map(_banner, open_ports):
+            banners[port] = b
+    # Build the guidance line — flag the primary port and highlight alternates.
+    lines = []
+    for port in sorted(banners.keys()):
+        tag = " (requested)" if port == primary else ""
+        lines.append(f"    {port}{tag}: {banners[port]}")
+    alt = [p for p in open_ports if p != primary]
+    header = f"Open ports on {ip} ({len(open_ports)}): {open_ports}."
+    if alt:
+        header += f" ALT PORTS to consider: {alt}."
+    # Give the synth explicit callout when the primary is CLOSED but alternates answer.
+    if primary and primary not in open_ports and alt:
+        header += (f" WARNING: requested port {primary} is CLOSED; retry against an "
+                   f"open port from {alt}.")
+    return header + "\n" + "\n".join(lines)
 
 
 def _scout_url_recon(ip, port, timeout=8):
@@ -14549,7 +14625,7 @@ def _zap_recon(ip, port, spider_timeout=90, active_scan=False):
 
 
 def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=True, model=None,
-                    auth=None, recon_first=False, recon_source="basic"):
+                    auth=None, recon_first=False, recon_source="basic", hint=None):
     """The full automatic-creation loop: RESEARCH (pull reference PoC material) -> synthesize
     -> run-and-refine -> anchor/reflection verify -> auto-save into the Exploit Store (with
     Python + Burp HTTP artifacts). Shared by the /software/build-poc endpoint AND the
@@ -14570,6 +14646,12 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
         sources = str(recon_source or "basic").lower()
         segments = []
         try:
+            # Always run the port sweep first — it's fast, always useful, and catches
+            # the "wrong port" and "side-channel port" cases before we invest LLM turns.
+            ps = _scout_open_ports(ip, port)
+            if ps:
+                segments.append(ps)
+                _poc_trace(run_id, "recon:port_sweep", response=ps[:1200])
             if "basic" in sources or sources == "both":
                 b = _scout_url_recon(ip, port)
                 if b: segments.append(b)
@@ -14593,7 +14675,25 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
         except Exception as e:  # noqa: BLE001
             logging.debug("build auth step failed: %s", e)
     # Automatic reference-PoC research: feed concrete public-exploit material into synth.
-    guidance = (recon_guidance + " " + auth_guidance).strip() if recon_guidance else auth_guidance
+    # Operator hints: highest-priority guidance. Inline `hint` (per-request) is prepended
+    # FIRST, then persistent hints for this (cve, ip, port), then recon + auth. Hints are
+    # tagged so the LLM knows this is operator-authoritative rather than retrieved material.
+    hint_guidance = ""
+    hint_parts = []
+    if hint and str(hint).strip():
+        hint_parts.append(str(hint).strip())
+    persistent_hint = _load_hints_for(cve, ip, port)
+    if persistent_hint:
+        hint_parts.append(persistent_hint)
+    if hint_parts:
+        hint_guidance = ("OPERATOR HINT (authoritative — follow this exactly, "
+                         "it overrides any conflicting recon/research): "
+                         + " | ".join(hint_parts) + ". ")
+        _poc_trace(run_id, "operator_hint",
+                   response=f"applied {len(hint_parts)} hint(s): "
+                            + " | ".join(hp[:200] for hp in hint_parts))
+    guidance = (hint_guidance + (recon_guidance + " " + auth_guidance).strip()
+                if recon_guidance else hint_guidance + auth_guidance)
     research_out = None
     if research:
         try:
@@ -14663,6 +14763,107 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
             "auth_method": (session_info or {}).get("method"), **result}
 
 
+def _ensure_poc_hints_table():
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS public.poc_hints (
+            id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+            cve text NOT NULL,
+            target_host text,           -- optional: apply to specific host+port
+            target_port integer,
+            hint text NOT NULL,
+            active boolean NOT NULL DEFAULT true,
+            engagement_id uuid,
+            created_by text,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            updated_at timestamptz NOT NULL DEFAULT now())""")
+        cur.execute("""CREATE INDEX IF NOT EXISTS ix_poc_hints_cve
+                       ON public.poc_hints(cve, active)""")
+        conn.commit()
+
+
+def _load_hints_for(cve, ip=None, port=None):
+    """Return the concatenated active hints matching this (cve, ip, port). Most-specific
+    first (exact host+port), then host-only, then cve-only. Empty on any failure."""
+    if not cve:
+        return ""
+    try:
+        _ensure_poc_hints_table()
+        parts = []
+        with get_db() as conn, conn.cursor() as cur:
+            # Match: exact host+port -> host only -> cve global
+            cur.execute("""SELECT hint FROM poc_hints
+                           WHERE active AND cve=%s
+                             AND ( (target_host = %s AND target_port = %s)
+                                OR (target_host = %s AND target_port IS NULL)
+                                OR (target_host IS NULL) )
+                           ORDER BY (target_host IS NOT NULL AND target_port IS NOT NULL) DESC,
+                                    (target_host IS NOT NULL) DESC,
+                                    created_at ASC""",
+                        (cve, ip, port, ip))
+            for row in cur.fetchall():
+                if row[0]:
+                    parts.append(str(row[0]).strip())
+        return " ".join(parts)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+class PocHintBody(BaseModel):
+    cve: str
+    hint: str
+    target_host: Optional[str] = None
+    target_port: Optional[int] = None
+    created_by: Optional[str] = "operator"
+
+
+@app.get("/software/poc-hints", tags=["Assets"])
+def list_poc_hints(cve: Optional[str] = None, target_host: Optional[str] = None,
+                   authorized: bool = Depends(auth)):
+    """List persistent per-CVE operator hints. Filter by cve or target_host."""
+    _ensure_poc_hints_table()
+    where, args = ["active"], []
+    if cve:
+        where.append("cve = %s"); args.append(cve.strip().upper())
+    if target_host:
+        where.append("(target_host = %s OR target_host IS NULL)"); args.append(target_host)
+    sql = "SELECT * FROM poc_hints WHERE " + " AND ".join(where) + " ORDER BY updated_at DESC LIMIT 200"
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, args)
+        return {"hints": [dict(r) for r in cur.fetchall()]}
+
+
+@app.post("/software/poc-hints", tags=["Assets"])
+def add_poc_hint(body: PocHintBody, authorized: bool = Depends(auth)):
+    """Persist an operator hint for future builds of this CVE. Prepended to synth guidance
+    ahead of recon/research/auth so it has priority."""
+    _ensure_poc_hints_table()
+    eid = _validate_engagement_uuid(_resolve_engagement_id())
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""INSERT INTO poc_hints (cve, target_host, target_port, hint, engagement_id, created_by)
+                       VALUES (%s,%s,%s,%s,%s,%s) RETURNING *""",
+                    (body.cve.strip().upper(), body.target_host, body.target_port,
+                     body.hint, eid, body.created_by or "operator"))
+        row = cur.fetchone(); conn.commit()
+    try:
+        emit_webhook("poc_hint_added", "software",
+                     {"cve": body.cve, "target": body.target_host, "hint_len": len(body.hint)})
+    except Exception:  # noqa: BLE001
+        pass
+    return dict(row)
+
+
+@app.delete("/software/poc-hints/{hint_id}", tags=["Assets"])
+def delete_poc_hint(hint_id: str, authorized: bool = Depends(auth)):
+    """Deactivate a hint (soft delete)."""
+    _ensure_poc_hints_table()
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE poc_hints SET active=false, updated_at=now() WHERE id=%s", (hint_id,))
+        n = cur.rowcount; conn.commit()
+    if not n:
+        raise HTTPException(404, "hint not found")
+    return {"ok": True, "deleted": n}
+
+
 @app.post("/software/build-poc", tags=["Assets"])
 def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     """PoC-builder: research -> synthesize -> run-and-refine. Invoking this authorizes
@@ -14686,7 +14887,7 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
                 "login_url": body.login_url, "bruteforce": body.bruteforce}
     core = _build_poc_core(cve, body.ip, body.port, body.product, body.version, eid,
                            body.max_iters, model=body.model, auth=auth, recon_first=body.recon_first,
-                           recon_source=body.recon_source or "basic")
+                           recon_source=body.recon_source or "basic", hint=body.hint)
     return {"ok": True, "cve": cve, **core}
 
 
