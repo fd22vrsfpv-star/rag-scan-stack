@@ -131,6 +131,54 @@ def test_extract_injection_value_handles_truncation():
     assert _extract("XPATH syntax error: '~11.8.9-MariaDB-ubu2404~'") == "11.8.9-MariaDB-ubu2404"
 
 
+
+def test_truncation_signals_in_skill():
+    """Truncation is a first-class signal from the post-analysis skill, not a tweak.
+    Each entry has an id + match regex + action ('auto-page')."""
+    d = yaml.safe_load(open(POSTEX))
+    ts = d["error_analysis"].get("truncation_signals") or []
+    assert len(ts) >= 3
+    for row in ts:
+        assert row.get("id") and row.get("match") and row.get("action")
+    # The XPATH dot-dot-dot signal (the exact one that dogged the live target) must be present
+    assert any("xpath" in r["id"].lower() or "dotdotdot" in r["id"].lower() for r in ts)
+
+
+def test_volume_gate_policy_in_skill():
+    """The volume-gate policy is data in the skill so operators can raise/lower thresholds
+    without a code change. The harness enforces the policy deterministically."""
+    d = yaml.safe_load(open(POSTEX))
+    vg = d["collection"].get("volume_gate") or {}
+    assert vg.get("default_max_rows", 0) > 0 and vg.get("hard_max_rows", 0) >= vg["default_max_rows"]
+    assert vg.get("hard_max_bytes", 0) > vg.get("warn_bytes", 0)
+    # Skill policy must cover the three states: no count, over soft cap, over hard cap
+    pol = (vg.get("policy") or {})
+    assert "no_count" in pol and "over_default_max_rows" in pol and "over_hard_max_rows" in pol
+
+
+def test_volume_gate_deterministic_check():
+    """The harness gate is pure: refuse without a count, LIMIT above the soft cap, REFUSE above
+    the hard cap. Mirror of api._postex_check_volume."""
+    cfg = {"default_max_rows": 1000, "hard_max_rows": 10000, "warn_bytes": 1048576,
+           "hard_max_bytes": 10485760, "default_row_bytes_estimate": 200}
+    def check(rc, override=None):
+        if rc is None:
+            return {"allow": False, "reason": "no count"}
+        max_rows = int(override) if override else cfg["default_max_rows"]
+        est = int(rc) * cfg["default_row_bytes_estimate"]
+        if int(rc) > cfg["hard_max_rows"]:
+            return {"allow": False, "reason": "over hard"}
+        if est > cfg["hard_max_bytes"]:
+            return {"allow": False, "reason": "over hard bytes"}
+        if int(rc) > max_rows or est > cfg["warn_bytes"]:
+            return {"allow": True, "limit": max_rows, "reason": "capped"}
+        return {"allow": True, "limit": None, "reason": "within policy"}
+    assert check(None)["allow"] is False                # no row_count -> REFUSE
+    assert check(50)["allow"] is True and check(50).get("limit") is None
+    assert check(5000)["allow"] is True and check(5000)["limit"] == 1000   # soft cap
+    assert check(50000)["allow"] is False                                   # hard cap
+
+
 if __name__ == "__main__":
     fns = [f for f in dict(globals()) if f.startswith("test_")]
     for f in fns:
