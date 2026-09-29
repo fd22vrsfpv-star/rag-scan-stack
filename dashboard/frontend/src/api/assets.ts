@@ -880,7 +880,7 @@ export interface BulkDismissParams {
 export function useBuildPoc() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (params: { cve: string; ip: string; port?: number; product?: string; version?: string; max_iters?: number; release?: boolean }) =>
+    mutationFn: (params: { cve: string; ip: string; port?: number; product?: string; version?: string; max_iters?: number; release?: boolean; recon_first?: boolean; recon_source?: 'basic' | 'zap' | 'both' | 'zap-active'; hint?: string }) =>
       apiFetch<{ ok: boolean; success: boolean; iterations: number; security_test_id: string | null; final_command?: string; log_path?: string }>(
         '/software/build-poc',
         { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params) },
@@ -1010,5 +1010,57 @@ export function useRecommendationBlockers() {
     queryKey: ['recommendation-blockers'],
     queryFn: () => apiFetch<BlockerSummary>('/scan-recommendations/blockers'),
     refetchInterval: POLL.NORMAL,
+  })
+}
+
+// ─── Operator hints for PoC builds ──────────────────────────────────────────
+export interface PocHint {
+  id: string
+  cve: string
+  target_host: string | null
+  target_port: number | null
+  hint: string
+  active: boolean
+  engagement_id: string | null
+  created_by: string | null
+  created_at: string
+  updated_at: string
+}
+
+/** List persistent hints for a CVE (and optional target host). */
+export function usePocHints(cve?: string, target_host?: string) {
+  return useQuery({
+    queryKey: ['poc-hints', cve || 'all', target_host || ''],
+    queryFn: () => {
+      const qs = new URLSearchParams()
+      if (cve) qs.set('cve', cve)
+      if (target_host) qs.set('target_host', target_host)
+      return apiFetch<{ hints: PocHint[] }>(`/software/poc-hints${qs.toString() ? '?' + qs.toString() : ''}`)
+    },
+    enabled: !!cve,
+  })
+}
+
+/** Persist a new operator hint. Applied to future build-poc runs for this (cve, host, port). */
+export function useAddPocHint() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (body: { cve: string; hint: string; target_host?: string; target_port?: number }) =>
+      apiFetch<PocHint>('/software/poc-hints', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['poc-hints'] }),
+  })
+}
+
+/** Deactivate a hint (soft delete). */
+export function useDeletePocHint() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) =>
+      apiFetch<{ ok: boolean; deleted: number }>(`/software/poc-hints/${id}`, { method: 'DELETE' }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['poc-hints'] }),
   })
 }
