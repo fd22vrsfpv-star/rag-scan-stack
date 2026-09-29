@@ -210,14 +210,17 @@ collection:
       sqlite: SELECT COUNT(*) FROM <TABLE>
     sample_subquery_template: SELECT length(concat_ws(',', <COLS>)) FROM `<TABLE>` LIMIT 1
 primitives:
-  purpose: Small composable POST-EX skills that CHAIN together. Each is a deterministic harness helper the collect agent invokes by name — the LLM supplies only SQL or a column list, never a curl (which
-    is where most exploitation errors come from).
+  purpose: 'Small composable POST-EX skills, one FAMILY per vuln class. Each family declares deterministic primitives (harness helpers) the LLM invokes by NAME with only structured args (SQL/path/params).
+    The harness handles the transport (curl, encoding, splicing) so the LLM never emits a curl command. This is the model for all enumeration + post-ex skills going forward: skill data + harness primitive
+    = small, composable, testable, editable-in-YAML.'
   sqli_subquery:
     description: Splice a SQL SUBQUERY into the corrected error-based template and run it. The harness handles URL-encoding, quoting, and executing; you only pick SQL.
     args:
       subquery: the SQL fragment (e.g. SELECT version(), or SELECT group_concat(table_name) FROM information_schema.tables WHERE table_schema=database())
     returns: the extracted ~value~ (up to ~32 chars via error-based) or None
     chain: Use for exploration and single-value extraction; when the value comes back at 32 chars, chain into sqli_autopage.
+    family: sqli
+    status: shipped
   sqli_autopage:
     description: 'Deterministically PAGE a truncated error-based value: the harness re-runs the subquery wrapped in substring(<expr>,N,32) chunks and concatenates the pieces. Use this whenever a value came
       back at ~32 chars.'
@@ -225,6 +228,8 @@ primitives:
       expr: the SQL expression to page — e.g. (SELECT group_concat(concat(username,0x3a,password) SEPARATOR 0x0a) FROM `user`)
     returns: the fully concatenated string
     chain: The natural next-step after sqli_subquery returns a 32-char (likely truncated) value.
+    family: sqli
+    status: shipped
   harvest_secret_columns:
     description: 'DETERMINISTIC filter: given a comma-separated column list, keep only the ones matching secret/password patterns (pass/pwd/hash/secret/token/api/key/cred/auth). Removes the LLM''s chance
       to prioritize the wrong columns.'
@@ -232,3 +237,105 @@ primitives:
       cols: the column list from information_schema (e.g. id,username,email,password,api_key,created_at)
     returns: the filtered short list — feed into sqli_autopage as the DUMP target
     chain: Runs after the columns stage; its output IS the dump target for sqli_autopage.
+    family: sqli
+    status: shipped
+  families:
+  - sqli
+  - lfi
+  - file_upload
+  - command_injection
+  - ssti
+  - xxe
+  - idor
+  - ssrf
+  lfi_read_file:
+    family: lfi
+    description: Read a target file through the confirmed LFI. The harness handles URL-encoding + template splicing; you only pick the path.
+    args:
+      path: the file path to read (e.g. /etc/passwd, /var/www/config.php)
+    returns: the file contents (or truncated snippet + a signal to auto-page)
+    chain: Chain into lfi_decode_wrapper when the read is filtered/binary.
+    status: shipped
+  lfi_probe_wrapper:
+    family: lfi
+    description: Probe which PHP wrappers the LFI accepts (php://filter, data://, expect://, phar://). Deterministic probe that returns a name -> supported map.
+    args: {}
+    returns: '{''php_filter'': bool, ''data'': bool, ''expect'': bool, ''phar'': bool}'
+    chain: Feeds into lfi_read_file's wrapper-selection when a raw read is filtered.
+    status: planned
+  lfi_decode_wrapper:
+    family: lfi
+    description: Read a file via php://filter/convert.base64-encode and decode the base64 response. For readable-but-not-pretty files (config, source).
+    args:
+      path: the file path
+    returns: the decoded file contents
+    chain: Used when lfi_read_file returns filtered/binary output.
+    status: planned
+  upload_probe_dir:
+    family: file_upload
+    description: Probe writable + web-served upload paths (uploads/, files/, tmp/).
+    status: planned
+  upload_webshell:
+    family: file_upload
+    description: Upload a minimal webshell (double-ext / MIME-spoof / .htaccess handler).
+    status: planned
+  upload_exec:
+    family: file_upload
+    description: Execute a command via the uploaded shell and capture the output.
+    status: planned
+  cmdi_probe:
+    family: command_injection
+    description: Probe which separator works (; | && $()) via a benign command.
+    status: planned
+  cmdi_read:
+    family: command_injection
+    description: Read a target file through the confirmed command injection.
+    status: planned
+  cmdi_exfil:
+    family: command_injection
+    description: Exfil bytes via a base64+curl chain to a collaborator or via the response body.
+    status: planned
+  ssti_fingerprint:
+    family: ssti
+    description: Fingerprint the template engine (Jinja2 / Twig / Freemarker / Velocity).
+    status: planned
+  ssti_exec:
+    family: ssti
+    description: Execute a command via engine-specific escape (once fingerprinted).
+    status: planned
+  ssti_read:
+    family: ssti
+    description: Read a target file via os.popen equivalents.
+    status: planned
+  xxe_read_file:
+    family: xxe
+    description: Read a file via in-band XXE (<!ENTITY x SYSTEM 'file://…'>).
+    status: planned
+  xxe_filter_decode:
+    family: xxe
+    description: Read a filtered/binary file via php://filter (in-band base64).
+    status: planned
+  xxe_oob_exfil:
+    family: xxe
+    description: Exfil via an external DTD callback (blind XXE).
+    status: planned
+  idor_walk:
+    family: idor
+    description: Walk an identifier range across the confirmed IDOR (id/GUID/filename).
+    status: planned
+  idor_dump:
+    family: idor
+    description: Dump one/many objects via the walked identifiers.
+    status: planned
+  ssrf_metadata:
+    family: ssrf
+    description: Fetch cloud metadata (169.254.169.254 / GCP-Metadata-Flavor).
+    status: planned
+  ssrf_probe_ports:
+    family: ssrf
+    description: Scan internal ports through the confirmed SSRF.
+    status: planned
+  ssrf_fetch:
+    family: ssrf
+    description: Fetch an arbitrary internal URL through the SSRF.
+    status: planned
