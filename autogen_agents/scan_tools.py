@@ -4292,6 +4292,25 @@ def get_vuln_methodology(issue_type: str = None, cwe: str = None,
     return json.dumps({"matched": True, **m}, indent=2)
 
 
+def get_web_postex(issue_type: str = None, cwe: str = None, name: str = None) -> str:
+    """Load the POST-EXPLOITATION ("loot") skill for a CONFIRMED web vuln class — how to
+    weaponize it to reach the objective: dump the DB / read the secret table (sqli), read
+    the target file (lfi/xxe), drop+exec a webshell (file_upload/command_injection/ssti),
+    reach the internal target (ssrf), access another principal's data (idor). GATED and
+    IMPACTFUL — use ONLY after the primitive is proven, in the approval/follow-on lane,
+    never to prove the vuln. Proof is REAL extracted data (never a literal you sent).
+    Returns JSON: {matched, canonical, objective, weaponize, proof}."""
+    try:
+        from common import vuln_skills
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"matched": False, "error": f"loader unavailable: {e}"})
+    cwe_list = [c.strip() for c in (cwe or "").split(",") if c.strip()]
+    p = vuln_skills.postex_for(issue_type=issue_type, cwe=cwe_list or None, name=name)
+    if not p:
+        return json.dumps({"matched": False})
+    return json.dumps({"matched": True, **p}, indent=2)
+
+
 def get_exploitdb_guidance(cve: str = None, query: str = None,
                            edb_id: str = None, limit: int = 8) -> str:
     """Read ExploitDB writeups relevant to a finding, to build a test from them.
