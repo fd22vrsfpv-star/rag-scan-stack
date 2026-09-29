@@ -319,6 +319,23 @@ def _render_postex_commands(data: Dict[str, Any]) -> List[Doc]:
     return docs
 
 
+def _render_postex_web(data: Dict[str, Any]) -> List[Doc]:
+    """Web post-exploitation ('loot') -> one doc per vuln class, so the planner can
+    retrieve HOW to weaponize a CONFIRMED web exploit (dump the DB, read the file,
+    drop a webshell) as gated follow-on knowledge, separate from the read-only prove
+    methodology."""
+    docs: List[Doc] = []
+    for cid, entry in (data.get("classes") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        docs.append((
+            f"Web post-exploitation ({cid})",
+            f"Once a {cid} exploit is CONFIRMED, weaponize it (GATED/impactful, "
+            f"follow-on lane): {entry.get('objective', '')} {entry.get('weaponize', '')} "
+            f"Proof = {entry.get('proof', '')}".strip()))
+    return docs
+
+
 def _render_msf_readonly_scanners(data: Dict[str, Any]) -> List[Doc]:
     """Read-only MSF auxiliary scanners -> one doc each, so the planner can
     retrieve WHICH Metasploit scanner modules are purely informational (and the
@@ -597,6 +614,7 @@ RENDERERS = {
     "dos_exploit_overrides": _render_dos_exploit_overrides,
     "enumeration_extractors": _render_enumeration_extractors,
     "postex_commands": _render_postex_commands,
+    "postex_web": _render_postex_web,
     "service_tools": _render_service_tools,
     "credential_followups": _render_credential_followups,
     "default_credentials": _render_default_credentials,

@@ -12731,6 +12731,65 @@ def _poc_reflection_detected(command, canary, ip, port, listener, vt):
     return (control in (out or ""), control)
 
 
+_INJECTION_EXEC_SIGNATURES = (
+    "sql syntax", "you have an error in your sql", "xpath syntax error",
+    "extractvalue(", "updatexml(", "warning: mysql", "mysql_fetch", "ora-0",
+    "sqlstate", "psql:", "unclosed quotation", "conversion failed",
+    "supplied argument is not a valid", "pg_query", "sqlite3.operationalerror",
+    "unterminated quoted string", "quoted string not properly terminated",
+    # template engines (SSTI) leaking eval structure
+    "jinja2.exceptions", "templatesyntaxerror", "freemarker.core", "twig\\error",
+)
+
+
+def _looks_like_injection_execution(output):
+    """True when the output shows the DB/template ENGINE executed our input (a SQL error
+    structure, an updatexml/extractvalue echo, a template-eval trace). In that case a
+    'reflected' marker is proof the primitive fired, not passive reflection."""
+    low = (output or "").lower()
+    return any(s in low for s in _INJECTION_EXEC_SIGNATURES)
+
+
+def _flag_exploit_confirmed(cve, ip, port, command, eid):
+    """A verified PoC = a CONFIRMED primitive. Emit an `exploit_confirmed` fact (webhook) and
+    a GATED weaponization follow-up carrying the post-ex 'loot' skill for the class, so the
+    next step (dump the DB / read the secret / drop a shell) runs as an approval-lane
+    follow-on — the prove->loot split. Class is inferred from the CVE; best-effort."""
+    try:
+        import uuid as _u
+        vclass = None; postex = ""
+        try:
+            from common import vuln_skills as _vs
+            details = _fetch_cve_details(cve) or {}
+            m = _vs.match(name=(details.get("description") or "")[:400], issue_type=cve)
+            if m:
+                vclass = m.get("canonical")
+                postex = _vs.postex_block({"issue_type": vclass, "name": vclass})
+        except Exception:  # noqa: BLE001
+            pass
+        title = f"Weaponize confirmed {cve} on {ip} (post-ex{f': {vclass}' if vclass else ''})"
+        reason = (f"{cve} exploit CONFIRMED on {ip}:{port}. Follow-on (GATED/impactful): "
+                  f"weaponize to reach the objective — see the get_web_postex skill"
+                  + (f".\n{postex}" if postex else " for this class."))
+        meta = {"cve": cve, "target": f"{ip}:{port}", "vuln_class": vclass,
+                "confirmed_command": (command or "")[:2000], "phase": "postex",
+                "gated": True, "skill": "postex_web"}
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""INSERT INTO follow_up_items
+                (id, finding_source, title, target, severity, reason, rule_id, confidence, tags, metadata)
+                VALUES (%s,'poc_builder',%s,%s,'high',%s,'exploit_confirmed',0.95,%s,%s)
+                ON CONFLICT (title, COALESCE(target,''), COALESCE(rule_id,'')) DO NOTHING""",
+                (str(_u.uuid4()), title, ip, reason,
+                 ["postex", "weaponize", "exploit_confirmed"] + ([vclass] if vclass else []),
+                 Json(meta)))
+            conn.commit()
+        emit_webhook("exploit_confirmed", "poc",
+                     {"cve": cve, "target": ip, "port": port, "vuln_class": vclass,
+                      "next": "weaponize (post-ex, gated)"})
+    except Exception as e:  # noqa: BLE001
+        logging.debug("flag exploit_confirmed failed: %s", e)
+
+
 def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guidance_extra="", model=None):
     """Increment 1: research the CVE + synthesize a first-draft PoC (command+assertion).
     Writes research+synth to the filesystem trail. Does NOT persist a security_test
@@ -13155,6 +13214,13 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                        response=f"reflected={reflection} control={ctrl}")
         except Exception:  # noqa: BLE001
             reflection = False
+        # SQLi/SSTI exception: when the injected marker comes back INSIDE a SQL error /
+        # template-eval structure, the DB/engine EXECUTED our input (that IS the primitive) —
+        # not passive reflection. Keep it verified; the postex follow-on extracts real data.
+        if reflection and _looks_like_injection_execution(output):
+            reflection = False
+            _poc_trace(run_id, "reflection_check", iteration=iters,
+                       response="reflected match is inside an execution/error context -> primitive confirmed, not reflection")
         if reflection:
             verified = False
     off_target = bool(success and not verified)
@@ -13180,6 +13246,8 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                 security_test_id = str(cur.fetchone()[0]); conn.commit()
         except Exception as e:  # noqa: BLE001
             logging.warning("store converged PoC failed: %s", e)
+        # Confirmed primitive -> emit the fact + a gated weaponization follow-on (prove->loot).
+        _flag_exploit_confirmed(cve, ip, port, command, eid)
     _poc_trace(run_id, "result", iteration=iters, assertion_passed=success, llm_model=llm_model,
                extra={"verified": verified, "off_target": off_target, "drifted": drifted},
                response=(f"success={success} verified={verified} off_target={off_target} "
