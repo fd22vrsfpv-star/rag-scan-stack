@@ -279,6 +279,15 @@ def postex_for(issue_type: Optional[str] = None, cwe: Optional[Any] = None,
     return {"canonical": m["canonical"], **entry}
 
 
+def postex_error_analysis() -> Dict[str, Any]:
+    """The class-agnostic error-analysis / correction skill from postex_web.yaml:
+    {methodology, error_fixes:[{match,fix}], tweaks:[{match,tweak}]}. Empty if absent.
+    The weaponization runner loads its deterministic fixes/tweaks from here (RAG-first: edit
+    the YAML, not the code)."""
+    ea = load_postex_pack().get("error_analysis")
+    return ea if isinstance(ea, dict) else {}
+
+
 def postex_block(finding: Dict[str, Any]) -> str:
     """The weaponization skill text for a confirmed finding's class, or '' if none."""
     try:

@@ -333,6 +333,21 @@ def _render_postex_web(data: Dict[str, Any]) -> List[Doc]:
             f"Once a {cid} exploit is CONFIRMED, weaponize it (GATED/impactful, "
             f"follow-on lane): {entry.get('objective', '')} {entry.get('weaponize', '')} "
             f"Proof = {entry.get('proof', '')}".strip()))
+    # The class-agnostic error-analysis / correction / collection methodology (two-phase
+    # weaponization) + each deterministic error fix, as retrievable knowledge.
+    ea = data.get("error_analysis") or {}
+    if ea.get("methodology"):
+        docs.append(("Web exploit error-analysis & correction methodology",
+                     f"Weaponize in two phases (correct then collect). {ea['methodology']}"))
+    for row in (ea.get("error_fixes") or []):
+        if isinstance(row, dict) and row.get("fix"):
+            docs.append((f"Exploit error fix: {row['fix'][:60]}",
+                         f"When a web-exploit command's output matches `{row.get('match', '')}`, "
+                         f"the fix is: {row['fix']}"))
+    for row in (ea.get("tweaks") or []):
+        if isinstance(row, dict) and row.get("tweak"):
+            docs.append((f"Exploit output tweak: {row['tweak'][:60]}",
+                         f"When the output matches `{row.get('match', '')}`, improve it: {row['tweak']}"))
     return docs
 
 
