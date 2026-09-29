@@ -254,6 +254,8 @@ services:
       # exposes /api/* and translates to the CONFIGURED backend), so these agents
       # run on the selected LLM (e.g. DeepSeek) instead of hitting Ollama direct.
       # OLLAMA_URL stays at real Ollama for anything that needs raw Ollama.
+      ZAP_URL: ${ZAP_URL:-http://zap:8090}
+      ZAP_API_KEY: ${ZAP_API_KEY:-changeme}
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://llm_query:8002}
       # gemma4:31b, matching scan-recommender and .env. The previous default
