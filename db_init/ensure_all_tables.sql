@@ -6183,6 +6183,25 @@ CREATE TABLE IF NOT EXISTS public.custom_enumeration_rules (
 -- knowledge/vuln_class_methodology.yaml (mirrors custom_enumeration_rules).
 -- common/vuln_skills._classes() merges these over the YAML; rag-api /skills
 -- manages them and embeds each into rag_documents.
+-- learned_postex_overlays — self-improvement loop: when a scan/exploit surfaces a new
+-- error pattern, a new secret-holding table, or a new class technique, the platform proposes
+-- (auto-applies low-risk enrichments) a learned overlay merged into the skill at load. Data
+-- persists across restarts and is embedded into RAG so retrieval improves too.
+CREATE TABLE IF NOT EXISTS public.learned_postex_overlays (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    kind          text NOT NULL,       -- error_fix | tweak | truncation | secret_table | secret_column | class
+    name          text NOT NULL,       -- short id (e.g. 'mysql_reserved_key', 'wp_users')
+    entry         jsonb NOT NULL,      -- the skill entry (regex+fix or the pattern/class content)
+    evidence      jsonb DEFAULT '{}'::jsonb,
+    active        boolean NOT NULL DEFAULT true,
+    source        text NOT NULL DEFAULT 'auto',
+    engagement_id uuid,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_learned_overlays_kind ON public.learned_postex_overlays(kind, active);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_learned_overlays_name ON public.learned_postex_overlays(kind, name);
+
 CREATE TABLE IF NOT EXISTS public.custom_vuln_skills (
     id            text PRIMARY KEY,          -- canonical vuln-class id (e.g. sqli)
     skill         jsonb NOT NULL,            -- {aliases[], web_hint, synth_methodology}

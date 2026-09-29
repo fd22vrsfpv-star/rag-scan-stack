@@ -12830,6 +12830,22 @@ def _postex_fixes_and_tweaks():
         truncation = tr
     except Exception:  # noqa: BLE001
         pass
+    # Merge LEARNED overlays (self-improvement loop). Any auto-applied entry appears here.
+    try:
+        for row in _load_learned_overlays("error_fix"):
+            e = row.get("entry") or {}
+            if e.get("match") and e.get("fix"):
+                fixes.append((e["match"], e["fix"]))
+        for row in _load_learned_overlays("tweak"):
+            e = row.get("entry") or {}
+            if e.get("match") and e.get("tweak"):
+                tweaks.append((e["match"], e["tweak"]))
+        for row in _load_learned_overlays("truncation"):
+            e = row.get("entry") or {}
+            if e.get("match"):
+                truncation.append((e["match"], e.get("action", ""), e.get("id", row.get("name"))))
+    except Exception:  # noqa: BLE001
+        pass
     _postex_ea_cache.update(t=_t.time(), fixes=fixes, tweaks=tweaks, truncation=truncation)
     return fixes, tweaks, truncation
 
@@ -13065,6 +13081,191 @@ def _postex_lfi_read_file(command, path, ip, port):
     return None, None
 
 
+# ── Learning / self-improvement loop ──────────────────────────────────────────────
+# When a scan/exploit finds something the CURRENT skills don't cover (a new diagnosis
+# pattern, a new secret-holding table, a new class-specific technique), the platform PROPOSES
+# a skill overlay. Low-risk enrichments (new pattern, new table name) auto-apply immediately;
+# higher-risk changes (new class methodology) surface as a follow-up for operator review.
+# The overlay is DB-persisted (survives restart) and merged into the skill at load time.
+
+
+def _ensure_learned_overlay_table():
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS public.learned_postex_overlays (
+            id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+            kind text NOT NULL,           -- error_fix | tweak | truncation | secret_table | secret_column | class
+            name text NOT NULL,           -- short id (e.g. 'mysql_reserved_key' or 'wp_users')
+            entry jsonb NOT NULL,         -- the skill entry (regex+fix or the pattern/class content)
+            evidence jsonb DEFAULT '{}'::jsonb,   -- what triggered this (cve, target, output snippet)
+            active boolean NOT NULL DEFAULT true,
+            source text NOT NULL DEFAULT 'auto',  -- auto | operator | agent
+            engagement_id uuid,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            updated_at timestamptz NOT NULL DEFAULT now())""")
+        cur.execute("""CREATE INDEX IF NOT EXISTS ix_learned_overlays_kind
+                       ON public.learned_postex_overlays(kind, active)""")
+        cur.execute("""CREATE UNIQUE INDEX IF NOT EXISTS ux_learned_overlays_name
+                       ON public.learned_postex_overlays(kind, name)""")
+        conn.commit()
+
+
+def _load_learned_overlays(kind):
+    """Enabled learned overlay rows for one kind. Best-effort, empty on error."""
+    try:
+        _ensure_learned_overlay_table()
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, name, entry, evidence, source FROM learned_postex_overlays "
+                        "WHERE kind = %s AND active = true", (kind,))
+            return [dict(r) for r in cur.fetchall()]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _learning_propose(kind, name, entry, evidence=None, auto_apply=True, eid=None,
+                      source="auto"):
+    """The self-improvement hook. When a scan/exploit finds a NEW pattern / table / class the
+    skill doesn't cover, propose a learned overlay: auto_apply=True (default for low-risk
+    enrichments) inserts it live; False creates a follow-up for operator review. Idempotent
+    on (kind, name). Emits an `exploit_learned` webhook so the UI/Feedback tab can surface it.
+    Returns {id, applied}."""
+    import uuid as _u
+    if not kind or not name or not isinstance(entry, dict):
+        return {"id": None, "applied": False, "reason": "bad args"}
+    payload_evidence = evidence or {}
+    if auto_apply:
+        try:
+            _ensure_learned_overlay_table()
+            with get_db() as conn, conn.cursor() as cur:
+                cur.execute("""INSERT INTO learned_postex_overlays
+                    (kind, name, entry, evidence, engagement_id, source)
+                    VALUES (%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (kind, name) DO UPDATE
+                       SET entry = EXCLUDED.entry,
+                           evidence = learned_postex_overlays.evidence || EXCLUDED.evidence,
+                           active = true, updated_at = now()
+                    RETURNING id""",
+                    (kind, name, Json(entry), Json(payload_evidence), eid, source))
+                new_id = str(cur.fetchone()[0]); conn.commit()
+            # Invalidate the 60s cache so the next scan sees the new overlay immediately.
+            try:
+                _postex_ea_cache["fixes"] = None
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                emit_webhook("exploit_learned", "skill",
+                             {"kind": kind, "name": name, "applied": True, "source": source,
+                              "engagement_id": eid})
+            except Exception:  # noqa: BLE001
+                pass
+            return {"id": new_id, "applied": True}
+        except Exception as e:  # noqa: BLE001
+            logging.warning("learning propose failed: %s", e)
+            return {"id": None, "applied": False, "reason": str(e)[:100]}
+    # auto_apply=False -> surface as a follow-up for operator review
+    try:
+        title = "Skill candidate: %s (%s)" % (name, kind)
+        reason = ("A scan/exploit surfaced a candidate skill: kind=%s name=%s. Review + "
+                  "approve via POST /skills/candidates/{id}/approve to add it as a learned "
+                  "overlay (merged into the skill at load, embedded in RAG)." % (kind, name))
+        meta = {"kind": kind, "name": name, "entry": entry, "evidence": payload_evidence,
+                "auto_apply": False, "skill": "learned_postex_overlay"}
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""INSERT INTO follow_up_items
+                (id, finding_source, title, target, severity, reason, rule_id, confidence, tags, metadata)
+                VALUES (%s,'skill_learning',%s,%s,'low',%s,'skill_candidate',0.8,%s,%s)
+                ON CONFLICT (title, COALESCE(target,''), COALESCE(rule_id,'')) DO NOTHING
+                RETURNING id""",
+                (str(_u.uuid4()), title, payload_evidence.get("target"), reason,
+                 ["learning", "skill_candidate", kind], Json(meta)))
+            row = cur.fetchone(); conn.commit()
+        return {"id": str(row[0]) if row else None, "applied": False}
+    except Exception as e:  # noqa: BLE001
+        logging.warning("learning follow-up create failed: %s", e)
+        return {"id": None, "applied": False, "reason": str(e)[:100]}
+
+
+class LearnedOverlayBody(BaseModel):
+    kind: str
+    name: str
+    entry: dict
+    evidence: Optional[dict] = None
+    source: Optional[str] = "operator"
+
+
+@app.get("/skills/learned", tags=["Skills"])
+def list_learned_overlays(kind: Optional[str] = None, authorized: bool = Depends(auth)):
+    """List learned post-ex skill overlays (auto-applied from scans + operator-added).
+    Merged into the skill at load and embedded into RAG. Filter by kind."""
+    _ensure_learned_overlay_table()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        if kind:
+            cur.execute("SELECT * FROM learned_postex_overlays WHERE kind=%s ORDER BY updated_at DESC", (kind,))
+        else:
+            cur.execute("SELECT * FROM learned_postex_overlays ORDER BY updated_at DESC LIMIT 500")
+        return {"learned": [dict(r) for r in cur.fetchall()]}
+
+
+@app.post("/skills/learned", tags=["Skills"])
+def add_learned_overlay(body: LearnedOverlayBody, authorized: bool = Depends(auth)):
+    """Add a learned overlay directly (operator path). Same underlying table as auto-applied."""
+    eid = _validate_engagement_uuid(_resolve_engagement_id())
+    r = _learning_propose(body.kind, body.name, body.entry, evidence=(body.evidence or {}),
+                          auto_apply=True, eid=eid, source=body.source or "operator")
+    if not r.get("applied"):
+        raise HTTPException(400, r.get("reason", "insert failed"))
+    return r
+
+
+@app.delete("/skills/learned/{overlay_id}", tags=["Skills"])
+def delete_learned_overlay(overlay_id: str, authorized: bool = Depends(auth)):
+    """Deactivate a learned overlay (soft delete). Merged skill drops it on next load."""
+    _ensure_learned_overlay_table()
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE learned_postex_overlays SET active=false, updated_at=now() WHERE id=%s", (overlay_id,))
+        n = cur.rowcount; conn.commit()
+    if not n:
+        raise HTTPException(404, "overlay not found")
+    try:
+        _postex_ea_cache["fixes"] = None
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "deleted": n}
+
+
+@app.get("/skills/candidates", tags=["Skills"])
+def list_skill_candidates(authorized: bool = Depends(auth)):
+    """Candidate skills queued for operator review (auto_apply=False path). Sourced from
+    the follow_up_items queue with rule_id='skill_candidate'."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""SELECT id, title, target, reason, metadata, created_at
+                       FROM follow_up_items WHERE rule_id='skill_candidate'
+                       ORDER BY created_at DESC LIMIT 200""")
+        return {"candidates": [dict(r) for r in cur.fetchall()]}
+
+
+@app.post("/skills/candidates/{followup_id}/approve", tags=["Skills"])
+def approve_skill_candidate(followup_id: str, authorized: bool = Depends(auth)):
+    """Approve a candidate skill: merge its entry into learned_postex_overlays (active)."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT metadata FROM follow_up_items WHERE id=%s::uuid AND rule_id='skill_candidate'",
+                    (followup_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "candidate not found")
+    md = row["metadata"] or {}
+    eid = _validate_engagement_uuid(_resolve_engagement_id())
+    r = _learning_propose(md.get("kind"), md.get("name"), md.get("entry") or {},
+                          evidence=md.get("evidence") or {}, auto_apply=True, eid=eid,
+                          source="operator")
+    if not r.get("applied"):
+        raise HTTPException(400, r.get("reason", "approve failed"))
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE follow_up_items SET status='resolved', updated_at=now() WHERE id=%s::uuid",
+                    (followup_id,))
+        conn.commit()
+    return r
+
+
 def _postex_primitive_registry():
     """Name -> callable + one-line description. This IS the set of composable skills the
     collect agent can invoke by name. Declared in postex_web.yaml `primitives:` for RAG."""
@@ -13122,6 +13323,28 @@ def _analyze_and_correct_exploit(cve, ip, port, command, vuln_class, eid, run_id
                    extra={"errors": enum["errors"], "sample": sample})
         if sample:                       # a real DB-computed value came back -> exploit WORKS
             corrected = True
+            # SELF-IMPROVE: if the last diagnosis unblocked us AND it doesn't match any
+            # existing error_fix, propose it as a new one so the next scan handles the same
+            # error without re-learning. Auto-apply low-risk enrichments.
+            try:
+                if diagnosis and enum.get("errors") is not None:
+                    fixes_now, _tw, _tr = _postex_fixes_and_tweaks()
+                    covered = any(diagnosis[:40].lower() in fix.lower() for _p, fix in fixes_now)
+                    if not covered:
+                        # A cheap match pattern from the LAST error output that this correction addressed.
+                        import re as _re, hashlib as _hl
+                        err_snippet = ""
+                        m2 = _re.search(r"""(near ["\']?[^<\n]{0,80})""", (output or "")[:400])
+                        if m2:
+                            err_snippet = m2.group(1)
+                        match_pat = _re.escape(err_snippet[:80]) if err_snippet else "cannot-derive-pattern"
+                        name = "learned_" + _hl.md5(diagnosis[:80].encode()).hexdigest()[:8]
+                        _learning_propose("error_fix", name,
+                            {"match": match_pat, "fix": diagnosis[:400]},
+                            evidence={"cve": cve, "target": ip, "output_head": (output or "")[:300]},
+                            auto_apply=True, eid=eid, source="agent")
+            except Exception as _e:  # noqa: BLE001
+                logging.debug("learn error_fix failed: %s", _e)
             break
         prompt = (f"AUTHORIZED lab pentest. CORRECT this {vuln_class} exploit so it EXECUTES and "
                   f"returns a TEST value. {auth}Target {tgt}. Skill: {weap}\n"
@@ -13304,6 +13527,21 @@ def _collect_data_agent(cve, ip, port, working_command, objective, vuln_class, e
                 discovered["row_count"] = str(val)[:40]
             elif stage["stage"] == "data":
                 data = str(val)[:2000]; extracted = True
+                # SELF-IMPROVE: if the extracted-from table isn't already in the skill's
+                # secret_targets.table_patterns, propose adding it so future scans hunt it
+                # first. Auto-apply — low risk enrichment (data-only skill edit).
+                try:
+                    from common import vuln_skills as _vs
+                    st = ((_vs.postex_collection() or {}).get("secret_targets") or {})
+                    known = set([x.lower() for x in (st.get("table_patterns") or [])])
+                    tt = (discovered.get("target_table") or "").strip().lower()
+                    if tt and tt not in known:
+                        _learning_propose("secret_table", "learned_%s" % tt,
+                            {"table_name": tt, "cve": cve, "discovered_via": stage["stage"]},
+                            evidence={"cve": cve, "target": ip, "extracted_snippet": str(val)[:120]},
+                            auto_apply=True, eid=eid, source="agent")
+                except Exception as _e:  # noqa: BLE001
+                    logging.debug("learn secret_table failed: %s", _e)
                 break
             stage_i += 1; attempts = 0
         else:
