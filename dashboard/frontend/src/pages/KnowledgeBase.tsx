@@ -31,7 +31,7 @@ import {
   type FlowRule,
   type FlowProposal,
 } from '@/api/flows'
-import { useSkills, useAddSkill, useDeleteSkill } from '@/api/skills'
+import { useSkills, useAddSkill, useDeleteSkill, useLearnedOverlays, useDeleteLearnedOverlay } from '@/api/skills'
 import { useEngagements } from '@/api/engagements'
 import { useUIStore } from '@/stores/ui'
 import ServicePrompts from '@/pages/ServicePrompts'
@@ -1210,71 +1210,153 @@ function SkillsPanel() {
   const { data } = useSkills()
   const add = useAddSkill()
   const del = useDeleteSkill()
-  const [open, setOpen] = useState(false)
+  const { data: learnedData } = useLearnedOverlays()
+  const delLearned = useDeleteLearnedOverlay()
+  const [selected, setSelected] = useState<string | null>(null)
   const [f, setF] = useState({ id: '', aliases: '', web_hint: '', synth_methodology: '' })
+  const [editing, setEditing] = useState(false)
   const inp = 'w-full bg-muted rounded-md px-2 py-1 text-sm border border-border outline-none focus:border-primary'
   const yaml = data?.yaml_skills || {}
   const custom = data?.custom_skills || {}
+  const learned = learnedData?.learned || []
+  const allIds = [...Object.keys(yaml).sort(), ...Object.keys(custom).sort()]
+  const sel = selected ? (custom[selected] || yaml[selected]) : null
+  const selIsCustom = selected ? !!custom[selected] : false
+
+  const openEdit = (id: string, source: 'yaml' | 'custom') => {
+    const entry = (source === 'custom' ? custom[id] : yaml[id]) || {}
+    setF({
+      id,
+      aliases: (entry.aliases || []).join(', '),
+      web_hint: entry.web_hint || '',
+      synth_methodology: entry.synth_methodology || '',
+    })
+    setEditing(true)
+  }
+
   return (
     <div className="border border-border rounded-lg p-3 space-y-2">
       <div className="flex items-center justify-between">
-        <h3 className="text-sm font-medium">Vuln-class skills <span className="text-xs text-muted-foreground">({data?.total ?? 0})</span></h3>
-        <button onClick={() => setOpen(o => !o)} className="text-xs text-primary">{open ? 'Hide' : 'Add / manage'}</button>
+        <h3 className="text-sm font-medium">Vuln-class skills <span className="text-xs text-muted-foreground">({data?.total ?? 0} shipped + {Object.keys(custom).length} custom + {learned.length} learned)</span></h3>
+        <button onClick={() => { setEditing(v => !v); if (!editing) setF({ id: '', aliases: '', web_hint: '', synth_methodology: '' }) }} className="text-xs text-primary">{editing ? 'Hide editor' : 'New / edit'}</button>
       </div>
       <p className="text-xs text-muted-foreground">
-        Curated per-class methodology fed to the exploit builders. Shipped packs are
-        read-only; add or override a class in the DB overlay — no code change, embeds into RAG.
+        Curated per-class methodology. Click a skill to view it; use "Override" on a shipped
+        one to make a custom overlay. Learned overlays come from self-improvement (scans that
+        find new patterns).
       </p>
 
-      {/* Always-visible skill list (previously hidden behind the Add/manage toggle). */}
-      <div className="space-y-2 text-xs">
-        <div>
-          <p className="text-muted-foreground mb-1">Custom (overlay) - {Object.keys(custom).length}</p>
-          {Object.keys(custom).length === 0 ? (
-            <p className="text-muted-foreground">none yet - use Add / manage to create one.</p>
-          ) : (
+      <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)] gap-2">
+        {/* Left: chip list */}
+        <div className="space-y-2 text-xs">
+          <div>
+            <p className="text-muted-foreground mb-1">Shipped — {Object.keys(yaml).length}</p>
             <div className="flex flex-wrap gap-1">
-              {Object.keys(custom).sort().map(id => (
-                <span key={id} className="inline-flex items-center gap-1 font-mono bg-muted border border-border rounded px-1.5 py-0.5">
-                  {id}
-                  <button onClick={() => del.mutate(id)} title="delete overlay skill" className="text-red-400">x</button>
-                </span>
+              {Object.keys(yaml).sort().map(id => (
+                <button key={id} onClick={() => setSelected(id)}
+                  className={`font-mono border rounded px-1.5 py-0.5 ${selected===id?'bg-primary/20 border-primary':'bg-muted/60 border-border hover:bg-muted'}`}>{id}</button>
               ))}
+            </div>
+          </div>
+          <div>
+            <p className="text-muted-foreground mb-1">Custom (overlay) — {Object.keys(custom).length}</p>
+            {Object.keys(custom).length === 0 ? (
+              <p className="text-muted-foreground">none yet.</p>
+            ) : (
+              <div className="flex flex-wrap gap-1">
+                {Object.keys(custom).sort().map(id => (
+                  <button key={id} onClick={() => setSelected(id)}
+                    className={`font-mono border rounded px-1.5 py-0.5 ${selected===id?'bg-primary/20 border-primary':'bg-muted border-border hover:bg-muted/80'}`}>{id}</button>
+                ))}
+              </div>
+            )}
+          </div>
+          <div>
+            <p className="text-muted-foreground mb-1">Learned (auto from scans) — {learned.length}</p>
+            {learned.length === 0 ? (
+              <p className="text-muted-foreground">none yet — scans will populate this as they discover new patterns.</p>
+            ) : (
+              <div className="space-y-1 max-h-40 overflow-y-auto">
+                {learned.slice(0, 40).map(r => (
+                  <div key={r.id} className="flex items-center justify-between border border-border rounded px-1.5 py-0.5">
+                    <span className="truncate"><span className="font-mono text-[10px] text-primary">{r.kind}</span> {r.name} <span className="text-muted-foreground text-[10px]">({r.source})</span></span>
+                    <button onClick={() => delLearned.mutate(r.id)} className="text-red-400 text-[10px] shrink-0">×</button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Right: detail view */}
+        <div className="border border-border rounded-lg p-2 bg-muted/20 text-xs min-h-[8rem]">
+          {!selected && <p className="text-muted-foreground">Select a skill on the left to view its content.</p>}
+          {selected && sel && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <h4 className="font-mono text-sm">{selected}</h4>
+                  <span className={`text-[10px] px-1.5 py-0.5 rounded ${selIsCustom?'bg-primary/20 text-primary':'bg-muted-foreground/20'}`}>{selIsCustom?'CUSTOM':'SHIPPED'}</span>
+                </div>
+                <div className="flex gap-1">
+                  {selIsCustom ? (
+                    <>
+                      <button onClick={() => openEdit(selected, 'custom')} className="text-primary">Edit</button>
+                      <button onClick={() => { del.mutate(selected); setSelected(null) }} className="text-red-400">Delete</button>
+                    </>
+                  ) : (
+                    <button onClick={() => openEdit(selected, 'yaml')} className="text-primary" title="Copy this shipped skill into a custom overlay so you can edit it (edits won't touch the read-only YAML).">Override</button>
+                  )}
+                </div>
+              </div>
+              {sel.aliases && sel.aliases.length > 0 && (
+                <div>
+                  <p className="text-muted-foreground text-[10px]">Aliases</p>
+                  <div className="flex flex-wrap gap-1 mt-0.5">
+                    {sel.aliases.map((a, i) => <span key={i} className="font-mono bg-muted rounded px-1 py-0.5 text-[10px]">{a}</span>)}
+                  </div>
+                </div>
+              )}
+              {sel.web_hint && (
+                <div>
+                  <p className="text-muted-foreground text-[10px]">web_hint (≤700 chars for the exploit builder)</p>
+                  <pre className="whitespace-pre-wrap font-sans bg-background border border-border rounded p-1.5 mt-0.5">{sel.web_hint}</pre>
+                </div>
+              )}
+              {sel.synth_methodology && (
+                <div>
+                  <p className="text-muted-foreground text-[10px]">synth_methodology (≤1500 chars — how to prove impact)</p>
+                  <pre className="whitespace-pre-wrap font-sans bg-background border border-border rounded p-1.5 mt-0.5">{sel.synth_methodology}</pre>
+                </div>
+              )}
             </div>
           )}
         </div>
-        <div>
-          <p className="text-muted-foreground mb-1">Shipped (read-only) - {Object.keys(yaml).length}</p>
-          <div className="flex flex-wrap gap-1">
-            {Object.keys(yaml).sort().map(id => (
-              <span key={id} className="font-mono bg-muted/60 border border-border rounded px-1.5 py-0.5">{id}</span>
-            ))}
-          </div>
-        </div>
       </div>
 
-      {open && (
-        <div className="space-y-2">
+      {editing && (
+        <div className="space-y-2 border-t border-border pt-2">
+          <p className="text-[10px] text-muted-foreground">Save writes an entry into the custom_vuln_skills DB overlay. It merges over the shipped YAML for that id and is embedded into RAG on save.</p>
           <div className="grid grid-cols-2 gap-2">
-            <input className={inp} placeholder="class id (e.g. deserialization)" value={f.id} onChange={e => setF(v => ({ ...v, id: e.target.value }))} />
+            <input className={inp} placeholder="class id (e.g. sqli, deserialization)" value={f.id} onChange={e => setF(v => ({ ...v, id: e.target.value }))} />
             <input className={inp} placeholder="aliases (comma-separated)" value={f.aliases} onChange={e => setF(v => ({ ...v, aliases: e.target.value }))} />
           </div>
-          <textarea className={cn(inp, 'font-mono h-16')} placeholder="web_hint (<=700 chars: techniques, payloads, success signals)" value={f.web_hint} onChange={e => setF(v => ({ ...v, web_hint: e.target.value }))} />
-          <textarea className={cn(inp, 'font-mono h-20')} placeholder="synth_methodology (<=1500 chars: how to prove impact)" value={f.synth_methodology} onChange={e => setF(v => ({ ...v, synth_methodology: e.target.value }))} />
+          <textarea className={cn(inp, 'font-mono h-20')} placeholder="web_hint (≤700 chars: techniques, payload shapes, success signals)" value={f.web_hint} onChange={e => setF(v => ({ ...v, web_hint: e.target.value }))} />
+          <textarea className={cn(inp, 'font-mono h-24')} placeholder="synth_methodology (≤1500 chars: how to prove impact)" value={f.synth_methodology} onChange={e => setF(v => ({ ...v, synth_methodology: e.target.value }))} />
           <button
             onClick={() => add.mutate({ id: f.id.trim(), aliases: f.aliases.split(',').map(a => a.trim()).filter(Boolean), web_hint: f.web_hint, synth_methodology: f.synth_methodology, enabled: true },
-              { onSuccess: () => setF({ id: '', aliases: '', web_hint: '', synth_methodology: '' }) })}
+              { onSuccess: () => { setEditing(false); setSelected(f.id.trim()); setF({ id: '', aliases: '', web_hint: '', synth_methodology: '' }) } })}
             disabled={add.isPending || !f.id.trim() || (!f.web_hint && !f.synth_methodology)}
             className="px-3 py-1.5 bg-primary text-primary-foreground rounded-md text-sm disabled:opacity-50">
-            {add.isPending ? 'Saving\u2026' : 'Add / update skill'}
+            {add.isPending ? 'Saving…' : 'Save / update overlay'}
           </button>
           {add.isError && <p className="text-xs text-red-400">{String((add.error as Error)?.message || 'save failed')}</p>}
-
         </div>
       )}
     </div>
   )
 }
+
 
 
 export default function KnowledgeBase() {
