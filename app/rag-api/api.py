@@ -12929,6 +12929,55 @@ def _postex_fixes_and_tweaks():
     return fixes, tweaks, truncation
 
 
+# ── Semantic fallback for output enumeration ───────────────────────────────────────
+# Regex-first is deterministic + fast. Semantic LLM classification catches novel error
+# phrasings, other-DB variants, WAF-mangled responses — but only WHEN regex found nothing
+# and the output is non-empty. Result is cached by hash so we pay the LLM cost once per
+# distinct output shape. Feature-flagged via POSTEX_SEMANTIC_ENUMERATE (default off).
+
+_semantic_enum_cache = {}          # in-process, best-effort; bounded to 512 entries
+
+
+def _semantic_enumerate_output(output, max_chars=1200):
+    """Semantic classifier for a post-ex command's output. Returns
+    {fix_class, suggested_fix, truncated, extracted_value, hint} or None on any failure.
+    Cheap fallback for the deterministic enumerator — the regex list catches the obvious
+    cases (fast, free); this handles the phrasings the regexes don't know. Feature-flagged."""
+    if os.environ.get("POSTEX_SEMANTIC_ENUMERATE", "0").lower() not in ("1", "true", "yes", "on"):
+        return None
+    o = (output or "").strip()
+    if not o or len(o) < 20:
+        return None
+    import hashlib as _hl
+    key = _hl.md5(o[:max_chars].encode("utf-8", errors="replace")).hexdigest()
+    if key in _semantic_enum_cache:
+        return _semantic_enum_cache[key]
+    prompt = (
+        "You are analyzing the output of a security-test injection attempt. Classify what "
+        "the response tells us so the tester can correct the next attempt. Do NOT execute "
+        "anything; just categorize.\n\n"
+        f"Output ({len(o)} chars):\n{o[:max_chars]}\n\n"
+        "Return ONE JSON object only: "
+        '{"fix_class": "<column_count|wrong_column|wrong_table|stray_quote_integer_context|'
+        'terminator_mismatch|privilege_denied|waf_blocked|nonce_expired|auth_required|'
+        'reserved_word|unknown|not_error>", '
+        '"suggested_fix": "<short actionable hint, one sentence>", '
+        '"truncated": <true iff the value visibly ends mid-word / at a fixed cap>, '
+        '"extracted_value": "<the meaningful value from the response, or empty>", '
+        '"hint": "<any other observation the next attempt should know>"}. '
+        "If the output is not an error and has no useful value, return "
+        '{"fix_class":"not_error","suggested_fix":"","truncated":false,"extracted_value":"","hint":""}.'
+    )
+    try:
+        res = _llm_for_model(prompt, model=None, caller="semantic_enum", num_predict=350)
+        j = _poc_extract_json(res.get("response", "") if isinstance(res, dict) else "") or None
+    except Exception:  # noqa: BLE001
+        j = None
+    if j and len(_semantic_enum_cache) < 512:
+        _semantic_enum_cache[key] = j
+    return j
+
+
 def _enumerate_postex_output(output):
     """Enumerate a post-ex command's output. Returns
     {errors, tweaks, truncated, truncation_signal, truncation_action, exec, empty}:
@@ -12964,8 +13013,30 @@ def _enumerate_postex_output(output):
                 truncated = True; sig_id = sid; sig_action = action; break
         except Exception:  # noqa: BLE001
             continue
+    # Semantic fallback: only when the deterministic pass found nothing and the output is
+    # non-trivial. Feature-flagged; cost-bounded via cache.
+    semantic = None
+    if not errs and not tws and not truncated and o.strip() and len(o) > 30:
+        try:
+            semantic = _semantic_enumerate_output(o)
+        except Exception:  # noqa: BLE001
+            semantic = None
+        if semantic:
+            fc = semantic.get("fix_class") or ""
+            fix = semantic.get("suggested_fix") or ""
+            if fix and fc and fc not in ("unknown", "not_error"):
+                errs.append(f"SEMANTIC: [{fc}] {fix}")
+            if semantic.get("truncated"):
+                truncated = True
+                sig_id = sig_id or "semantic_truncation"
+                sig_action = sig_action or (semantic.get("hint") or
+                                             "Semantic classifier detected truncation — auto-page")
+            if semantic.get("hint") and semantic.get("fix_class") == "not_error":
+                # A useful non-error hint — keep as a tweak so the LLM sees it
+                tws.append("SEMANTIC HINT: " + semantic["hint"])
     return {"errors": errs, "tweaks": tws, "truncated": truncated,
             "truncation_signal": sig_id, "truncation_action": sig_action,
+            "semantic": semantic,
             "exec": _looks_like_injection_execution(o),
             "empty": not o.strip()}
 
