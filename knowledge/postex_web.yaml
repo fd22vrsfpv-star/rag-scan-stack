@@ -107,3 +107,44 @@ classes:
       or a file (file:///path/secret where the fetcher allows it). Use gopher:// to speak
       to a non-HTTP internal service if the objective needs it.
     proof: "The internal resource's response / metadata credentials returned via the vulnerable fetcher."
+
+# ── Error-analysis / correction / collection METHODOLOGY (class-agnostic) ──────────
+# The two-phase weaponization skill, as DATA: how to diagnose a failing web exploit from
+# its error output and correct it, then collect the objective. The runner loads error_fixes
+# / tweaks from here (common/vuln_skills.postex_error_analysis) — edit here, not in code —
+# and they are embedded into RAG (etl/load_knowledge_documents._render_postex_web).
+error_analysis:
+  methodology: >-
+    Weaponize in TWO phases. PHASE 1 — CORRECT: make the exploit EXECUTE and return a test
+    value (version() / current_user delimited as ~<value>~). Diagnose the ROOT CAUSE from the
+    error text, do not just retry: integer vs quoted context, wrong comment terminator, wrong
+    technique, or a WAF. PHASE 2 — COLLECT (agent): reuse the WORKING payload and change only
+    the subquery to reach the objective; enumerate columns/tables from information_schema
+    first, page truncated error-based values, and group_concat all rows.
+  # match = a regex tested (case-insensitive) against the command's output; fix = the guidance.
+  error_fixes:
+    - match: "different number of columns|the used select statements have a different number|column count"
+      fix: "UNION column-count mismatch: change the number of NULLs to match. Find the count with ORDER BY N-- (increase N until it errors), then UNION SELECT that many columns."
+    - match: "near [\"']{2,}|near [\"'] ?(and|or|union|updatexml|extractvalue|--|#|,)|near [\"']\\s*$"
+      fix: "STRAY QUOTE right at the injection point — the parameter is almost certainly NUMERIC/integer context. DROP the surrounding quote: id=1 AND updatexml(...) (NOT id=1' AND ...). Remove the quote from EVERY payload."
+    - match: "xpath syntax error|extractvalue|updatexml|~[^~\\s]{1,40}~"
+      fix: "Error-based works: extract ONE value per request (updatexml/extractvalue truncate ~32 chars — use substring(...,1,32), substring(...,33,32) to page longer values)."
+    - match: "you have an error in your sql syntax|unterminated|unclosed quotation|quoted string not properly"
+      fix: "Syntax broke: fix the quote/comment terminator (-- - vs #), or switch technique (union -> error-based -> boolean -> time). If the error echoes a stray quote at your marker, the param is numeric — drop the quote entirely."
+    - match: "unknown column|no such column|invalid column name"
+      fix: "Wrong column name: enumerate columns from information_schema.columns WHERE table_name='<t>' (MySQL/PG) or PRAGMA table_info (SQLite)."
+    - match: "table.*(doesn'?t exist|not found)|no such table|invalid object name"
+      fix: "Wrong table: enumerate tables from information_schema.tables (or sqlite_master.name)."
+    - match: "access denied|command denied to user|permission denied|insufficient privileg"
+      fix: "The DB user lacks that privilege (e.g. FILE for LOAD_FILE): pivot to a table you CAN read."
+    - match: "403 forbidden|waf|blocked|not acceptable"
+      fix: "Likely a WAF: encode/obfuscate (comments /**/ , mixed case, URL/hex, 0x literals)."
+  tweaks:
+    - match: "~[^~]{1,40}~"
+      tweak: "Error-based value is delimited by ~…~ and capped ~32 chars — page the rest with substring(<expr>,33,32), substring(<expr>,65,32), … and concatenate."
+    - match: "[A-Za-z0-9+/]{40,}={0,2}"
+      tweak: "Output looks BASE64 — decode it (| base64 -d) to read the value."
+    - match: "\\b[0-9a-f]{32,}\\b"
+      tweak: "Output looks HEX / a hash — unhex() it, or if it's a password hash that IS the loot (hand it to cracking)."
+    - match: "limit|only .* row|1 row in set|single row"
+      tweak: "Only one row came back — use group_concat()/string_agg() (or LIMIT/OFFSET paging) to get all rows at once."
