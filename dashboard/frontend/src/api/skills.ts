@@ -55,3 +55,35 @@ export function useTestSkill() {
         '/skills/test', { method: 'POST', body: JSON.stringify(v) }),
   })
 }
+
+// ── Learned skill overlays (self-improvement from scans + operator additions) ──
+export interface LearnedOverlay {
+  id: string
+  kind: string
+  name: string
+  entry: Record<string, unknown>
+  evidence?: Record<string, unknown>
+  active: boolean
+  source: string
+  engagement_id?: string | null
+  created_at: string
+  updated_at: string
+}
+
+export function useLearnedOverlays(kind?: string) {
+  const qs = kind ? `?kind=${encodeURIComponent(kind)}` : ''
+  return useQuery({
+    queryKey: ['skills-learned', kind || 'all'],
+    queryFn: () => apiFetch<{ learned: LearnedOverlay[] }>(`/skills/learned${qs}`),
+    refetchInterval: 30_000,
+  })
+}
+
+export function useDeleteLearnedOverlay() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) =>
+      apiFetch<{ ok: boolean; deleted: number }>(`/skills/learned/${id}`, { method: 'DELETE' }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['skills-learned'] }),
+  })
+}
