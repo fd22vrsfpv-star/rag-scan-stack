@@ -134,6 +134,18 @@ TOOL_SPECS: List[ToolSpec] = [
         func=scan_tools.build_cve_poc,
     ),
     ToolSpec(
+        name="weaponize_exploit",
+        description=(
+            "POST-EXPLOITATION: weaponize a CONFIRMED exploit (an exploit_store entry — e.g. "
+            "the exploit_store_id from build_cve_poc) into EXTRACTED DATA. Iterates "
+            "run -> ENUMERATE the output (fix errors, apply tweaks for encoded/truncated/"
+            "partial data, discover tables/columns/files) -> go deeper, until it reads the "
+            "objective (the secret table / creds / target file / command output), per the "
+            "get_web_postex skill. GATED/impactful. Pass an objective + creds if needed."
+        ),
+        func=scan_tools.weaponize_exploit,
+    ),
+    ToolSpec(
         name="get_vuln_methodology",
         description=(
             "Load the exploitation methodology skill pack for a vulnerability "
