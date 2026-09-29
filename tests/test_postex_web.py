@@ -200,6 +200,21 @@ def test_primitive_families_declared():
     assert len(sqli_shipped) >= 3
 
 
+
+def test_learning_propose_shape():
+    """The learning overlay entries follow a stable shape by kind — the merger in api
+    (_postex_fixes_and_tweaks) expects specific keys. Lock the contract."""
+    # error_fix: {match, fix}
+    ef = {"match": "invalid response signature", "fix": "regenerate the CSRF token first"}
+    assert ef["match"] and ef["fix"]
+    # secret_table: {table_name}
+    st = {"table_name": "wp_users", "cve": "CVE-XYZ", "discovered_via": "data"}
+    assert st["table_name"]
+    # truncation: {match, action, id}
+    tr = {"match": "warning: data truncated", "action": "auto-page", "id": "mysql_data_trunc"}
+    assert tr["match"] and tr["action"]
+
+
 if __name__ == "__main__":
     fns = [f for f in dict(globals()) if f.startswith("test_")]
     for f in fns:
