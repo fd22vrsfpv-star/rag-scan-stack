@@ -82,6 +82,20 @@ def test_enumerate_flags_truncation_paging():
     assert "page" in _enum("XPATH syntax error: '~abcdef~'")["tweaks"]
 
 
+
+def test_error_analysis_skill_loads():
+    """The error-analysis / correction methodology is a SKILL in postex_web.yaml (data), so
+    editing the YAML changes behavior without a code change (RAG-first)."""
+    os.environ["VULN_POSTEX_PATH"]=POSTEX
+    sys.path.insert(0, os.path.join(REPO,"common"))
+    import importlib, vuln_skills; importlib.reload(vuln_skills)
+    ea=vuln_skills.postex_error_analysis()
+    assert ea.get("methodology") and len(ea.get("error_fixes",[]))>=5 and len(ea.get("tweaks",[]))>=3
+    # the integer-context fix (the one that unblocked a live target) must be present
+    joined=" ".join(r["fix"] for r in ea["error_fixes"])
+    assert "NUMERIC" in joined or "integer context" in joined.lower()
+
+
 if __name__ == "__main__":
     fns = [f for f in dict(globals()) if f.startswith("test_")]
     for f in fns:
