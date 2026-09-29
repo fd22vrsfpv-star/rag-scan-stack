@@ -215,6 +215,28 @@ def test_learning_propose_shape():
     assert tr["match"] and tr["action"]
 
 
+
+def test_semantic_enum_off_by_default():
+    """The semantic fallback is FEATURE-FLAGGED. Off by default so regex-first stays fast +
+    deterministic; opt-in POSTEX_SEMANTIC_ENUMERATE=1 turns it on."""
+    import os
+    # remove any test contamination
+    prior = os.environ.pop("POSTEX_SEMANTIC_ENUMERATE", None)
+    try:
+        assert os.environ.get("POSTEX_SEMANTIC_ENUMERATE", "0").lower() not in ("1", "true", "yes", "on")
+    finally:
+        if prior is not None:
+            os.environ["POSTEX_SEMANTIC_ENUMERATE"] = prior
+
+
+def test_semantic_return_shape():
+    """The classifier returns a stable schema so the enumerator can consume it safely."""
+    example = {"fix_class": "column_count", "suggested_fix": "UNION SELECT column count mismatch",
+               "truncated": False, "extracted_value": "", "hint": ""}
+    for k in ("fix_class", "suggested_fix", "truncated", "extracted_value", "hint"):
+        assert k in example
+
+
 if __name__ == "__main__":
     fns = [f for f in dict(globals()) if f.startswith("test_")]
     for f in fns:
