@@ -4454,6 +4454,28 @@ def build_cve_poc(cve: str, target: str, port: int = 80, product: str = "",
         return json.dumps({"ok": False, "error": str(e)}, indent=2)
 
 
+def weaponize_exploit(exploit_id: str, objective: str = "", vuln_class: str = "",
+                      max_iters: int = 4, username: str = "", password: str = "") -> str:
+    """POST-EXPLOITATION: weaponize a CONFIRMED exploit (an exploit_store entry, e.g. the
+    exploit_store_id returned by build_cve_poc) into EXTRACTED DATA. Runs the loop that
+    ENUMERATES each command's output — fixes errors, applies tweaks (decode/​page/​group_concat
+    when the data is encoded/truncated/partial), discovers structure, and chases the data
+    deeper (dump -> tables -> the secret) per the get_web_postex skill. GATED/impactful. Pass
+    an `objective` (e.g. 'read the secret table') or leave blank for the class default, and
+    creds if the surface needs auth. Returns {extracted, extracted_data, iterations}."""
+    api_key = os.environ.get("API_KEY", "changeme")
+    t = get_scan_tools()
+    try:
+        r = httpx.post(f"{t.rag_api_url}/exploit-store/{exploit_id}/weaponize",
+                       json={"objective": objective or None, "vuln_class": vuln_class or None,
+                             "max_iters": max_iters, "username": username or None,
+                             "password": password or None},
+                       headers={"x-api-key": api_key}, verify=False, timeout=300)
+        return json.dumps(r.json() if r.status_code < 400 else {"ok": False, "error": r.text[:300]}, indent=2)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": str(e)}, indent=2)
+
+
 def research_exploit(cve: str, target: str = "", port: int = 80, product: str = "",
                      version: str = "") -> str:
     """Research the reference PoC for a CVE and break down WHAT THE EXPLOIT CONSISTS OF —

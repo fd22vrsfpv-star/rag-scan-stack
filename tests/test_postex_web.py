@@ -57,6 +57,31 @@ def test_sqli_error_echo_is_execution_not_reflection():
     assert _looks_like_injection_execution("<h1>Search results for POCz123</h1>") is False
 
 
+
+# --- output enumeration: fix errors + improvement tweaks (mirror of api helpers) ---
+import re as _re
+_ERR = [(r"different number of columns|column count", "col-count"),
+        (r"unknown column|no such column", "col-name"),
+        (r"access denied|permission denied", "priv")]
+_TWK = [(r"~[^~]{1,40}~", "page"),
+        (r"[A-Za-z0-9+/]{40,}={0,2}", "base64"),
+        (r"\b[0-9a-f]{32,}\b", "hex")]
+def _enum(output):
+    low=(output or "").lower()
+    return {"errors":[t for p,t in _ERR if _re.search(p,low)],
+            "tweaks":[t for p,t in _TWK if _re.search(p,output or "")]}
+
+def test_enumerate_flags_column_count_error():
+    assert "col-count" in _enum("The used SELECT statements have a different number of columns")["errors"]
+
+def test_enumerate_flags_base64_and_hex_tweaks():
+    assert "base64" in _enum("data: "+"QUJD"*20+"==")["tweaks"]
+    assert "hex" in _enum("5f4dcc3b5aa765d61d8327deb882cf99")["tweaks"]
+
+def test_enumerate_flags_truncation_paging():
+    assert "page" in _enum("XPATH syntax error: '~abcdef~'")["tweaks"]
+
+
 if __name__ == "__main__":
     fns = [f for f in dict(globals()) if f.startswith("test_")]
     for f in fns:

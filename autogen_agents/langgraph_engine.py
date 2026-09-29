@@ -115,6 +115,7 @@ EXPLOIT_PLAN_TOOLS = {
     "customize_exploit", "list_pending_exploits", "get_exploit_approval_status",
     "queue_exploit_for_approval", "search_knowledge_base", "fetch_preconditions",
     "establish_web_session", "research_exploit", "build_cve_poc",
+    "get_web_postex", "weaponize_exploit",
 }
 
 _RECON_SYSTEM = (

