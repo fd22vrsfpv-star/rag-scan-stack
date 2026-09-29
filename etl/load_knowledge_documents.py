@@ -358,6 +358,17 @@ def _render_postex_web(data: Dict[str, Any]) -> List[Doc]:
             docs.append((f"Collection stage: {st['stage']}",
                          f"Stage '{st['stage']}' — {st.get('goal', '')}. Subquery: "
                          f"{st.get('subquery', '')}".strip()))
+    # Composable POST-EX PRIMITIVES — the small chainable skills the collect agent invokes.
+    prims = data.get("primitives") or {}
+    if prims.get("purpose"):
+        docs.append(("Post-ex primitives — purpose",
+                     f"Composable post-exploitation skills. {prims['purpose']}"))
+    for pname, p in prims.items():
+        if pname == "purpose" or not isinstance(p, dict):
+            continue
+        docs.append((f"Post-ex primitive: {pname}",
+                     f"{p.get('description', '')} Args: {p.get('args')}. "
+                     f"Returns: {p.get('returns')}. Chain: {p.get('chain')}".strip()))
     return docs
 
 
