@@ -14261,7 +14261,9 @@ class BuildPocBody(BaseModel):
     port: Optional[int] = None
     product: Optional[str] = None
     version: Optional[str] = None
-    max_iters: int = 3
+    max_iters: int = 5
+    recon_first: bool = True    # do a fast target recon (fetch page/robots/forms) and feed
+                                # what's found to synth; catches shape/params synth would miss.
     # release=true is the operator authorizing this endpoint for PoC building — a
     # STANDING grant that persists until revoked/stopped. Agent-initiated builds leave
     # it false, so they run ONLY where a grant already exists (fail-closed).
@@ -14316,8 +14318,62 @@ def establish_session_endpoint(body: EstablishSessionBody, authorized: bool = De
     return {"ok": s.get("ok", False), **s}
 
 
+def _scout_url_recon(ip, port, timeout=8):
+    """Fast target self-recon: fetch the landing page + robots.txt, extract HREFs, form actions,
+    input field names, meta generator/tech hints. Feeds synth concrete attack-surface knowledge
+    the CVE description alone wouldn't reveal. All read-only, one connection per URL.
+    Returns a short guidance string (empty on any failure)."""
+    import httpx as _hx, re as _re
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    parts = []
+    try:
+        with _hx.Client(verify=False, follow_redirects=True, timeout=timeout) as cli:
+            # Landing page
+            try:
+                r = cli.get(base + "/")
+                html = (r.text or "")[:60000]
+                # Server + tech
+                srv = r.headers.get("server", "")
+                xpb = r.headers.get("x-powered-by", "")
+                gen = _re.search(r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']([^"\'>]+)', html, _re.I)
+                if srv or xpb or gen:
+                    parts.append("Tech: " + "; ".join(x for x in [f"Server={srv}" if srv else "",
+                                                                    f"X-Powered-By={xpb}" if xpb else "",
+                                                                    f"Generator={gen.group(1)}" if gen else ""] if x))
+                # HREFs
+                hrefs = list(dict.fromkeys(_re.findall(r'href=["\']([^"\'#?]+\.(?:php|jsp|aspx|py|do))(?:\?[^"\'#]*)?["\']', html, _re.I)))[:8]
+                if hrefs:
+                    parts.append(f"Endpoints: {', '.join(hrefs)}")
+                # Forms + input names
+                for fm in _re.finditer(r"<form[^>]*?action=[\"\']([^\"\']*)[\"\'][^>]*?(?:method=[\"\']([^\"\']+)[\"\'])?[^>]*>(.*?)</form>", html, _re.I | _re.S):
+                    action, method, body = fm.groups()
+                    inputs = _re.findall(r'name=["\']([^"\']+)["\']', body or "")
+                    if inputs:
+                        parts.append(f"Form {method or 'GET'} {action or '/'} fields={inputs[:8]}")
+                    if len(parts) > 10:
+                        break
+            except Exception:  # noqa: BLE001
+                pass
+            # robots.txt
+            try:
+                r2 = cli.get(base + "/robots.txt")
+                if r2.status_code == 200 and "text" in (r2.headers.get("content-type", "").lower()):
+                    lines = [l.strip() for l in (r2.text or "").splitlines()
+                             if l.strip().lower().startswith(("disallow:", "allow:"))]
+                    if lines:
+                        parts.append("robots.txt: " + "; ".join(lines[:6]))
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        return ""
+    if not parts:
+        return ""
+    return "Target recon (self-fetched): " + " | ".join(parts)
+
+
 def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=True, model=None,
-                    auth=None):
+                    auth=None, recon_first=False):
     """The full automatic-creation loop: RESEARCH (pull reference PoC material) -> synthesize
     -> run-and-refine -> anchor/reflection verify -> auto-save into the Exploit Store (with
     Python + Burp HTTP artifacts). Shared by the /software/build-poc endpoint AND the
@@ -14327,6 +14383,14 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
     import time as _t
     _t0 = _t.time()
     run_id = f"{cve}_{ip}_{int(_t.time())}"
+    # Recon: fast target self-fetch (page/robots/forms) to seed synth with real attack-surface
+    # knowledge. Cheap; runs before research if requested. Empty on any failure.
+    recon_guidance = ""
+    if recon_first:
+        try:
+            recon_guidance = _scout_url_recon(ip, port)
+        except Exception:  # noqa: BLE001
+            recon_guidance = ""
     # Auth: establish a logged-in session (supplied creds, or brute-force default creds) so
     # an authenticated attack surface is reachable, and hand the cookie to synth.
     auth_guidance = ""; session_info = None
@@ -14341,7 +14405,8 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
         except Exception as e:  # noqa: BLE001
             logging.debug("build auth step failed: %s", e)
     # Automatic reference-PoC research: feed concrete public-exploit material into synth.
-    guidance = auth_guidance; research_out = None
+    guidance = (recon_guidance + " " + auth_guidance).strip() if recon_guidance else auth_guidance
+    research_out = None
     if research:
         try:
             research_out = _research_exploit(cve, ip, port, product, version, eid, model=model)
@@ -14432,7 +14497,7 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
         auth = {"username": body.username, "password": body.password,
                 "login_url": body.login_url, "bruteforce": body.bruteforce}
     core = _build_poc_core(cve, body.ip, body.port, body.product, body.version, eid,
-                           body.max_iters, model=body.model, auth=auth)
+                           body.max_iters, model=body.model, auth=auth, recon_first=body.recon_first)
     return {"ok": True, "cve": cve, **core}
 
 
@@ -15021,6 +15086,41 @@ def save_exploit_version(exploit_id: str, body: SaveVersionBody, authorized: boo
         ver, vid = _snapshot_exploit_version(cur, dict(row), label=(body.label or "manual snapshot"))
         conn.commit()
     return {"ok": True, "version": ver, "version_id": vid}
+
+
+@app.get("/exploit-store/{exploit_id}/trace", tags=["Exploit Store"])
+def get_exploit_trace(exploit_id: str, authorized: bool = Depends(auth)):
+    """Return the full verbose trace for this exploit's build/collect run: every research,
+    precondition fetch, synthesize prompt/response, run+output, refine, reflection check,
+    drift detection, and enumerate step (with errors/tweaks that fired). Reads the JSONL
+    file at metadata.log; returns an empty list if the log is missing."""
+    import json as _j
+    _ensure_exploit_store()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT poc_log_path, metadata FROM exploit_store WHERE id = %s", (exploit_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "exploit not found")
+    md = row.get("metadata") or {}
+    log_path = row.get("poc_log_path") or md.get("log")
+    if not log_path:
+        return {"ok": True, "log_path": None, "phases": [], "reason": "no log path on this entry"}
+    try:
+        entries = []
+        with open(log_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(_j.loads(line))
+                except Exception:  # noqa: BLE001
+                    continue
+        return {"ok": True, "log_path": log_path, "count": len(entries), "phases": entries}
+    except FileNotFoundError:
+        return {"ok": True, "log_path": log_path, "phases": [], "reason": "log file missing"}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"read trace: {e}")
 
 
 @app.post("/exploit-store/{exploit_id}/restore/{version}", tags=["Exploit Store"])
