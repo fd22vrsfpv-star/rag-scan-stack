@@ -96,6 +96,41 @@ def test_error_analysis_skill_loads():
     assert "NUMERIC" in joined or "integer context" in joined.lower()
 
 
+
+def test_secret_targets_in_skill():
+    """The password/secret column + table patterns are declared as DATA in the skill."""
+    d = yaml.safe_load(open(POSTEX))
+    st = d["collection"].get("secret_targets") or {}
+    assert set(["password","pass","pwd","hash","secret","token","api_key"]) <= set(st.get("column_patterns", []))
+    assert "user" in st.get("table_patterns", []) and "secret" in st["table_patterns"]
+
+
+def test_primitives_declared_in_skill():
+    """The composable post-ex primitives are declared as data in the skill; the harness
+    registry names must match so the LLM can invoke them by name (chained skills)."""
+    d = yaml.safe_load(open(POSTEX))
+    prims = d.get("primitives") or {}
+    assert "purpose" in prims
+    for name in ("sqli_subquery", "sqli_autopage", "harvest_secret_columns"):
+        e = prims.get(name)
+        assert isinstance(e, dict) and e.get("description") and e.get("args") and e.get("returns")
+
+
+def test_extract_injection_value_handles_truncation():
+    """The value MySQL truncates at 32 chars ends with '...' inside the quoted error message —
+    the extractor must return the truncated value so the harness can auto-page it."""
+    import re
+    def _extract(o):
+        # mirror of api._extract_injection_value truncation branch
+        m = re.search(r"~([^~<\s][^~<]{0,300})~", o or "")
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+        m = re.search(r"'~([^~<\']{1,32}?)\.\.\.'", o) or re.search(r"~([^~<\'\s]{1,32})\.\.\.", o)
+        return m.group(1).strip() if m else None
+    assert _extract("XPATH syntax error: '~payroll,secret,position,user...'") == "payroll,secret,position,user"
+    assert _extract("XPATH syntax error: '~11.8.9-MariaDB-ubu2404~'") == "11.8.9-MariaDB-ubu2404"
+
+
 if __name__ == "__main__":
     fns = [f for f in dict(globals()) if f.startswith("test_")]
     for f in fns:

