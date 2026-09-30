@@ -16643,13 +16643,21 @@ def _save_exploit_store(name, cve=None, kind="cve_poc", target_host=None, target
                           "target": target_host, "engagement_id": eid})
         except Exception:  # noqa: BLE001
             pass
-        # Live-embed verified techniques into RAG (no-op when flag off or unverified)
+        # Live-embed technique into RAG. Verified rows go to verified_exploit_technique
+        # (positive signal); unverified go to failed_technique (negative signal — stops
+        # the strategist from re-exploring shapes we've seen fail).
         try:
             if verified:
                 _load_verified_technique_into_rag({
                     "verified": True, "target_host": target_host, "cve": cve,
                     "product": product, "version": version, "command": command,
                     "engagement_id": eid}, engagement_id=eid)
+            else:
+                _load_failed_technique_into_rag({
+                    "verified": False, "target_host": target_host, "cve": cve,
+                    "product": product, "version": version, "command": command,
+                    "engagement_id": eid, "metadata": metadata or {}},
+                    engagement_id=eid)
         except Exception:  # noqa: BLE001
             pass
         return new_id
@@ -29394,12 +29402,19 @@ RAG_DISCOVERED_ENDPOINT_SOURCE = "discovered_endpoint"
 RAG_WEB_FINDING_SOURCE = "web_finding"
 RAG_API_SCHEMA_SOURCE = "api_schema"
 RAG_INFO_DISCLOSURE_SOURCE = "info_disclosure"
+# Tier 3: negative-signal + tenant intel + framework-fingerprint patterns
+RAG_FAILED_TECHNIQUE_SOURCE = "failed_technique"
+RAG_SUBDOMAIN_PATTERN_SOURCE = "subdomain_pattern"
+RAG_SESSION_SCHEME_SOURCE = "session_scheme"
+RAG_SHELL_ACCESS_SOURCE = "shell_access"
 _RAG_FACT_SOURCES = (RAG_OBSERVED_FACTS_SOURCE, RAG_ENUM_FACT_SOURCE,
                      RAG_CREDENTIAL_SOURCE, RAG_IDENTITY_SOURCE,
                      RAG_VERIFIED_TECHNIQUE_SOURCE, RAG_VULN_FINDING_SOURCE,
                      RAG_SERVICE_FINGERPRINT_SOURCE, RAG_DISCOVERED_ENDPOINT_SOURCE,
                      RAG_WEB_FINDING_SOURCE, RAG_API_SCHEMA_SOURCE,
-                     RAG_INFO_DISCLOSURE_SOURCE)
+                     RAG_INFO_DISCLOSURE_SOURCE,
+                     RAG_FAILED_TECHNIQUE_SOURCE, RAG_SUBDOMAIN_PATTERN_SOURCE,
+                     RAG_SESSION_SCHEME_SOURCE, RAG_SHELL_ACCESS_SOURCE)
 
 
 def observed_facts_enabled() -> bool:
@@ -30148,6 +30163,59 @@ def _compose_recall_context(ip, product=None, limit=8):
                              "already mapped):\n" + "\n".join(lines))
     except Exception:  # noqa: BLE001
         pass
+    # 10. Session scheme + shell access (small blocks — high signal per row)
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT metadata FROM rag_documents
+                     WHERE metadata->>'source' = ANY(%s) AND metadata->>'ip' = %s
+                     ORDER BY (metadata->>'observed_at') DESC LIMIT %s""",
+                ([RAG_SESSION_SCHEME_SOURCE, RAG_SHELL_ACCESS_SOURCE], ip, limit))
+            aux = [r["metadata"] for r in cur.fetchall()]
+            if aux:
+                lines = [f"  * [{a.get('source', '?').replace('_', ' ')}] {a.get('value', '')[:200]}"
+                         for a in aux]
+                parts.append("SESSION + SHELL ACCESS (auth mechanisms + current holds):\n"
+                             + "\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
+    # 11. Failed techniques — NEGATIVE signal, positioned LAST so it doesn't crowd
+    # positive signals. Use to skip retry of things we already know don't work.
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT metadata FROM rag_documents
+                     WHERE metadata->>'source' = %s
+                       AND (metadata->>'ip' = %s OR metadata->>'product' = %s)
+                     ORDER BY (metadata->>'observed_at') DESC LIMIT %s""",
+                (RAG_FAILED_TECHNIQUE_SOURCE, ip, product or "", min(6, limit)))
+            fs = [r["metadata"] for r in cur.fetchall()]
+            if fs:
+                lines = [f"  * [{f.get('kind', 'failed')}] {f.get('value', '')[:200]}" for f in fs]
+                parts.append("PREVIOUSLY-FAILED APPROACHES (do NOT repeat these shapes — "
+                             "they were tried and did not verify on this or a similar target):\n"
+                             + "\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
+    # 12. Subdomain patterns (for tenant-scoped recall)
+    try:
+        parent = None
+        if product and "." in str(product):
+            parent = ".".join(str(product).split(".")[-2:])
+        if parent:
+            with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """SELECT metadata FROM rag_documents
+                         WHERE metadata->>'source' = %s
+                           AND metadata->>'product' = %s
+                         ORDER BY (metadata->>'observed_at') DESC LIMIT %s""",
+                    (RAG_SUBDOMAIN_PATTERN_SOURCE, parent, limit))
+                sd = [r["metadata"] for r in cur.fetchall()]
+                if sd:
+                    lines = [f"  * {s.get('value', '')[:200]}" for s in sd]
+                    parts.append(f"SUBDOMAIN PATTERNS on {parent}:\n" + "\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
     return "\n\n".join(parts)
 
 
@@ -30285,6 +30353,160 @@ def _backfill_tier2_to_rag(engagement_id=None, limit=500):
     return counts
 
 
+def _load_failed_technique_into_rag(exploit_row, engagement_id=None):
+    """Embed one UNVERIFIED exploit_store row (off_target=true or drifted or
+    reflection-tripped) as a NEGATIVE-SIGNAL RAG object. Recall answers 'this
+    payload shape was tried on N similar targets and never verified' — the
+    strategist uses this to STOP re-exploring dead-ends. Kind starts with
+    'failed_' so downstream code can distinguish from positive-signal
+    verified_exploit_technique rows."""
+    if not observed_facts_enabled() or not exploit_row:
+        return False
+    # Only save clearly-failed attempts, not "still in flight" ones
+    if exploit_row.get("verified"):
+        return False
+    try:
+        ip = str(exploit_row.get("target_host") or "")
+        cve = exploit_row.get("cve") or ""
+        product = exploit_row.get("product") or ""
+        cmd = str(exploit_row.get("command") or "")[:400]
+        md = exploit_row.get("metadata") or {}
+        # Failure signature — helps strategist see WHY (drift/reflection/off_target/no-response)
+        sig = ("off_target" if md.get("off_target") else
+               "drifted" if md.get("drifted") else
+               "reflection" if md.get("reflection") else
+               "no_pass")
+        v = f"[{sig}] cve={cve} product={product} :: {cmd[:250]}"
+        return _load_observed_fact_into_rag(
+            RAG_FAILED_TECHNIQUE_SOURCE, ip, f"failed_{sig}", v,
+            engagement_id=engagement_id or str(exploit_row.get("engagement_id") or "") or None,
+            product=product or cve)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("failed_technique->rag load failed: %s", e)
+        return False
+
+
+def _load_subdomain_pattern_into_rag(subdomain_row, engagement_id=None):
+    """Embed one recon_findings row where finding_type='subdomain'. Recall lets
+    the recon phase 'guess' new subdomains on a similar tenant based on naming
+    patterns already seen ("we've seen <env>-<service> naming in this tenant")."""
+    if not observed_facts_enabled() or not subdomain_row:
+        return False
+    try:
+        target = subdomain_row.get("target") or ""
+        if not target:
+            data = subdomain_row.get("data") or {}
+            target = data.get("subdomain") or data.get("host") or ""
+        if not target:
+            return False
+        parent = ""
+        if "." in target:
+            parent = ".".join(target.split(".")[-2:])
+        v = f"{target} (parent={parent})"
+        # Pseudo-ip is the parent domain so recall groups by tenant
+        return _load_observed_fact_into_rag(
+            RAG_SUBDOMAIN_PATTERN_SOURCE, parent or target,
+            "subdomain", v,
+            engagement_id=engagement_id or str(subdomain_row.get("engagement_id") or "") or None,
+            product=parent)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("subdomain_pattern->rag load failed: %s", e)
+        return False
+
+
+def _load_session_scheme_into_rag(ip, cookie_name, cookie_pattern=None,
+                                    product=None, engagement_id=None):
+    """Embed one session-scheme observation: 'This target uses <cookie_name>
+    with pattern <regex-ish>'. Recall lets recon skip probes when we already
+    know the auth mechanism for a product (e.g. Spage uses PHPSESSID)."""
+    if not observed_facts_enabled() or not cookie_name:
+        return False
+    try:
+        v = f"cookie={cookie_name}" + (f" pattern={cookie_pattern}" if cookie_pattern else "")
+        return _load_observed_fact_into_rag(
+            RAG_SESSION_SCHEME_SOURCE, ip, f"session_{cookie_name}", v,
+            engagement_id=engagement_id, product=product)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("session_scheme->rag load failed: %s", e)
+        return False
+
+
+def _load_shell_access_into_rag(ip, shell_type, port=None, source=None,
+                                  session_id=None, engagement_id=None):
+    """Embed one shell/access observation: 'We currently hold a bind shell on
+    <ip>:<port> via <source>'. Recall lets post-ex / lateral-movement planning
+    know what access is available. Marker-only — session details stay in the
+    holds/access table."""
+    if not observed_facts_enabled() or not shell_type:
+        return False
+    try:
+        v = (f"type={shell_type}" + (f" @ port={port}" if port else "")
+             + (f" via {source}" if source else "")
+             + (f" session={str(session_id)[:20]}" if session_id else ""))
+        return _load_observed_fact_into_rag(
+            RAG_SHELL_ACCESS_SOURCE, ip, f"shell_{shell_type}", v,
+            engagement_id=engagement_id, product=source)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("shell_access->rag load failed: %s", e)
+        return False
+
+
+def _backfill_tier3_to_rag(engagement_id=None, limit=500):
+    """Backfill Tier 3 from existing tables: failed exploits (exploit_store
+    WHERE verified=false), subdomain recon_findings, and session cookies
+    observed in credential_findings.banner (Set-Cookie captures)."""
+    if not observed_facts_enabled():
+        return {}
+    counts = {"failed_technique": 0, "subdomain_pattern": 0,
+              "session_scheme": 0, "shell_access": 0}
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            where, args = "", []
+            if engagement_id:
+                where = "WHERE engagement_id = %s"
+                args.append(str(engagement_id))
+            # Failed techniques
+            cur.execute(
+                f"""SELECT * FROM exploit_store {where}
+                     {"AND" if where else "WHERE"} verified = false
+                     ORDER BY built_at DESC LIMIT %s""",
+                args + [limit])
+            for row in cur.fetchall():
+                if _load_failed_technique_into_rag(dict(row), engagement_id=engagement_id):
+                    counts["failed_technique"] += 1
+            # Subdomains
+            cur.execute(
+                f"""SELECT * FROM recon_findings {where}
+                     {"AND" if where else "WHERE"} finding_type = 'subdomain'
+                     ORDER BY created_at DESC LIMIT %s""",
+                args + [limit])
+            for row in cur.fetchall():
+                if _load_subdomain_pattern_into_rag(dict(row), engagement_id=engagement_id):
+                    counts["subdomain_pattern"] += 1
+            # Session cookies — look for Set-Cookie names in ports.banner
+            eng_join = "AND a.engagement_id = %s" if engagement_id else ""
+            eng_args = [str(engagement_id)] if engagement_id else []
+            cur.execute(
+                f"""SELECT p.banner, host(a.ip)::text AS ip, p.service, p.product FROM ports p
+                     JOIN assets a ON a.id = p.asset_id
+                     WHERE p.banner ILIKE '%%set-cookie%%' {eng_join}
+                     ORDER BY p.last_seen DESC LIMIT %s""",
+                eng_args + [limit])
+            import re as _re
+            for row in cur.fetchall():
+                banner = row.get("banner") or ""
+                for m in _re.finditer(r"[Ss]et-[Cc]ookie:\s*([A-Za-z0-9_.-]+)=", banner):
+                    if _load_session_scheme_into_rag(
+                            row["ip"], m.group(1),
+                            product=row.get("product") or row.get("service"),
+                            engagement_id=engagement_id):
+                        counts["session_scheme"] += 1
+                        break  # one per target is enough
+    except Exception as e:  # noqa: BLE001
+        logging.debug("backfill_tier3 failed: %s", e)
+    return counts
+
+
 @app.post("/rag/backfill/{source}", tags=["RAG"])
 def backfill_source_endpoint(source: str,
                               engagement_id: Optional[str] = None,
@@ -30296,6 +30518,8 @@ def backfill_source_endpoint(source: str,
       'tier1' or one of ('verified_technique', 'vuln_finding',
       'service_fingerprint', 'discovered_endpoint')
       'tier2' or one of ('web_finding', 'info_disclosure')
+      'tier3' or one of ('failed_technique', 'subdomain_pattern',
+      'session_scheme', 'shell_access')
       'credentials'
       'all' — everything."""
     if not observed_facts_enabled():
@@ -30312,12 +30536,17 @@ def backfill_source_endpoint(source: str,
     if src in ("tier2", "web_finding", "info_disclosure", "api_schema"):
         counts = _backfill_tier2_to_rag(engagement_id=engagement_id, limit=limit)
         return {"ok": True, "source": src, "counts": counts}
+    if src in ("tier3", "failed_technique", "subdomain_pattern",
+                "session_scheme", "shell_access"):
+        counts = _backfill_tier3_to_rag(engagement_id=engagement_id, limit=limit)
+        return {"ok": True, "source": src, "counts": counts}
     if src == "all":
         n_c, n_i = _backfill_credentials_and_identities_to_rag(engagement_id=engagement_id, limit=limit)
         c1 = _backfill_tier1_to_rag(engagement_id=engagement_id, limit=limit)
         c2 = _backfill_tier2_to_rag(engagement_id=engagement_id, limit=limit)
+        c3 = _backfill_tier3_to_rag(engagement_id=engagement_id, limit=limit)
         return {"ok": True, "source": "all",
-                "counts": {**c1, **c2, "credentials": n_c, "identities": n_i}}
+                "counts": {**c1, **c2, **c3, "credentials": n_c, "identities": n_i}}
     raise HTTPException(400, f"unknown source '{source}' — see docstring")
 
 
