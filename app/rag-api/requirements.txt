@@ -9,3 +9,4 @@ pyyaml
 httpx
 slowapi
 
+arjun>=2.2.5   # parameter-name discovery on a single URL (recon phase)
