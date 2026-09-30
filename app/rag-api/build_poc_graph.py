@@ -243,6 +243,16 @@ def node_response_mine(state: BuildPocState) -> Dict[str, Any]:
     admin_paths = list(dict.fromkeys(admin_paths))
     detected_frameworks = list(dict.fromkeys(
         x.get("framework") for x in intel_list if x.get("framework")))
+    # Embed curated observed facts into rag_documents (Option 2). No-op when the
+    # RAG_OBSERVED_FACTS flag is off. Best-effort — failure here doesn't affect
+    # the response-mine output the rest of the pipeline uses.
+    try:
+        from api import _embed_response_mine_intel
+        prod = detected_frameworks[0] if detected_frameworks else None
+        _embed_response_mine_intel(state["ip"], intel_list,
+                                    engagement_id=state.get("eid"), product=prod)
+    except Exception:  # noqa: BLE001
+        pass
     return {"segments": seg,
             "intel_list": intel_list,
             "cred_hints": cred_hints,
