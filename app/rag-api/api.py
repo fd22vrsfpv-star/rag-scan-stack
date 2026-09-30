@@ -14826,6 +14826,271 @@ def _waf_evasion_hint(waf_family, vuln_class):
     return "; ".join(variants[:6])
 
 
+# Framework fingerprints: (body-needle, framework-name, probe-endpoints-for-deep-enum).
+# When one of these hits, _deep_enum_framework fires the endpoints to pin the version
+# and surface known-CVE-bearing endpoints.
+_FRAMEWORK_FINGERPRINTS = [
+    # (needle, name, [probe_paths])
+    ("wp-content",           "WordPress",   ["/wp-json/wp/v2/users", "/wp-includes/version.php", "/wp-login.php", "/readme.html", "/wp-json/"]),
+    ("wp-includes",          "WordPress",   ["/wp-json/wp/v2/users", "/readme.html"]),
+    ("/administrator/",      "Joomla",      ["/administrator/manifests/files/joomla.xml", "/language/en-GB/en-GB.xml"]),
+    ("Joomla!",              "Joomla",      ["/administrator/manifests/files/joomla.xml"]),
+    ("Drupal",               "Drupal",      ["/CHANGELOG.txt", "/core/CHANGELOG.txt", "/user/login"]),
+    ("LyLme Spage",          "LyLme Spage", ["/apply/", "/pwd/", "/include/", "/data/config.php"]),
+    ("Spage",                "LyLme Spage", ["/apply/", "/pwd/"]),
+    ("phpMyAdmin",           "phpMyAdmin",  ["/phpmyadmin/README", "/phpmyadmin/ChangeLog"]),
+    ("Directus",             "Directus",    ["/server/info", "/users/me"]),
+    ("MediaWiki",            "MediaWiki",   ["/api.php?action=query&meta=siteinfo&format=json"]),
+    ("Grafana",              "Grafana",     ["/api/health", "/login"]),
+    ("Jenkins",              "Jenkins",     ["/api/json", "/manage", "/login"]),
+    ("Kibana",               "Kibana",      ["/api/status"]),
+    ("Prometheus",           "Prometheus",  ["/api/v1/status/config"]),
+]
+
+# Info-disclosure probes: paths that COMMONLY leak version/config/creds when misconfigured.
+# Fired once against every target regardless of framework, cheap (~1s total).
+_INFO_DISCLOSURE_PROBES = [
+    "/robots.txt", "/sitemap.xml", "/.env", "/.git/config", "/.git/HEAD",
+    "/package.json", "/composer.json", "/config.php.bak", "/backup.zip",
+    "/phpinfo.php", "/info.php", "/server-status", "/server-info",
+    "/actuator/env", "/actuator/health", "/.DS_Store", "/README.md",
+    "/CHANGELOG.md", "/config.yml", "/debug", "/?debug=1", "/?trace=1",
+]
+
+# Auth-wall signatures: response indicates a login is required. When detected, the
+# deep-enum layer can try default creds for the identified stack.
+_AUTH_WALL_SIGNALS = [
+    "please log in", "sign in", "login required", "authentication required",
+    "unauthorized", "401", "WWW-Authenticate", "csrf token",
+    "<title>login", "<title>sign in", "<title>访问管理",
+]
+
+
+def _mine_response(url, resp, tag="mine"):
+    """Extract bypass/version/hidden-endpoint signals from one HTTP response.
+    Returns a dict of extracted intel — headers, cookies, tech-stack matches, HTML/JS
+    comments (first 6), hidden form inputs, error-stack hints, auth-wall flag,
+    framework matches. Never raises."""
+    import re as _re
+    intel = {"url": url, "status": None, "tag": tag}
+    try:
+        intel["status"] = resp.status_code
+        # Headers of interest — these often name the exact tech + version
+        wanted_hdrs = ("server", "x-powered-by", "x-cdn", "x-cache", "cf-ray",
+                       "x-sucuri-id", "x-firewall-version", "x-drupal-cache",
+                       "x-generator", "x-aspnet-version", "x-runtime")
+        intel["headers"] = {h: resp.headers.get(h) for h in wanted_hdrs
+                            if resp.headers.get(h)}
+        # Cookies — session mechanism + framework-identifying names
+        set_cookie = resp.headers.get("set-cookie", "")
+        cookie_names = list(dict.fromkeys(
+            _re.findall(r"(?:^|,\s*)([A-Za-z0-9_-]+)=", set_cookie)))[:6]
+        if cookie_names:
+            intel["cookies"] = cookie_names
+        body = (resp.text or "")[:60000]
+        intel["body_len"] = len(body)
+        # Framework match
+        for needle, name, _probes in _FRAMEWORK_FINGERPRINTS:
+            if needle.lower() in body.lower():
+                intel["framework"] = name
+                intel["framework_needle"] = needle
+                break
+        # Auth wall?
+        for sig in _AUTH_WALL_SIGNALS:
+            if sig.lower() in body.lower():
+                intel["auth_wall"] = sig
+                break
+        # HTML comments (first 6) — dev notes, hidden endpoints, debug flags
+        comments = [c.strip()[:160] for c in _re.findall(r"<!--(.*?)-->", body, _re.S)][:6]
+        if comments:
+            intel["html_comments"] = comments
+        # JS-style comments in scripts (block only)
+        js_comments = [c.strip()[:160] for c in _re.findall(r"/\*(.*?)\*/", body, _re.S)][:4]
+        if js_comments:
+            intel["js_comments"] = js_comments
+        # Hidden inputs — often reveal CSRF tokens or hidden fields the LLM should include
+        hidden_inputs = list(dict.fromkeys(
+            _re.findall(r'<input[^>]+type=["\']hidden["\'][^>]+name=["\']([^"\']+)["\']', body, _re.I)))[:8]
+        if hidden_inputs:
+            intel["hidden_inputs"] = hidden_inputs
+        # Error / stack hints
+        error_hints = []
+        for pat, tag2 in [(r"([A-Z][a-zA-Z]+Error): ([^\n]{0,120})", "exception"),
+                           (r"Stack trace:\s*(#0[^\n]{0,180})",       "stacktrace"),
+                           (r"(Warning: [^\n]{0,140})",                "php_warning"),
+                           (r"(Fatal error: [^\n]{0,140})",            "php_fatal"),
+                           (r"on line (\d+) of ([^\s<]+)",             "location")]:
+            for m in _re.finditer(pat, body):
+                error_hints.append(f"{tag2}: {' | '.join(m.groups())[:180]}")
+                if len(error_hints) >= 4:
+                    break
+        if error_hints:
+            intel["error_hints"] = error_hints
+        # Version hints in body
+        vmatches = _re.findall(r"(?:version|v(?:er)?)\s*[:=\-]?\s*(\d+\.\d+(?:\.\d+)?)", body, _re.I)
+        if vmatches:
+            intel["version_hints"] = list(dict.fromkeys(vmatches))[:5]
+        # Non-static HREFs (endpoints the app links to, may include hidden)
+        hrefs = list(dict.fromkeys(
+            _re.findall(r'href=["\'](/[a-zA-Z0-9_\-/.]+(?:\.(?:php|jsp|aspx|py|cgi))?)["\']', body)))[:8]
+        if hrefs:
+            intel["hrefs"] = hrefs
+        # Credential + admin-path hints from README / docs / config leaks — these are
+        # gold: many CMSes ship with default creds AND their READMEs leak the admin URL.
+        # A leaked README with "admin/123456" + admin path is basically a foothold handed
+        # to us. Extract creds in common phrasings + admin/backend/dashboard URLs.
+        cred_pairs = []
+        for pat in (
+            # "账号密码：`admin`/`123456`" or "username: admin password: 123456"
+            r"(?:账号|username|user|login)[:\s`']+([A-Za-z][A-Za-z0-9_.-]{0,30})[`'\s]*[/:,\s]+(?:密码|password|pass|pwd)[:\s`']+([^\s`'<>]{3,40})",
+            r"(?:密码|password|pass|pwd)[:\s`']+([^\s`'<>]{3,40})[`'\s]*[/:,\s]+(?:账号|username|user|login)[:\s`']+([A-Za-z][A-Za-z0-9_.-]{0,30})",
+            # `admin`/`123456` shorthand
+            r"`([A-Za-z][A-Za-z0-9_.-]{2,30})`\s*[/:]\s*`([^`\s]{3,40})`",
+            # "default admin/password"
+            r"default\s+(?:credentials?)?\s*[:\-]\s*([A-Za-z][A-Za-z0-9_.-]{0,30})\s*[/:]\s*([^\s<>]{3,40})",
+        ):
+            for m in _re.finditer(pat, body, _re.I):
+                a, b = m.group(1), m.group(2)
+                if a and b and 3 <= len(b) <= 40:
+                    cred_pairs.append(f"{a}:{b}")
+        if cred_pairs:
+            intel["credential_hints"] = list(dict.fromkeys(cred_pairs))[:5]
+        # Admin/backend/dashboard paths mentioned in docs
+        admin_paths = list(dict.fromkeys(
+            _re.findall(r"[`'\"](\/(?:admin|backend|dashboard|manage(?:ment)?|console|install|setup|login)[a-zA-Z0-9_\-/.]*)[`'\"]", body)))[:5]
+        if admin_paths:
+            intel["admin_paths"] = admin_paths
+    except Exception:  # noqa: BLE001
+        pass
+    return intel
+
+
+def _scout_response_mine(ip, port, timeout=4):
+    """Fire the info-disclosure probes + baseline and extract deterministic intel from
+    every response. Returns (guidance_text, intel_list). Fast (~1-3s total, parallelized)
+    and idempotent. Feeds two downstream things: the reactive deep-enum step
+    (_deep_enum_framework) and the strategist (bypass angles, hidden endpoints, exact
+    tech versions, exposed credentials, debug flags)."""
+    import httpx as _hx, concurrent.futures as _cf
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    probes = ["/"] + _INFO_DISCLOSURE_PROBES
+    intel_list = []
+    def _fetch(path):
+        try:
+            with _hx.Client(verify=False, follow_redirects=False, timeout=timeout) as cli:
+                r = cli.get(base + path)
+                return path, r
+        except Exception:  # noqa: BLE001
+            return path, None
+    with _cf.ThreadPoolExecutor(max_workers=12) as ex:
+        for path, r in ex.map(_fetch, probes):
+            if r is None:
+                continue
+            item = _mine_response(base + path, r, tag="disclosure" if path != "/" else "landing")
+            intel_list.append(item)
+    # Filter to responses that gave us something useful — 200s with content, or a
+    # 500 with error hints, or any framework/auth-wall/cookie hit.
+    signal = [x for x in intel_list
+              if x.get("status") in (200, 500)
+              or any(k in x for k in ("framework", "auth_wall", "error_hints",
+                                       "hidden_inputs", "html_comments", "cookies",
+                                       "version_hints"))]
+    if not signal:
+        return "", intel_list
+    # Compact summary for the LLM + operator
+    parts = []
+    frameworks = list(dict.fromkeys(x.get("framework") for x in signal if x.get("framework")))
+    if frameworks:
+        parts.append(f"FRAMEWORK: {', '.join(frameworks)}")
+    versions = list(dict.fromkeys(v for x in signal for v in x.get("version_hints", [])))
+    if versions:
+        parts.append(f"VERSION HINTS: {', '.join(versions[:6])}")
+    all_hdrs = {}
+    for x in signal:
+        for k, v in (x.get("headers") or {}).items():
+            all_hdrs.setdefault(k, set()).add(v)
+    if all_hdrs:
+        parts.append("HEADERS: " + "; ".join(
+            f"{k}={list(v)[0][:40]}" for k, v in list(all_hdrs.items())[:6]))
+    all_cookies = list(dict.fromkeys(c for x in signal for c in x.get("cookies", [])))
+    if all_cookies:
+        parts.append(f"COOKIES: {', '.join(all_cookies[:6])}")
+    disclosures = [x for x in signal if x.get("tag") == "disclosure" and x.get("status") == 200]
+    if disclosures:
+        parts.append("INFO DISCLOSURE (200 on):\n  "
+                     + "\n  ".join(f"{x['url']} ({x['body_len']} bytes)"
+                                    for x in disclosures[:6]))
+    aw = [x for x in signal if x.get("auth_wall")]
+    if aw:
+        parts.append(f"AUTH WALL detected: {aw[0]['auth_wall']!r} at {aw[0]['url']}")
+    hidden = list(dict.fromkeys(h for x in signal for h in x.get("hidden_inputs", [])))
+    if hidden:
+        parts.append(f"HIDDEN FORM INPUTS: {', '.join(hidden[:8])}")
+    comments_all = [c for x in signal for c in x.get("html_comments", []) if c.strip()]
+    if comments_all:
+        parts.append("HTML COMMENTS (dev notes / hidden endpoints):\n  "
+                     + "\n  ".join(f"'{c[:120]}'" for c in comments_all[:5]))
+    errors = [e for x in signal for e in x.get("error_hints", [])]
+    if errors:
+        parts.append("ERROR HINTS: " + " | ".join(errors[:4]))
+    hrefs_all = list(dict.fromkeys(h for x in signal for h in x.get("hrefs", [])))
+    if hrefs_all:
+        parts.append(f"LINKED PATHS: {', '.join(hrefs_all[:10])}")
+    # Credential hints and admin paths get top-billing — these are the biggest gains
+    # from response mining (default creds in a leaked README = handed foothold).
+    cred_all = list(dict.fromkeys(c for x in signal for c in x.get("credential_hints", [])))
+    if cred_all:
+        parts.insert(0, f"CREDENTIAL HINTS (from mined docs/READMEs — TRY THESE FIRST): "
+                        + ", ".join(cred_all[:6]))
+    admin_all = list(dict.fromkeys(a for x in signal for a in x.get("admin_paths", [])))
+    if admin_all:
+        parts.insert(0 if not cred_all else 1,
+                     f"ADMIN/BACKEND PATHS (from mined docs): {', '.join(admin_all[:6])}")
+    guidance = ("RESPONSE INTEL (mined from " + str(len(intel_list))
+                + " probes across the target — includes info-disclosure attempts):\n"
+                + "\n".join(f"  * {p}" for p in parts))
+    return guidance, intel_list
+
+
+def _deep_enum_framework(ip, port, framework, intel_list=None, timeout=3):
+    """When _mine_response detected a specific framework, probe its known
+    version/config endpoints to pin the version and surface framework-specific
+    known-CVE-bearing paths. Returns compact guidance; empty when the framework
+    isn't in _FRAMEWORK_FINGERPRINTS or its probes returned nothing useful."""
+    import httpx as _hx
+    if not framework:
+        return ""
+    probes = []
+    for needle, name, paths in _FRAMEWORK_FINGERPRINTS:
+        if name == framework:
+            probes = paths
+            break
+    if not probes:
+        return ""
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    hits = []
+    try:
+        with _hx.Client(verify=False, follow_redirects=False, timeout=timeout) as cli:
+            for path in probes[:8]:
+                try:
+                    r = cli.get(base + path)
+                    if r.status_code in (200, 401, 403):
+                        hits.append(f"{path} -> {r.status_code} ({len(r.text or '')} bytes)")
+                except Exception:  # noqa: BLE001
+                    continue
+    except Exception:  # noqa: BLE001
+        return ""
+    if not hits:
+        return ""
+    return (f"FRAMEWORK DEEP-ENUM ({framework}): probed known version/config endpoints — "
+            f"live results:\n  " + "\n  ".join(hits)
+            + f"\n  These are known-CVE-bearing paths for {framework}; the strategist "
+              "should consider them as primary/alternative attack surface before "
+              "guessing at generic endpoints.")
+
+
 def _characterize_waf(ip, port, family, timeout=4):
     """When a WAF is detected, PROBE it with real evasion variants to learn what
     actually gets through. This turns the generic playbook into empirical evidence:
@@ -15413,6 +15678,42 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
                 if b:
                     segments.append(b)
                     _poc_trace(run_id, "recon:basic", response=b[:1200])
+                # Response mining: fires the info-disclosure probe battery + baseline
+                # and extracts deterministic intel from every response (headers, cookies,
+                # framework signature, hidden inputs, HTML comments, error hints, version
+                # strings, linked hrefs). Deep-enum for the identified framework fires
+                # reactively: framework match -> its known version/config paths.
+                _t0 = _t.time()
+                try:
+                    mine_line, intel_list = _scout_response_mine(ip, port)
+                except Exception:  # noqa: BLE001
+                    mine_line, intel_list = "", []
+                recon_metrics["response_mine"] = {
+                    "seconds": round(_t.time() - _t0, 2),
+                    "chars_added": len(mine_line or ""),
+                    "signal": "headers/cookies/comments/errors/hidden inputs/info-disclosure",
+                }
+                if mine_line:
+                    segments.append(mine_line)
+                    _poc_trace(run_id, "recon:response_mine", response=mine_line[:1500])
+                # Reactive framework deep-enum
+                detected_frameworks = list(dict.fromkeys(
+                    x.get("framework") for x in intel_list if x.get("framework")))
+                for fw in detected_frameworks[:2]:  # cap: at most 2 frameworks probed
+                    _t0 = _t.time()
+                    try:
+                        fw_line = _deep_enum_framework(ip, port, fw, intel_list)
+                    except Exception:  # noqa: BLE001
+                        fw_line = ""
+                    recon_metrics[f"deep_enum:{fw}"] = {
+                        "seconds": round(_t.time() - _t0, 2),
+                        "chars_added": len(fw_line or ""),
+                        "signal": f"{fw}-specific known-CVE-bearing paths",
+                    }
+                    if fw_line:
+                        segments.append(fw_line)
+                        _poc_trace(run_id, f"recon:deep_enum:{fw}",
+                                   response=fw_line[:1200])
             # Order: ZAP spider FIRST so Arjun can fan out across the discovered paths.
             # Falls back to a single Arjun on '/' when ZAP wasn't requested.
             zap_paths = []
