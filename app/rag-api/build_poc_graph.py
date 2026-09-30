@@ -613,6 +613,27 @@ def node_save_store(state: BuildPocState) -> Dict[str, Any]:
                       "security_test_id": result.get("security_test_id")})
     except Exception:  # noqa: BLE001
         pass
+    # Auto-hint feedback: on an unverified build, extract the strongest signals we
+    # already collected (framework, WAF, LIVE/SUSPECT endpoints, honored params,
+    # dead endpoints to avoid, mined creds) and persist as a poc_hint so the next
+    # rebuild picks them up. Closes the loop: fail once -> analyze -> hint -> retry.
+    if store_id and not result.get("verified"):
+        try:
+            from api import (_read_trace_entries, _summarize_build_trace,
+                              _derive_auto_hint, _auto_save_recon_hint, _poc_trace)
+            entries = _read_trace_entries(store_id)
+            summary = _summarize_build_trace(entries)
+            hint_text = _derive_auto_hint(summary)
+            if hint_text:
+                hid = _auto_save_recon_hint(state["cve"], state["ip"], state["port"],
+                                             hint_text, state.get("eid"))
+                if hid:
+                    _poc_trace(state["run_id"], "auto_hint_saved",
+                               response=f"persisted auto-hint {hid} for next rebuild "
+                                        f"({len(hint_text)} chars from prior recon)",
+                               extra={"hint_id": str(hid), "hint_len": len(hint_text)})
+        except Exception:  # noqa: BLE001
+            pass
     return {"exploit_store_id": store_id}
 
 

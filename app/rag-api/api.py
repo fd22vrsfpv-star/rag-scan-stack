@@ -15927,6 +15927,273 @@ def list_poc_hints(cve: Optional[str] = None, target_host: Optional[str] = None,
         return {"hints": [dict(r) for r in cur.fetchall()]}
 
 
+def _read_trace_entries(exploit_id):
+    """Load the JSONL trace for a build. Returns [] on any error. Centralizes the
+    read so the summary + auto-hint paths share the parser."""
+    import json as _j
+    try:
+        _ensure_exploit_store()
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT poc_log_path, metadata FROM exploit_store WHERE id = %s",
+                        (exploit_id,))
+            row = cur.fetchone()
+        if not row:
+            return []
+        md = row.get("metadata") or {}
+        log_path = row.get("poc_log_path") or md.get("log")
+        if not log_path:
+            return []
+        out = []
+        with open(log_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(_j.loads(line))
+                except Exception:  # noqa: BLE001
+                    continue
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _summarize_build_trace(entries):
+    """Extract structured intel from a build's JSONL trace so the operator gets a
+    one-glance view instead of scrolling through every phase.
+    Returns a dict with:
+      framework, waf_family, waf_proven_variants, open_ports, endpoints_discovered,
+      honored_params (with classification), credentials_found, admin_paths, has_captcha,
+      strategist_primary, plan_verdicts, iterations_summary (each iter -> status/HTTP/
+      last-response-fragment), dead_endpoints (404s), waf_blocks, final_verdict.
+    Used by /exploit-store/{id}/summary and by the auto-hint extractor."""
+    import re as _re
+    s = {
+        "framework": None, "waf_family": None, "waf_proven_variants": {},
+        "open_ports": [], "endpoints_discovered": [], "honored_params": [],
+        "credentials_found": [], "admin_paths": [], "has_captcha": False,
+        "strategist_primary": None, "strategist_alts": [],
+        "plan_verdicts": {}, "iterations_summary": [],
+        "dead_endpoints": [], "waf_blocks": 0,
+    }
+    for e in entries:
+        ph = str(e.get("phase") or "")
+        resp = str(e.get("response") or "")
+        extra = e.get("extra") or {}
+        if ph == "recon:port_sweep":
+            m = _re.search(r"Open ports on [\d.]+\s*\(\d+\):\s*(\[[^\]]+\])", resp)
+            if m:
+                try: s["open_ports"] = eval(m.group(1))  # noqa: S307 - trusted own trace
+                except Exception: pass
+        elif ph == "recon:waf":
+            m = _re.search(r"WAF FAMILY:\s*([a-z_]+)", resp)
+            if m: s["waf_family"] = m.group(1)
+        elif ph == "recon:waf_characterize":
+            if extra.get("proven"):
+                s["waf_proven_variants"] = extra["proven"]
+        elif ph == "recon:zap" or ph == "recon:zap_active":
+            m = _re.search(r"ZAP-spidered paths:\s*([^|]+?)(?:\s*\||$)", resp)
+            if m:
+                for p in m.group(1).split(","):
+                    p = p.strip()
+                    if p and p not in s["endpoints_discovered"]:
+                        s["endpoints_discovered"].append(p)
+        elif ph == "recon:arjun":
+            for m in _re.finditer(r"^\s*(/[^\s:]+):\s*(.+)$", resp, _re.M):
+                path, params_str = m.group(1), m.group(2)
+                for pn in [x.strip() for x in params_str.split(",") if x.strip()]:
+                    s["honored_params"].append({"path": path, "param": pn})
+            # Also grab classified line to enrich with vuln class
+            for m in _re.finditer(r"(/\S+)\s+param\s+`([^`]+)`\s+→\s+likely\s+([^\.]+?)\.\s+(.+?)(?=\n|$)", resp):
+                path, param, cls, hint = m.group(1), m.group(2), m.group(3).strip(), m.group(4).strip()[:180]
+                # If already present without class, upgrade in place
+                found = False
+                for h in s["honored_params"]:
+                    if h["path"] == path and h["param"] == param:
+                        h["class"] = cls; h["payload_hint"] = hint; found = True
+                        break
+                if not found:
+                    s["honored_params"].append({"path": path, "param": param,
+                                                 "class": cls, "payload_hint": hint})
+        elif ph == "recon:response_mine":
+            m = _re.search(r"FRAMEWORK:\s*([^\n]+)", resp)
+            if m: s["framework"] = m.group(1).strip()
+            m = _re.search(r"CREDENTIAL HINTS[^:]*:\s*([^\n]+)", resp)
+            if m:
+                for c in m.group(1).split(","):
+                    c = c.strip().rstrip(".")
+                    if ":" in c: s["credentials_found"].append(c)
+            m = _re.search(r"ADMIN/BACKEND PATHS[^:]*:\s*([^\n]+)", resp)
+            if m:
+                for p in m.group(1).split(","):
+                    p = p.strip().rstrip(".")
+                    if p and p.startswith("/"): s["admin_paths"].append(p)
+        elif ph == "recon:auto_login":
+            if "captcha" in resp.lower(): s["has_captcha"] = True
+        elif ph == "recon:strategist":
+            m = _re.search(r"PRIMARY:\s+class=(\S+)\s+endpoint=(\S+)\s+param=(\S+)\s+method=(\S+)",
+                           resp)
+            if m:
+                s["strategist_primary"] = {"class": m.group(1), "endpoint": m.group(2),
+                                            "param": m.group(3), "method": m.group(4)}
+            for am in _re.finditer(r"(ALT\d):\s+class=(\S+)\s+endpoint=(\S+)\s+param=(\S+)", resp):
+                s["strategist_alts"].append({"label": am.group(1), "class": am.group(2),
+                                              "endpoint": am.group(3), "param": am.group(4)})
+        elif ph == "recon:plan_verified":
+            if extra.get("verdicts"):
+                s["plan_verdicts"] = extra["verdicts"]
+        elif ph == "run":
+            it = int(e.get("iteration") or 0)
+            out = str(e.get("run_output") or "")[:400]
+            passed = bool(e.get("assertion_passed"))
+            status = "PASSED" if passed else "FAILED"
+            if "404 Not Found" in out or "\"404 Not Found\"" in out:
+                status = "404"
+            elif "网站防火墙" in out or "blocked by" in out.lower():
+                status = "WAF-BLOCKED"; s["waf_blocks"] += 1
+            s["iterations_summary"].append({"iter": it, "status": status,
+                                             "output_head": out[:200]})
+        elif ph == "waf_block_detected":
+            s["waf_blocks"] += 1
+        elif ph == "result":
+            s["final_verdict"] = {
+                "verified": bool(e.get("verified")),
+                "reason": e.get("reason") or e.get("response") or ""}
+    # Derived: dead endpoints from 404s across iterations
+    for it_s in s["iterations_summary"]:
+        if it_s["status"] == "404":
+            m = _re.search(r'"([^"]+)"\s+\d+ ', it_s["output_head"])
+            if m and m.group(1) not in s["dead_endpoints"]:
+                s["dead_endpoints"].append(m.group(1))
+    return s
+
+
+def _derive_auto_hint(summary):
+    """Turn a build summary into an operator-hint string. Highest-signal items first
+    so a synth agent reading this immediately sees the strongest attack surface.
+    Returns "" when nothing hint-worthy was collected (empty recon)."""
+    if not summary:
+        return ""
+    lines = []
+    # Framework + WAF context
+    ctx = []
+    if summary.get("framework"): ctx.append(f"framework={summary['framework']}")
+    if summary.get("waf_family"): ctx.append(f"WAF family={summary['waf_family']}")
+    if summary.get("waf_proven_variants"):
+        proven_bits = []
+        for cls, variants in (summary["waf_proven_variants"] or {}).items():
+            if variants:
+                proven_bits.append(f"{cls} passes with [{', '.join(variants[:3])}]")
+        if proven_bits:
+            ctx.append("WAF empirical: " + "; ".join(proven_bits))
+    if ctx:
+        lines.append("CONTEXT: " + " | ".join(ctx))
+    # Confirmed / suspect endpoints from plan verifier — these are gold: proven live
+    if summary.get("plan_verdicts") and summary.get("strategist_primary"):
+        pri = summary["strategist_primary"]
+        v_pri = summary["plan_verdicts"].get("PRIMARY")
+        if v_pri in ("LIVE", "SUSPECT"):
+            lines.append(f"CONFIRMED endpoint (verdict={v_pri}): {pri['method']} "
+                         f"{pri['endpoint']} with param `{pri['param']}` (class {pri['class']}). "
+                         f"This was empirically probed — the endpoint exists and the param is honored. "
+                         f"Use THIS endpoint, not a guessed alternative.")
+        for alt, v_alt in summary["plan_verdicts"].items():
+            if alt == "PRIMARY": continue
+            if v_alt == "LIVE":
+                match = next((a for a in summary.get("strategist_alts", []) if a["label"] == alt), None)
+                if match:
+                    lines.append(f"ALT ({alt}) verified LIVE: {match['endpoint']} param `{match['param']}` "
+                                 f"class {match['class']} — also worth exploiting.")
+    # Classified honored params (Arjun): concrete injection points with payload hints
+    for hp in (summary.get("honored_params") or [])[:6]:
+        if hp.get("class"):
+            lines.append(f"HONORED PARAM: {hp['path']}?{hp['param']}= — likely {hp['class']}. "
+                         f"{hp.get('payload_hint', '')}")
+    # Credentials from mined docs
+    if summary.get("credentials_found"):
+        creds = ", ".join(summary["credentials_found"][:3])
+        line = f"CREDS from leaked docs: {creds}"
+        if summary.get("has_captcha"):
+            line += " (login form has captcha — auto-login skipped; operator must log in manually to get session cookie)"
+        elif summary.get("admin_paths"):
+            line += f" — admin at {', '.join(summary['admin_paths'][:3])}"
+        lines.append(line)
+    # Dead endpoints — tell synth NOT to retry these
+    if summary.get("dead_endpoints"):
+        lines.append(f"DEAD ENDPOINTS (returned 404 on prior attempts, DO NOT retry): "
+                     + ", ".join(summary["dead_endpoints"][:6]))
+    # WAF-blocked earlier
+    if summary.get("waf_blocks", 0) > 0:
+        lines.append(f"WAF blocks previously hit: {summary['waf_blocks']} times. "
+                     "Use only empirical proven-passable variants (see CONTEXT above).")
+    if not lines:
+        return ""
+    return ("AUTO-HINT (derived from prior build's recon — the pipeline already saw "
+            "these signals live on this target): " + " | ".join(lines))
+
+
+def _auto_save_recon_hint(cve, ip, port, hint_text, engagement_id=None):
+    """Persist an auto-derived hint tagged `auto_from_recon` so the next build against
+    the same (cve, host, port) picks it up. Dedupes: replaces any prior auto-hint
+    for the same target rather than accumulating."""
+    if not hint_text:
+        return None
+    _ensure_poc_hints_table()
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Deactivate any prior auto-hint for this (cve, host, port)
+            cur.execute("""UPDATE poc_hints SET active=false, updated_at=now()
+                           WHERE cve=%s AND target_host=%s
+                             AND (target_port = %s OR (%s IS NULL AND target_port IS NULL))
+                             AND created_by = 'auto_from_recon' AND active = true""",
+                        (cve, ip, port, port))
+            cur.execute("""INSERT INTO poc_hints
+                           (cve, target_host, target_port, hint, engagement_id, created_by)
+                           VALUES (%s,%s,%s,%s,%s,'auto_from_recon') RETURNING id""",
+                        (cve, ip, port, hint_text, engagement_id))
+            new_id = cur.fetchone()["id"]; conn.commit()
+        return new_id
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@app.get("/exploit-store/{exploit_id}/summary", tags=["Exploit Store"])
+def get_exploit_summary(exploit_id: str, authorized: bool = Depends(auth)):
+    """One-glance overview of a build's recon + plan + iters + verdict.
+    Answers "what did this build see?" without walking the JSONL trace phase-by-phase.
+    Also returns the auto-hint text that would be persisted (whether or not a hint
+    was actually saved) so the operator can decide to keep, edit, or discard it
+    before the next rebuild."""
+    entries = _read_trace_entries(exploit_id)
+    summary = _summarize_build_trace(entries)
+    auto_hint = _derive_auto_hint(summary)
+    return {"ok": True, "exploit_id": exploit_id, "phase_count": len(entries),
+            "summary": summary, "auto_hint": auto_hint}
+
+
+@app.post("/exploit-store/{exploit_id}/derive-hint", tags=["Exploit Store"])
+def derive_and_save_hint(exploit_id: str, authorized: bool = Depends(auth)):
+    """Explicitly extract an auto-hint from this build's trace and persist it as a
+    poc_hint (scoped to the build's CVE + target). The next rebuild automatically
+    uses it. Idempotent: replaces any prior auto-hint for the same target."""
+    _ensure_exploit_store()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT cve, target_host, target_port, engagement_id FROM exploit_store WHERE id = %s",
+                    (exploit_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "exploit not found")
+    entries = _read_trace_entries(exploit_id)
+    summary = _summarize_build_trace(entries)
+    hint_text = _derive_auto_hint(summary)
+    if not hint_text:
+        return {"ok": False, "reason": "no hint-worthy signals in this build's trace"}
+    hint_id = _auto_save_recon_hint(row["cve"], row["target_host"], row["target_port"],
+                                      hint_text, row.get("engagement_id"))
+    return {"ok": bool(hint_id), "hint_id": str(hint_id) if hint_id else None,
+            "hint_text": hint_text}
+
+
 @app.post("/software/poc-hints", tags=["Assets"])
 def add_poc_hint(body: PocHintBody, authorized: bool = Depends(auth)):
     """Persist an operator hint for future builds of this CVE. Prepended to synth guidance
