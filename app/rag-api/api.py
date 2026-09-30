@@ -29390,10 +29390,16 @@ RAG_VERIFIED_TECHNIQUE_SOURCE = "verified_exploit_technique"
 RAG_VULN_FINDING_SOURCE = "vuln_finding"
 RAG_SERVICE_FINGERPRINT_SOURCE = "service_fingerprint"
 RAG_DISCOVERED_ENDPOINT_SOURCE = "discovered_endpoint"
+# Tier 2: web findings by class + api schemas + info-disclosure paths
+RAG_WEB_FINDING_SOURCE = "web_finding"
+RAG_API_SCHEMA_SOURCE = "api_schema"
+RAG_INFO_DISCLOSURE_SOURCE = "info_disclosure"
 _RAG_FACT_SOURCES = (RAG_OBSERVED_FACTS_SOURCE, RAG_ENUM_FACT_SOURCE,
                      RAG_CREDENTIAL_SOURCE, RAG_IDENTITY_SOURCE,
                      RAG_VERIFIED_TECHNIQUE_SOURCE, RAG_VULN_FINDING_SOURCE,
-                     RAG_SERVICE_FINGERPRINT_SOURCE, RAG_DISCOVERED_ENDPOINT_SOURCE)
+                     RAG_SERVICE_FINGERPRINT_SOURCE, RAG_DISCOVERED_ENDPOINT_SOURCE,
+                     RAG_WEB_FINDING_SOURCE, RAG_API_SCHEMA_SOURCE,
+                     RAG_INFO_DISCLOSURE_SOURCE)
 
 
 def observed_facts_enabled() -> bool:
@@ -30096,7 +30102,187 @@ def _compose_recall_context(ip, product=None, limit=8):
                 parts.append("PRIOR VULN FINDINGS on this target:\n" + "\n".join(lines))
     except Exception:  # noqa: BLE001
         pass
+    # 7. info-disclosure paths — very high signal (leaked config = often auth)
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT metadata FROM rag_documents
+                     WHERE metadata->>'source' = %s AND metadata->>'ip' = %s
+                     ORDER BY (metadata->>'observed_at') DESC LIMIT %s""",
+                (RAG_INFO_DISCLOSURE_SOURCE, ip, limit))
+            ids_ = [r["metadata"] for r in cur.fetchall()]
+            if ids_:
+                lines = [f"  * [{i.get('kind', '?')}] {i.get('value', '')[:200]}" for i in ids_]
+                parts.append("INFO-DISCLOSURE PATHS (accessible sensitive files — "
+                             "fetch these BEFORE guessing at auth):\n" + "\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
+    # 8. web findings by class (XSS/SQLi/CSRF locations we've seen)
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT metadata FROM rag_documents
+                     WHERE metadata->>'source' = %s
+                       AND (metadata->>'ip' = %s OR metadata->>'product' = %s)
+                     ORDER BY (metadata->>'observed_at') DESC LIMIT %s""",
+                (RAG_WEB_FINDING_SOURCE, ip, product or "", limit))
+            wfs = [r["metadata"] for r in cur.fetchall()]
+            if wfs:
+                lines = [f"  * [{w.get('kind', '?')}] {w.get('value', '')[:250]}" for w in wfs]
+                parts.append("WEB VULNERABILITY FINDINGS (issue-class + location — "
+                             "re-check if still present):\n" + "\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
+    # 9. api schemas — GraphQL/OpenAPI/WSDL dumps if present
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT metadata FROM rag_documents
+                     WHERE metadata->>'source' = %s AND metadata->>'ip' = %s
+                     ORDER BY (metadata->>'observed_at') DESC LIMIT %s""",
+                (RAG_API_SCHEMA_SOURCE, ip, limit))
+            sc = [r["metadata"] for r in cur.fetchall()]
+            if sc:
+                lines = [f"  * {s.get('value', '')[:200]}" for s in sc]
+                parts.append("API SCHEMAS (schema/introspection dumps — the API surface is "
+                             "already mapped):\n" + "\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
     return "\n\n".join(parts)
+
+
+def _load_web_finding_into_rag(finding_row, engagement_id=None, ip=None):
+    """Embed one web_findings row as first-class RAG. Recall answers 'we've
+    seen SQLi on any Spage /pwd/ before?'. Keyed on (source, ip, issue_type,
+    value_hash of url+payload)."""
+    if not observed_facts_enabled() or not finding_row:
+        return False
+    try:
+        _ip = ip or ""
+        if not _ip:
+            asset_id = finding_row.get("asset_id")
+            if asset_id:
+                with get_db() as conn, conn.cursor() as cur:
+                    cur.execute("SELECT host(ip)::text FROM assets WHERE id = %s", (asset_id,))
+                    r = cur.fetchone()
+                    _ip = r[0] if r else ""
+        if not _ip:
+            return False
+        issue = finding_row.get("issue_type") or finding_row.get("name") or "unknown"
+        url = str(finding_row.get("url") or "")[:250]
+        param = finding_row.get("param") or ""
+        method = finding_row.get("method") or "GET"
+        sev = finding_row.get("severity") or "info"
+        payload = str(finding_row.get("payload") or "")[:120]
+        v = f"[{sev}] {issue} :: {method} {url} param={param} payload={payload}"
+        return _load_observed_fact_into_rag(
+            RAG_WEB_FINDING_SOURCE, _ip, issue.lower().replace(" ", "_")[:40], v,
+            engagement_id=engagement_id,
+            product=finding_row.get("source") or None)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("web_finding->rag load failed: %s", e)
+        return False
+
+
+def _load_api_schema_into_rag(ip, schema_type, schema_url, snippet=None,
+                                engagement_id=None, product=None):
+    """Embed one API schema discovery (GraphQL introspection dump, OpenAPI
+    spec URL, WSDL URL, .well-known/openapi.json). Very high signal — one
+    hit gives the entire API surface."""
+    if not observed_facts_enabled():
+        return False
+    try:
+        v = f"{schema_type} @ {schema_url[:200]}"
+        if snippet:
+            v += f" :: {str(snippet)[:300]}"
+        return _load_observed_fact_into_rag(
+            RAG_API_SCHEMA_SOURCE, ip, schema_type[:40], v,
+            engagement_id=engagement_id, product=product)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("api_schema->rag load failed: %s", e)
+        return False
+
+
+def _load_info_disclosure_into_rag(ip, path, status_code=None,
+                                     size_bytes=None, engagement_id=None,
+                                     product=None, kind_hint=None):
+    """Embed one accessible-info-disclosure path (.env, .git/config, README.md
+    with creds, /wp-config.php, /server-status, etc.). Extremely high signal —
+    one hit often gives auth or config. Distinct from generic
+    discovered_endpoint because it names the SENSITIVE-ness explicitly, letting
+    recall filter to just 'leaked config file paths seen on this product'."""
+    if not observed_facts_enabled() or not path:
+        return False
+    try:
+        kind = kind_hint or _classify_info_disclosure(path)
+        v = f"{path} ({status_code or '?'} · {size_bytes or '?'}B)"
+        return _load_observed_fact_into_rag(
+            RAG_INFO_DISCLOSURE_SOURCE, ip, kind, v,
+            engagement_id=engagement_id, product=product)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("info_disclosure->rag load failed: %s", e)
+        return False
+
+
+def _classify_info_disclosure(path):
+    """Give info-disclosure a semantic kind so recall can filter to a class."""
+    p = (path or "").lower()
+    if any(x in p for x in (".env", "wp-config", "config.php", "settings.py")):
+        return "config_file"
+    if any(x in p for x in (".git/", "/.hg/", "/.svn/")):
+        return "vcs_metadata"
+    if "readme" in p or "changelog" in p:
+        return "docs_leaked"
+    if "server-status" in p or "server-info" in p or "actuator" in p:
+        return "server_diagnostic"
+    if "phpinfo" in p or "info.php" in p:
+        return "phpinfo"
+    if "backup" in p or p.endswith((".bak", ".zip", ".tar", ".sql")):
+        return "backup_file"
+    return "other_disclosure"
+
+
+def _backfill_tier2_to_rag(engagement_id=None, limit=500):
+    """One-shot backfill for Tier 2 sources. Reads web_findings and any
+    known info-disclosure URLs. API schemas typically don't exist as a
+    separate table (they're discovered live); those get live-embed only."""
+    if not observed_facts_enabled():
+        return {}
+    counts = {"web_finding": 0, "info_disclosure": 0}
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            eng_join = "AND a.engagement_id = %s" if engagement_id else ""
+            eng_args = [str(engagement_id)] if engagement_id else []
+            # Web findings — every parsed nuclei/zap/burp finding
+            cur.execute(
+                f"""SELECT w.*, host(a.ip)::text AS _ip FROM web_findings w
+                     JOIN assets a ON a.id = w.asset_id
+                     WHERE 1=1 {eng_join}
+                     ORDER BY w.created_at DESC LIMIT %s""",
+                eng_args + [limit])
+            for row in cur.fetchall():
+                if _load_web_finding_into_rag(dict(row), engagement_id=engagement_id,
+                                               ip=row.get("_ip")):
+                    counts["web_finding"] += 1
+            # Info-disclosure: pull from web_findings where issue_type/name matches
+            # known-sensitive patterns
+            cur.execute(
+                f"""SELECT w.url, w.status_code, host(a.ip)::text AS _ip
+                     FROM web_findings w JOIN assets a ON a.id = w.asset_id
+                     WHERE (w.issue_type ILIKE '%%disclosure%%'
+                           OR w.name ILIKE '%%disclosure%%'
+                           OR w.url ~* '(\\.env|\\.git/|wp-config|phpinfo|readme|backup)')
+                       {eng_join}
+                     ORDER BY w.created_at DESC LIMIT %s""",
+                eng_args + [limit])
+            for row in cur.fetchall():
+                if _load_info_disclosure_into_rag(
+                        row["_ip"], row["url"], status_code=row.get("status_code"),
+                        engagement_id=engagement_id):
+                    counts["info_disclosure"] += 1
+    except Exception as e:  # noqa: BLE001
+        logging.debug("backfill_tier2 failed: %s", e)
+    return counts
 
 
 @app.post("/rag/backfill/{source}", tags=["RAG"])
@@ -30106,9 +30292,12 @@ def backfill_source_endpoint(source: str,
                               authorized: bool = Depends(auth)):
     """Generic backfill: embed existing rows from a specific source's underlying
     table(s) into rag_documents. Idempotent (dedup by value_hash). Requires
-    RAG_OBSERVED_FACTS=1. `source` = 'tier1' (all 4 tier-1 sources at once),
-    'credentials', 'verified_technique', 'vuln_finding', 'service_fingerprint',
-    'discovered_endpoint'."""
+    RAG_OBSERVED_FACTS=1. `source` supports:
+      'tier1' or one of ('verified_technique', 'vuln_finding',
+      'service_fingerprint', 'discovered_endpoint')
+      'tier2' or one of ('web_finding', 'info_disclosure')
+      'credentials'
+      'all' — everything."""
     if not observed_facts_enabled():
         raise HTTPException(400, "RAG_OBSERVED_FACTS is disabled — set the env flag first")
     src = (source or "").lower()
@@ -30120,6 +30309,15 @@ def backfill_source_endpoint(source: str,
                 "service_fingerprint", "discovered_endpoint"):
         counts = _backfill_tier1_to_rag(engagement_id=engagement_id, limit=limit)
         return {"ok": True, "source": src, "counts": counts}
+    if src in ("tier2", "web_finding", "info_disclosure", "api_schema"):
+        counts = _backfill_tier2_to_rag(engagement_id=engagement_id, limit=limit)
+        return {"ok": True, "source": src, "counts": counts}
+    if src == "all":
+        n_c, n_i = _backfill_credentials_and_identities_to_rag(engagement_id=engagement_id, limit=limit)
+        c1 = _backfill_tier1_to_rag(engagement_id=engagement_id, limit=limit)
+        c2 = _backfill_tier2_to_rag(engagement_id=engagement_id, limit=limit)
+        return {"ok": True, "source": "all",
+                "counts": {**c1, **c2, "credentials": n_c, "identities": n_i}}
     raise HTTPException(400, f"unknown source '{source}' — see docstring")
 
 

@@ -284,3 +284,53 @@ def test_backfill_tier1_endpoint():
     assert "counts" in resp
     assert set(resp["counts"].keys()) >= {"verified_technique", "vuln_finding",
                                            "service_fingerprint", "discovered_endpoint"}
+
+
+def test_tier2_info_disclosure_classification():
+    """_classify_info_disclosure correctly tags known-sensitive paths."""
+    py = """
+import sys; sys.path.insert(0, '/app')
+from api import _classify_info_disclosure
+assert _classify_info_disclosure('/.env') == 'config_file'
+assert _classify_info_disclosure('/.git/config') == 'vcs_metadata'
+assert _classify_info_disclosure('/README.md') == 'docs_leaked'
+assert _classify_info_disclosure('/phpinfo.php') == 'phpinfo'
+assert _classify_info_disclosure('/backup.zip') == 'backup_file'
+assert _classify_info_disclosure('/server-status') == 'server_diagnostic'
+assert _classify_info_disclosure('/random/path') == 'other_disclosure'
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and "OK" in out, f"stderr: {err}"
+
+
+def test_tier2_web_finding_load_and_recall():
+    """A web_findings-shaped dict embeds one row that shows up in compose block."""
+    ip = f"198.51.100.{__import__('random').randint(1, 254)}"
+    py = f"""
+import sys; sys.path.insert(0, '/app')
+from api import (_load_web_finding_into_rag, _compose_recall_context,
+                 purge_observed_facts, RAG_WEB_FINDING_SOURCE)
+row = {{'issue_type': 'SQL Injection', 'url': 'http://{ip}/pwd/?id=1',
+        'method': 'GET', 'param': 'id', 'severity': 'high',
+        'payload': "1' OR 1=1--", 'source': 'nuclei'}}
+loaded = _load_web_finding_into_rag(row, ip='{ip}')
+ctx = _compose_recall_context('{ip}')
+purge_observed_facts(ip='{ip}', source=RAG_WEB_FINDING_SOURCE)
+print(loaded, 'WEB VULNERABILITY FINDINGS' in ctx, 'SQL Injection' in ctx)
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0, f"stderr: {err}"
+    assert out.split() == ["True", "True", "True"], f"got: {out!r}"
+
+
+def test_backfill_all_endpoint():
+    """POST /rag/backfill/all returns counts for every source."""
+    rc, resp = _call("POST", "/rag/backfill/all")
+    assert rc == 0
+    assert resp.get("ok") is True
+    c = resp.get("counts", {})
+    assert set(c.keys()) >= {"verified_technique", "vuln_finding",
+                              "service_fingerprint", "discovered_endpoint",
+                              "web_finding", "info_disclosure",
+                              "credentials", "identities"}
