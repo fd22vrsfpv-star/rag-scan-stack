@@ -17090,6 +17090,59 @@ def get_exploit_version(exploit_id: str, version: int, authorized: bool = Depend
         return dict(r)
 
 
+@app.post("/exploit-store/{exploit_id}/versions/{version}/run", tags=["Exploit Store"])
+def run_exploit_version(exploit_id: str, version: int, authorized: bool = Depends(auth)):
+    """Run ONE specific version's command through the listener. Used by the bake-off
+    side-by-side view so the operator can select each LLM's variant and see how each
+    one actually behaves on the live target — 'which model's output really works?'
+    Mirrors /exploit-store/{id}/run but pulls command + assertion from the version
+    row instead of the exploit's current state. Target host/port come from the
+    parent exploit_store row so the version doesn't need to duplicate them."""
+    import httpx as _hx
+    import time as _t
+    _ensure_exploit_store()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT target_host, target_port, cve FROM exploit_store WHERE id = %s",
+                    (exploit_id,))
+        parent = cur.fetchone()
+        if not parent:
+            raise HTTPException(404, "exploit not found")
+        cur.execute("SELECT command, assertion, llm_model, label FROM exploit_store_versions "
+                    "WHERE exploit_id = %s AND version = %s", (exploit_id, version))
+        v = cur.fetchone()
+        if not v:
+            raise HTTPException(404, "version not found")
+    if not v.get("command"):
+        return {"ok": False, "reason": "no command on this version"}
+    listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    vt = int(os.environ.get("VECTOR_RUN_TIMEOUT", "600"))
+    t0 = _t.time()
+    try:
+        lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
+                       json={"command": v["command"], "target": str(parent.get("target_host") or ""),
+                              "port": parent.get("target_port") or 80, "timeout": vt},
+                       headers={"x-api-key": API_KEY}, verify=False, timeout=vt + 60)
+        d = lr.json() if lr.status_code < 400 else {}
+        output = (d.get("output", "") if isinstance(d, dict) else "") or lr.text
+        exit_code = d.get("exit_code") if isinstance(d, dict) else None
+    except Exception as e:  # noqa: BLE001
+        output, exit_code = f"listener error: {e}", None
+    still_works = False
+    try:
+        still_works = _poc_assertion_passes(v.get("assertion") or {}, output, exit_code)
+    except Exception:  # noqa: BLE001
+        pass
+    return {
+        "ok": True, "exploit_id": exploit_id, "version": version,
+        "label": v.get("label"), "llm_model": v.get("llm_model"),
+        "cve": parent.get("cve"),
+        "target": f"{parent.get('target_host')}:{parent.get('target_port')}",
+        "command": v["command"], "output": output[:20000],
+        "exit_code": exit_code, "still_works": still_works,
+        "seconds": round(_t.time() - t0, 2),
+    }
+
+
 @app.post("/exploit-store/{exploit_id}/versions", tags=["Exploit Store"])
 def save_exploit_version(exploit_id: str, body: SaveVersionBody, authorized: bool = Depends(auth)):
     """Snapshot the CURRENT state of an exploit as a new (optionally labeled) version —
