@@ -334,3 +334,57 @@ def test_backfill_all_endpoint():
                               "service_fingerprint", "discovered_endpoint",
                               "web_finding", "info_disclosure",
                               "credentials", "identities"}
+
+
+def test_tier3_failed_technique_compose_last():
+    """Failed techniques appear in the compose block LAST (negative signal)
+    and use the '[<kind>]' prefix format."""
+    ip = f"198.51.100.{__import__('random').randint(1, 254)}"
+    py = f"""
+import sys; sys.path.insert(0, '/app')
+from api import (_load_failed_technique_into_rag, _compose_recall_context,
+                 purge_observed_facts, RAG_FAILED_TECHNIQUE_SOURCE)
+row = {{'verified': False, 'target_host': '{ip}', 'cve': 'CVE-2099-FAIL',
+        'product': 'TestProduct', 'command': "curl bogus",
+        'metadata': {{'off_target': True}}}}
+loaded = _load_failed_technique_into_rag(row)
+ctx = _compose_recall_context('{ip}', product='TestProduct')
+purge_observed_facts(ip='{ip}', source=RAG_FAILED_TECHNIQUE_SOURCE)
+print(loaded, 'PREVIOUSLY-FAILED' in ctx, 'off_target' in ctx)
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0, f"stderr: {err}"
+    assert out.split() == ["True", "True", "True"], f"got: {out!r}"
+
+
+def test_tier3_session_scheme_shell_access():
+    """Session cookie + shell access embed together and show up in the
+    SESSION + SHELL ACCESS compose section."""
+    ip = f"198.51.100.{__import__('random').randint(1, 254)}"
+    py = f"""
+import sys; sys.path.insert(0, '/app')
+from api import (_load_session_scheme_into_rag, _load_shell_access_into_rag,
+                 _compose_recall_context, purge_observed_facts,
+                 RAG_SESSION_SCHEME_SOURCE, RAG_SHELL_ACCESS_SOURCE)
+a = _load_session_scheme_into_rag('{ip}', 'JSESSIONID', product='tomcat')
+b = _load_shell_access_into_rag('{ip}', 'meterpreter', port=4444, source='msf',
+                                  session_id='1')
+ctx = _compose_recall_context('{ip}')
+purge_observed_facts(ip='{ip}', source=RAG_SESSION_SCHEME_SOURCE)
+purge_observed_facts(ip='{ip}', source=RAG_SHELL_ACCESS_SOURCE)
+print(a, b, 'SESSION + SHELL ACCESS' in ctx, 'JSESSIONID' in ctx,
+      'meterpreter' in ctx)
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0, f"stderr: {err}"
+    assert out.split() == ["True", "True", "True", "True", "True"], f"got: {out!r}"
+
+
+def test_tier3_backfill_and_all_source_recognized():
+    """POST /rag/backfill/tier3 returns per-source counts."""
+    rc, resp = _call("POST", "/rag/backfill/tier3")
+    assert rc == 0
+    assert resp.get("ok") is True
+    c = resp.get("counts", {})
+    assert set(c.keys()) >= {"failed_technique", "subdomain_pattern",
+                              "session_scheme", "shell_access"}
