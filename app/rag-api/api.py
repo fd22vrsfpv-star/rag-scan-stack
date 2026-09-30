@@ -14168,6 +14168,29 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
     except Exception:  # noqa: BLE001
         pass
     guidance_extra = (guidance_extra + " " + pre_guidance).strip()
+    # PRIOR OBSERVATIONS: recall observed_target_fact + enum_fact_for_exploit rows
+    # from rag_documents (self-target strict match + cross-target product match).
+    # Prepends a compact block to guidance so synth sees what we already saw here
+    # or on similar targets without re-discovering. No-op when RAG_OBSERVED_FACTS
+    # flag is off. Also embeds this build's enum_facts window so the NEXT build
+    # can recall them. Both fail-soft — the pipeline continues on any DB failure.
+    try:
+        _facts = _recall_observed_facts(ip, product=product, limit=12)
+        _recall = _format_recall_block(_facts)
+        if _recall:
+            guidance_extra = _recall + "\n\n" + guidance_extra
+            _poc_trace(run_id, "recall_prior_observations",
+                       response=f"recalled {len(_facts)} fact(s)",
+                       extra={"self_scope": sum(1 for f in _facts if f.get("scope") == "self"),
+                              "cross_scope": sum(1 for f in _facts if f.get("scope") == "cross-target")})
+    except Exception as e:  # noqa: BLE001
+        logging.debug("recall_prior_observations skipped: %s", e)
+    try:
+        _n = _embed_enum_facts_for_target(ip, engagement_id=eid, product=product)
+        if _n:
+            _poc_trace(run_id, "embed_enum_facts", response=f"embedded {_n} enum-fact(s) into RAG")
+    except Exception as e:  # noqa: BLE001
+        logging.debug("embed_enum_facts skipped: %s", e)
     # Listener-based verification: for blind/OOB classes (SSRF, blind SQLi, XXE, etc.)
     # the response won't reflect the canary — success is proven by an out-of-band signal.
     # Detect from guidance whether the strategist flagged a blind class AND whether a
@@ -29322,6 +29345,289 @@ def export_msf_options_endpoint(_: bool = Depends(auth)):
 # knowledge/vuln_class_methodology.yaml (via common/vuln_skills._classes) and embed
 # into rag_documents, with no code change per skill.
 VULN_SKILL_RAG_SOURCE = "custom_vuln_skill"
+
+# ── observed target facts + enum_facts as first-class RAG objects ─────────────
+# Dynamic facts an agent SAW on a target (framework, credentials, admin paths,
+# WAF family, honored params, and the enum_facts window from post_enumeration)
+# get embedded into rag_documents so a future build against the same OR a
+# similar target can RECALL them via similarity search — closing the gap where
+# rules were retrievable but observations weren't.
+#
+# Behind RAG_OBSERVED_FACTS env flag (default off). Cleanup helpers +
+# DELETE /rag/observed-facts endpoint let the operator trim stale rows.
+RAG_OBSERVED_FACTS_SOURCE = "observed_target_fact"
+RAG_ENUM_FACT_SOURCE = "enum_fact_for_exploit"
+_RAG_FACT_SOURCES = (RAG_OBSERVED_FACTS_SOURCE, RAG_ENUM_FACT_SOURCE)
+
+
+def observed_facts_enabled() -> bool:
+    """True when observed-fact embedding + recall should run. Env-flag default off."""
+    return os.environ.get("RAG_OBSERVED_FACTS", "0").lower() in ("1", "true", "yes", "on")
+
+
+def _observed_fact_value_hash(ip, kind, value):
+    """Stable short hash for the dedup key (source, ip, kind, value_hash). Different
+    facts on the same target produce distinct rows; the same fact upserts."""
+    import hashlib as _h
+    return _h.sha256(f"{ip}|{kind}|{value}".encode("utf-8", "ignore")).hexdigest()[:16]
+
+
+def _load_observed_fact_into_rag(source, ip, kind, value, engagement_id=None, product=None):
+    """Embed ONE observed-target fact and upsert it into rag_documents. Idempotent
+    per (source, ip, kind, value_hash). Fail-soft — never raises, so a DB or
+    embed failure never breaks the pipeline that produced the fact."""
+    if not observed_facts_enabled():
+        return False
+    if source not in _RAG_FACT_SOURCES:
+        return False
+    try:
+        v = str(value)[:1000]
+        value_hash = _observed_fact_value_hash(ip, kind, v)
+        title = f"[observed] {ip} {kind}={v[:80]}"
+        body = (f"Target: {ip}\nKind: {kind}\nValue: {v}"
+                + (f"\nProduct: {product}" if product else ""))
+        vec = _embed_text(f"{title}\n{body}")
+        vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+        meta = {"source": source, "ip": ip, "kind": kind, "value": v,
+                "value_hash": value_hash, "engagement_id": engagement_id,
+                "product": product,
+                "observed_at": __import__("datetime").datetime.utcnow().isoformat() + "Z"}
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM rag_documents WHERE metadata->>'source' = %s "
+                "AND metadata->>'ip' = %s AND metadata->>'kind' = %s "
+                "AND metadata->>'value_hash' = %s",
+                (source, ip, kind, value_hash))
+            cur.execute(
+                "INSERT INTO rag_documents (title, text_chunk, metadata, embedding) "
+                "VALUES (%s, %s, %s, %s::vector)",
+                (title, body, Json(meta), vec_str))
+            conn.commit()
+        return True
+    except Exception as e:  # noqa: BLE001
+        logging.debug("observed-fact->rag load failed for %s/%s/%s: %s", source, ip, kind, e)
+        return False
+
+
+def _remove_observed_facts_for_ip(ip, source=None):
+    """Drop all observed/enum-fact rows for one target. Used by engagement purge
+    so a re-scan of the same host starts clean."""
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            if source:
+                cur.execute(
+                    "DELETE FROM rag_documents WHERE metadata->>'source' = %s "
+                    "AND metadata->>'ip' = %s", (source, ip))
+            else:
+                cur.execute(
+                    "DELETE FROM rag_documents WHERE metadata->>'source' = ANY(%s) "
+                    "AND metadata->>'ip' = %s", (list(_RAG_FACT_SOURCES), ip))
+            n = cur.rowcount
+            conn.commit()
+        return n
+    except Exception as e:  # noqa: BLE001
+        logging.debug("observed-fact->rag remove for ip=%s failed: %s", ip, e)
+        return 0
+
+
+def purge_observed_facts(older_than_days=None, engagement_id=None, ip=None, source=None):
+    """Bulk cleanup of observed/enum-fact RAG rows. All filters optional; caller
+    supplies whichever combination they want (older_than_days keeps recent rows;
+    engagement_id scopes to one engagement's data; ip to one host; source to
+    only observed_target_fact OR enum_fact_for_exploit).
+    Returns the deleted row count. Safe to call twice — second call returns 0."""
+    where = ["metadata->>'source' = ANY(%s)"]
+    args = [list([source]) if source else list(_RAG_FACT_SOURCES)]
+    if ip:
+        where.append("metadata->>'ip' = %s"); args.append(ip)
+    if engagement_id:
+        where.append("metadata->>'engagement_id' = %s"); args.append(str(engagement_id))
+    if older_than_days is not None:
+        # observed_at is ISO — Postgres can compare as text OK, but safer via cast
+        where.append("(metadata->>'observed_at')::timestamptz < (now() - (%s || ' days')::interval)")
+        args.append(str(int(older_than_days)))
+    sql = "DELETE FROM rag_documents WHERE " + " AND ".join(where)
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(sql, args)
+            n = cur.rowcount
+            conn.commit()
+        return n
+    except Exception as e:  # noqa: BLE001
+        logging.debug("purge_observed_facts failed: %s", e)
+        return 0
+
+
+def _recall_observed_facts(ip, product=None, limit=12):
+    """Query rag_documents for prior observed/enum facts on THIS ip (strict match)
+    OR similar product (loose match). Returns a list ordered by exactness (ip
+    match first, then product match), most-recent first. Used by synth to
+    prepend a PRIOR OBSERVATIONS block."""
+    if not observed_facts_enabled():
+        return []
+    try:
+        results = []
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT title, metadata FROM rag_documents
+                     WHERE metadata->>'source' = ANY(%s)
+                       AND metadata->>'ip' = %s
+                     ORDER BY (metadata->>'observed_at') DESC
+                     LIMIT %s""",
+                (list(_RAG_FACT_SOURCES), ip, limit))
+            for r in cur.fetchall():
+                m = r["metadata"] or {}
+                results.append({"scope": "self", "ip": m.get("ip"),
+                                 "kind": m.get("kind"), "value": m.get("value"),
+                                 "source": m.get("source")})
+            remaining = max(0, limit - len(results))
+            if remaining > 0 and product:
+                cur.execute(
+                    """SELECT title, metadata FROM rag_documents
+                         WHERE metadata->>'source' = ANY(%s)
+                           AND metadata->>'product' = %s
+                           AND metadata->>'ip' <> %s
+                         ORDER BY (metadata->>'observed_at') DESC
+                         LIMIT %s""",
+                    (list(_RAG_FACT_SOURCES), product, ip, remaining))
+                for r in cur.fetchall():
+                    m = r["metadata"] or {}
+                    results.append({"scope": "cross-target", "ip": m.get("ip"),
+                                     "kind": m.get("kind"), "value": m.get("value"),
+                                     "source": m.get("source")})
+        return results
+    except Exception as e:  # noqa: BLE001
+        logging.debug("_recall_observed_facts failed for ip=%s: %s", ip, e)
+        return []
+
+
+def _format_recall_block(facts):
+    """Compose the PRIOR OBSERVATIONS guidance string from _recall_observed_facts.
+    Empty string when no facts — synth guidance unchanged in that case."""
+    if not facts:
+        return ""
+    # Group by kind so the strategist sees a compact structured view
+    by_kind = {}
+    for f in facts:
+        by_kind.setdefault(f["kind"], []).append(f)
+    lines = []
+    for kind, items in by_kind.items():
+        vals = []
+        for it in items[:5]:  # cap per kind
+            tag = "self" if it["scope"] == "self" else f"seen@{it['ip']}"
+            vals.append(f"{it['value']} ({tag})")
+        lines.append(f"  * {kind}: " + "; ".join(vals))
+    return ("PRIOR OBSERVATIONS (recalled from this or a similar target — facts "
+            "the platform already saw here or elsewhere; TREAT AS SUGGESTIVE, not "
+            "authoritative, and re-verify what you use):\n" + "\n".join(lines))
+
+
+def _embed_response_mine_intel(ip, intel_list, engagement_id=None, product=None):
+    """Iterate _scout_response_mine's intel_list and embed each curated fact.
+    Called from build_poc_graph.node_response_mine when the flag is on. No-op
+    when observed_facts_enabled() returns False."""
+    if not observed_facts_enabled() or not intel_list:
+        return 0
+    written = 0
+    try:
+        for x in intel_list:
+            fw = x.get("framework")
+            if fw and _load_observed_fact_into_rag(
+                    RAG_OBSERVED_FACTS_SOURCE, ip, "framework", fw,
+                    engagement_id=engagement_id, product=product or fw):
+                written += 1
+            for c in (x.get("credential_hints") or []):
+                if _load_observed_fact_into_rag(
+                        RAG_OBSERVED_FACTS_SOURCE, ip, "credential", c,
+                        engagement_id=engagement_id, product=product):
+                    written += 1
+            for p in (x.get("admin_paths") or []):
+                if _load_observed_fact_into_rag(
+                        RAG_OBSERVED_FACTS_SOURCE, ip, "admin_path", p,
+                        engagement_id=engagement_id, product=product):
+                    written += 1
+            if x.get("auth_wall") and _load_observed_fact_into_rag(
+                    RAG_OBSERVED_FACTS_SOURCE, ip, "auth_wall", str(x["auth_wall"])[:100],
+                    engagement_id=engagement_id, product=product):
+                written += 1
+    except Exception as e:  # noqa: BLE001
+        logging.debug("embed_response_mine_intel failed: %s", e)
+    return written
+
+
+def _embed_enum_facts_for_target(ip, engagement_id=None, product=None, window=50):
+    """Read the target's most recent enum_facts (assets/ports/vulns/web_findings/
+    credential_findings — whichever the engagement has) and embed a compact
+    window as enum_fact_for_exploit rows. Called from build-poc when the flag
+    is on. Reuses existing tables; doesn't require post_enumeration to run."""
+    if not observed_facts_enabled():
+        return 0
+    written = 0
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # asset_id lookup
+            cur.execute("SELECT id FROM assets WHERE ip = %s LIMIT 1", (ip,))
+            row = cur.fetchone()
+            if not row:
+                return 0
+            asset_id = row["id"]
+            # Ports (kind='port_service')
+            cur.execute("SELECT port, service, banner FROM ports WHERE asset_id = %s "
+                         "AND COALESCE(is_open, true) LIMIT %s", (asset_id, window))
+            for p in cur.fetchall():
+                v = f"port={p['port']} service={p['service'] or '?'} banner={(p['banner'] or '')[:80]}"
+                if _load_observed_fact_into_rag(
+                        RAG_ENUM_FACT_SOURCE, ip, "port_service", v,
+                        engagement_id=engagement_id, product=product):
+                    written += 1
+            # Web findings (kind='web_finding')
+            try:
+                cur.execute("SELECT name, url FROM web_findings WHERE asset_id = %s "
+                             "ORDER BY created_at DESC LIMIT %s", (asset_id, window))
+                for w in cur.fetchall():
+                    v = f"{w['name']} @ {(w['url'] or '')[:120]}"
+                    if _load_observed_fact_into_rag(
+                            RAG_ENUM_FACT_SOURCE, ip, "web_finding", v,
+                            engagement_id=engagement_id, product=product):
+                        written += 1
+            except Exception:  # noqa: BLE001
+                pass
+            # Credential findings (kind='credential')
+            try:
+                cur.execute("SELECT username, service, port FROM credential_findings "
+                             "WHERE asset_id = %s ORDER BY created_at DESC LIMIT %s",
+                             (asset_id, window))
+                for c in cur.fetchall():
+                    v = f"user={c['username']} on {c['service'] or '?'}:{c['port'] or '?'}"
+                    if _load_observed_fact_into_rag(
+                            RAG_ENUM_FACT_SOURCE, ip, "credential_finding", v,
+                            engagement_id=engagement_id, product=product):
+                        written += 1
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception as e:  # noqa: BLE001
+        logging.debug("embed_enum_facts_for_target ip=%s failed: %s", ip, e)
+    return written
+
+
+class PurgeObservedFactsResponse(BaseModel):
+    ok: bool
+    deleted: int
+
+
+@app.delete("/rag/observed-facts", tags=["RAG"])
+def delete_observed_facts(older_than_days: Optional[int] = None,
+                          engagement_id: Optional[str] = None,
+                          ip: Optional[str] = None,
+                          source: Optional[str] = None,
+                          authorized: bool = Depends(auth)):
+    """Purge observed-fact / enum-fact RAG rows. All params optional — combine to
+    scope the purge. Returns {ok, deleted}. Idempotent (second call = 0)."""
+    if source and source not in _RAG_FACT_SOURCES:
+        raise HTTPException(400, f"source must be one of {list(_RAG_FACT_SOURCES)}")
+    n = purge_observed_facts(older_than_days=older_than_days,
+                              engagement_id=engagement_id, ip=ip, source=source)
+    return {"ok": True, "deleted": n}
 
 _CUSTOM_SKILLS_DDL = """
 CREATE TABLE IF NOT EXISTS public.custom_vuln_skills (

@@ -256,6 +256,7 @@ services:
       # OLLAMA_URL stays at real Ollama for anything that needs raw Ollama.
       POSTEX_SEMANTIC_ENUMERATE: ${POSTEX_SEMANTIC_ENUMERATE:-1}
       BUILD_POC_LANGGRAPH: ${BUILD_POC_LANGGRAPH:-1}   # StateGraph refactor of _build_poc_core (default ON post-migration; set 0 to fall back)
+      RAG_OBSERVED_FACTS: ${RAG_OBSERVED_FACTS:-0}     # Embed observed target facts + enum_facts into rag_documents so prior observations recall across builds (off by default; opt-in)
       ZAP_URL: ${ZAP_URL:-http://zap:8090}
       ZAP_API_KEY: ${ZAP_API_KEY:-changeme}
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
