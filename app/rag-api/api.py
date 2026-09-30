@@ -14186,31 +14186,18 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
     # or on similar targets without re-discovering. No-op when RAG_OBSERVED_FACTS
     # flag is off. Also embeds this build's enum_facts window so the NEXT build
     # can recall them. Both fail-soft — the pipeline continues on any DB failure.
+    # ONE compose call replaces the previously-stacked per-source prepends. Returns
+    # a stable-ordered block containing every enabled RAG-source's recall — Tier 1
+    # (verified techniques, service fingerprints, endpoints, vulns) + credentials +
+    # observed facts. Empty string when no matches: synth guidance unchanged.
     try:
-        _facts = _recall_observed_facts(ip, product=product, limit=12)
-        _recall = _format_recall_block(_facts)
-        if _recall:
-            guidance_extra = _recall + "\n\n" + guidance_extra
-            _poc_trace(run_id, "recall_prior_observations",
-                       response=f"recalled {len(_facts)} fact(s)",
-                       extra={"self_scope": sum(1 for f in _facts if f.get("scope") == "self"),
-                              "cross_scope": sum(1 for f in _facts if f.get("scope") == "cross-target")})
+        _ctx = _compose_recall_context(ip, product=product, limit=8)
+        if _ctx:
+            guidance_extra = _ctx + "\n\n" + guidance_extra
+            _poc_trace(run_id, "recall_context",
+                       response=f"composed recall block ({len(_ctx)} chars)")
     except Exception as e:  # noqa: BLE001
-        logging.debug("recall_prior_observations skipped: %s", e)
-    # Credential/identity recall: prior credential_findings + identities matching
-    # this target (or its product family) are prepended so synth can attempt them
-    # first. Retrieval only names the account+context; the actual plaintext lives
-    # in credential_findings.recovered_secret and the LLM asks for it via a
-    # follow-up when it needs to use one.
-    try:
-        _creds = _recall_credentials(target_ip=ip, product=product, limit=10)
-        _cred_block = _format_credentials_recall_block(_creds)
-        if _cred_block:
-            guidance_extra = _cred_block + "\n\n" + guidance_extra
-            _poc_trace(run_id, "recall_credentials",
-                       response=f"recalled {len(_creds)} credential/identity row(s)")
-    except Exception as e:  # noqa: BLE001
-        logging.debug("recall_credentials skipped: %s", e)
+        logging.debug("recall_context skipped: %s", e)
     try:
         _n = _embed_enum_facts_for_target(ip, engagement_id=eid, product=product)
         if _n:
@@ -16654,6 +16641,15 @@ def _save_exploit_store(name, cve=None, kind="cve_poc", target_host=None, target
             emit_webhook("exploit_store_saved", "exploit_store",
                          {"id": new_id, "cve": cve, "kind": kind, "verified": verified,
                           "target": target_host, "engagement_id": eid})
+        except Exception:  # noqa: BLE001
+            pass
+        # Live-embed verified techniques into RAG (no-op when flag off or unverified)
+        try:
+            if verified:
+                _load_verified_technique_into_rag({
+                    "verified": True, "target_host": target_host, "cve": cve,
+                    "product": product, "version": version, "command": command,
+                    "engagement_id": eid}, engagement_id=eid)
         except Exception:  # noqa: BLE001
             pass
         return new_id
@@ -29388,8 +29384,16 @@ RAG_ENUM_FACT_SOURCE = "enum_fact_for_exploit"
 # does this engagement have access to?" via similarity, not just exact SQL.
 RAG_CREDENTIAL_SOURCE = "credential_identity"
 RAG_IDENTITY_SOURCE = "directory_identity"
+# Tier 1: highest-ROI first-class RAG sources — techniques that worked, vulns
+# confirmed, service fingerprints, and every endpoint we've seen.
+RAG_VERIFIED_TECHNIQUE_SOURCE = "verified_exploit_technique"
+RAG_VULN_FINDING_SOURCE = "vuln_finding"
+RAG_SERVICE_FINGERPRINT_SOURCE = "service_fingerprint"
+RAG_DISCOVERED_ENDPOINT_SOURCE = "discovered_endpoint"
 _RAG_FACT_SOURCES = (RAG_OBSERVED_FACTS_SOURCE, RAG_ENUM_FACT_SOURCE,
-                     RAG_CREDENTIAL_SOURCE, RAG_IDENTITY_SOURCE)
+                     RAG_CREDENTIAL_SOURCE, RAG_IDENTITY_SOURCE,
+                     RAG_VERIFIED_TECHNIQUE_SOURCE, RAG_VULN_FINDING_SOURCE,
+                     RAG_SERVICE_FINGERPRINT_SOURCE, RAG_DISCOVERED_ENDPOINT_SOURCE)
 
 
 def observed_facts_enabled() -> bool:
@@ -29816,6 +29820,307 @@ def backfill_credentials_endpoint(engagement_id: Optional[str] = None,
         raise HTTPException(400, "RAG_OBSERVED_FACTS is disabled — set the env flag first")
     n_cred, n_id = _backfill_credentials_and_identities_to_rag(engagement_id=engagement_id, limit=limit)
     return {"ok": True, "credentials_embedded": n_cred, "identities_embedded": n_id}
+
+
+def _load_verified_technique_into_rag(exploit_row, engagement_id=None):
+    """Embed one verified exploit_store row as a first-class RAG object. Recall
+    lets a strategist say 'SSRF via /apply/index.php has worked on LyLme Spage
+    v1.9 — try it here'. Only VERIFIED rows go in (unverified are Tier 3
+    'failed_technique' territory). Fail-soft."""
+    if not observed_facts_enabled() or not exploit_row:
+        return False
+    if not exploit_row.get("verified"):
+        return False
+    try:
+        ip = str(exploit_row.get("target_host") or "")
+        cve = exploit_row.get("cve") or ""
+        product = exploit_row.get("product") or ""
+        version = exploit_row.get("version") or ""
+        cmd = str(exploit_row.get("command") or "")[:600]
+        kind = "verified_technique"
+        v = (f"cve={cve} product={product} v={version} :: {cmd[:400]}").strip()
+        return _load_observed_fact_into_rag(
+            RAG_VERIFIED_TECHNIQUE_SOURCE, ip, kind, v,
+            engagement_id=engagement_id or str(exploit_row.get("engagement_id") or "") or None,
+            product=product or cve)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("verified_technique->rag load failed: %s", e)
+        return False
+
+
+def _load_vuln_finding_into_rag(vuln_row, engagement_id=None, ip=None):
+    """Embed one vulns row (nuclei / nmap-nse / CVE-Bench / manual). Recall
+    answers 'we've seen this CVE class on similar targets'. Fail-soft."""
+    if not observed_facts_enabled() or not vuln_row:
+        return False
+    try:
+        _ip = ip or str(vuln_row.get("ip") or "")
+        if not _ip:
+            # Vuln row may not have ip directly; resolve via asset_id
+            asset_id = vuln_row.get("asset_id")
+            if asset_id:
+                with get_db() as conn, conn.cursor() as cur:
+                    cur.execute("SELECT host(ip)::text FROM assets WHERE id = %s", (asset_id,))
+                    r = cur.fetchone()
+                    _ip = r[0] if r else ""
+        if not _ip:
+            return False
+        cves = vuln_row.get("cve") or []
+        cve_str = ", ".join(cves[:3]) if isinstance(cves, list) else str(cves)
+        script = vuln_row.get("script") or ""
+        title = vuln_row.get("title") or ""
+        sev = vuln_row.get("severity") or "info"
+        v = f"{sev} {script} {cve_str} :: {title}"[:500]
+        kind = script or "vuln"
+        return _load_observed_fact_into_rag(
+            RAG_VULN_FINDING_SOURCE, _ip, kind, v,
+            engagement_id=engagement_id or str(vuln_row.get("engagement_id") or "") or None,
+            product=cves[0] if isinstance(cves, list) and cves else None)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("vuln_finding->rag load failed: %s", e)
+        return False
+
+
+def _load_service_fingerprint_into_rag(port_row, engagement_id=None, ip=None):
+    """Embed one ports row (banner+service+version). Recall enables 'we've seen
+    nginx 1.18 on 40 hosts — check for CVE-X'. Only writes when service+banner
+    are populated (bare open ports without fingerprints have no signal)."""
+    if not observed_facts_enabled() or not port_row:
+        return False
+    try:
+        _ip = ip or str(port_row.get("ip") or "")
+        if not _ip:
+            asset_id = port_row.get("asset_id")
+            if asset_id:
+                with get_db() as conn, conn.cursor() as cur:
+                    cur.execute("SELECT host(ip)::text FROM assets WHERE id = %s", (asset_id,))
+                    r = cur.fetchone()
+                    _ip = r[0] if r else ""
+        if not _ip:
+            return False
+        port = port_row.get("port") or 0
+        svc = port_row.get("service") or ""
+        banner = str(port_row.get("banner") or "")[:200]
+        product = port_row.get("product") or ""
+        version = port_row.get("version") or ""
+        if not (svc or banner or product):
+            return False  # bare open port — skip
+        v = f"port={port} service={svc} product={product} v={version} banner={banner}".strip()
+        kind = f"port_{port}_{svc}" if port and svc else "service"
+        return _load_observed_fact_into_rag(
+            RAG_SERVICE_FINGERPRINT_SOURCE, _ip, kind, v,
+            engagement_id=engagement_id,
+            product=(product or svc or "").strip() or None)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("service_fingerprint->rag load failed: %s", e)
+        return False
+
+
+def _load_discovered_endpoint_into_rag(ip, url_or_path, method=None,
+                                         status_code=None, engagement_id=None,
+                                         product=None, source_hint=None):
+    """Embed one discovered endpoint (URL/path). Recall answers 'what URLs
+    have we seen on Spage instances?' — feeds strategist attack-surface
+    without re-crawling. Called from mining, ZAP spider result, katana output,
+    and web_findings.url. Fail-soft."""
+    if not observed_facts_enabled() or not url_or_path:
+        return False
+    try:
+        import re as _re
+        # Normalize: strip host+scheme, keep path+query
+        m = _re.match(r"^https?://[^/]+(/.*)$", url_or_path)
+        path = m.group(1) if m else url_or_path
+        path = path[:400]
+        method = (method or "GET").upper()[:10]
+        v = f"{method} {path}" + (f" ({status_code})" if status_code else "")
+        if source_hint:
+            v = f"{v} [via {source_hint}]"
+        kind = f"endpoint_{method.lower()}"
+        return _load_observed_fact_into_rag(
+            RAG_DISCOVERED_ENDPOINT_SOURCE, ip, kind, v,
+            engagement_id=engagement_id, product=product)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("discovered_endpoint->rag load failed: %s", e)
+        return False
+
+
+def _backfill_tier1_to_rag(engagement_id=None, limit=500):
+    """One-shot: read verified exploits + vulns + ports (with banners) + web
+    findings URLs and embed each into RAG. Idempotent via the dedup keys.
+    Returns per-source counts."""
+    if not observed_facts_enabled():
+        return {}
+    counts = {"verified_technique": 0, "vuln_finding": 0,
+              "service_fingerprint": 0, "discovered_endpoint": 0}
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            where, args = "", []
+            if engagement_id:
+                where = "WHERE engagement_id = %s"
+                args.append(str(engagement_id))
+            # Verified exploits
+            cur.execute(f"""SELECT * FROM exploit_store {where}
+                             {"AND" if where else "WHERE"} verified = true
+                             ORDER BY built_at DESC LIMIT %s""",
+                         args + [limit])
+            for row in cur.fetchall():
+                if _load_verified_technique_into_rag(dict(row), engagement_id=engagement_id):
+                    counts["verified_technique"] += 1
+            # Vulns
+            cur.execute(f"""SELECT * FROM vulns {where}
+                             ORDER BY created_at DESC LIMIT %s""",
+                         args + [limit])
+            for row in cur.fetchall():
+                if _load_vuln_finding_into_rag(dict(row), engagement_id=engagement_id):
+                    counts["vuln_finding"] += 1
+            # Service fingerprints — join ports+assets to get ip
+            eng_join = "AND a.engagement_id = %s" if engagement_id else ""
+            eng_args = [str(engagement_id)] if engagement_id else []
+            cur.execute(
+                f"""SELECT p.*, host(a.ip)::text AS ip FROM ports p
+                     JOIN assets a ON a.id = p.asset_id
+                     WHERE COALESCE(p.is_open, true) {eng_join}
+                     ORDER BY p.last_seen DESC LIMIT %s""",
+                eng_args + [limit])
+            for row in cur.fetchall():
+                if _load_service_fingerprint_into_rag(dict(row), engagement_id=engagement_id,
+                                                       ip=row.get("ip")):
+                    counts["service_fingerprint"] += 1
+            # Endpoints from web_findings.url
+            cur.execute(
+                f"""SELECT w.url, w.method, w.status_code, host(a.ip)::text AS ip
+                     FROM web_findings w JOIN assets a ON a.id = w.asset_id
+                     WHERE w.url IS NOT NULL {eng_join}
+                     ORDER BY w.created_at DESC LIMIT %s""",
+                eng_args + [limit])
+            for row in cur.fetchall():
+                if _load_discovered_endpoint_into_rag(
+                        row["ip"], row["url"], method=row.get("method"),
+                        status_code=row.get("status_code"),
+                        engagement_id=engagement_id, source_hint="web_finding"):
+                    counts["discovered_endpoint"] += 1
+    except Exception as e:  # noqa: BLE001
+        logging.debug("backfill_tier1 failed: %s", e)
+    return counts
+
+
+def _compose_recall_context(ip, product=None, limit=8):
+    """Compose ONE ordered recall context block for synth guidance. Includes
+    every enabled first-class RAG source, in a stable priority order. Empty
+    string when no matches (synth guidance unchanged). Cleaner than stacking
+    conditional prepends for each source."""
+    if not observed_facts_enabled():
+        return ""
+    parts = []
+    # 1. verified techniques FIRST — highest signal (something confirmed works)
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            where = ["metadata->>'source' = %s"]
+            args = [RAG_VERIFIED_TECHNIQUE_SOURCE]
+            if product:
+                where.append("(metadata->>'product' = %s OR metadata->>'value' ILIKE %s)")
+                args.extend([product, f"%{product}%"])
+            elif ip:
+                where.append("metadata->>'ip' = %s")
+                args.append(ip)
+            sql = ("SELECT metadata FROM rag_documents WHERE " + " AND ".join(where)
+                    + " ORDER BY (metadata->>'observed_at') DESC LIMIT %s")
+            args.append(limit)
+            cur.execute(sql, args)
+            techniques = [r["metadata"] for r in cur.fetchall()]
+            if techniques:
+                lines = [f"  * {t.get('value', '')[:300]}" for t in techniques]
+                parts.append("KNOWN-WORKING TECHNIQUES (verified against this or a similar target — "
+                             "adapt the endpoint/param/payload; the command already led to a verified proof):\n"
+                             + "\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
+    # 2. observed target facts (framework, WAF, admin, credentials-context)
+    try:
+        _obs = _recall_observed_facts(ip, product=product, limit=limit)
+        _obs_block = _format_recall_block(_obs)
+        if _obs_block:
+            parts.append(_obs_block)
+    except Exception:  # noqa: BLE001
+        pass
+    # 3. credential + identity recall
+    try:
+        _creds = _recall_credentials(target_ip=ip, product=product, limit=limit)
+        _cred_block = _format_credentials_recall_block(_creds)
+        if _cred_block:
+            parts.append(_cred_block)
+    except Exception:  # noqa: BLE001
+        pass
+    # 4. service fingerprints (versions worth CVE-matching)
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT metadata FROM rag_documents
+                     WHERE metadata->>'source' = %s AND metadata->>'ip' = %s
+                     ORDER BY (metadata->>'observed_at') DESC LIMIT %s""",
+                (RAG_SERVICE_FINGERPRINT_SOURCE, ip, limit))
+            fps = [r["metadata"] for r in cur.fetchall()]
+            if fps:
+                lines = [f"  * {f.get('value', '')[:200]}" for f in fps]
+                parts.append("SERVICE FINGERPRINTS (this target's live services + versions):\n"
+                             + "\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
+    # 5. discovered endpoints (attack surface without re-crawling)
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT metadata FROM rag_documents
+                     WHERE metadata->>'source' = %s AND metadata->>'ip' = %s
+                     ORDER BY (metadata->>'observed_at') DESC LIMIT %s""",
+                (RAG_DISCOVERED_ENDPOINT_SOURCE, ip, min(16, limit * 2)))
+            eps = [r["metadata"] for r in cur.fetchall()]
+            if eps:
+                # Compact — endpoints are noisy, list them one-per-line but cap at ~10
+                lines = [f"  * {e.get('value', '')[:150]}" for e in eps[:10]]
+                parts.append(f"DISCOVERED ENDPOINTS ({len(eps)} seen on this target — "
+                             "attack surface already known):\n" + "\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
+    # 6. vuln findings for this target (CVE-anchored)
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT metadata FROM rag_documents
+                     WHERE metadata->>'source' = %s AND metadata->>'ip' = %s
+                     ORDER BY (metadata->>'observed_at') DESC LIMIT %s""",
+                (RAG_VULN_FINDING_SOURCE, ip, limit))
+            vs = [r["metadata"] for r in cur.fetchall()]
+            if vs:
+                lines = [f"  * {v.get('value', '')[:250]}" for v in vs]
+                parts.append("PRIOR VULN FINDINGS on this target:\n" + "\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
+    return "\n\n".join(parts)
+
+
+@app.post("/rag/backfill/{source}", tags=["RAG"])
+def backfill_source_endpoint(source: str,
+                              engagement_id: Optional[str] = None,
+                              limit: int = 500,
+                              authorized: bool = Depends(auth)):
+    """Generic backfill: embed existing rows from a specific source's underlying
+    table(s) into rag_documents. Idempotent (dedup by value_hash). Requires
+    RAG_OBSERVED_FACTS=1. `source` = 'tier1' (all 4 tier-1 sources at once),
+    'credentials', 'verified_technique', 'vuln_finding', 'service_fingerprint',
+    'discovered_endpoint'."""
+    if not observed_facts_enabled():
+        raise HTTPException(400, "RAG_OBSERVED_FACTS is disabled — set the env flag first")
+    src = (source or "").lower()
+    if src == "credentials":
+        n_c, n_i = _backfill_credentials_and_identities_to_rag(engagement_id=engagement_id, limit=limit)
+        return {"ok": True, "source": src, "credentials_embedded": n_c,
+                "identities_embedded": n_i}
+    if src in ("tier1", "verified_technique", "vuln_finding",
+                "service_fingerprint", "discovered_endpoint"):
+        counts = _backfill_tier1_to_rag(engagement_id=engagement_id, limit=limit)
+        return {"ok": True, "source": src, "counts": counts}
+    raise HTTPException(400, f"unknown source '{source}' — see docstring")
 
 
 class PurgeObservedFactsResponse(BaseModel):

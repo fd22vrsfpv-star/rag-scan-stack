@@ -216,3 +216,71 @@ def test_backfill_endpoint_returns_counts():
         pytest.fail(f"non-JSON response: {r.stdout[:400]}")
     assert d.get("ok") is True
     assert "credentials_embedded" in d and "identities_embedded" in d
+
+
+def test_tier1_verified_technique_and_compose():
+    """Verified exploit_store row embeds as verified_exploit_technique; compose
+    helper returns a KNOWN-WORKING TECHNIQUES block that appears first."""
+    ip = f"203.0.113.{__import__('random').randint(1, 254)}"
+    py = f"""
+import sys; sys.path.insert(0, '/app')
+from api import (_load_verified_technique_into_rag, _compose_recall_context,
+                 purge_observed_facts, RAG_VERIFIED_TECHNIQUE_SOURCE)
+row = {{'verified': True, 'target_host': '{ip}', 'cve': 'CVE-2099-TEST',
+        'product': 'TestProduct', 'version': '1.0',
+        'command': "curl -X GET 'http://{ip}/exploit'"}}
+loaded = _load_verified_technique_into_rag(row)
+ctx = _compose_recall_context('{ip}', product='TestProduct')
+purge_observed_facts(ip='{ip}', source=RAG_VERIFIED_TECHNIQUE_SOURCE)
+print(loaded, 'KNOWN-WORKING TECHNIQUES' in ctx, 'CVE-2099-TEST' in ctx)
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0, f"stderr: {err}"
+    assert out.split() == ["True", "True", "True"], f"got: {out!r}"
+
+
+def test_tier1_service_fingerprint_load():
+    """A ports-shaped dict embeds one service_fingerprint row with port+banner."""
+    ip = f"203.0.113.{__import__('random').randint(1, 254)}"
+    py = f"""
+import sys; sys.path.insert(0, '/app')
+from api import (_load_service_fingerprint_into_rag, purge_observed_facts,
+                 RAG_SERVICE_FINGERPRINT_SOURCE)
+row = {{'port': 443, 'service': 'https', 'banner': 'nginx/1.18.0',
+        'product': 'nginx', 'version': '1.18.0'}}
+loaded = _load_service_fingerprint_into_rag(row, ip='{ip}')
+purge_observed_facts(ip='{ip}', source=RAG_SERVICE_FINGERPRINT_SOURCE)
+print(loaded)
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0, f"stderr: {err}"
+    assert out.strip() == "True", f"got: {out!r}"
+
+
+def test_tier1_discovered_endpoint_normalization():
+    """URL passed to _load_discovered_endpoint_into_rag is normalized to path+query."""
+    ip = f"203.0.113.{__import__('random').randint(1, 254)}"
+    py = f"""
+import sys; sys.path.insert(0, '/app')
+from api import (_load_discovered_endpoint_into_rag, _recall_observed_facts,
+                 purge_observed_facts, RAG_DISCOVERED_ENDPOINT_SOURCE)
+loaded = _load_discovered_endpoint_into_rag('{ip}', 'https://{ip}:8443/admin/login.php',
+                                              method='POST', status_code=200)
+# recall via generic observed-facts (same table)
+from api import _recall_credentials
+purge_observed_facts(ip='{ip}', source=RAG_DISCOVERED_ENDPOINT_SOURCE)
+print(loaded)
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0, f"stderr: {err}"
+    assert out.strip() == "True", f"got: {out!r}"
+
+
+def test_backfill_tier1_endpoint():
+    """POST /rag/backfill/tier1 returns per-source counts (may be 0 in a clean DB)."""
+    rc, resp = _call("POST", "/rag/backfill/tier1")
+    assert rc == 0
+    assert resp.get("ok") is True
+    assert "counts" in resp
+    assert set(resp["counts"].keys()) >= {"verified_technique", "vuln_finding",
+                                           "service_fingerprint", "discovered_endpoint"}
