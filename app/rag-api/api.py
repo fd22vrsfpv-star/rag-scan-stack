@@ -16943,12 +16943,178 @@ def restore_exploit_version(exploit_id: str, version: int, authorized: bool = De
     return dict(row)
 
 
+def _fetch_advisory_text(url, timeout=6, max_bytes=40000):
+    """Fetch a URL body and reduce it to plain text (strip scripts/styles, collapse HTML
+    tags). Size-capped, timeout-capped, failure-quiet — this feeds LLM context, so a
+    dead or huge URL should never break the pipeline."""
+    import httpx as _hx, re as _re
+    try:
+        with _hx.Client(verify=False, follow_redirects=True, timeout=timeout,
+                         headers={"User-Agent": "Mozilla/5.0 (compatible; PentestBot/1)"}) as cli:
+            r = cli.get(url)
+        if r.status_code >= 400:
+            return ""
+        ct = (r.headers.get("content-type") or "").lower()
+        body = r.text[:max_bytes]
+        if "html" in ct:
+            body = _re.sub(r"<script[^>]*>.*?</script>", "", body, flags=_re.S | _re.I)
+            body = _re.sub(r"<style[^>]*>.*?</style>", "", body, flags=_re.S | _re.I)
+            body = _re.sub(r"<[^>]+>", " ", body)
+            body = _re.sub(r"\s+", " ", body).strip()
+        return body[:max_bytes]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _fetch_cve_advisories_from_apis(cve, timeout=8):
+    """Pull CVE-specific advisory content from JSON APIs that don't need scraping.
+    GitHub Advisories API + CIRCL CVE Search return structured data — no client-side
+    JS shells, no rate-limit surprises like DDG. This is the primary path; DDG scrape
+    is the fallback when APIs miss.
+    Returns a compact text block with each source's advisory content."""
+    import httpx as _hx, json as _j
+    if not cve:
+        return ""
+    chunks = []
+    # 1. GitHub Advisories API — best source for vector-level detail
+    try:
+        with _hx.Client(verify=False, follow_redirects=True, timeout=timeout) as cli:
+            r = cli.get(f"https://api.github.com/advisories?cve_id={cve}",
+                         headers={"Accept": "application/vnd.github+json"})
+        if r.status_code == 200:
+            for adv in (r.json() or [])[:2]:
+                bits = [f"GHSA: {adv.get('ghsa_id')}",
+                        f"Summary: {adv.get('summary', '')[:300]}",
+                        f"Severity: {adv.get('severity', '')}"]
+                if adv.get("description"):
+                    bits.append(f"Description: {adv['description'][:2500]}")
+                refs = adv.get("references") or []
+                if refs:
+                    bits.append("References: " + ", ".join(x.get("url", "") for x in refs[:6]))
+                chunks.append("--- GITHUB ADVISORY ---\n" + "\n".join(bits))
+                # Fetch each referenced repo/issue/PR (often the exact PoC)
+                for ref in refs[:3]:
+                    url = ref.get("url") or ""
+                    if any(h in url for h in ("github.com/", "gitee.com/")):
+                        body = _fetch_advisory_text(url, timeout=5, max_bytes=4000)
+                        if body:
+                            chunks.append(f"--- REF ({url}) ---\n{body[:3500]}")
+    except Exception:  # noqa: BLE001
+        pass
+    # 2. CIRCL CVE Search — mirrors NVD + references as JSON
+    try:
+        with _hx.Client(verify=False, follow_redirects=True, timeout=timeout) as cli:
+            r = cli.get(f"https://cve.circl.lu/api/cve/{cve}")
+        if r.status_code == 200:
+            j = r.json() or {}
+            bits = []
+            if j.get("summary"): bits.append(f"Summary: {j['summary'][:2000]}")
+            if j.get("cvss"): bits.append(f"CVSS: {j['cvss']}")
+            if j.get("references"):
+                bits.append("References: " + ", ".join(j["references"][:8]))
+            if bits:
+                chunks.append("--- CIRCL/NVD ---\n" + "\n".join(bits))
+    except Exception:  # noqa: BLE001
+        pass
+    # 3. Nuclei templates — the goldmine when it exists. Direct raw content.
+    for nuclei_url in (
+        f"https://raw.githubusercontent.com/projectdiscovery/nuclei-templates/main/http/cves/{cve[4:8]}/{cve}.yaml",
+        f"https://raw.githubusercontent.com/projectdiscovery/nuclei-templates/master/http/cves/{cve[4:8]}/{cve}.yaml",
+    ):
+        try:
+            with _hx.Client(verify=False, follow_redirects=True, timeout=timeout) as cli:
+                r = cli.get(nuclei_url)
+            if r.status_code == 200 and len(r.text) > 100:
+                chunks.append(f"--- NUCLEI TEMPLATE ({nuclei_url}) ---\n{r.text[:4000]}")
+                break
+        except Exception:  # noqa: BLE001
+            continue
+    if not chunks:
+        return ""
+    return ("PUBLIC ADVISORIES for " + cve + " (from GitHub Advisories API + CIRCL + "
+            "Nuclei templates — these usually name the exact vulnerable endpoint/param):\n"
+            + "\n".join(chunks))
+
+
+def _research_cve_advisories(cve, max_results=3, per_url_bytes=6000):
+    """Advisory retrieval for a CVE. Fills the vector-level gap for novel CVEs where
+    MSF/ExploitDB have nothing. Order:
+      1. GitHub Advisories API + CIRCL + Nuclei template (structured JSON/YAML, no
+         rate-limit surprises).
+      2. DDG scrape (fallback when APIs miss).
+    Returns a compact text block; empty on total failure."""
+    if not cve:
+        return ""
+    # Try structured APIs first — always land, contain vector-level detail directly.
+    api_text = _fetch_cve_advisories_from_apis(cve)
+    if api_text:
+        return api_text
+    # Fire two queries and merge — DDG advanced operators (site:, quoted-strings, OR)
+    # often collapse the result set to zero on some result-page shapes. Plain queries
+    # get many more hits; we do the filtering client-side.
+    all_results = []
+    for query in (f"{cve} poc github", f"{cve} exploit advisory"):
+        try:
+            all_results.extend(ddg_search(query, max_results=10, timeout=8) or [])
+        except Exception:  # noqa: BLE001
+            pass
+    # Filter to real advisory-shaped URLs; skip DDG click-tracking, PDFs, ads.
+    seen_urls = set()
+    good = []
+    for r in all_results:
+        url = (r.get("url") or "").strip()
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        if url.endswith(".pdf") or "duckduckgo.com/y.js" in url or "bing.com/aclick" in url:
+            continue
+        # Prioritize by likely value: nuclei templates (best — literal request template),
+        # GitHub advisories / repos / gists, Gitee, NVD, PoC aggregators, vendor changelogs.
+        weight = 0
+        if "nuclei-templates" in url or ".yaml" in url or ".yml" in url: weight += 5
+        if "github.com/advisories/" in url or "github.com/" in url and cve.lower() in url.lower(): weight += 4
+        if "github.com" in url or "gitee.com" in url: weight += 3
+        if "nvd.nist.gov" in url or "cve.mitre.org" in url: weight += 2
+        if "poc_detail" in url.lower() or "advisory" in url.lower() or "cvefeed" in url: weight += 2
+        if weight > 0:
+            r["_weight"] = weight
+            good.append(r)
+    good.sort(key=lambda x: -x.get("_weight", 0))
+    good = good[:max_results]
+    # Fallback: DDG occasionally returns empty (rate-limit, page-shape change). Hit a
+    # handful of well-known CVE aggregators directly so we always have SOMETHING.
+    if not good:
+        for direct_url, title in (
+            (f"https://nvd.nist.gov/vuln/detail/{cve}",
+             f"NVD detail for {cve}"),
+            (f"https://github.com/advisories?query={cve}",
+             f"GitHub Advisories search: {cve}"),
+            (f"https://cve.mitre.org/cgi-bin/cvename.cgi?name={cve}",
+             f"MITRE CVE record: {cve}"),
+        ):
+            good.append({"url": direct_url, "title": title, "_weight": 1})
+        good = good[:max_results]
+    chunks = []
+    for r in good[:max_results]:
+        url = r["url"]
+        title = (r.get("title") or "")[:120]
+        body = _fetch_advisory_text(url, max_bytes=per_url_bytes)
+        if body:
+            chunks.append(f"--- ADVISORY: {title}\nURL: {url}\n{body[:per_url_bytes]}\n")
+    if not chunks:
+        return ""
+    return ("PUBLIC ADVISORIES for " + cve + " (fetched from DDG top hits — these often "
+            "name the exact vulnerable endpoint/param when MSF/ExploitDB have nothing):\n"
+            + "\n".join(chunks))
+
+
 def _research_exploit(cve, ip=None, port=None, product=None, version=None, eid=None, model=None):
     """Reference-PoC research: pull public exploit material for a CVE (Metasploit module,
-    ExploitDB PoC text, NVD refs) and have the LLM explain WHAT THE EXPLOIT CONSISTS OF —
-    preconditions, endpoint, method, params, payload, success signal — plus a seed command
-    to reproduce it on the target. This is the material that makes a synthesized PoC land
-    (vs a description-only guess). Returns {cve, analysis, sources, reference_poc, llm_model}."""
+    ExploitDB PoC text, NVD refs, GitHub/Gitee advisories via DDG) and have the LLM
+    explain WHAT THE EXPLOIT CONSISTS OF — preconditions, endpoint, method, params,
+    payload, success signal — plus a seed command to reproduce it on the target. This
+    is the material that makes a synthesized PoC land (vs a description-only guess).
+    Returns {cve, analysis, sources, reference_poc, llm_model}."""
     import requests as _rq
     cve = (cve or "").strip().upper()
     er = EXPLOIT_RUNNER_URL.rstrip("/")
@@ -16971,6 +17137,15 @@ def _research_exploit(cve, ip=None, port=None, product=None, version=None, eid=N
         if e.get("poc"):
             poc_text += f"\n--- EDB-{e.get('edb_id')}: {e.get('title', '')} ---\n{str(e['poc'])[:4000]}\n"
     msf_text = "\n".join(f"- MSF module {m.get('module')} (rank {m.get('rank')})" for m in msf)
+    # Advisory retrieval: for novel CVEs where MSF/ExploitDB have nothing, pull the
+    # top DDG-searched GitHub/Gitee/NVD advisory bodies. Often names the exact endpoint
+    # + param — the vector-level detail that unblocks description-only synth.
+    advisory_text = ""
+    if not msf and not poc_text:
+        try:
+            advisory_text = _research_cve_advisories(cve, max_results=3, per_url_bytes=6000)
+        except Exception:  # noqa: BLE001
+            advisory_text = ""
     tgt = f"http://{ip}:{port}" if ip else "the target"
     # Documentation posture: a defender/tester on an AUTHORIZED engagement writing up how the
     # vuln works and how to VALIDATE it. This framing gets a substantive answer where a
@@ -16983,6 +17158,7 @@ def _research_exploit(cve, ip=None, port=None, product=None, version=None, eid=N
               f"CVE description: {nvd.get('description') or '(none)'}\n"
               f"Metasploit module(s): {msf_text or '(none)'}\n"
               f"Public reference (ExploitDB):{poc_text or ' (none)'}\n"
+              f"{advisory_text or ''}\n"
               f"Return ONE JSON object documenting the vulnerability's mechanics: {{"
               f'"summary": "<2-3 sentences: what the weakness is and how it is triggered>", '
               f'"components": ["<the moving parts: endpoint, auth, input, etc.>"], '
@@ -17015,8 +17191,10 @@ def _research_exploit(cve, ip=None, port=None, product=None, version=None, eid=N
                            "has_poc": bool(e.get("poc"))} for e in edb],
             "nvd_refs": (nvd.get("refs") or [])[:8],
             "has_public_module": bool(msf or edb),
+            "has_advisory_text": bool(advisory_text),
         },
         "reference_poc": poc_text[:8000],
+        "advisory_text": advisory_text[:12000],
         "llm_model": llm_model,
     }
 
