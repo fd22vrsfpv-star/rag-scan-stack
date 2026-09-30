@@ -1064,3 +1064,45 @@ export function useDeletePocHint() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['poc-hints'] }),
   })
 }
+
+// ─── Exploit build summary (one-glance recon overview) ──────────────────────
+export interface ExploitSummary {
+  framework: string | null
+  waf_family: string | null
+  waf_proven_variants: Record<string, string[]>
+  open_ports: number[]
+  endpoints_discovered: string[]
+  honored_params: Array<{ path: string; param: string; class?: string; payload_hint?: string }>
+  credentials_found: string[]
+  admin_paths: string[]
+  has_captcha: boolean
+  strategist_primary: { class: string; endpoint: string; param: string; method: string } | null
+  strategist_alts: Array<{ label: string; class: string; endpoint: string; param: string }>
+  plan_verdicts: Record<string, string>
+  iterations_summary: Array<{ iter: number; status: string; output_head: string }>
+  dead_endpoints: string[]
+  waf_blocks: number
+  final_verdict?: { verified: boolean; reason: string }
+}
+
+export function useExploitSummary(exploitId: string | null | undefined) {
+  return useQuery({
+    queryKey: ['exploit-summary', exploitId],
+    queryFn: () => apiFetch<{ ok: boolean; exploit_id: string; phase_count: number; summary: ExploitSummary; auto_hint: string }>(
+      `/exploit-store/${exploitId}/summary`,
+    ),
+    enabled: !!exploitId,
+  })
+}
+
+export function useDeriveHint() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (exploitId: string) =>
+      apiFetch<{ ok: boolean; hint_id: string | null; hint_text: string; reason?: string }>(
+        `/exploit-store/${exploitId}/derive-hint`,
+        { method: 'POST' },
+      ),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['poc-hints'] }),
+  })
+}
