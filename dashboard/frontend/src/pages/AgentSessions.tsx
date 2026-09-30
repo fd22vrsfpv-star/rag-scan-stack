@@ -378,8 +378,14 @@ function ScanFlowSummary({ summary, validation }: {
   )
 }
 
-function ScanCard({ scan }: { scan: SessionScan }) {
-  const [expanded, setExpanded] = useState(false)
+function ScanCard({ scan, forceExpanded }: { scan: SessionScan; forceExpanded?: boolean | null }) {
+  // Local expand state, syncing to a parent-controlled expand-all toggle when set.
+  // Lets the operator open every scan card in one click (no more click-per-row) while
+  // still allowing per-card toggle after that.
+  const [expanded, setExpanded] = useState<boolean>(!!forceExpanded)
+  useEffect(() => {
+    if (forceExpanded !== null && forceExpanded !== undefined) setExpanded(forceExpanded)
+  }, [forceExpanded])
   const p = scan.progress
 
   const durationStr = scan.duration_seconds != null
@@ -539,6 +545,10 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     : storedFlow)
   const claimValidation = sessionMeta?.claim_validation as ClaimValidation | undefined
   const [activeTab, setActiveTab] = useState<'messages' | 'scans' | 'security'>('messages')
+  // Global expand control for the Scans & Tools tab: null = per-card, true =
+  // everyone open, false = everyone closed, 'interesting' = auto-open only
+  // failed / no-output cards. Reset on tab switch so it doesn't stick.
+  const [scansExpand, setScansExpand] = useState<null | boolean | 'interesting'>(null)
   const [showToolCalls, setShowToolCalls] = useState(true)
 
   const logRef = useRef<HTMLDivElement>(null)
@@ -1048,8 +1058,10 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
           {flowSummary && (
             <ScanFlowSummary summary={flowSummary} validation={claimValidation} />
           )}
-          {/* Summary bar */}
-          <div className="flex items-center gap-4 text-xs">
+          {/* Summary bar + expand controls — one click to see every scan's output
+              without click-per-row. `forceExpanded` propagates to each ScanCard;
+              cards keep their own state when it's null. */}
+          <div className="flex items-center gap-4 text-xs flex-wrap">
             <span className="text-muted-foreground">
               Total: <span className="text-foreground font-medium">{scanCounts.total}</span>
             </span>
@@ -1068,6 +1080,20 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
                 Failed: {scanCounts.failed}
               </span>
             )}
+            <div className="flex-1" />
+            <button onClick={() => setScansExpand(true)}
+              className="h-6 px-2 rounded border border-border hover:bg-accent text-[11px]">
+              Expand all
+            </button>
+            <button onClick={() => setScansExpand(false)}
+              className="h-6 px-2 rounded border border-border hover:bg-accent text-[11px]">
+              Collapse all
+            </button>
+            <button onClick={() => setScansExpand('interesting')}
+              className="h-6 px-2 rounded border border-primary/40 text-primary hover:bg-primary/10 text-[11px]"
+              title="Open failed scans + scans that produced no output (the ones worth reviewing)">
+              Open interesting
+            </button>
           </div>
           {/* Scan cards */}
           {scans.length === 0 && (
@@ -1076,9 +1102,18 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
             </p>
           )}
           <div className="space-y-2">
-            {scans.map(scan => (
-              <ScanCard key={scan.scan_id || scan.job_id} scan={scan} />
-            ))}
+            {scans.map(scan => {
+              // Compute per-card forceExpanded: null = card decides; else parent decides.
+              let forced: boolean | null = null
+              if (scansExpand === true) forced = true
+              else if (scansExpand === false) forced = false
+              else if (scansExpand === 'interesting') {
+                forced = scan.status === 'failed'
+                  || scan.status === 'error'
+                  || (scan.status === 'completed' && !((scan as any).result_bytes) && !((scan as any).artifact_bytes))
+              }
+              return <ScanCard key={scan.scan_id || scan.job_id} scan={scan} forceExpanded={forced} />
+            })}
           </div>
 
           {/* Available MCP Tools */}
