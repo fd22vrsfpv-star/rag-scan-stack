@@ -14128,7 +14128,8 @@ def _flag_precondition(cve, ip, pc, eid):
 
 def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale="",
                     product=None, version=None, max_iters=3, canary=None,
-                    origin_family=None, llm_model=None, metrics=None, model=None):
+                    origin_family=None, llm_model=None, metrics=None, model=None,
+                    recon_source_used=None):
     """Increment 2: run the PoC against the target; on failure, refine via the LLM,
     re-run — up to max_iters. Verbose trail -> filesystem.
 
@@ -14159,6 +14160,13 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
 
     orig = tuple(origin_family or _poc_target_family(command))
     success = False; iters = 0; drifted = False; output = ""
+    # Escalation: after this many failed iters, run zap-active as a fallback recon and
+    # inject its findings into the refine prompt. One-shot per build. Skipped when
+    # zap-active was already the primary recon.
+    _escalate_after = int(os.environ.get("ZAP_ACTIVE_ESCALATE_AFTER", "3") or "3")
+    _already_zap_active = "active" in (str(recon_source_used or "").lower())
+    escalation_guidance = ""
+    escalated = False
     for it in range(1, max(1, max_iters) + 1):
         iters = it
         fam = _poc_target_family(command)
@@ -14183,6 +14191,25 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                    extra={"target_family": list(fam), "drifted": drifted})
         if success or it >= max_iters:
             break
+        # Escalation: once we've iterated ESCALATE_AFTER times without success and the
+        # primary recon wasn't already zap-active, kick a zap-active scan and fold its
+        # findings into the next refine. Fires exactly once per build.
+        if (not escalated and not _already_zap_active
+                and it >= _escalate_after and it < max_iters):
+            try:
+                _te = _t.time()
+                zactive = _zap_recon(ip, port, active_scan=True)
+                _poc_trace(run_id, "escalation:zap_active", iteration=it,
+                           response=(zactive or "no findings")[:1200],
+                           extra={"seconds": round(_t.time() - _te, 2)})
+                if zactive:
+                    escalation_guidance = ("\nESCALATION RECON (zap-active fired after "
+                                           f"{it} failed iters — treat as new authoritative "
+                                           "attack-surface intel): " + zactive)
+                escalated = True
+            except Exception as e:  # noqa: BLE001
+                logging.debug("zap-active escalation failed: %s", e)
+                escalated = True  # don't retry on this build
         precond = ""
         if _poc_needs_precondition(output):
             pc = _fetch_preconditions(ip, port)
@@ -14210,7 +14237,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                            f"the exploit aimed at {orig[1] or 'the vulnerable endpoint'}.")
         rprompt = (f"AUTHORIZED lab pentest. The PoC for {cve} on http://{ip}:{port} did NOT "
                    f"succeed.\nCommand: {command}\nOutput:\n{(output or '')[:1500]}{precond}"
-                   f"{anchor_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
+                   f"{escalation_guidance}{anchor_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
                    f"appear. Return ONE JSON object only: {{\"command\": \"<better command, may "
                    f"chain curl calls with ; and shell vars to fetch a token first>\", "
                    f"\"assertion\": {{\"expect_regex\": \"{canary or '<regex>'}\"}}}}. No prose.")
@@ -14335,8 +14362,12 @@ class BuildPocBody(BaseModel):
     max_iters: int = 5
     recon_first: bool = True    # do a fast target recon (fetch page/robots/forms) and feed
                                 # what's found to synth; catches shape/params synth would miss.
-    recon_source: Optional[str] = "basic"    # 'basic' (self-fetch, ~2s) | 'zap' (spider, ~90s)
-                                             # | 'both' (basic + zap) | 'zap-active' (spider+ascan, ~3-5min)
+    recon_source: Optional[str] = "basic"    # 'basic' (self-fetch, ~2s) | 'arjun' (param names, ~30s)
+                                             # | 'zap' (spider, ~90s) | 'both' (basic + zap)
+                                             # | 'params' (basic + arjun; recommended first pass)
+                                             # | 'full' (basic + arjun + zap; ~2-3min)
+                                             # | 'zap-active' (spider + active scan, ~3-5min).
+                                             # Port sweep always runs regardless.
     hint: Optional[str] = None               # per-run operator guidance (highest priority; prepended
                                              # ahead of recon/research/auth in synth guidance).
     # release=true is the operator authorizing this endpoint for PoC building — a
@@ -14487,6 +14518,56 @@ def _scout_open_ports(ip, primary_port, timeout=1.2):
         except Exception:  # noqa: BLE001
             pass
     return header + "\n" + "\n".join(lines)
+
+
+def _scout_arjun(ip, port, path="/", timeout=60, threads=25):
+    """Parameter-name discovery on a single URL via Arjun. Diffs baseline vs test
+    requests to spot params the app honors (reflection / status / length change) —
+    answers "which query params are wired up" definitively before synth guesses.
+    Returns short guidance string; empty on any failure (never breaks a build).
+    Rationale: hrefs on the landing page reveal params only when the app links to
+    them; Arjun finds the hidden ones (id, page, file, cmd, redirect, callback, ...)."""
+    import subprocess as _sp, tempfile as _tf, json as _js, os as _os
+    if not ip:
+        return ""
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    url = f"{scheme}://{ip}:{port or 80}{path if path.startswith('/') else '/' + path}"
+    try:
+        with _tf.NamedTemporaryFile("r", suffix=".json", delete=False) as fh:
+            out_path = fh.name
+        r = _sp.run(
+            ["arjun", "-u", url, "-o", out_path, "-t", str(threads),
+             "--disable-redirects", "-q"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if not _os.path.exists(out_path):
+            return ""
+        try:
+            with open(out_path) as fh:
+                data = _js.load(fh)
+        finally:
+            try: _os.unlink(out_path)
+            except Exception: pass
+        # Arjun's JSON schema: {url: {params: [...], method, ...}} — normalize.
+        params = []
+        for key, val in (data or {}).items():
+            if isinstance(val, dict):
+                params.extend(val.get("params") or [])
+            elif isinstance(val, list):
+                params.extend(val)
+        params = [str(p) for p in params][:16]
+        if not params:
+            return f"Arjun recon on {url}: no honored params discovered"
+        return (f"Arjun recon on {url} ({len(params)} honored params — the app "
+                f"reacts differently when these are set): {', '.join(params)}. "
+                f"Try these as injection points before guessing at param names.")
+    except _sp.TimeoutExpired:
+        return f"Arjun recon on {url}: TIMEOUT after {timeout}s"
+    except FileNotFoundError:
+        return ""  # arjun not installed (development env)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("arjun recon failed: %s", e)
+        return ""
 
 
 def _scout_url_recon(ip, port, timeout=8):
@@ -14664,22 +14745,57 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
     #   both      — basic + zap combined
     # Any failure returns empty and continues without recon (never breaks the build).
     recon_guidance = ""
+    recon_metrics = {}  # tool -> {"seconds": float, "chars_added": int, "signal": str}
     if recon_first:
         sources = str(recon_source or "basic").lower()
         segments = []
+        # `full` = basic + arjun + zap ; `params` = basic + arjun ; kept independent
+        # so operators can still ask for a single tool.
+        want_basic = ("basic" in sources) or (sources in ("both", "full", "params"))
+        want_arjun = ("arjun" in sources) or (sources in ("params", "full"))
+        want_zap = ("zap" in sources) or (sources == "full")
+        want_zap_active = "active" in sources
         try:
-            # Always run the port sweep first — it's fast, always useful, and catches
-            # the "wrong port" and "side-channel port" cases before we invest LLM turns.
+            # Port sweep first: fast, always on, catches wrong-port and side-channel-port.
+            _t0 = _t.time()
             ps = _scout_open_ports(ip, port)
+            recon_metrics["port_sweep"] = {"seconds": round(_t.time() - _t0, 2),
+                                           "chars_added": len(ps or ""),
+                                           "signal": "open-port list + banners"}
             if ps:
                 segments.append(ps)
                 _poc_trace(run_id, "recon:port_sweep", response=ps[:1200])
-            if "basic" in sources or sources == "both":
+            if want_basic:
+                _t0 = _t.time()
                 b = _scout_url_recon(ip, port)
-                if b: segments.append(b)
-            if "zap" in sources:
-                z = _zap_recon(ip, port, active_scan=("active" in sources))
-                if z: segments.append(z)
+                recon_metrics["basic"] = {"seconds": round(_t.time() - _t0, 2),
+                                          "chars_added": len(b or ""),
+                                          "signal": "landing page HREFs + forms + robots"}
+                if b:
+                    segments.append(b)
+                    _poc_trace(run_id, "recon:basic", response=b[:1200])
+            if want_arjun:
+                _t0 = _t.time()
+                a = _scout_arjun(ip, port)
+                recon_metrics["arjun"] = {"seconds": round(_t.time() - _t0, 2),
+                                          "chars_added": len(a or ""),
+                                          "signal": "honored param names (single URL)"}
+                if a:
+                    segments.append(a)
+                    _poc_trace(run_id, "recon:arjun", response=a[:1200])
+            if want_zap:
+                _t0 = _t.time()
+                z = _zap_recon(ip, port, active_scan=want_zap_active)
+                recon_metrics["zap" + ("_active" if want_zap_active else "")] = {
+                    "seconds": round(_t.time() - _t0, 2),
+                    "chars_added": len(z or ""),
+                    "signal": ("spider + passive + active scan"
+                               if want_zap_active else "spider + passive alerts"),
+                }
+                if z:
+                    segments.append(z)
+                    _poc_trace(run_id, "recon:zap" + ("_active" if want_zap_active else ""),
+                               response=z[:1200])
         except Exception:  # noqa: BLE001
             pass
         recon_guidance = " ".join(segments)
@@ -14746,10 +14862,18 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
                              run_id, rationale=built.get("rationale", ""),
                              product=product, version=version, max_iters=max_iters,
                              canary=built.get("canary"), origin_family=built.get("origin_family"),
-                             llm_model=built.get("llm_model"), metrics=built.get("metrics"), model=model)
+                             llm_model=built.get("llm_model"), metrics=built.get("metrics"), model=model,
+                             recon_source_used=recon_source)
     _metrics = result.get("metrics") or {}
     _metrics["build_seconds"] = round(_t.time() - _t0, 1)
     _metrics["researched"] = bool(research_out and (research_out.get("analysis") or research_out.get("sources", {}).get("has_public_module")))
+    # Recon comparison — which tools ran, wall-clock each, how much guidance each added.
+    # Reads on the store row as metadata.recon_comparison; the /recon-comparison endpoint
+    # renders a compact table for the operator.
+    if recon_metrics:
+        _metrics["recon_comparison"] = recon_metrics
+        _metrics["recon_source"] = recon_source
+        _metrics["recon_seconds_total"] = round(sum(v.get("seconds", 0) for v in recon_metrics.values()), 2)
     # A verified PoC is saved verified; an off-target/unverified run is saved too so the
     # operator can inspect/edit it, but flagged verified=false.
     store_id = None
@@ -15533,6 +15657,44 @@ def get_exploit_trace(exploit_id: str, authorized: bool = Depends(auth)):
         return {"ok": True, "log_path": log_path, "phases": [], "reason": "log file missing"}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(500, f"read trace: {e}")
+
+
+@app.get("/exploit-store/{exploit_id}/recon-comparison", tags=["Exploit Store"])
+def get_exploit_recon_comparison(exploit_id: str, authorized: bool = Depends(auth)):
+    """Per-tool recon comparison for this build: wall-clock and characters-added by each
+    tool that ran (port_sweep / basic / arjun / zap / zap_active), plus which recon_source
+    the operator picked. Read from metadata.metrics.recon_comparison set at build time.
+    Answers 'which recon tool was worth the time on this target?' — the benchmark data."""
+    _ensure_exploit_store()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT cve, target_host, target_port, metadata FROM exploit_store WHERE id = %s",
+                    (exploit_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "exploit not found")
+    md = row.get("metadata") or {}
+    metrics = md.get("metrics") or {}
+    rc = metrics.get("recon_comparison") or {}
+    if not rc:
+        return {"ok": True, "cve": row["cve"], "target": f"{row['target_host']}:{row['target_port']}",
+                "recon_comparison": {}, "reason": "no recon comparison stored (older build)"}
+    # Rank tools by chars_added / second (signal-per-second) so the winner is obvious.
+    ranked = []
+    for tool, m in rc.items():
+        secs = float(m.get("seconds") or 0)
+        chars = int(m.get("chars_added") or 0)
+        rate = round(chars / secs, 1) if secs > 0 else None
+        ranked.append({"tool": tool, "seconds": secs, "chars_added": chars,
+                       "signal": m.get("signal", ""), "chars_per_sec": rate})
+    ranked.sort(key=lambda x: (-(x["chars_per_sec"] or 0), x["seconds"]))
+    return {
+        "ok": True, "cve": row["cve"],
+        "target": f"{row['target_host']}:{row['target_port']}",
+        "recon_source": metrics.get("recon_source"),
+        "recon_seconds_total": metrics.get("recon_seconds_total"),
+        "ranked": ranked,
+        "recon_comparison": rc,
+    }
 
 
 @app.post("/exploit-store/{exploit_id}/restore/{version}", tags=["Exploit Store"])
