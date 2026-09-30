@@ -255,6 +255,7 @@ services:
       # run on the selected LLM (e.g. DeepSeek) instead of hitting Ollama direct.
       # OLLAMA_URL stays at real Ollama for anything that needs raw Ollama.
       POSTEX_SEMANTIC_ENUMERATE: ${POSTEX_SEMANTIC_ENUMERATE:-1}
+      BUILD_POC_LANGGRAPH: ${BUILD_POC_LANGGRAPH:-0}   # StateGraph refactor of _build_poc_core (flag off during migration)
       ZAP_URL: ${ZAP_URL:-http://zap:8090}
       ZAP_API_KEY: ${ZAP_API_KEY:-changeme}
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}

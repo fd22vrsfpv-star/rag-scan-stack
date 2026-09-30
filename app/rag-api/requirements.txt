@@ -10,3 +10,4 @@ httpx
 slowapi
 
 arjun>=2.2.5   # parameter-name discovery on a single URL (recon phase)
+langgraph<2   # StateGraph refactor of _build_poc_core (build_poc_graph.py)
