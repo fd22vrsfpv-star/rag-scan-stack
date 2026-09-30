@@ -154,3 +154,65 @@ print('OK')
 """
     out, err, rc = _in_container(py)
     assert rc == 0 and "OK" in out, f"stderr: {err}"
+
+
+def test_credential_into_rag_load_and_recall():
+    """A credential_findings-shaped dict embeds one row that _recall_credentials
+    finds back. Marker <known> is stored — actual secret is NOT in RAG."""
+    ip = f"198.51.100.{__import__('random').randint(1, 254)}"
+    py = f"""
+import sys; sys.path.insert(0, '/app')
+from api import (_load_credential_into_rag, _recall_credentials,
+                 purge_observed_facts, RAG_CREDENTIAL_SOURCE)
+row = {{'ip': '{ip}', 'port': 22, 'protocol': 'ssh',
+        'username': 'root', 'valid_cred': True, 'auth_type': 'password',
+        'secret_type': 'password', 'source': 'brutus',
+        'engagement_id': None}}
+loaded = _load_credential_into_rag(row, product='openssh')
+r = _recall_credentials(target_ip='{ip}')
+purge_observed_facts(ip='{ip}', source=RAG_CREDENTIAL_SOURCE)
+# Marker <known> present, plaintext password NOT in the recall
+val = r[0]['value'] if r else ''
+print(loaded, len(r), '<known>' in val, 'plaintext' not in val)
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0, f"stderr: {err}"
+    assert out.split() == ["True", "1", "True", "True"], f"got: {out!r}"
+
+
+def test_identity_into_rag_admin_flagged():
+    """An admin identity is recalled with 'ADMIN' in the value string."""
+    py = """
+import sys; sys.path.insert(0, '/app')
+from api import (_load_identity_into_rag, _recall_credentials,
+                 purge_observed_facts, RAG_IDENTITY_SOURCE)
+ident = {'provider': 'azure', 'identifier': 'admin@example.onmicrosoft.com',
+         'principal_type': 'user', 'status': 'active', 'mfa_state': 'disabled',
+         'is_admin': True, 'tenant_id': 't-123', 'engagement_id': None}
+loaded = _load_identity_into_rag(ident)
+r = _recall_credentials(product='azure')
+purge_observed_facts(source=RAG_IDENTITY_SOURCE)
+has_admin = any('ADMIN' in row.get('value', '') and 'admin@' in row.get('value', '') for row in r)
+print(loaded, len(r) >= 1, has_admin)
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0, f"stderr: {err}"
+    assert out.split() == ["True", "True", "True"], f"got: {out!r}"
+
+
+def test_backfill_endpoint_returns_counts():
+    """POST /rag/backfill-credentials returns credentials_embedded + identities_embedded
+    counts (may be 0 if the tables are empty for this engagement) and requires the flag."""
+    r = subprocess.run(
+        ["docker", "exec", "-e", "RAG_OBSERVED_FACTS=1", "rag-api", "sh", "-lc",
+         'curl -sk -X POST https://localhost:8000/rag/backfill-credentials '
+         '-H "x-api-key: $API_KEY"'],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert r.returncode == 0
+    try:
+        d = json.loads(r.stdout)
+    except Exception:
+        pytest.fail(f"non-JSON response: {r.stdout[:400]}")
+    assert d.get("ok") is True
+    assert "credentials_embedded" in d and "identities_embedded" in d

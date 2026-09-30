@@ -12486,6 +12486,18 @@ def _store_researched_cred_candidates(product: str, version: str, pairs: list) -
                              _Json({"product": product, "version": version,
                                     "note": p.get("note", ""), "via": "default_cred_research"})))
                         n += 1
+                        # Live-embed into RAG so a follow-on build recalls it
+                        # (no-op when RAG_OBSERVED_FACTS is off)
+                        try:
+                            _load_credential_into_rag({
+                                "ip": ip, "port": port, "protocol": "http",
+                                "username": p["username"], "auth_type": "form",
+                                "secret_type": "password", "source": "default_cred_research",
+                                "valid_cred": False,
+                                "engagement_id": eng,
+                            }, engagement_id=eng, product=product)
+                        except Exception:  # noqa: BLE001
+                            pass
                     except Exception:  # noqa: BLE001
                         conn.rollback()
             conn.commit()
@@ -14185,6 +14197,20 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
                               "cross_scope": sum(1 for f in _facts if f.get("scope") == "cross-target")})
     except Exception as e:  # noqa: BLE001
         logging.debug("recall_prior_observations skipped: %s", e)
+    # Credential/identity recall: prior credential_findings + identities matching
+    # this target (or its product family) are prepended so synth can attempt them
+    # first. Retrieval only names the account+context; the actual plaintext lives
+    # in credential_findings.recovered_secret and the LLM asks for it via a
+    # follow-up when it needs to use one.
+    try:
+        _creds = _recall_credentials(target_ip=ip, product=product, limit=10)
+        _cred_block = _format_credentials_recall_block(_creds)
+        if _cred_block:
+            guidance_extra = _cred_block + "\n\n" + guidance_extra
+            _poc_trace(run_id, "recall_credentials",
+                       response=f"recalled {len(_creds)} credential/identity row(s)")
+    except Exception as e:  # noqa: BLE001
+        logging.debug("recall_credentials skipped: %s", e)
     try:
         _n = _embed_enum_facts_for_target(ip, engagement_id=eid, product=product)
         if _n:
@@ -29357,7 +29383,13 @@ VULN_SKILL_RAG_SOURCE = "custom_vuln_skill"
 # DELETE /rag/observed-facts endpoint let the operator trim stale rows.
 RAG_OBSERVED_FACTS_SOURCE = "observed_target_fact"
 RAG_ENUM_FACT_SOURCE = "enum_fact_for_exploit"
-_RAG_FACT_SOURCES = (RAG_OBSERVED_FACTS_SOURCE, RAG_ENUM_FACT_SOURCE)
+# Credentials + identities as first-class RAG so retrieval can answer
+# "have we seen this user/pass on any similar product?" and "which accounts
+# does this engagement have access to?" via similarity, not just exact SQL.
+RAG_CREDENTIAL_SOURCE = "credential_identity"
+RAG_IDENTITY_SOURCE = "directory_identity"
+_RAG_FACT_SOURCES = (RAG_OBSERVED_FACTS_SOURCE, RAG_ENUM_FACT_SOURCE,
+                     RAG_CREDENTIAL_SOURCE, RAG_IDENTITY_SOURCE)
 
 
 def observed_facts_enabled() -> bool:
@@ -29608,6 +29640,182 @@ def _embed_enum_facts_for_target(ip, engagement_id=None, product=None, window=50
     except Exception as e:  # noqa: BLE001
         logging.debug("embed_enum_facts_for_target ip=%s failed: %s", ip, e)
     return written
+
+
+def _load_credential_into_rag(cred_row, engagement_id=None, product=None):
+    """Embed one credential_findings row as a first-class RAG object. Key on
+    (source, ip, kind, value_hash) where value = "<user>:<secret_or_hash_marker>
+    on <service>:<port>". Metadata carries username/service/port/auth_type/
+    secret_type/valid_cred/source so retrieval can filter beyond similarity.
+    Fail-soft — never raises."""
+    if not observed_facts_enabled() or not cred_row:
+        return False
+    try:
+        ip = str(cred_row.get("ip") or "")
+        u = cred_row.get("username") or ""
+        svc = cred_row.get("protocol") or cred_row.get("service") or "?"
+        port = cred_row.get("port") or "?"
+        auth = cred_row.get("auth_type") or "password"
+        secret_type = cred_row.get("secret_type") or "password"
+        src = cred_row.get("source") or "unknown"
+        valid = bool(cred_row.get("valid_cred", True))
+        # We do NOT embed the plaintext secret here — even at high signal it's a
+        # material a stolen RAG dump would leak. Embed a MARKER, keep the actual
+        # secret in credential_findings.recovered_secret. Retrieval says "we have
+        # a pass for admin here" and the operator retrieves the value via SQL.
+        secret_marker = "<known>" if valid else "<invalid>"
+        v = f"{u}:{secret_marker}@{svc}:{port} ({secret_type}, source={src})"
+        return _load_observed_fact_into_rag(
+            RAG_CREDENTIAL_SOURCE, ip, "credential", v,
+            engagement_id=engagement_id or str(cred_row.get("engagement_id") or "") or None,
+            product=product)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("credential->rag load failed: %s", e)
+        return False
+
+
+def _load_identity_into_rag(identity_row, engagement_id=None):
+    """Embed one identities row (Azure/AD/AWS/etc. directory identity) as RAG.
+    Metadata carries provider, identifier, principal_type, status, mfa_state,
+    is_admin, tenant/domain so recall can answer "which admins?" or "which
+    accounts had MFA disabled in this tenant?". Fail-soft."""
+    if not observed_facts_enabled() or not identity_row:
+        return False
+    try:
+        prov = identity_row.get("provider") or "?"
+        ident = identity_row.get("identifier") or ""
+        ptype = identity_row.get("principal_type") or "?"
+        status = identity_row.get("status") or "unknown"
+        mfa = identity_row.get("mfa_state") or "unknown"
+        is_admin = bool(identity_row.get("is_admin"))
+        tenant = identity_row.get("tenant_id") or identity_row.get("domain") or ""
+        v = (f"{ident} [{prov} {ptype}] status={status} mfa={mfa}"
+             + (" ADMIN" if is_admin else "")
+             + (f" tenant={tenant}" if tenant else ""))
+        # Use provider+identifier as the "ip" slot for dedup keying — identities
+        # aren't ip-scoped, but the (source, "ip", kind, value_hash) shape
+        # already works when we substitute the provider+identifier there.
+        pseudo_ip = f"{prov}/{ident}"
+        return _load_observed_fact_into_rag(
+            RAG_IDENTITY_SOURCE, pseudo_ip, ptype or "identity", v,
+            engagement_id=engagement_id or str(identity_row.get("engagement_id") or "") or None,
+            product=prov)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("identity->rag load failed: %s", e)
+        return False
+
+
+def _backfill_credentials_and_identities_to_rag(engagement_id=None, limit=500):
+    """One-shot backfill: read existing credential_findings + identities and
+    embed each into rag_documents. Used to populate RAG the first time the
+    flag is turned on for an engagement with existing data. Idempotent via
+    the dedup key. Returns (creds_written, identities_written)."""
+    if not observed_facts_enabled():
+        return (0, 0)
+    n_cred = 0; n_id = 0
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            where, args = "", []
+            if engagement_id:
+                where = "WHERE engagement_id = %s"
+                args.append(str(engagement_id))
+            cur.execute(f"""SELECT * FROM credential_findings {where}
+                             ORDER BY created_at DESC LIMIT %s""",
+                         args + [limit])
+            for row in cur.fetchall():
+                if _load_credential_into_rag(dict(row), engagement_id=engagement_id):
+                    n_cred += 1
+            try:
+                cur.execute(f"""SELECT * FROM identities {where}
+                                 ORDER BY last_seen DESC LIMIT %s""",
+                             args + [limit])
+                for row in cur.fetchall():
+                    if _load_identity_into_rag(dict(row), engagement_id=engagement_id):
+                        n_id += 1
+            except Exception:  # noqa: BLE001 — identities table optional
+                pass
+    except Exception as e:  # noqa: BLE001
+        logging.debug("backfill_credentials_identities failed: %s", e)
+    return (n_cred, n_id)
+
+
+def _recall_credentials(target_ip=None, product=None, service=None, username=None, limit=12):
+    """Query rag_documents for prior credential/identity rows matching any of
+    the given filters. Ordered: exact ip match first, then service/product,
+    then username fuzzy. Returns list of {ip, kind, value, source, metadata}.
+    Used by synth guidance + credential-attack loops."""
+    if not observed_facts_enabled():
+        return []
+    try:
+        rows = []
+        where = ["metadata->>'source' = ANY(%s)"]
+        args = [[RAG_CREDENTIAL_SOURCE, RAG_IDENTITY_SOURCE]]
+        if target_ip:
+            where.append("metadata->>'ip' = %s")
+            args.append(target_ip)
+        if product:
+            # Loose match — either exact product or contained-in
+            where.append("(metadata->>'product' = %s OR metadata->>'value' ILIKE %s)")
+            args.extend([product, f"%{product}%"])
+        if service:
+            where.append("metadata->>'value' ILIKE %s")
+            args.append(f"%@{service}:%")
+        if username:
+            where.append("metadata->>'value' ILIKE %s")
+            args.append(f"{username}:%")
+        sql = ("SELECT title, metadata FROM rag_documents WHERE " + " AND ".join(where)
+                + " ORDER BY (metadata->>'observed_at') DESC LIMIT %s")
+        args.append(limit)
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, args)
+            for r in cur.fetchall():
+                m = r["metadata"] or {}
+                rows.append({"ip": m.get("ip"), "kind": m.get("kind"),
+                              "value": m.get("value"), "source": m.get("source"),
+                              "product": m.get("product")})
+        return rows
+    except Exception as e:  # noqa: BLE001
+        logging.debug("_recall_credentials failed: %s", e)
+        return []
+
+
+def _format_credentials_recall_block(rows):
+    """Compose a KNOWN CREDENTIALS block for synth guidance. Empty when no
+    matches — synth prompt unchanged in that case."""
+    if not rows:
+        return ""
+    # Group by source (credential_identity vs directory_identity)
+    creds = [r for r in rows if r.get("source") == RAG_CREDENTIAL_SOURCE]
+    idents = [r for r in rows if r.get("source") == RAG_IDENTITY_SOURCE]
+    parts = []
+    if creds:
+        cred_lines = []
+        for c in creds[:8]:
+            tag = "@self" if c.get("ip") else ""
+            cred_lines.append(f"  * {c['value']} {tag}".rstrip())
+        parts.append("KNOWN CREDENTIALS (from prior credential_findings on this or a similar target — "
+                     "use them AS-IS on the exploit request; the RAG entry only names them, "
+                     "the plaintext is in credential_findings.recovered_secret):\n"
+                     + "\n".join(cred_lines))
+    if idents:
+        id_lines = []
+        for i in idents[:6]:
+            id_lines.append(f"  * {i['value']}")
+        parts.append("KNOWN IDENTITIES (directory entries from prior scans):\n" + "\n".join(id_lines))
+    return "\n\n".join(parts)
+
+
+@app.post("/rag/backfill-credentials", tags=["RAG"])
+def backfill_credentials_endpoint(engagement_id: Optional[str] = None,
+                                    limit: int = 500,
+                                    authorized: bool = Depends(auth)):
+    """One-shot: embed existing credential_findings + identities into
+    rag_documents so recall works against data collected before the flag was
+    on. Idempotent (dedup by value_hash). Requires RAG_OBSERVED_FACTS=1."""
+    if not observed_facts_enabled():
+        raise HTTPException(400, "RAG_OBSERVED_FACTS is disabled — set the env flag first")
+    n_cred, n_id = _backfill_credentials_and_identities_to_rag(engagement_id=engagement_id, limit=limit)
+    return {"ok": True, "credentials_embedded": n_cred, "identities_embedded": n_id}
 
 
 class PurgeObservedFactsResponse(BaseModel):
