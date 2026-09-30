@@ -1506,6 +1506,32 @@ def get_assets(
         for row in rows:
             row["discovered_by"] = sorted(source_map.get(str(row["id"]), set()))
 
+        # PoC/exploit count per asset — surfaces "this host has a built exploit" on
+        # the Assets list without requiring an extra click into ExploitManager.
+        # verified_poc_count = verified rows; poc_count = total rows (verified + unverified).
+        try:
+            poc_map: dict = {}
+            with get_db() as conn3, conn3.cursor() as cur3:
+                ip_list = [r["ip"] for r in rows if r.get("ip")]
+                if ip_list:
+                    cur3.execute(
+                        """SELECT target_host,
+                                  count(*) AS total,
+                                  count(*) FILTER (WHERE verified) AS verified
+                             FROM exploit_store
+                             WHERE target_host = ANY(%s)
+                             GROUP BY target_host""",
+                        (ip_list,),
+                    )
+                    for r in cur3.fetchall():
+                        poc_map[r[0]] = {"total": int(r[1] or 0), "verified": int(r[2] or 0)}
+            for row in rows:
+                counts = poc_map.get(row.get("ip") or "", {"total": 0, "verified": 0})
+                row["poc_count"] = counts["total"]
+                row["verified_poc_count"] = counts["verified"]
+        except Exception as _poc_err:
+            logger.warning("[assets] PoC-count lookup failed: %s", _poc_err)
+
     # Reverse DNS lookup (dig -x) for assets still missing a hostname
     import subprocess as _sp
     for row in rows:
@@ -13814,6 +13840,41 @@ def _flag_exploit_confirmed(cve, ip, port, command, eid):
                 (str(_u.uuid4()), title, ip, reason,
                  ["postex", "weaponize", "exploit_confirmed"] + ([vclass] if vclass else []),
                  Json(meta)))
+            # Also record as a first-class VULN on the target's asset so it shows up
+            # in Asset -> Vulns and any dashboard "confirmed exploits" query. Ties to
+            # the asset by IP and to the port by (asset_id, port). Dedup via CVE + IP.
+            cur.execute("SELECT id FROM assets WHERE ip = %s LIMIT 1", (ip,))
+            asset_row = cur.fetchone()
+            asset_id = asset_row[0] if asset_row else None
+            port_id = None
+            if asset_id and port:
+                cur.execute("SELECT id FROM ports WHERE asset_id = %s AND port = %s LIMIT 1",
+                             (asset_id, port))
+                pr = cur.fetchone()
+                port_id = pr[0] if pr else None
+            cvss = 9.0  # confirmed exploits are high-severity; refine from CVE details if we have them
+            try:
+                cvss = float(_fetch_cve_details(cve).get("cvss") or 9.0)
+            except Exception:  # noqa: BLE001
+                pass
+            severity = "critical" if cvss >= 9.0 else "high"
+            title_v = f"{cve}: verified exploit on {ip}:{port}"
+            # Dedup: (asset_id, cve) via script column + array
+            cur.execute("""SELECT id FROM vulns
+                             WHERE asset_id IS NOT DISTINCT FROM %s
+                               AND %s = ANY(cve)
+                               AND script = 'poc_builder' LIMIT 1""",
+                         (asset_id, cve))
+            existed = cur.fetchone()
+            if not existed:
+                cur.execute("""INSERT INTO vulns
+                    (asset_id, port_id, script, title, output, severity, cve, cvss, refs,
+                     metadata, engagement_id, workflow_status)
+                    VALUES (%s, %s, 'poc_builder', %s, %s, %s, %s, %s, %s, %s, %s, 'confirmed')""",
+                    (asset_id, port_id, title_v,
+                     (command or "")[:8000], severity, [cve], cvss,
+                     Json({"cve_ref": f"https://nvd.nist.gov/vuln/detail/{cve}"}),
+                     Json({**meta, "poc_verified": True}), eid))
             conn.commit()
         emit_webhook("exploit_confirmed", "poc",
                      {"cve": cve, "target": ip, "port": port, "vuln_class": vclass,
@@ -16736,6 +16797,52 @@ def regenerate_exploit_artifacts(exploit_id: str, authorized: bool = Depends(aut
     return dict(out)
 
 
+@app.post("/exploit-store/{exploit_id}/run", tags=["Exploit Store"])
+def run_exploit(exploit_id: str, authorized: bool = Depends(auth)):
+    """Run the stored PoC's shell command through the listener and return the output.
+    Operator triggers this from the detail panel to confirm the exploit still works
+    (targets change, WAFs get tuned) without leaving the UI. Reuses the same
+    /vectors/run listener the build+refine loop already uses, so scope gate + timeout
+    + logging behave identically."""
+    import httpx as _hx
+    import time as _t
+    _ensure_exploit_store()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM exploit_store WHERE id = %s", (exploit_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "exploit not found")
+    if not row.get("command"):
+        return {"ok": False, "reason": "no command on this exploit"}
+    listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    vt = int(os.environ.get("VECTOR_RUN_TIMEOUT", "600"))
+    t0 = _t.time()
+    try:
+        lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
+                       json={"command": row["command"], "target": str(row.get("target_host") or ""),
+                              "port": row.get("target_port") or 80, "timeout": vt},
+                       headers={"x-api-key": API_KEY}, verify=False, timeout=vt + 60)
+        d = lr.json() if lr.status_code < 400 else {}
+        output = (d.get("output", "") if isinstance(d, dict) else "") or lr.text
+        exit_code = d.get("exit_code") if isinstance(d, dict) else None
+    except Exception as e:  # noqa: BLE001
+        output, exit_code = f"listener error: {e}", None
+    # Check the stored assertion against the fresh output to answer "does it STILL work?"
+    still_works = False
+    try:
+        still_works = _poc_assertion_passes(row.get("assertion") or {}, output, exit_code)
+    except Exception:  # noqa: BLE001
+        pass
+    return {
+        "ok": True, "exploit_id": exploit_id, "cve": row.get("cve"),
+        "target": f"{row.get('target_host')}:{row.get('target_port')}",
+        "command": row["command"], "output": output[:20000],
+        "exit_code": exit_code, "still_works": still_works,
+        "seconds": round(_t.time() - t0, 2),
+        "asserted_verified": bool(row.get("verified")),
+    }
+
+
 @app.get("/exploit-store/{exploit_id}/download", tags=["Exploit Store"])
 def download_exploit(exploit_id: str, fmt: str = "python", authorized: bool = Depends(auth)):
     """Download an artifact as a file: fmt=python | http | curl | json."""
@@ -16746,26 +16853,35 @@ def download_exploit(exploit_id: str, fmt: str = "python", authorized: bool = De
         row = cur.fetchone()
         if not row:
             raise HTTPException(404, "exploit not found")
-    safe = _re.sub(r"[^A-Za-z0-9_.-]+", "_", (row["cve"] or row["name"] or "exploit"))
+    # Filename shape (operator ask): "<cve>_<host>_<port>_<kind>.<ext>" when CVE known,
+    # else "<host>_<port>_<kind>.<ext>". Falls back to name/exploit if neither is set.
+    def _clean(s):
+        return _re.sub(r"[^A-Za-z0-9_.-]+", "_", str(s or "")).strip("_") or ""
+    parts = []
+    if row.get("cve"):     parts.append(_clean(row["cve"]))
+    if row.get("target_host"): parts.append(_clean(row["target_host"]))
+    if row.get("target_port"): parts.append(str(row["target_port"]))
+    if row.get("kind"):    parts.append(_clean(row["kind"]))
+    base = "_".join(p for p in parts if p) or _clean(row.get("name")) or "exploit"
     if fmt == "python":
         content = row["python_code"] or ""
         if not content and row["command"]:
             content = _exploit_store_artifacts(row["kind"], row["command"], row["name"],
                                                row["cve"], row["rationale"], row["assertion"])["python_code"] or ""
-        media, fn = "text/x-python", f"{safe}_poc.py"
+        media, fn = "text/x-python", f"{base}.py"
     elif fmt == "http":
         content = row["http_request"] or ""
         if not content and row["command"]:
             from common import exploit_artifacts as _ea
             content = _ea.curl_to_http_request(row["command"])
-        media, fn = "text/plain", f"{safe}_request.http"
+        media, fn = "text/plain", f"{base}.http"
     elif fmt == "curl":
-        content, media, fn = (row["command"] or ""), "text/plain", f"{safe}.sh"
+        content, media, fn = (row["command"] or ""), "text/plain", f"{base}.sh"
     elif fmt == "json":
         content = json.dumps({k: (str(v) if isinstance(v, (uuid.UUID,)) else v)
                               for k, v in dict(row).items()
                               if k not in ("engagement_id",)}, default=str, indent=2)
-        media, fn = "application/json", f"{safe}.json"
+        media, fn = "application/json", f"{base}.json"
     else:
         raise HTTPException(400, "fmt must be python|http|curl|json")
     return Response(content=content, media_type=media,

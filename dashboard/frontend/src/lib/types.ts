@@ -25,6 +25,11 @@ export interface Asset {
   // Open login services with no valid credential yet — a small default-cred
   // spray is the acceptable first credential step. Same source; drives a badge.
   spray_ready?: number
+  // Built PoCs / exploits scoped to this host (from exploit_store.target_host).
+  // Answers "is there a saved exploit for this host?" at the list level so the
+  // operator doesn't have to click through to ExploitManager to find out.
+  poc_count?: number
+  verified_poc_count?: number
 }
 
 export interface Port {

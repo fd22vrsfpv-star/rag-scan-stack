@@ -13,7 +13,7 @@ import { DataTable } from '@/components/common/DataTable'
 import { StatusDot } from '@/components/common/StatusDot'
 import type { ColumnDef, RowSelectionState } from '@tanstack/react-table'
 import type { Asset, Port, Vuln, ScanRecommendation } from '@/lib/types'
-import { X, Trash2, Key, Plus, ShieldCheck, ShieldX, ShieldQuestion, ShieldOff, AlertTriangle, Globe, Camera, Cpu, Settings2, Search, ExternalLink, Cloud, Server, ChevronDown, ChevronRight, Eye, EyeOff, Copy, Check, Terminal, Zap} from 'lucide-react'
+import { X, Trash2, Key, Plus, ShieldCheck, ShieldX, ShieldQuestion, ShieldOff, AlertTriangle, Globe, Camera, Cpu, Settings2, Search, ExternalLink, Cloud, Server, ChevronDown, ChevronRight, Eye, EyeOff, Copy, Check, Terminal, Zap, Sparkles} from 'lucide-react'
 import { ScopeAssignModal } from '@/components/common/ScopeAssignModal'
 import { ScopeFilter } from '@/components/common/ScopeFilter'
 import { KbSuggestionsModal } from '@/components/recommendations/KbSuggestionsModal'
@@ -115,10 +115,12 @@ const assetColumns: ColumnDef<Asset, unknown>[] = [
   }},
   // Releasable actions waiting on this host — exploits pending approval and/or a
   // small default-cred spray opportunity — highlighted and linked to their queue.
-  { accessorKey: 'pending_exploits', header: 'To Approve', size: 150, cell: ({ row }) => {
+  { accessorKey: 'pending_exploits', header: 'To Approve', size: 180, cell: ({ row }) => {
     const n = Number(row.original.pending_exploits ?? 0)
     const spray = Number(row.original.spray_ready ?? 0)
-    if (n === 0 && spray === 0) return <span className="text-xs text-muted-foreground">—</span>
+    const poc = Number(row.original.poc_count ?? 0)
+    const vpoc = Number(row.original.verified_poc_count ?? 0)
+    if (n === 0 && spray === 0 && poc === 0) return <span className="text-xs text-muted-foreground">—</span>
     return (
       <span className="inline-flex items-center gap-1 flex-wrap">
         {n > 0 && (
@@ -139,6 +141,18 @@ const assetColumns: ColumnDef<Asset, unknown>[] = [
             className="inline-flex items-center gap-1 text-xs font-semibold px-1.5 py-0.5 rounded border bg-sky-500/15 text-sky-400 border-sky-500/40 hover:bg-sky-500/25"
           >
             <Key className="h-3 w-3" />spray
+          </Link>
+        )}
+        {poc > 0 && (
+          <Link
+            to={`/exploits?tab=store&ip=${encodeURIComponent(row.original.ip)}`}
+            onClick={e => e.stopPropagation()}
+            title={`${poc} built PoC(s), ${vpoc} verified — jump to Exploit Store`}
+            className={cn('inline-flex items-center gap-1 text-xs font-semibold px-1.5 py-0.5 rounded border',
+              vpoc > 0
+                ? 'bg-green-500/15 text-green-400 border-green-500/40 hover:bg-green-500/25'
+                : 'bg-purple-500/15 text-purple-400 border-purple-500/40 hover:bg-purple-500/25')}>
+            <Sparkles className="h-3 w-3" />{vpoc > 0 ? `${vpoc}✓/${poc} PoC` : `${poc} PoC`}
           </Link>
         )}
       </span>
