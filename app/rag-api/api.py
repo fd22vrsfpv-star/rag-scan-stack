@@ -3131,7 +3131,16 @@ _NEWS_SORTS = {
 }
 
 
-def _ser_news_item(r: dict) -> dict:
+def _ser_news_item(r: dict, engagement_id: Optional[str] = None) -> dict:
+    # Expose the current-engagement match slot out of metadata.engagement_match
+    # as a flat `engagement_match` field — the frontend never has to index by
+    # engagement id, and the shape is: null (never analysed) vs {match_count: 0}
+    # (analysed and clean) vs {match_count: N, summary, sources, confidence}.
+    md = r.get("metadata") or {}
+    em_block = None
+    if engagement_id:
+        em_all = (md.get("engagement_match") or {}) if isinstance(md, dict) else {}
+        em_block = em_all.get(str(engagement_id))
     return {
         "id": str(r["id"]),
         "title": r["title"],
@@ -3150,6 +3159,7 @@ def _ser_news_item(r: dict) -> dict:
         "articles": r["articles"] or [],
         "github_links": r["github_links"] or [],
         "asset_matches": r["asset_matches"] or [],
+        "engagement_match": em_block,
         "published_at": r["published_at"].isoformat() if r.get("published_at") else None,
         "first_seen": r["first_seen"].isoformat() if r["first_seen"] else None,
         "last_seen": r["last_seen"].isoformat() if r["last_seen"] else None,
@@ -3250,6 +3260,8 @@ def news_items_list(
     kev_listed: Optional[bool] = Query(None),
     rce: Optional[bool] = Query(None),
     red_team_only: bool = Query(False, description="Only items with at least one offensive flag (kev/rce/easy/itw/malware)"),
+    affects_engagement: bool = Query(False, description="Only items with a cached match against the current engagement (any confidence tier). Requires X-Engagement-Id."),
+    strong_only: bool = Query(False, description="Secondary filter — restrict affects_engagement hits to confidence='strong'. Ignored when affects_engagement is false."),
     q: Optional[str] = Query(None, description="Substring on title/summary"),
     since: Optional[str] = Query(None, description="ISO timestamp; only items with last_seen >= since"),
     published_since: Optional[str] = Query(None, description="ISO timestamp; only items PUBLISHED at or after this (items with no published_at are excluded)"),
@@ -3285,6 +3297,18 @@ def news_items_list(
             "(kev_listed IS TRUE OR rce IS TRUE OR easily_exploitable IS TRUE "
             "OR active_internet_breach IS TRUE OR malware_exploitable IS TRUE)"
         )
+    # Engagement-match filter — matches items whose metadata.engagement_match
+    # cache for the CURRENT engagement reports match_count > 0. strong_only
+    # narrows to confidence='strong'.
+    _eid_for_filter = _resolve_engagement_id() if affects_engagement else None
+    if affects_engagement:
+        if not _eid_for_filter:
+            raise HTTPException(400, "affects_engagement requires X-Engagement-Id")
+        conds.append("(metadata #> ARRAY['engagement_match', %s, 'match_count'])::text::int > 0")
+        params.append(_eid_for_filter)
+        if strong_only:
+            conds.append("(metadata #>> ARRAY['engagement_match', %s, 'confidence']) = 'strong'")
+            params.append(_eid_for_filter)
     if q:
         conds.append("(title ILIKE %s OR summary ILIKE %s)")
         params.extend([f"%{q}%", f"%{q}%"])
@@ -3313,8 +3337,9 @@ def news_items_list(
             list(params) + [limit, offset],
         )
         rows = cur.fetchall()
+    _eid = _resolve_engagement_id()
     return {"total": total, "limit": limit, "offset": offset,
-            "results": [_ser_news_item(r) for r in rows]}
+            "results": [_ser_news_item(r, engagement_id=_eid) for r in rows]}
 
 
 @app.get("/news/items/{item_id}", tags=["News"])
@@ -3324,7 +3349,7 @@ def news_item_detail(item_id: str, authorized: bool = Depends(auth)):
         row = cur.fetchone()
         if not row:
             raise HTTPException(404, "item not found")
-        return _ser_news_item(row)
+        return _ser_news_item(row, engagement_id=_resolve_engagement_id())
 
 
 @app.patch("/news/items/{item_id}", tags=["News"])
@@ -3434,6 +3459,267 @@ def news_item_github_search(item_id: str, authorized: bool = Depends(auth)):
 @app.post("/news/items/{item_id}/enrich", tags=["News"])
 def news_item_enrich(item_id: str, authorized: bool = Depends(auth)):
     return _news_runner_post("/jobs/enrich", {"item_id": item_id}, timeout=300)
+
+
+# ─── News-item ↔ engagement-data matcher ─────────────────────────────────
+# Does this news item flag on anything the operator is actually testing?
+# Three sources (ordered by signal strength):
+#   STRONG (CVE match on in-engagement data):
+#     - vulns.cve && item.cves + v.asset_id -> assets.engagement_id
+#     - follow_up_items.rule_id='software_known_cve' + title regex for CVE,
+#       scoped by (engagement_id = X OR NULL)
+#     - detected_software by CVE cross-referenced through follow_up_items
+#       title regex (gives us port + product + version context)
+#   WEAK (product mention in news summary matches detected_software product):
+#     - lowered-equality product match from the item summary against
+#       detected_software — catches "Apache advisory" items that don't yet
+#       carry a CVE id.
+# Result cached in news_items.metadata.engagement_match.<eid>; stale after
+# NEWS_MATCH_MAX_AGE_HOURS. Re-fire via the single-item endpoint for a
+# forced refresh.
+_NEWS_MATCH_MAX_AGE_HOURS = int(os.environ.get("NEWS_MATCH_MAX_AGE_HOURS", "24"))
+_PRODUCT_TOKEN_RE = _re_module.compile(r"\b([A-Z][a-zA-Z0-9]{2,})\b")  # cheap product-noun grabber
+
+
+def _match_news_item_against_engagement(item_row: dict, engagement_id: str) -> dict:
+    """Return the engagement-match block for one news item against one
+    engagement. Shape documented in the plan — summary/match_count/sources/
+    confidence. Pure read: writes are the caller's job (so we can batch)."""
+    cves = list(item_row.get("all_cves") or [])
+    primary = item_row.get("primary_cve")
+    if primary and primary != "UNKNOWN" and primary not in cves:
+        cves.append(primary)
+    cves = sorted({c.strip().upper() for c in cves if c})
+    summary_text = f"{item_row.get('title') or ''} {item_row.get('summary') or ''}"
+
+    sources = {"vulns": [], "follow_ups": [], "software": []}
+    confidence = "weak"
+
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # ─── STRONG tier: CVE-based ───────────────────────────────────────
+        if cves:
+            # (1) vulns on an in-engagement asset
+            cur.execute("""
+                SELECT c.cve, v.severity, a.id AS asset_id,
+                       a.ip::text AS ip, a.hostname
+                  FROM vulns v
+                  JOIN assets a ON a.id = v.asset_id
+                  CROSS JOIN LATERAL unnest(v.cve) AS c(cve)
+                 WHERE v.cve && %s::text[]
+                   AND c.cve = ANY(%s)
+                   AND a.engagement_id = %s
+                 ORDER BY c.cve
+                 LIMIT 50
+            """, (cves, cves, engagement_id))
+            for r in cur.fetchall():
+                sources["vulns"].append({
+                    "cve": r["cve"], "severity": r["severity"],
+                    "asset_id": str(r["asset_id"]),
+                    "ip": r["ip"], "hostname": r["hostname"],
+                })
+
+            # (2) open follow-ups with the CVE in the title
+            cve_regex = "(" + "|".join(_re_module.escape(c) for c in cves) + ")"
+            cur.execute("""
+                SELECT id, target, title, severity
+                  FROM follow_up_items
+                 WHERE rule_id = 'software_known_cve'
+                   AND status != 'dismissed'
+                   AND (engagement_id = %s OR engagement_id IS NULL)
+                   AND title ~ %s
+                 ORDER BY severity, created_at DESC
+                 LIMIT 50
+            """, (engagement_id, cve_regex))
+            for r in cur.fetchall():
+                hit_cves = _re_module.findall(r"CVE-\d{4}-\d{4,}", (r["title"] or "").upper())
+                matching = [c for c in hit_cves if c in cves]
+                sources["follow_ups"].append({
+                    "id": str(r["id"]), "ip": r["target"],
+                    "severity": r["severity"], "title": (r["title"] or "")[:200],
+                    "cves": matching,
+                })
+
+            # (3) detected_software: cross-ref via follow-up titles for pv
+            if sources["follow_ups"]:
+                # Extract (product, version) from the follow-up titles we just
+                # matched; look them up in detected_software for port + source.
+                pvs = []
+                for fu in sources["follow_ups"]:
+                    m = _re_module.match(r"Vulnerable:\s+(.+?)\s+(\S+)\s+on\s+",
+                                         fu["title"])
+                    if m:
+                        pvs.append((m.group(1), m.group(2), fu["ip"]))
+                for product, version, ip in pvs[:20]:
+                    cur.execute("""
+                        SELECT port, source
+                          FROM detected_software
+                         WHERE ip = %s
+                           AND lower(product) = lower(%s)
+                           AND (version IS NULL OR version = %s)
+                         ORDER BY last_seen DESC
+                         LIMIT 1
+                    """, (ip, product, version))
+                    r = cur.fetchone()
+                    if r:
+                        sources["software"].append({
+                            "ip": ip, "port": r["port"],
+                            "product": product, "version": version,
+                            "source": r["source"],
+                        })
+
+            if sources["vulns"] or sources["follow_ups"]:
+                confidence = "strong"
+
+        # ─── WEAK tier: product mention in news summary → detected_software ──
+        # Only fired when no strong match landed, to keep the UI from showing
+        # weak chips alongside strong ones. Candidate product tokens are
+        # Capitalized words of ≥3 chars from the title+summary; intersected
+        # against lowercased detected_software.product for this engagement.
+        if confidence == "weak" and summary_text.strip():
+            tokens = {t.lower() for t in _PRODUCT_TOKEN_RE.findall(summary_text)}
+            # Filter out obvious noise so we don't match on "Linux", "Windows",
+            # "Server", etc. (which are too generic to be useful).
+            STOP = {"linux", "windows", "server", "security", "advisory",
+                    "update", "patch", "vulnerability", "cve", "critical",
+                    "high", "alert", "report", "research", "blog", "post",
+                    "project", "team", "news", "api", "service", "system"}
+            tokens = {t for t in tokens if t not in STOP and len(t) >= 4}
+            if tokens:
+                cur.execute("""
+                    SELECT DISTINCT ds.ip, ds.port, ds.product, ds.version
+                      FROM detected_software ds
+                      JOIN assets a ON a.id = ds.asset_id
+                     WHERE a.engagement_id = %s
+                       AND lower(ds.product) = ANY(%s::text[])
+                     LIMIT 25
+                """, (engagement_id, list(tokens)))
+                for r in cur.fetchall():
+                    sources["software"].append({
+                        "ip": r["ip"], "port": r["port"],
+                        "product": r["product"], "version": r["version"],
+                        "source": "weak:product-mention",
+                    })
+
+    match_count = (len(sources["vulns"]) + len(sources["follow_ups"])
+                   + len(sources["software"]))
+
+    # One-line summary — the operator reads this before expanding the drawer.
+    if match_count == 0:
+        summary = "No matches against current engagement data."
+    else:
+        bits = []
+        if sources["software"]:
+            top = sources["software"][0]
+            bits.append(f"{top['product']}{(' ' + top['version']) if top.get('version') else ''}"
+                        f" on {top['ip']}")
+        if sources["vulns"]:
+            bits.append(f"{len(sources['vulns'])} vuln row(s)")
+        if sources["follow_ups"]:
+            bits.append(f"{len(sources['follow_ups'])} open follow-up(s)")
+        verb = "Affects" if confidence == "strong" else "Possible match on"
+        summary = f"{verb} " + ", ".join(bits)
+
+    return {
+        "matched_at": datetime.now(timezone.utc).isoformat(),
+        "match_count": match_count,
+        "confidence": confidence,
+        "summary": summary,
+        "sources": sources,
+    }
+
+
+def _store_news_engagement_match(item_id: str, engagement_id: str, block: dict) -> None:
+    """Merge the match block into news_items.metadata.engagement_match.<eid>
+    and add/remove the 'affects-engagement' tag based on match_count."""
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("""
+            UPDATE news_items
+               SET metadata = COALESCE(metadata, '{}'::jsonb)
+                 || jsonb_build_object(
+                       'engagement_match',
+                       COALESCE(metadata->'engagement_match', '{}'::jsonb)
+                       || jsonb_build_object(%s::text, %s::jsonb)),
+                   tags = CASE
+                       WHEN %s > 0 AND NOT ('affects-engagement' = ANY(COALESCE(tags, '{}'::text[])))
+                            THEN array_append(COALESCE(tags, '{}'::text[]), 'affects-engagement')
+                       WHEN %s = 0 AND 'affects-engagement' = ANY(COALESCE(tags, '{}'::text[]))
+                            THEN array_remove(tags, 'affects-engagement')
+                       ELSE tags
+                   END
+             WHERE id = %s::uuid
+        """, (engagement_id, Json(block), block["match_count"],
+              block["match_count"], item_id))
+        conn.commit()
+
+
+@app.post("/news/items/{item_id}/match-engagement", tags=["News"])
+def news_item_match_engagement(item_id: str, authorized: bool = Depends(auth)):
+    """Analyse one news item against the current engagement's assets, software,
+    and open follow-ups. Caches the result in
+    news_items.metadata.engagement_match.<eid> and tags the item with
+    'affects-engagement' when match_count > 0."""
+    eid = _validate_engagement_uuid(_resolve_engagement_id())
+    if not eid:
+        raise HTTPException(400, "no engagement selected (set X-Engagement-Id)")
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM news_items WHERE id = %s::uuid", (item_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "item not found")
+    block = _match_news_item_against_engagement(row, eid)
+    _store_news_engagement_match(item_id, eid, block)
+    return {"ok": True, "item_id": item_id, "engagement_id": eid,
+            "engagement_match": block}
+
+
+@app.post("/news/items/match-engagement", tags=["News"])
+def news_items_match_engagement_batch(
+    limit: int = Query(200, ge=1, le=1000),
+    max_age_hours: int = Query(None, ge=0, le=720,
+                               description="Skip items already matched for this engagement within this many hours (default from env NEWS_MATCH_MAX_AGE_HOURS)"),
+    statuses: str = Query("new,reviewed,follow_up",
+                          description="CSV of statuses to include"),
+    authorized: bool = Depends(auth),
+):
+    """Batch matcher — runs across news items in active statuses, skipping
+    items whose engagement_match cache for this engagement is fresher than
+    max_age_hours. Returns per-run counts the UI can show."""
+    eid = _validate_engagement_uuid(_resolve_engagement_id())
+    if not eid:
+        raise HTTPException(400, "no engagement selected (set X-Engagement-Id)")
+    from datetime import timedelta as _td
+    cutoff_hours = max_age_hours if max_age_hours is not None else _NEWS_MATCH_MAX_AGE_HOURS
+    cutoff = datetime.now(timezone.utc) - _td(hours=cutoff_hours)
+    wanted = [s.strip() for s in statuses.split(",") if s.strip()]
+    scanned = matched = skipped = updated = 0
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT * FROM news_items
+             WHERE status = ANY(%s::text[])
+             ORDER BY last_seen DESC
+             LIMIT %s
+        """, (wanted, limit))
+        rows = cur.fetchall()
+    for row in rows:
+        scanned += 1
+        md = row.get("metadata") or {}
+        em = (md.get("engagement_match") or {}).get(eid) if isinstance(md, dict) else None
+        if em and em.get("matched_at"):
+            try:
+                prev = datetime.fromisoformat(em["matched_at"].replace("Z", "+00:00"))
+                if prev > cutoff:
+                    skipped += 1
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+        block = _match_news_item_against_engagement(row, eid)
+        _store_news_engagement_match(str(row["id"]), eid, block)
+        updated += 1
+        if block["match_count"] > 0:
+            matched += 1
+    return {"ok": True, "scanned": scanned, "updated": updated,
+            "skipped": skipped, "matched_hits": matched,
+            "engagement_id": eid, "max_age_hours": cutoff_hours}
 
 
 @app.post("/news/items/stage2", tags=["News"])
@@ -31164,6 +31450,86 @@ def _start_rag_purge_daemon():
         _ensure_rag_purge_daemon()
     except Exception as e:  # noqa: BLE001
         logging.warning("could not start rag purge daemon: %s", e)
+
+
+# ─── News engagement-match sweep daemon ──────────────────────────────────────
+# Periodically runs the batch matcher so new news items get tagged without
+# an operator click. Opt-out: NEWS_MATCH_DISABLE=1. The sweep is a no-op when
+# no engagement is selected on the ambient context — it won't thrash through
+# every known engagement, because there's no sane default to pick. Operators
+# who want cross-engagement sweeps can POST to the batch endpoint explicitly
+# with X-Engagement-Id per call.
+_NEWS_MATCH_INTERVAL_SEC = int(os.environ.get("NEWS_MATCH_INTERVAL_SEC", "1800"))
+_news_match_thread_started = False
+
+
+def _news_match_sweep_loop():
+    import time as _t
+    from datetime import timedelta as _td
+    while True:
+        try:
+            if os.environ.get("NEWS_MATCH_DISABLE", "0").lower() not in ("1", "true", "yes", "on"):
+                # Sweep every engagement that has at least one asset — the
+                # context-var path doesn't apply in a background thread.
+                try:
+                    with get_db() as conn, conn.cursor() as cur:
+                        cur.execute("SELECT DISTINCT engagement_id FROM assets "
+                                    "WHERE engagement_id IS NOT NULL LIMIT 50")
+                        eids = [str(r[0]) for r in cur.fetchall()]
+                except Exception:  # noqa: BLE001
+                    eids = []
+                for eid in eids:
+                    try:
+                        # Reuse the matcher directly (no HTTP round-trip).
+                        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+                            cur.execute("""
+                                SELECT * FROM news_items
+                                 WHERE status = ANY('{new,reviewed,follow_up}'::text[])
+                                 ORDER BY last_seen DESC LIMIT 200
+                            """)
+                            rows = cur.fetchall()
+                        cutoff = datetime.now(timezone.utc) - _td(hours=_NEWS_MATCH_MAX_AGE_HOURS)
+                        updated = 0
+                        for row in rows:
+                            md = row.get("metadata") or {}
+                            em = (md.get("engagement_match") or {}).get(eid) if isinstance(md, dict) else None
+                            if em and em.get("matched_at"):
+                                try:
+                                    prev = datetime.fromisoformat(em["matched_at"].replace("Z", "+00:00"))
+                                    if prev > cutoff:
+                                        continue
+                                except Exception:  # noqa: BLE001
+                                    pass
+                            block = _match_news_item_against_engagement(row, eid)
+                            _store_news_engagement_match(str(row["id"]), eid, block)
+                            updated += 1
+                        if updated:
+                            logging.info("news-match sweep eid=%s updated=%d", eid, updated)
+                    except Exception as e:  # noqa: BLE001
+                        logging.warning("news-match sweep eid=%s failed: %s", eid, e)
+        except Exception as e:  # noqa: BLE001
+            logging.warning("news-match sweep iteration failed: %s", e)
+        _t.sleep(_NEWS_MATCH_INTERVAL_SEC)
+
+
+def _ensure_news_match_daemon():
+    global _news_match_thread_started
+    if _news_match_thread_started:
+        return
+    import threading as _th
+    t = _th.Thread(target=_news_match_sweep_loop, name="news-match-sweep", daemon=True)
+    t.start()
+    _news_match_thread_started = True
+    logging.info("news-match sweep daemon armed (interval=%ds, max_age=%dh)",
+                 _NEWS_MATCH_INTERVAL_SEC, _NEWS_MATCH_MAX_AGE_HOURS)
+
+
+@app.on_event("startup")
+def _start_news_match_daemon():
+    try:
+        _ensure_news_match_daemon()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("could not start news-match daemon: %s", e)
 
 
 class PurgeObservedFactsResponse(BaseModel):
