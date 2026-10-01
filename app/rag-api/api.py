@@ -29653,6 +29653,13 @@ def _load_observed_fact_into_rag(source, ip, kind, value, engagement_id=None, pr
         return False
     if source not in _RAG_FACT_SOURCES:
         return False
+    # Lazy-start the nightly purge daemon on first embed. Idempotent; cheap.
+    # Covers the case where the FastAPI startup event hasn't armed it yet
+    # (test harnesses, headless invocations, in-container python shells).
+    try:
+        _ensure_rag_purge_daemon()
+    except Exception:  # noqa: BLE001
+        pass
     try:
         v = str(value)[:1000]
         value_hash = _observed_fact_value_hash(ip, kind, v)
@@ -30764,6 +30771,60 @@ def backfill_source_endpoint(source: str,
         return {"ok": True, "source": "all",
                 "counts": {**c1, **c2, **c3, "credentials": n_c, "identities": n_i}}
     raise HTTPException(400, f"unknown source '{source}' — see docstring")
+
+
+# ── nightly purge daemon for observed/enum/credential/identity RAG rows ──────
+# Bounds rag_documents growth: without this, every build adds dozens of fact
+# rows and the ivfflat index gradually degrades. Runs in-process (no external
+# cron needed): one daemon thread sleeps 24h, calls purge_observed_facts for
+# every engagement, then sleeps again. Opt-out via RAG_PURGE_DISABLE=1.
+_RAG_PURGE_INTERVAL_SEC = int(os.environ.get("RAG_PURGE_INTERVAL_SEC", "86400"))
+_RAG_PURGE_AGE_DAYS = int(os.environ.get("RAG_PURGE_AGE_DAYS", "90"))
+_rag_purge_thread_started = False
+
+
+def _rag_nightly_purge_loop():
+    """Daemon-thread body: every RAG_PURGE_INTERVAL_SEC, purge rows older than
+    RAG_PURGE_AGE_DAYS. Logs the deleted count. Honors RAG_PURGE_DISABLE and
+    is a no-op when observed_facts_enabled() is False (nothing to purge if
+    nothing's embedded). Any exception sleeps and retries next tick."""
+    import time as _t, threading as _th
+    while True:
+        try:
+            if (os.environ.get("RAG_PURGE_DISABLE", "0").lower() not in ("1", "true", "yes", "on")
+                    and observed_facts_enabled()):
+                n = purge_observed_facts(older_than_days=_RAG_PURGE_AGE_DAYS)
+                if n:
+                    logging.info("rag nightly purge: deleted %d row(s) older than %d days",
+                                 n, _RAG_PURGE_AGE_DAYS)
+        except Exception as e:  # noqa: BLE001
+            logging.warning("rag nightly purge iteration failed: %s", e)
+        _t.sleep(_RAG_PURGE_INTERVAL_SEC)
+
+
+def _ensure_rag_purge_daemon():
+    """Idempotent start. Called from the FastAPI startup event + lazily on
+    the first fact-embed, so even test/dev stacks that skip startup still
+    get the purge loop armed."""
+    global _rag_purge_thread_started
+    if _rag_purge_thread_started:
+        return
+    import threading as _th
+    t = _th.Thread(target=_rag_nightly_purge_loop, name="rag-nightly-purge",
+                   daemon=True)
+    t.start()
+    _rag_purge_thread_started = True
+    logging.info("rag nightly purge daemon armed (interval=%ds, age=%dd)",
+                 _RAG_PURGE_INTERVAL_SEC, _RAG_PURGE_AGE_DAYS)
+
+
+@app.on_event("startup")
+def _start_rag_purge_daemon():
+    """Arm the nightly purge thread when rag-api comes up."""
+    try:
+        _ensure_rag_purge_daemon()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("could not start rag purge daemon: %s", e)
 
 
 class PurgeObservedFactsResponse(BaseModel):
