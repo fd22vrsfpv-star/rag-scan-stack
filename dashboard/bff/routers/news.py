@@ -93,6 +93,8 @@ async def news_items_list(
     kev_listed: Optional[bool] = Query(None),
     rce: Optional[bool] = Query(None),
     red_team_only: bool = Query(False),
+    affects_engagement: bool = Query(False),
+    strong_only: bool = Query(False),
     q: Optional[str] = Query(None),
     since: Optional[str] = Query(None),
     published_since: Optional[str] = Query(None),
@@ -104,6 +106,7 @@ async def news_items_list(
     params: dict[str, Any] = {
         "limit": limit, "offset": offset,
         "include_deleted": include_deleted, "red_team_only": red_team_only,
+        "affects_engagement": affects_engagement, "strong_only": strong_only,
         "sort": sort,
     }
     for k, v in (("status", status), ("hide_statuses", hide_statuses),
@@ -164,6 +167,36 @@ async def news_items_stage2():
 async def news_item_match_assets(item_id: str):
     async with _client() as c:
         resp = await c.post(_u(f"/news/items/{item_id}/match-assets"), headers=_h())
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.post("/api/news/items/{item_id}/match-engagement")
+async def news_item_match_engagement(item_id: str):
+    """Analyse ONE news item against the current engagement's data (vulns +
+    open follow-ups + detected software). Caches on news_items.metadata."""
+    async with _client() as c:
+        resp = await c.post(_u(f"/news/items/{item_id}/match-engagement"), headers=_h())
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.post("/api/news/items/match-engagement")
+async def news_items_match_engagement_batch(
+    limit: int = Query(200, ge=1, le=1000),
+    max_age_hours: int = Query(None, ge=0, le=720),
+    statuses: str = Query("new,reviewed,follow_up"),
+):
+    """Batch: run the engagement matcher across active-status news items,
+    skipping items already matched within max_age_hours."""
+    params: dict[str, Any] = {"limit": limit, "statuses": statuses}
+    if max_age_hours is not None:
+        params["max_age_hours"] = max_age_hours
+    async with _client() as c:
+        resp = await c.post(_u("/news/items/match-engagement"), params=params,
+                            headers=_h(), timeout=120.0)
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)
         return safe_json(resp)

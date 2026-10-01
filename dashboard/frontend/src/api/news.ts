@@ -27,6 +27,11 @@ export interface NewsListFilters {
   kev_listed?: boolean
   rce?: boolean
   red_team_only?: boolean
+  // When true, only items whose cached engagement_match for the current
+  // engagement has match_count > 0. Requires an engagement to be selected.
+  affects_engagement?: boolean
+  // Only effective with affects_engagement=true: restricts to confidence='strong'.
+  strong_only?: boolean
   q?: string
   since?: string  // ISO timestamp; items with last_seen >= since
   published_since?: string  // ISO timestamp; items PUBLISHED at/after this
@@ -166,6 +171,42 @@ export function useMatchAssets() {
     onSuccess: (_data, id) => {
       qc.invalidateQueries({ queryKey: ['news', 'item', id] })
       qc.invalidateQueries({ queryKey: ['news', 'items'] })
+    },
+  })
+}
+
+// Engagement-match: analyse ONE item against the current engagement.
+export function useMatchNewsEngagement() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) =>
+      apiFetch<{ ok: boolean; item_id: string; engagement_id: string;
+                 engagement_match: import('@/lib/types').NewsEngagementMatch }>(
+        `/news/items/${id}/match-engagement`, { method: 'POST' }),
+    onSuccess: (_data, id) => {
+      qc.invalidateQueries({ queryKey: ['news', 'item', id] })
+      qc.invalidateQueries({ queryKey: ['news', 'items'] })
+    },
+  })
+}
+
+// Batch engagement match across active-status items for the current engagement.
+export function useBatchMatchNewsEngagement() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (opts?: { limit?: number; max_age_hours?: number; statuses?: string }) => {
+      const p = new URLSearchParams()
+      if (opts?.limit) p.set('limit', String(opts.limit))
+      if (opts?.max_age_hours !== undefined) p.set('max_age_hours', String(opts.max_age_hours))
+      if (opts?.statuses) p.set('statuses', opts.statuses)
+      const qs = p.toString()
+      return apiFetch<{ ok: boolean; scanned: number; updated: number;
+                        skipped: number; matched_hits: number }>(
+        `/news/items/match-engagement${qs ? `?${qs}` : ''}`, { method: 'POST' })
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['news', 'items'] })
+      qc.invalidateQueries({ queryKey: ['news', 'item'] })
     },
   })
 }

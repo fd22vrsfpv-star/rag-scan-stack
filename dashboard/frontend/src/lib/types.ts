@@ -559,6 +559,24 @@ export interface NewsItem {
   asset_matched_at: string | null
   notes: string | null
   tags: string[]
+  /** Cached match of this news item against the CURRENT engagement's data —
+   *  populated by _ser_news_item from metadata.engagement_match.<eid>.
+   *  null = never analysed for this engagement; match_count=0 = analysed, no hits. */
+  engagement_match?: NewsEngagementMatch | null
+}
+
+export interface NewsEngagementMatchSource {
+  vulns: Array<{ cve: string; severity: string | null; asset_id: string; ip: string | null; hostname: string | null }>
+  follow_ups: Array<{ id: string; ip: string | null; severity: string | null; title: string; cves: string[] }>
+  software: Array<{ ip: string; port: number | null; product: string; version: string | null; source: string }>
+}
+
+export interface NewsEngagementMatch {
+  matched_at: string
+  match_count: number
+  confidence: 'strong' | 'weak'
+  summary: string
+  sources: NewsEngagementMatchSource
 }
 
 export interface NewsSource {
