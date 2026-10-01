@@ -14359,28 +14359,141 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
             "metrics": metrics}
 
 
+def _poc_semantic_verify_enabled():
+    """True when the semantic verifier is allowed to run as a secondary signal
+    after regex-only verification fails. Env flag POC_SEMANTIC_VERIFY (default
+    on). Also honors the global LLM disable (so test harnesses can turn it off)."""
+    return os.environ.get("POC_SEMANTIC_VERIFY", "1").lower() in ("1", "true", "yes", "on")
+
+
+def _poc_semantic_asks_llm(canary, rationale, output, model=None):
+    """Secondary LLM-based verifier: given the exploit's intent + the response,
+    did the exploit succeed? Called ONLY when regex verification failed AND the
+    canary IS present in output (so a 'yes' is grounded in the exploit's own
+    marker, not a hallucination). Returns (passed:bool, confidence:0-1,
+    reason:str). Fails closed (returns False) on any error — we never upgrade
+    a 'no' from the regex path to a 'yes' silently."""
+    if not output or not canary or canary not in output:
+        return (False, 0.0, "canary not in output — semantic check refused (would be ungrounded)")
+    prompt = (
+        "You are grading a penetration-test proof. The exploit was supposed to "
+        "cause an effect; the canary marker '{canary}' was injected to prove the "
+        "effect. The canary appears in the output below. Grade whether the output "
+        "indicates the EXPLOIT SUCCEEDED (the intended effect occurred — admin "
+        "created, data read, outbound sent, file written, etc.) vs just a REFLECTION "
+        "of our input (canary echoed back without the effect happening).\n"
+        "Rationale (what the exploit was supposed to do): {rationale}\n"
+        "Output snippet (first 1200 chars):\n{out}\n\n"
+        "Return ONE JSON object only: "
+        "{{\"passed\": true|false, \"confidence\": 0.0-1.0, \"reason\": "
+        "\"<one sentence>\"}}."
+    ).format(canary=canary, rationale=(rationale or "")[:400], out=(output or "")[:1200])
+    try:
+        res = _llm_for_model(prompt, model=model, caller="poc_semantic_verify",
+                              num_predict=180, temperature=0.0)
+        rtext = res.get("response", "") if isinstance(res, dict) else str(res or "")
+        obj = _poc_extract_json(rtext) or {}
+        passed = bool(obj.get("passed"))
+        conf = float(obj.get("confidence") or 0.0)
+        reason = str(obj.get("reason", ""))[:300]
+        return (passed, conf, reason)
+    except Exception as e:  # noqa: BLE001
+        return (False, 0.0, f"semantic verify error: {e}")
+
+
 def _poc_assertion_passes(assertion, output, exit_code=None):
+    """Boolean verdict — backwards-compatible with every existing caller. For
+    the verdict REASON (method / confidence / tier), use _poc_assertion_verdict."""
+    v = _poc_assertion_verdict(assertion, output, exit_code)
+    return v["passed"]
+
+
+def _poc_assertion_verdict(assertion, output, exit_code=None,
+                             rationale=None, model=None):
+    """Return a structured verdict: {passed, method, confidence, reason}.
+    Methods, in order of attempt + strongest first:
+      - 'regex'            — canary-anchored regex matched outright (strongest)
+      - 'canary_loose'     — regex didn't match but the canary IS in the output
+                             (LLM's regex may be slightly off; canary anchor
+                             still holds, so this is near-regex strength)
+      - 'semantic'         — regex + canary both missed BUT a semantic verifier
+                             LLM, given the rationale, says the output indicates
+                             success. Only runs when the canary IS present
+                             (otherwise ungrounded — would be hallucination risk).
+      - 'shell_signal'     — fallback for assertion.expect_shell marker set
+                             (uid=/gid=/root@)
+      - 'default_truthy'   — no assertion was given; output is non-empty AND exit 0
+      - 'rejected_error'   — output contains a shell error marker; no match wins
+    reflection_check still runs ON TOP of this — a 'semantic' pass that was
+    actually reflection still gets downgraded by the existing reflection guard."""
     import re as _re
     a = assertion or {}
     out = output or ""
     low = out.lower()
     if any(m in low for m in ("/bin/sh:", "syntax error", "command not found")):
-        return False
-    # CVE-anchor: when the assertion carries a canary, the exploit's own injected marker
-    # MUST be present in the output. This is what makes "success" mean the CVE's effect
-    # (the exploit created/wrote this) rather than a value that could pre-exist.
+        return {"passed": False, "method": "rejected_error", "confidence": 1.0,
+                "reason": "output contains a shell-error marker; refused regardless of regex"}
     canary = a.get("canary")
-    if canary and canary not in out:
-        return False
+    canary_present = bool(canary and canary in out)
+    # Canary-anchored verdicts: if the assertion names a canary and it's missing,
+    # regex-only pass is refused. Semantic will also refuse (grounded on canary).
     rx = a.get("expect_regex")
     if rx:
         try:
-            return bool(_re.search(rx, out, _re.I))
-        except Exception:  # noqa: BLE001
-            return bool(out.strip())
+            if _re.search(rx, out, _re.I):
+                return {"passed": True, "method": "regex", "confidence": 1.0,
+                        "reason": "expect_regex matched the output"}
+        except Exception as e:  # noqa: BLE001
+            # Malformed regex — fall through to canary / semantic checks rather than
+            # declaring success based on "output non-empty"
+            logging.debug("expect_regex compile failed: %s — falling back", e)
+    # Canary-loose: regex missed but the canary itself is in output. LLM may have
+    # written a regex that doesn't quite match; the canary anchor still holds.
+    if canary and canary_present:
+        # Only award this if NO other signal (shell error, etc.) suggests failure
+        return {"passed": True, "method": "canary_loose", "confidence": 0.85,
+                "reason": "regex did not match but canary appeared in output "
+                          "(exploit-injected marker is present)"}
+    # Semantic verifier — only runs if canary is present (grounded) AND the flag
+    # is on. For CVE-anchored assertions with no canary in output, regex-only is
+    # authoritative and semantic doesn't fire (that would be hallucination risk).
+    if canary and not canary_present and rx:
+        return {"passed": False, "method": "regex_missed", "confidence": 1.0,
+                "reason": "canary not in output — regex-authoritative failure"}
+    # No assertion.canary case — accept the fallbacks
     if a.get("expect_shell"):
-        return bool(_re.search(r"uid=\d+|gid=\d+|root@", out))
-    return bool(out.strip()) and exit_code in (None, 0)
+        if _re.search(r"uid=\d+|gid=\d+|root@", out):
+            return {"passed": True, "method": "shell_signal", "confidence": 0.9,
+                    "reason": "shell execution signal matched (uid=/gid=/root@)"}
+    if rx is None and not a.get("expect_shell"):
+        if out.strip() and exit_code in (None, 0):
+            return {"passed": True, "method": "default_truthy", "confidence": 0.5,
+                    "reason": "no assertion given; output non-empty and exit 0"}
+    return {"passed": False, "method": "no_match", "confidence": 1.0,
+            "reason": "no regex / canary / shell signal matched"}
+
+
+def _poc_assertion_verdict_with_semantic(assertion, output, exit_code=None,
+                                           rationale=None, model=None):
+    """Full verdict including semantic fallback. Call this from _run_refine_poc
+    when the raw verdict returns passed=False — it tries the LLM pass as a
+    secondary signal, bounded by the canary-grounded safety check."""
+    v = _poc_assertion_verdict(assertion, output, exit_code,
+                                 rationale=rationale, model=model)
+    if v["passed"]:
+        return v
+    if not _poc_semantic_verify_enabled():
+        return v
+    canary = (assertion or {}).get("canary")
+    # Semantic fallback only when canary present AND regex didn't already pass
+    if not canary or canary not in (output or ""):
+        return v
+    passed, conf, reason = _poc_semantic_asks_llm(canary, rationale, output, model=model)
+    if passed and conf >= 0.6:
+        return {"passed": True, "method": "semantic", "confidence": conf,
+                "reason": f"semantic verifier: {reason}"}
+    # Semantic said no (or low confidence) — keep the original regex verdict
+    return v
 
 
 _POC_PRECOND_SIGNALS = ("nonce", "csrf", "xsrf", "token", "unauthorized", "forbidden",
@@ -14640,9 +14753,19 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             output = f"listener error: {e}"; ec = None
         metrics["target_runs"] += 1
         metrics["run_seconds"] = round(metrics["run_seconds"] + (_t.time() - _r0), 3)
-        success = _poc_assertion_passes(assertion, output, ec)
+        # Hybrid verdict: regex-anchored first, then canary-loose, then semantic
+        # LLM pass (only when canary is present in output — grounded). Store the
+        # method so downstream can distinguish regex-verified from semantic-verified.
+        _verdict = _poc_assertion_verdict_with_semantic(
+            assertion, output, ec, rationale=rationale, model=model)
+        success = _verdict["passed"]
+        verification_method = _verdict["method"]
+        verification_confidence = _verdict["confidence"]
         _poc_trace(run_id, "run", iteration=it, run_output=output, assertion_passed=success,
-                   extra={"target_family": list(fam), "drifted": drifted})
+                   extra={"target_family": list(fam), "drifted": drifted,
+                          "method": verification_method,
+                          "confidence": verification_confidence,
+                          "reason": _verdict.get("reason", "")})
         if success or it >= max_iters:
             break
         # Escalation: once we've iterated ESCALATE_AFTER times without success and the
@@ -14811,6 +14934,8 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             "anchored": anchored, "drifted": drifted, "off_target": off_target,
             "reflection": reflection, "canary": canary, "iterations": iters, "log": log_path,
             "llm_model": llm_model, "built_at": built_at, "product": product, "version": version,
+            "verification_method": verification_method,
+            "verification_confidence": verification_confidence,
             "metrics": metrics}
     if verified:
         # Only a CVE-ANCHORED converged PoC is stored in the DB as a reusable security_test.
@@ -14837,7 +14962,9 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             "drifted": drifted, "anchored": anchored, "reflection": reflection, "canary": canary,
             "iterations": iters, "final_command": command, "final_assertion": assertion,
             "llm_model": llm_model, "built_at": built_at, "metrics": metrics,
-            "security_test_id": security_test_id, "log_path": log_path}
+            "security_test_id": security_test_id, "log_path": log_path,
+            "verification_method": verification_method,
+            "verification_confidence": verification_confidence}
 
 
 def _poc_target_key(ip, port):
