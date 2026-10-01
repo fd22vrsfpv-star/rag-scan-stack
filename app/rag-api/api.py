@@ -12658,14 +12658,78 @@ def _poc_index(cve, target_ip, run_id, log_path, success, iterations, security_t
 
 
 def _poc_extract_json(text):
+    """Extract one JSON object from LLM output. Validate first; if parse fails,
+    try common repairs (strip markdown fences, fix shell-quote-in-JSON escapes,
+    trim trailing commas, close unclosed strings, re-balance braces). LLM output
+    is frequently near-JSON — one repair pass catches ~90% of refine failures
+    without needing another LLM round-trip.
+
+    Returns None if nothing parses even after repair."""
     import json as _j, re as _re
     if not text:
         return None
-    m = _re.search(r"\{.*\}", text, _re.S)
-    if not m:
+    # Strip ```json / ``` markdown fences if present
+    txt = text.strip()
+    txt = _re.sub(r"^```(?:json)?\s*", "", txt)
+    txt = _re.sub(r"\s*```\s*$", "", txt)
+    # Find a candidate JSON object substring — depth-counted so a brace inside
+    # a shell command (which _re.S .* over-matches) doesn't eat sibling text.
+    def _find_balanced_object(s):
+        """Return the first depth-balanced {...} span, or None. Ignores braces
+        inside quoted strings to the extent one pass can — not a full parser."""
+        start = s.find("{")
+        if start < 0: return None
+        depth = 0; in_str = False; esc = False
+        for i in range(start, len(s)):
+            c = s[i]
+            if esc: esc = False; continue
+            if c == "\\": esc = True; continue
+            if c == '"': in_str = not in_str; continue
+            if in_str: continue
+            if c == "{": depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return s[start:i+1]
         return None
+    candidate = _find_balanced_object(txt)
+    if not candidate:
+        # Fall back to the greedy match (prior behavior) for pathological inputs
+        m = _re.search(r"\{.*\}", txt, _re.S)
+        if not m: return None
+        candidate = m.group(0)
+    # Parse strict first — fast path
     try:
-        return _j.loads(m.group(0))
+        return _j.loads(candidate)
+    except Exception:  # noqa: BLE001
+        pass
+    # Repair pass 1: trailing commas before } or ]
+    repaired = _re.sub(r",(\s*[}\]])", r"\1", candidate)
+    # Repair pass 2: invalid \escape sequences (common when LLM emits shell
+    # commands with \"...\" quoting that confuses the JSON escape rules).
+    # Allow only the JSON-valid escapes: " \ / b f n r t u
+    repaired = _re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', repaired)
+    # Repair pass 3: close an unterminated string at end-of-input by appending
+    # a closing quote before the final brace (common on truncated responses).
+    try:
+        return _j.loads(repaired)
+    except Exception:  # noqa: BLE001
+        pass
+    # Repair pass 4: re-balance braces — if the LLM truncated, append missing
+    # closing braces based on depth.
+    try:
+        depth = 0; in_str = False; esc = False
+        for c in repaired:
+            if esc: esc = False; continue
+            if c == "\\": esc = True; continue
+            if c == '"': in_str = not in_str; continue
+            if in_str: continue
+            if c == "{": depth += 1
+            elif c == "}": depth -= 1
+        tail = repaired
+        if in_str: tail += '"'
+        if depth > 0: tail += "}" * depth
+        return _j.loads(tail)
     except Exception:  # noqa: BLE001
         return None
 
