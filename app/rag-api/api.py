@@ -15129,10 +15129,18 @@ def _grant_poc(ip, port, eid, granted_by="operator", note=""):
 
 class BuildPocBody(BaseModel):
     cve: str
-    ip: str
+    # ip is only required when target_url is not supplied — the resolver below
+    # back-fills ip (and port) from a full URL. Validator enforces one-or-both.
+    ip: Optional[str] = None
     port: Optional[int] = None
     product: Optional[str] = None
     version: Optional[str] = None
+    # Operator can hand the builder a specific URL / endpoint to aim at — e.g.
+    # from Scan Results, Findings, or Burp. If supplied, host+port are parsed
+    # from it (unless ip/port are also set — explicit wins), and the path is
+    # folded into the operator hint channel so synth + refine aim there first.
+    target_url: Optional[str] = None
+    endpoint_hint: Optional[str] = None   # free-text operator note about the endpoint
     max_iters: int = 5
     recon_first: bool = True    # do a fast target recon (fetch page/robots/forms) and feed
                                 # what's found to synth; catches shape/params synth would miss.
@@ -16814,30 +16822,68 @@ def delete_poc_hint(hint_id: str, authorized: bool = Depends(auth)):
     return {"ok": True, "deleted": n}
 
 
+def _resolve_target_url(target_url, ip, port, endpoint_hint, hint):
+    """Resolve a target_url into (ip, port, composed_hint). Explicit ip/port
+    always win; URL fills in the gaps. The parsed path + any endpoint_hint are
+    folded into the operator-hint channel so synth + refine aim there first.
+    Returns (ip, port, hint). Raises HTTPException(400) if URL is unparseable."""
+    from urllib.parse import urlparse
+    url_hint_bits = []
+    if target_url:
+        u = urlparse(target_url.strip())
+        if not u.hostname:
+            raise HTTPException(400, f"target_url is unparseable: {target_url!r}")
+        if not ip:
+            ip = u.hostname
+        if not port:
+            port = u.port or (443 if u.scheme == "https" else 80)
+        path = (u.path or "") + (f"?{u.query}" if u.query else "")
+        if path and path != "/":
+            url_hint_bits.append(
+                f"OPERATOR-SUPPLIED TARGET ENDPOINT: aim the PoC at `{path}` "
+                f"specifically (host {u.hostname}:{port}, scheme {u.scheme}). "
+                f"Do NOT pivot to a different path unless this one is proven dead."
+            )
+    if endpoint_hint:
+        url_hint_bits.append(f"OPERATOR ENDPOINT NOTE: {endpoint_hint.strip()}")
+    composed = hint or ""
+    if url_hint_bits:
+        prefix = " ".join(url_hint_bits)
+        composed = (prefix + ("\n" + composed if composed else "")).strip()
+    return (ip, port, composed or None)
+
+
 @app.post("/software/build-poc", tags=["Assets"])
 def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     """PoC-builder: research -> synthesize -> run-and-refine. Invoking this authorizes
     the ENTIRE loop (scope-gated traffic every iteration). The verbose prompt/response/
     output trail is written to POC_LOG_DIR/<run_id>.jsonl for review; the DB stores only
-    a small index row, and a security_test ONLY if the PoC converges."""
+    a small index row, and a security_test ONLY if the PoC converges.
+
+    Accepts EITHER explicit ip+port OR a target_url (parsed into both, with
+    the path/query folded into the operator hint)."""
     eid = _validate_engagement_uuid(_resolve_engagement_id())
     cve = (body.cve or "").strip().upper()
     if not cve.startswith("CVE-"):
         raise HTTPException(400, "cve must be a CVE id")
+    ip, port, hint = _resolve_target_url(
+        body.target_url, body.ip, body.port, body.endpoint_hint, body.hint)
+    if not ip:
+        raise HTTPException(400, "either ip or target_url is required")
     # Fail-closed authorization: an operator "release" grants this endpoint (standing,
     # revocable); otherwise a grant must already exist. No grant -> refuse.
     if body.release:
-        _grant_poc(body.ip, body.port, eid, granted_by="operator", note=f"released via build-poc for {cve}")
-    elif not _poc_grant_active(body.ip, body.port, eid):
+        _grant_poc(ip, port, eid, granted_by="operator", note=f"released via build-poc for {cve}")
+    elif not _poc_grant_active(ip, port, eid):
         raise HTTPException(403, "PoC building is not released for this endpoint. An operator "
                                  "must release it (grant) first; it stays granted until revoked.")
     auth = None
     if body.username or body.password or body.bruteforce:
         auth = {"username": body.username, "password": body.password,
                 "login_url": body.login_url, "bruteforce": body.bruteforce}
-    core = _build_poc_core(cve, body.ip, body.port, body.product, body.version, eid,
+    core = _build_poc_core(cve, ip, port, body.product, body.version, eid,
                            body.max_iters, model=body.model, auth=auth, recon_first=body.recon_first,
-                           recon_source=body.recon_source or "basic", hint=body.hint)
+                           recon_source=body.recon_source or "basic", hint=hint)
     return {"ok": True, "cve": cve, **core}
 
 
@@ -16845,6 +16891,102 @@ class PocGrantBody(BaseModel):
     ip: str
     port: Optional[int] = None
     note: Optional[str] = ""
+
+
+@app.get("/software/cves-without-poc", tags=["Assets"])
+def software_cves_without_poc(limit: int = 100,
+                              severity: Optional[str] = None,
+                              engagement_id: Optional[str] = None,
+                              authorized: bool = Depends(auth)):
+    """Asset-software CVEs with NO stored PoC in exploit_store, so the UI can
+    surface a "Build PoC" action per row — the operator one-clicks and
+    /software/build-poc runs. Pulls from follow_up_items where rule_id =
+    'software_known_cve'; extracts the CVE id from the title/tags; left-joins
+    exploit_store to filter out any CVE that already has a build.
+
+    Returns rows ordered by severity (critical first) + newest first. Each row
+    carries enough to pre-fill a build-poc call: cve, ip, port, product,
+    version, severity, follow_up_id, title snippet."""
+    import re as _re
+    eid = engagement_id or _resolve_engagement_id()
+    sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+    sev_filter = (severity or "").strip().lower() or None
+    rows = []
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # Pull all open software_known_cve follow-ups scoped by engagement
+        args = []
+        where = ["rule_id = 'software_known_cve'", "status != 'dismissed'"]
+        if eid:
+            where.append("(engagement_id = %s OR engagement_id IS NULL)")
+            args.append(eid)
+        if sev_filter:
+            where.append("severity = %s"); args.append(sev_filter)
+        cur.execute(f"""
+            SELECT id, target, title, severity, reason, tags, created_at
+            FROM follow_up_items
+            WHERE {' AND '.join(where)}
+            ORDER BY created_at DESC
+            LIMIT %s
+        """, args + [max(1, min(500, limit * 4))])  # over-fetch; we filter below
+        fu_rows = cur.fetchall()
+        # Build a set of (cve, ip) that already have a PoC
+        cur.execute("""SELECT DISTINCT upper(cve) AS cve, target_host AS ip
+                       FROM exploit_store
+                       WHERE cve IS NOT NULL AND cve ILIKE 'CVE-%'""")
+        has_poc = {(r["cve"], r["ip"]) for r in cur.fetchall()}
+        # Enrich: resolve port+product+version from detected_software
+        for fu in fu_rows:
+            title = fu.get("title") or ""
+            ip = fu.get("target") or ""
+            # Extract CVE ids
+            cves = _re.findall(r"CVE-\d{4}-\d{4,}", title.upper())
+            if not cves:
+                continue
+            # Extract product + version from "Vulnerable: {product} {version} on ..."
+            product, version = None, None
+            m = _re.match(r"Vulnerable:\s+(.+?)\s+(\S+)\s+on\s+", title)
+            if m:
+                product, version = m.group(1), m.group(2)
+            # Resolve port via detected_software (best-effort)
+            port = None
+            try:
+                cur.execute("""SELECT port FROM detected_software
+                               WHERE ip = %s
+                                 AND (%s IS NULL OR lower(product) = lower(%s))
+                                 AND port IS NOT NULL
+                               ORDER BY last_seen DESC LIMIT 1""",
+                            (ip, product, product))
+                r = cur.fetchone()
+                if r:
+                    port = r["port"]
+            except Exception:  # noqa: BLE001
+                pass
+            for cve in cves:
+                if (cve, ip) in has_poc:
+                    continue
+                rows.append({
+                    "cve": cve,
+                    "ip": ip,
+                    "port": port,
+                    "product": product,
+                    "version": version,
+                    "severity": fu.get("severity") or "info",
+                    "follow_up_id": str(fu.get("id")),
+                    "title": title[:200],
+                    "first_seen": (fu.get("created_at").isoformat()
+                                   if fu.get("created_at") else None),
+                    # Operator one-click action: POST this to /software/build-poc
+                    "build_poc_payload": {
+                        "cve": cve, "ip": ip, "port": port,
+                        "product": product, "version": version,
+                        "recon_source": "full", "max_iters": 5,
+                    },
+                })
+    # Sort by severity, then first_seen desc
+    rows.sort(key=lambda r: (sev_order.get(r["severity"], 9),
+                             -(1 if r.get("first_seen") else 0),
+                             r.get("first_seen") or ""), reverse=False)
+    return {"count": len(rows[:limit]), "total_candidates": len(rows), "items": rows[:limit]}
 
 
 @app.get("/software/poc-grants", tags=["Assets"])
@@ -16985,6 +17127,77 @@ def _save_exploit_store(name, cve=None, kind="cve_poc", target_host=None, target
                           "target": target_host, "engagement_id": eid})
         except Exception:  # noqa: BLE001
             pass
+        # (2) Dedicated webhook for the CVE PoC-builder path — carries the rich
+        # context an operator needs to decide whether to tweak-and-rerun or move
+        # on: iterations, verification method, confidence, canary, and the final
+        # command (truncated). Generic exploit_store_saved stays for other kinds.
+        if (kind == "cve_poc" or source == "cve_poc_builder") and cve:
+            try:
+                _md = metadata or {}
+                _m = (_md.get("metrics") or {}) if isinstance(_md, dict) else {}
+                emit_webhook("poc_build_completed", "cve_poc_builder", {
+                    "id": new_id, "cve": cve, "verified": bool(verified),
+                    "target": target_host, "port": target_port,
+                    "engagement_id": eid,
+                    "verification_method": _md.get("verification_method"),
+                    "verification_confidence": _md.get("verification_confidence"),
+                    "iterations": _m.get("iterations") or _m.get("target_runs"),
+                    "skipped_syntax": _m.get("skipped_runs_bad_syntax"),
+                    "skipped_refusal": _m.get("skipped_runs_llm_refusal"),
+                    "model": llm_model,
+                    "build_seconds": _m.get("build_seconds"),
+                    "needs_tweaking": not bool(verified),  # the trigger for review
+                    "command_preview": (command or "")[:280],
+                })
+            except Exception:  # noqa: BLE001
+                pass
+        # (3) Mirror the PoC build as a raw_artifacts row so it surfaces on the
+        # Scan Results page alongside tool scans. tool="cve_poc_builder" is a
+        # new category — distinguishable from nmap/nuclei/zap so operators can
+        # filter it. content is the human-readable build summary (verdict,
+        # metrics, final command, how to tweak) — not the raw trace, which stays
+        # at poc_log_path for deep forensics.
+        if (kind == "cve_poc" or source == "cve_poc_builder") and cve and command:
+            try:
+                _md = metadata or {}
+                _m = (_md.get("metrics") or {}) if isinstance(_md, dict) else {}
+                verdict = "VERIFIED" if verified else "FAILED — needs tweaking"
+                vmethod = _md.get("verification_method") or "n/a"
+                iters = _m.get("iterations") or _m.get("target_runs") or 0
+                skipped = ((_m.get("skipped_runs_bad_syntax") or 0)
+                           + (_m.get("skipped_runs_llm_refusal") or 0))
+                canary = (assertion or {}).get("canary") if isinstance(assertion, dict) else None
+                _artifact_content = (
+                    f"CVE PoC Build: {cve}\n"
+                    f"Target: {target_host}:{target_port}\n"
+                    f"Verdict: {verdict}\n"
+                    f"Verification method: {vmethod}\n"
+                    f"Iterations: {iters} (skipped-pre-dispatch: {skipped})\n"
+                    f"Canary: {canary or 'n/a'}\n"
+                    f"Model: {llm_model or 'n/a'}\n"
+                    f"Build seconds: {_m.get('build_seconds', 'n/a')}\n"
+                    f"Exploit Store id: {new_id}\n"
+                    f"PoC log: {poc_log_path or 'n/a'}\n"
+                    f"\n--- Final command ---\n{command}\n"
+                    f"\n--- Rationale ---\n{rationale or '(none)'}\n"
+                    f"\n--- Tweak-and-rerun ---\n"
+                    f"Open /exploits → Exploit Store → id {new_id} to edit the "
+                    f"command/assertion and re-run against the target."
+                )
+                _store_artifact_row(
+                    tool="cve_poc_builder",
+                    content=_artifact_content,
+                    command=(command or "")[:4000],
+                    target=target_host,
+                    port=target_port,
+                    service=product or "web",
+                    source="cve_poc_builder",
+                    engagement_id=eid,
+                    note=f"{cve} — {verdict}",
+                    content_format="text",
+                )
+            except Exception as e:  # noqa: BLE001
+                logging.debug("mirror cve_poc to raw_artifacts failed: %s", e)
         # Live-embed technique into RAG. Verified rows go to verified_exploit_technique
         # (positive signal); unverified go to failed_technique (negative signal — stops
         # the strategist from re-exploring shapes we've seen fail).
