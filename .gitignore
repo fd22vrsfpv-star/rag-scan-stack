@@ -224,3 +224,6 @@ exports/
 # promote-skills.sh backups of the vuln-class methodology pack
 knowledge/*.bak-*
 poc_logs/
+
+# Helix build state (per-workspace; shouldn't ship in PRs)
+.helix/
