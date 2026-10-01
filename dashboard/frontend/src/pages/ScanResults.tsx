@@ -131,6 +131,18 @@ export default function ScanResults() {
         </div>
         <Select value={filters.tool} onChange={v => { setFilters(f => ({ ...f, tool: v })); setPage(0) }}
                 placeholder="All tools" options={tools} />
+        {/* Quick-filter chip: PoC builder output. Every /software/build-poc run
+            lands a raw_artifacts row with tool="cve_poc_builder" so operators
+            can review (and tweak) failed builds alongside the tool scans. */}
+        <button
+          onClick={() => { setFilters(f => ({ ...f, tool: f.tool === 'cve_poc_builder' ? undefined : 'cve_poc_builder' })); setPage(0) }}
+          className={cn('h-7 px-2 rounded-full border text-xs inline-flex items-center gap-1',
+            filters.tool === 'cve_poc_builder'
+              ? 'bg-orange-500/25 border-orange-400 text-orange-200'
+              : 'bg-muted/30 border-gray-700 text-gray-400 hover:text-white')}
+          title="Show PoC-builder results (verified + failed) — click rows to view and tweak">
+          <Zap className="w-3 h-3" /> PoC Builds
+        </button>
         <Select value={filters.llm_status} onChange={v => { setFilters(f => ({ ...f, llm_status: v })); setPage(0) }}
                 placeholder="Any status" options={['pending', 'processing', 'done', 'failed', 'skipped']} />
         <Select value={filters.content_format} onChange={v => { setFilters(f => ({ ...f, content_format: v })); setPage(0) }}
