@@ -285,6 +285,23 @@ async def bulk_dismiss_software(request: Request):
         return safe_json(resp)
 
 
+@router.get("/api/software/cves-without-poc")
+async def list_cves_without_poc(limit: int = 100, severity: str = None,
+                                 engagement_id: str = None):
+    """Asset-software CVEs with no stored PoC — powers the Build-PoC tab's
+    one-click surface. Thin proxy to rag-api."""
+    s = get_settings()
+    params: dict = {"limit": limit}
+    if severity:
+        params["severity"] = severity
+    if engagement_id:
+        params["engagement_id"] = engagement_id
+    async with httpx.AsyncClient(timeout=30) as c:
+        resp = await c.get(f"{s.rag_api_url}/software/cves-without-poc", params=params,
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
 @router.get("/api/software/poc-grants")
 async def list_poc_grants():
     s = get_settings()
