@@ -125,6 +125,73 @@ print(v['method'], v['passed'], v['confidence'])
     assert out.split() == ["default_truthy", "True", "0.5"], f"got: {out!r}"
 
 
+def test_shell_syntax_dry_parse_catches_unbalanced_quotes():
+    """Pre-dispatch dry-parse refuses commands with unbalanced quotes so the
+    refine path gets the specific error instead of wasting a listener run."""
+    py = """
+import sys; sys.path.insert(0, '/app')
+from api import _poc_shell_syntax_check
+ok, err = _poc_shell_syntax_check('curl -d "unclosed')
+assert ok is False, 'unbalanced double quote should fail'
+assert 'quot' in err.lower() or 'unmatched' in err.lower() or 'no closing' in err.lower(), err
+ok2, _ = _poc_shell_syntax_check('curl -d "closed" http://x')
+assert ok2 is True
+# Unbalanced parens (shlex misses these — our heuristic catches)
+ok3, err3 = _poc_shell_syntax_check('bash -c "$(echo hi"')
+assert ok3 is False, f'unbalanced parens should fail: {err3}'
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and "OK" in out, f"stderr: {err}"
+
+
+def test_llm_refusal_detection_catches_prose_as_command():
+    """Pre-dispatch detector catches LLM-refusal prose (REFUSE:/I cannot provide/
+    Sorry) so refine gets an authorization-restoring nudge instead of /bin/sh
+    trying to execute English."""
+    py = """
+import sys; sys.path.insert(0, '/app')
+from api import _poc_detect_llm_refusal, _poc_shell_syntax_check
+
+# Starts with REFUSE
+r, _ = _poc_detect_llm_refusal('REFUSE: I cannot provide exploit commands.')
+assert r is True
+# Contains refusal marker mid-string
+r2, _ = _poc_detect_llm_refusal('curl http://x && I cannot provide further detail')
+assert r2 is True
+# Starts with "Sorry"
+r3, _ = _poc_detect_llm_refusal('Sorry, I cannot help with that request.')
+assert r3 is True
+# Real commands pass
+r4, _ = _poc_detect_llm_refusal('curl -sk http://host/ && grep POCzABC')
+assert r4 is False
+# Dry-parse rolls refusal into its overall refuse-dispatch verdict
+ok, err = _poc_shell_syntax_check('REFUSE: I cannot provide exploit commands.')
+assert ok is False and 'refusal' in err.lower()
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and "OK" in out, f"stderr: {err}"
+
+
+def test_shell_syntax_dry_parse_allows_empty_result_fail_open():
+    """Shlex quirks that bash would accept must NOT block dispatch — fail-open
+    on unknown exceptions (we only block on ValueError = parse refusal)."""
+    py = """
+import sys; sys.path.insert(0, '/app')
+from api import _poc_shell_syntax_check
+# Normal command — must pass
+ok, err = _poc_shell_syntax_check('curl -sk http://host/path?a=1 | grep POC')
+assert ok is True, err
+# Empty command — explicit fail (nothing to dispatch)
+ok2, err2 = _poc_shell_syntax_check('')
+assert ok2 is False and 'empty' in err2.lower()
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and "OK" in out, f"stderr: {err}"
+
+
 def test_poc_assertion_passes_backward_compat():
     """Original boolean function still works for every pre-existing caller."""
     py = """
