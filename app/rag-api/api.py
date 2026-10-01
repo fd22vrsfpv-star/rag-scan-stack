@@ -14664,6 +14664,31 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             rtext = ""
         _poc_trace(run_id, "refine", iteration=it, prompt=rprompt, response=rtext, llm_model=llm_model)
         obj = _poc_extract_json(rtext)
+        # Malformed-JSON retry: forensics showed ~10/35 sweep failures were PARTIAL
+        # iters because the refine LLM returned prose/truncated-JSON on iter 1 and
+        # the loop broke before any real refinement. One-shot retry with a terser,
+        # stricter prompt — same guidance, but demands a bare JSON object.
+        if not obj or not obj.get("command"):
+            try:
+                strict_prompt = (
+                    "Your previous reply wasn't a parseable JSON object (likely trailing "
+                    "prose or truncation). Return ONE JSON object ONLY, no prose, no "
+                    "markdown fences, no leading text. Shape required: "
+                    f"{{\"command\": \"<single shell command fixing the PoC for {cve} on "
+                    f"http://{ip}:{port}>\", "
+                    f"\"assertion\": {{\"expect_regex\": \"{canary or '<regex>'}\"}}}}. "
+                    f"Previous failing command for context: {command[:400]}. "
+                    f"Previous output: {(output or '')[:400]}."
+                )
+                res2 = _llm_for_model(strict_prompt, model=model, caller="cve_poc_refine_retry")
+                rtext2 = res2.get("response", "") if isinstance(res2, dict) else str(res2 or "")
+                _acc_llm_metrics(metrics, res2)
+                _poc_trace(run_id, "refine_retry", iteration=it,
+                           prompt=strict_prompt[:400], response=rtext2[:400],
+                           llm_model=llm_model)
+                obj = _poc_extract_json(rtext2)
+            except Exception:  # noqa: BLE001
+                pass
         if not obj or not obj.get("command"):
             break
         command = str(obj["command"]).strip()
