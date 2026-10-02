@@ -15675,7 +15675,12 @@ def _grant_poc(ip, port, eid, granted_by="operator", note=""):
 
 
 class BuildPocBody(BaseModel):
-    cve: str
+    # cve is OPTIONAL — not every target has (or needs) a CVE. Operator may
+    # want to build a PoC against an arbitrary endpoint on observed product +
+    # version alone (e.g. a logic flaw, a misconfig, a 0-day). When absent,
+    # the endpoint synthesizes a NOCVE-<timestamp> token so run_id/hints
+    # remain unique.
+    cve: Optional[str] = None
     # ip is only required when target_url is not supplied — the resolver below
     # back-fills ip (and port) from a full URL. Validator enforces one-or-both.
     ip: Optional[str] = None
@@ -17411,12 +17416,23 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     the path/query folded into the operator hint)."""
     eid = _validate_engagement_uuid(_resolve_engagement_id())
     cve = (body.cve or "").strip().upper()
-    if not cve.startswith("CVE-"):
-        raise HTTPException(400, "cve must be a CVE id")
+    # cve is optional — synth a NOCVE-<timestamp> token when absent so the
+    # build pipeline (run_id, hints, Store rows) stays unique. Still accepts
+    # a CVE-YYYY-NNNNN id when the operator supplies one.
+    if cve and not cve.startswith("CVE-"):
+        raise HTTPException(400, "cve must be a CVE id (CVE-YYYY-NNNNN) or empty")
+    if not cve:
+        import time as _ttmp
+        cve = f"NOCVE-{int(_ttmp.time())}"
     ip, port, hint = _resolve_target_url(
         body.target_url, body.ip, body.port, body.endpoint_hint, body.hint)
     if not ip:
         raise HTTPException(400, "either ip or target_url is required")
+    # Without a CVE we need SOMETHING to tell the builder what to look for.
+    # Require either a product name or an endpoint hint so synth has signal.
+    if cve.startswith("NOCVE-") and not (body.product or hint or body.target_url):
+        raise HTTPException(400, "without a CVE, supply at least product, "
+                                 "target_url, or endpoint_hint so synth has signal")
     # Fail-closed authorization: an operator "release" grants this endpoint (standing,
     # revocable); otherwise a grant must already exist. No grant -> refuse.
     if body.release:
@@ -17444,6 +17460,8 @@ class PocGrantBody(BaseModel):
 def software_cves_without_poc(limit: int = 100,
                               severity: Optional[str] = None,
                               engagement_id: Optional[str] = None,
+                              all_engagements: bool = False,
+                              scope_only: bool = True,
                               authorized: bool = Depends(auth)):
     """Asset-software CVEs with NO stored PoC in exploit_store, so the UI can
     surface a "Build PoC" action per row — the operator one-clicks and
@@ -17453,7 +17471,15 @@ def software_cves_without_poc(limit: int = 100,
 
     Returns rows ordered by severity (critical first) + newest first. Each row
     carries enough to pre-fill a build-poc call: cve, ip, port, product,
-    version, severity, follow_up_id, title snippet."""
+    version, severity, follow_up_id, title snippet.
+
+    Engagement + scope filtering (CLAUDE.md rule — reads must respect both):
+      - engagement_id (or X-Engagement-Id) scopes to that engagement; rows
+        with engagement_id NULL are kept unless all_engagements=true.
+      - scope_only=true (default) further restricts to targets that match
+        scope_targets for the resolved engagement. Set scope_only=false to
+        list every known candidate.
+    """
     import re as _re
     eid = engagement_id or _resolve_engagement_id()
     sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
@@ -17463,8 +17489,17 @@ def software_cves_without_poc(limit: int = 100,
         # Pull all open software_known_cve follow-ups scoped by engagement
         args = []
         where = ["rule_id = 'software_known_cve'", "status != 'dismissed'"]
-        if eid:
+        if eid and not all_engagements:
             where.append("(engagement_id = %s OR engagement_id IS NULL)")
+            args.append(eid)
+        if scope_only and eid:
+            # Fail-closed-ish scope filter: only rows whose target matches a
+            # scope_targets entry for this engagement (or a global one).
+            where.append(
+                "EXISTS (SELECT 1 FROM scope_targets st "
+                "WHERE (st.engagement_id = %s OR st.engagement_id IS NULL) "
+                "AND (target = st.target OR target LIKE st.target || '%%'))"
+            )
             args.append(eid)
         if sev_filter:
             where.append("severity = %s"); args.append(sev_filter)
