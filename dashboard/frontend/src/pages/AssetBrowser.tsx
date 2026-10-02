@@ -1350,16 +1350,11 @@ export default function AssetBrowser() {
   const [hideBlankProductVersion, setHideBlankProductVersion] = useState(true)
   const [softwareSort, setSoftwareSort] = useState<'hostname' | 'product' | 'version' | 'cve-count'>('hostname')
   const [showBulkDismiss, setShowBulkDismiss] = useState(false)
-  const [exploitLookup, setExploitLookup] = useState<{ product: string; version: string; cveFlags?: any[] } | null>(() => {
-    // Auto-open the Workbench when the URL carries ?exploit_lookup=product
-    // (optionally &elv=version). The popped-out resizable window uses this
-    // path: `window.open('/assets?exploit_lookup=...', 'ExploitWorkbench',
-    // 'resizable=yes,...')` → the receiving page lands on Assets with the
-    // modal already open on the right product.
-    const p = urlParams.get('exploit_lookup')
-    const v = urlParams.get('elv') || ''
-    return p ? { product: p, version: v } : null
-  })
+  // The inline <ExploitLookupModal> that used to live over Assets is gone —
+  // clicking View on a software row now opens /exploits-popout (the single
+  // chromeless Workbench) in a new tab. The ExploitLookupModal component is
+  // still exported from this file so ExploitManager's Workbench tab can
+  // render it inline there.
   const resolveExploit = useResolveExploit()
   const [resolveMsg, setResolveMsg] = useState<Record<string, string>>({})
   const buildPoc = useBuildPoc()
@@ -2346,10 +2341,23 @@ export default function AssetBrowser() {
                                   <span className="h-2 w-2 rounded-full bg-green-500 shrink-0" title="AI checked" />
                                 )}
                                 <button
-                                  onClick={() => setExploitLookup({ product: sw.product, version: sw.version || '', cveFlags: sw.cve_flags })}
+                                  onClick={() => {
+                                    // Open the single Exploit Workbench
+                                    // (chromeless /exploits-popout) in a new
+                                    // browser tab with this product + version
+                                    // pre-filled on the PoC Exploit Workbench
+                                    // tab. No inline modal in Assets — one
+                                    // consistent surface for all exploit
+                                    // functions (research, build-poc,
+                                    // operations, detail, bake-off).
+                                    const url = `/exploits-popout?tab=workbench`
+                                      + `&product=${encodeURIComponent(sw.product)}`
+                                      + (sw.version ? `&version=${encodeURIComponent(sw.version)}` : '')
+                                    window.open(url, '_blank', 'noopener,noreferrer')
+                                  }}
                                   className="px-1.5 py-0.5 rounded text-[10px] border border-purple-500/40 text-purple-400 hover:bg-purple-500/10"
-                                  title="AI-powered exploit & CVE research"
-                                ><Search className="inline h-2.5 w-2.5 mr-0.5" />{(sw as any).ai_checked ? 'View' : 'AI Check'}</button>
+                                  title="Open the Exploit Workbench in a new tab (chromeless, resizable)"
+                                ><Search className="inline h-2.5 w-2.5 mr-0.5" />{(sw as any).ai_checked ? 'View in Workbench' : 'AI Check'}</button>
                               </div>
                             </td>
                           </tr>
@@ -2510,8 +2518,9 @@ export default function AssetBrowser() {
         </div>
       )}
 
-      {/* Exploit Lookup Modal */}
-      {exploitLookup && <ExploitLookupModal product={exploitLookup.product} version={exploitLookup.version} cveFlags={exploitLookup.cveFlags} onClose={() => setExploitLookup(null)} />}
+      {/* The Exploit Lookup Modal is no longer rendered inline here —
+          clicking View on a software row opens the single Workbench
+          (/exploits-popout) in a new browser tab. */}
 
       {/* CVE Rule Tuning Dialog */}
       {showCveTuning && cveTuningData?.tuning && (() => {
