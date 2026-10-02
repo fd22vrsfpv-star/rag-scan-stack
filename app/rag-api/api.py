@@ -17481,6 +17481,7 @@ def software_cves_without_poc(limit: int = 100,
         list every known candidate.
     """
     import re as _re
+    from etl.scope_gate import is_in_scope as _is_in_scope, load_engagement_scope as _load_eng_scope
     eid = engagement_id or _resolve_engagement_id()
     sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
     sev_filter = (severity or "").strip().lower() or None
@@ -17492,17 +17493,29 @@ def software_cves_without_poc(limit: int = 100,
         if eid and not all_engagements:
             where.append("(engagement_id = %s OR engagement_id IS NULL)")
             args.append(eid)
-        if scope_only and eid:
-            # Fail-closed-ish scope filter: only rows whose target matches a
-            # scope_targets entry for this engagement (or a global one).
-            where.append(
-                "EXISTS (SELECT 1 FROM scope_targets st "
-                "WHERE (st.engagement_id = %s OR st.engagement_id IS NULL) "
-                "AND (target = st.target OR target LIKE st.target || '%%'))"
-            )
-            args.append(eid)
         if sev_filter:
             where.append("severity = %s"); args.append(sev_filter)
+        # Scope filter is applied in Python (not SQL) because the authority is
+        # etl.scope_gate.is_in_scope — same CIDR/domain-wildcard/URL matching
+        # the dispatch gate uses. A `LIKE st.target || '%'` SQL filter would
+        # miss CIDR entries (`192.168.1.0/24` would never LIKE-match
+        # `192.168.1.150`) and would false-match hostname prefixes. Load the
+        # scope rows once; filter rows before enrichment to keep the loop tight.
+        scope_rows = []
+        if scope_only and eid:
+            scope_rows = _load_eng_scope(cur, eid)
+            # Fallback: include global (NULL-engagement) scope rows too so a
+            # mixed engagement/global scope set still gates correctly.
+            try:
+                cur.execute("SELECT target, target_type FROM public.scope_targets "
+                            "WHERE engagement_id IS NULL AND name != 'not_in_scope'")
+                for r in cur.fetchall():
+                    t = r.get("target") if isinstance(r, dict) else r[0]
+                    tt = r.get("target_type") if isinstance(r, dict) else r[1]
+                    if t:
+                        scope_rows.append((t, tt))
+            except Exception:  # noqa: BLE001
+                pass
         cur.execute(f"""
             SELECT id, target, title, severity, reason, tags, created_at
             FROM follow_up_items
@@ -17520,6 +17533,12 @@ def software_cves_without_poc(limit: int = 100,
         for fu in fu_rows:
             title = fu.get("title") or ""
             ip = fu.get("target") or ""
+            # Scope filter — use the dispatch gate's own is_in_scope so CIDR
+            # (192.168.1.0/24), domain wildcards and URL rules all behave
+            # identically on read as on dispatch. Skip rows that aren't in
+            # scope for the resolved engagement.
+            if scope_only and eid and scope_rows and not _is_in_scope(ip, scope_rows):
+                continue
             # Extract CVE ids
             cves = _re.findall(r"CVE-\d{4}-\d{4,}", title.upper())
             if not cves:
