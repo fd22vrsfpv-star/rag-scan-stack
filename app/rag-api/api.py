@@ -15281,7 +15281,8 @@ def _flag_precondition(cve, ip, pc, eid):
 def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale="",
                     product=None, version=None, max_iters=3, canary=None,
                     origin_family=None, llm_model=None, metrics=None, model=None,
-                    recon_source_used=None):
+                    recon_source_used=None, arjun_discovered=None,
+                    focused_urls_from_body=None):
     """Increment 2: run the PoC against the target; on failure, refine via the LLM,
     re-run — up to max_iters. Verbose trail -> filesystem.
 
@@ -15314,8 +15315,12 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
     success = False; iters = 0; drifted = False; output = ""
     # Escalation: after this many failed iters, run zap-active as a fallback recon and
     # inject its findings into the refine prompt. One-shot per build. Skipped when
-    # zap-active was already the primary recon.
-    _escalate_after = int(os.environ.get("ZAP_ACTIVE_ESCALATE_AFTER", "3") or "3")
+    # zap-active was already the primary recon. Default changed from 3 → 1 per
+    # operator ask: "go active after 1" — ZAP active brings the most new signal
+    # per unit of build time, so firing it after the first miss (instead of
+    # burning through 3 misses first) saves 2 LLM round-trips on a build that
+    # was going to need the escalation anyway.
+    _escalate_after = int(os.environ.get("ZAP_ACTIVE_ESCALATE_AFTER", "1") or "1")
     _already_zap_active = "active" in (str(recon_source_used or "").lower())
     escalation_guidance = ""
     escalated = False
@@ -15453,6 +15458,43 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                     escalation_guidance = ("\nESCALATION RECON (zap-active fired after "
                                            f"{it} failed iters — treat as new authoritative "
                                            "attack-surface intel): " + zactive)
+                # Focused per-URL active scan on the arjun / Burp-discovered
+                # params for this host. ZAP's generic active scan recurses the
+                # whole site; this runs focused attacks on URLs ZAP's spider
+                # may NOT have reached (arjun's parameter fanout, Burp's
+                # discovered_params table, any operator-supplied focused URLs).
+                focused_urls = []
+                # 1) arjun paths from this build's own recon
+                if arjun_discovered:
+                    for p in (arjun_discovered or [])[:20]:
+                        if p: focused_urls.append(p)
+                # 2) Burp / katana / etc. discovered_params for this host
+                try:
+                    with get_db() as _c, _c.cursor(cursor_factory=RealDictCursor) as _cur:
+                        _cur.execute("""
+                            SELECT DISTINCT url
+                            FROM discovered_params
+                            WHERE url ILIKE %s
+                            ORDER BY first_seen DESC NULLS LAST
+                            LIMIT 20
+                        """, (f"%{ip}%",))
+                        for r in _cur.fetchall():
+                            u = r.get("url")
+                            if u: focused_urls.append(u)
+                except Exception as _dpe:  # noqa: BLE001
+                    logging.debug("discovered_params lookup failed: %s", _dpe)
+                # 3) operator-supplied focused URLs from BuildPocBody (if any)
+                for u in (focused_urls_from_body or []):
+                    if u: focused_urls.append(u)
+                if focused_urls:
+                    _tf = _t.time()
+                    zfocused = _zap_focused_active_scan(ip, port, focused_urls)
+                    _poc_trace(run_id, "escalation:zap_focused_active", iteration=it,
+                               response=(zfocused or "no findings")[:1200],
+                               extra={"seconds": round(_t.time() - _tf, 2),
+                                      "url_count": len(focused_urls)})
+                    if zfocused:
+                        escalation_guidance = (escalation_guidance or "") + "\n" + zfocused
                 escalated = True
             except Exception as e:  # noqa: BLE001
                 logging.debug("zap-active escalation failed: %s", e)
@@ -15736,6 +15778,12 @@ class BuildPocBody(BaseModel):
                                              # Port sweep always runs regardless.
     hint: Optional[str] = None               # per-run operator guidance (highest priority; prepended
                                              # ahead of recon/research/auth in synth guidance).
+    # focused_urls: operator-supplied list of specific URLs (typically pasted from
+    # Burp Repeater after manual tweaking) that the escalation path should run a
+    # focused ZAP active scan on, in addition to arjun's live findings. Each URL
+    # gets its own `recurse=false` active scan so attention isn't diluted across
+    # the whole site. Capped at 10 upstream.
+    focused_urls: List[str] = []
     # release=true is the operator authorizing this endpoint for PoC building — a
     # STANDING grant that persists until revoked/stopped. Agent-initiated builds leave
     # it false, so they run ONLY where a grant already exists (fail-closed).
@@ -17005,8 +17053,107 @@ def _zap_recon(ip, port, spider_timeout=90, active_scan=False):
     return "ZAP recon: " + " | ".join(parts)
 
 
+def _zap_focused_active_scan(ip, port, urls, max_total_wait=300, per_url_wait=90):
+    """Focused ZAP active scan over a specific list of URLs (not the whole host).
+
+    The generic `_zap_recon(active_scan=True)` scans the entire target recursively.
+    This variant lets the caller hand in URLs the generic spider would NOT reach —
+    typically arjun's live findings, Burp's `discovered_params`, or an operator's
+    tweaked request from Repeater — and runs an active scan per URL with
+    `recurse=false` so each one gets focused attack vectors on its specific
+    parameters rather than attention diluted across the whole site.
+
+    Returns a compact guidance string in the same shape `_zap_recon` emits:
+    "ZAP focused-active: <URL> - [risk] <alert_name> (param=<p>) evidence: ...".
+    Returns "" on any error so the escalation path never breaks the build.
+    """
+    import httpx as _hx, time as _t, urllib.parse as _up
+    if not urls:
+        return ""
+    zap_url = os.environ.get("ZAP_URL", "http://zap:8090").rstrip("/")
+    zap_key = os.environ.get("ZAP_API_KEY", "changeme")
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    host_prefix = f"{scheme}://{ip}:{port or 80}"
+
+    def _api(path, **params):
+        params["apikey"] = zap_key
+        return f"{zap_url}{path}?" + _up.urlencode(params)
+
+    # Normalize each URL to absolute form and keep only ones under this host.
+    # (ZAP's inScopeOnly=true would silently drop out-of-scope URLs otherwise.)
+    norm = []
+    for u in urls:
+        if not u: continue
+        if u.startswith("http://") or u.startswith("https://"):
+            if u.startswith(host_prefix):
+                norm.append(u)
+        else:
+            norm.append(host_prefix + (u if u.startswith("/") else "/" + u))
+    if not norm:
+        return ""
+    # Dedup while preserving order; cap at 10 so a huge arjun fanout can't
+    # consume the whole escalation budget.
+    seen = set(); dedup = []
+    for u in norm:
+        if u in seen: continue
+        seen.add(u); dedup.append(u)
+    dedup = dedup[:10]
+
+    parts = []
+    deadline = _t.time() + max_total_wait
+    try:
+        with _hx.Client(timeout=15, verify=False) as cli:
+            # Verify ZAP alive
+            r = cli.get(_api("/JSON/core/view/version/"))
+            if r.status_code != 200:
+                return ""
+            for u in dedup:
+                if _t.time() >= deadline:
+                    parts.append(f"(stopped early — budget exhausted after {len(parts)} URLs)")
+                    break
+                # Kick a focused scan on just this URL
+                r = cli.get(_api("/JSON/ascan/action/scan/", url=u, recurse="false",
+                                 inScopeOnly="true"))
+                if r.status_code != 200:
+                    continue
+                sid = r.json().get("scan")
+                if not sid:
+                    continue
+                # Poll per-URL (bounded)
+                t0 = _t.time()
+                while _t.time() - t0 < per_url_wait and _t.time() < deadline:
+                    _t.sleep(3)
+                    st = cli.get(_api("/JSON/ascan/view/status/", scanId=str(sid)))
+                    if st.status_code == 200 and int(st.json().get("status", 0)) >= 100:
+                        break
+                # Pull alerts for THIS URL (baseurl filter so other-URL alerts
+                # don't dilute the per-URL signal)
+                r = cli.get(_api("/JSON/alert/view/alerts/", baseurl=u))
+                if r.status_code != 200:
+                    continue
+                alerts = r.json().get("alerts") or []
+                if not alerts:
+                    continue
+                loc = u[len(host_prefix):] if u.startswith(host_prefix) else u
+                for a in alerts[:5]:  # top 5 alerts per URL
+                    name = a.get("name", "")
+                    if not name: continue
+                    risk = a.get("risk", ""); param = a.get("param", "")
+                    ev = (a.get("evidence") or "")[:80]
+                    parts.append(f"  - {loc}: [{risk}] {name}"
+                                 + (f" (param={param})" if param else "")
+                                 + (f" evidence: {ev}" if ev else ""))
+    except Exception as e:  # noqa: BLE001
+        logging.debug("zap focused-active failed: %s", e)
+        return ""
+    if not parts:
+        return ""
+    return "ZAP focused-active (per-URL attacks on arjun/burp-discovered endpoints):\n" + "\n".join(parts)
+
+
 def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=True, model=None,
-                    auth=None, recon_first=False, recon_source="basic", hint=None):
+                    auth=None, recon_first=False, recon_source="basic", hint=None,
+                    focused_urls=None):
     """Dispatch the full build-poc pipeline via the LangGraph in build_poc_graph.
 
     All ten recon phases (port_sweep -> waf_detect -> waf_characterize -> basic_recon ->
@@ -17034,6 +17181,7 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
         cve, ip, port, product=product, version=version, eid=eid,
         max_iters=max_iters, research=research, model=model, auth=auth,
         recon_first=recon_first, recon_source=recon_source, hint=hint,
+        focused_urls=focused_urls or [],
     )
     return _bpg.invoke_build_poc(_state)
 
@@ -17478,7 +17626,8 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
                 "login_url": body.login_url, "bruteforce": body.bruteforce}
     core = _build_poc_core(cve, ip, port, body.product, body.version, eid,
                            body.max_iters, model=body.model, auth=auth, recon_first=body.recon_first,
-                           recon_source=body.recon_source or "basic", hint=hint)
+                           recon_source=body.recon_source or "basic", hint=hint,
+                           focused_urls=body.focused_urls or [])
     return {"ok": True, "cve": cve, **core}
 
 
