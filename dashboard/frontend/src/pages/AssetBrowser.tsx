@@ -3339,7 +3339,10 @@ export function ExploitLookupModal({ product, version, cveFlags, onClose }: { pr
                 // the tab out to its own window if the operator wants.
                 // Chromeless /exploits-popout route (no sidebar / topbar
                 // overlaid) — just the Workbench content in a new tab.
-                const url = `/exploits-popout?tab=research`
+                // Lands on the unified PoC Exploit Workbench tab with
+                // product + version pre-filled; the Research surface
+                // opens from the Open-Research button inside.
+                const url = `/exploits-popout?tab=workbench`
                   + `&product=${encodeURIComponent(product)}`
                   + (version ? `&version=${encodeURIComponent(version)}` : '')
                 window.open(url, '_blank', 'noopener,noreferrer')
