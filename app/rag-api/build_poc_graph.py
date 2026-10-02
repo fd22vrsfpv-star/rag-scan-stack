@@ -52,6 +52,8 @@ class BuildPocState(TypedDict, total=False):
     recon_metrics: Dict[str, Dict[str, Any]]
     intel_list: List[Dict[str, Any]]
     zap_paths: List[str]
+    arjun_discovered: List[str]       # arjun's live-found URLs for the focused ZAP active scan
+    focused_urls: List[str]           # operator-supplied URLs (BuildPocBody.focused_urls)
     cred_hints: List[str]
     admin_paths_mined: List[str]
     detected_frameworks: List[str]
@@ -103,7 +105,8 @@ def enabled() -> bool:
 def initial_state(cve: str, ip: str, port: int, product=None, version=None, eid=None,
                   max_iters: int = 3, research: bool = True, model=None, auth=None,
                   recon_first: bool = False, recon_source: str = "basic",
-                  hint: Optional[str] = None) -> BuildPocState:
+                  hint: Optional[str] = None,
+                  focused_urls: Optional[List[str]] = None) -> BuildPocState:
     """Build the initial state dict handed to the graph. Mirrors the argument shape
     of _build_poc_core so the wrapper is trivial."""
     return {
@@ -114,7 +117,8 @@ def initial_state(cve: str, ip: str, port: int, product=None, version=None, eid=
         "run_id": f"{cve}_{ip}_{int(time.time())}",
         "t0": time.time(),
         "segments": [], "recon_metrics": {}, "intel_list": [],
-        "zap_paths": [], "cred_hints": [], "admin_paths_mined": [],
+        "zap_paths": [], "arjun_discovered": [], "focused_urls": list(focused_urls or []),
+        "cred_hints": [], "admin_paths_mined": [],
         "detected_frameworks": [], "waf_family": None, "waf_characterization": {},
         "auth": auth or {}, "auth_guidance": "", "session_info": None,
         "hint_guidance": "", "hint_parts": [], "research_out": None,
@@ -356,9 +360,17 @@ def node_arjun_recon(state: BuildPocState) -> Dict[str, Any]:
     from api import _scout_arjun, _scout_arjun_paths, _poc_trace
     _t0 = time.time()
     zap_paths = state.get("zap_paths") or []
+    arjun_discovered: List[str] = []
+    scheme = "https" if int(state.get("port") or 80) in (443, 8443) else "http"
+    host_prefix = f"{scheme}://{state['ip']}:{state.get('port') or 80}"
     if zap_paths:
         a, per_path = _scout_arjun_paths(state["ip"], state["port"], zap_paths)
         signal = f"honored params per endpoint (fanned across {len(per_path)} paths)"
+        # Each arjun-attacked path becomes a focused-active-scan candidate.
+        # per_path maps path -> list of params; a path landing in per_path
+        # means arjun actually probed it (even if 0 params honored).
+        for p in (per_path or {}).keys():
+            if p: arjun_discovered.append(host_prefix + (p if p.startswith("/") else "/" + p))
     else:
         a = _scout_arjun(state["ip"], state["port"])
         signal = "honored param names (single URL, no zap paths)"
@@ -370,6 +382,7 @@ def node_arjun_recon(state: BuildPocState) -> Dict[str, Any]:
         seg.append(a)
         _poc_trace(state["run_id"], "recon:arjun", response=a[:1400])
     return {"segments": seg,
+            "arjun_discovered": arjun_discovered,
             "recon_metrics": {**state.get("recon_metrics", {}), **metrics}}
 
 
@@ -557,7 +570,13 @@ def node_run_refine(state: BuildPocState) -> Dict[str, Any]:
         canary=built.get("canary"), origin_family=built.get("origin_family"),
         llm_model=built.get("llm_model"), metrics=built.get("metrics"),
         model=state.get("model"),
-        recon_source_used=state.get("recon_source"))
+        recon_source_used=state.get("recon_source"),
+        # Hand arjun's live findings + any operator-supplied focused URLs
+        # (BuildPocBody.focused_urls) to the escalation path, which runs a
+        # per-URL ZAP active scan on them in addition to the generic
+        # host-level scan. Catches URLs ZAP's own spider would never reach.
+        arjun_discovered=state.get("arjun_discovered"),
+        focused_urls_from_body=state.get("focused_urls"))
     return {"result": result,
             "verified": bool(result.get("verified")),
             "reflection": bool(result.get("reflection")),
