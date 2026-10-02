@@ -3083,7 +3083,12 @@ function ExploitLookupModal({ product, version, cveFlags, onClose }: { product: 
   const [manualUrls, setManualUrls] = useState('')
   const [manualUrlResults, setManualUrlResults] = useState<any[]>([])
   const [manualUrlLoading, setManualUrlLoading] = useState(false)
-  const [modalTab, setModalTab] = useState<'exploits' | 'research' | 'vulnx' | 'github' | 'log'>('exploits')
+  // 'exploits' + 'research' used to be separate tabs; they answer the same
+  // operator question ("what known attacks exist for this product?") via
+  // different sources (ExploitDB/Nuclei vs Web+LLM analysis), so they're
+  // merged into one 'exploits_research' tab that renders both sections in
+  // sequence. The combined view is the default landing tab.
+  const [modalTab, setModalTab] = useState<'exploits_research' | 'vulnx' | 'github' | 'log'>('exploits_research')
   // GitHub PoC tab data (from ddgData or standalone fetch)
   const [githubPocs, setGithubPocs] = useState<any[]>([])
   const [githubLoading, setGithubLoading] = useState(false)
@@ -3183,8 +3188,7 @@ function ExploitLookupModal({ product, version, cveFlags, onClose }: { product: 
         {/* Tab bar */}
         <div className="flex gap-1 border-b border-border">
           {([
-            ['exploits', 'Exploits & Nuclei'],
-            ['research', 'AI Research'],
+            ['exploits_research', 'Exploits & Research'],
             ['vulnx', 'VulnX CVEs'],
             ['github', 'GitHub PoCs'],
             ['log', 'Debug Log'],
@@ -3501,8 +3505,8 @@ function ExploitLookupModal({ product, version, cveFlags, onClose }: { product: 
           </div>
         )}
 
-        {/* ── TAB: Exploits & Nuclei ── */}
-        {modalTab === 'exploits' && (<>
+        {/* ── TAB: Exploits & Research — Section 1: ExploitDB ── */}
+        {modalTab === 'exploits_research' && (<>
         {/* ── Section 1: ExploitDB / SearchSploit ── */}
         <div className="border border-border rounded-md p-3 space-y-2">
           <div className="flex items-center justify-between">
@@ -3618,8 +3622,8 @@ function ExploitLookupModal({ product, version, cveFlags, onClose }: { product: 
 
         </>)}
 
-        {/* ── TAB: AI Research ── */}
-        {modalTab === 'research' && (<>
+        {/* ── TAB: Exploits & Research — Section 2: Web + AI Analysis ── */}
+        {modalTab === 'exploits_research' && (<>
         {/* ── Section 2: Web Search (DDG + AI) ── */}
         <div className="border border-border rounded-md p-3 space-y-2">
           <div className="flex items-center justify-between">
@@ -3717,8 +3721,8 @@ function ExploitLookupModal({ product, version, cveFlags, onClose }: { product: 
 
         </>)}
 
-        {/* ── TAB: Exploits (continued — Nuclei in same tab) ── */}
-        {modalTab === 'exploits' && ddgData && (<>
+        {/* ── TAB: Exploits & Research — Section 3: Nuclei templates ── */}
+        {modalTab === 'exploits_research' && ddgData && (<>
         {/* ── Section 3: Nuclei Templates ── */}
         {ddgData?.nuclei_templates && ddgData.nuclei_templates.length > 0 && (
           <div className="border border-cyan-500/30 rounded-md p-3 bg-cyan-500/5 space-y-2">
@@ -3883,10 +3887,10 @@ function ExploitLookupModal({ product, version, cveFlags, onClose }: { product: 
         )}
         {modalTab === 'log' && !showLog && (
           <div className="text-xs text-muted-foreground">
-            <p>Run an AI Research first — the debug log appears after the LLM analysis completes.</p>
-            <button onClick={() => { setShowLog(true); setModalTab('research') }}
+            <p>Run a Web Search first (Exploits &amp; Research tab) — the debug log appears after the LLM analysis completes.</p>
+            <button onClick={() => { setShowLog(true); setModalTab('exploits_research') }}
               className="mt-2 px-3 py-1.5 text-xs rounded border border-border hover:bg-muted">
-              Go to AI Research tab
+              Go to Exploits &amp; Research tab
             </button>
           </div>
         )}
