@@ -567,19 +567,32 @@ export default function News() {
                       : item.enriched_at
                         ? <div className="text-xs text-muted-foreground italic mt-1">no summary returned</div>
                         : <div className="text-xs text-muted-foreground/70 italic mt-1">not enriched — select and click Enrich</div>}
-                    {item.engagement_match && item.engagement_match.match_count > 0 && (
-                      <div className={cn(
-                        'inline-flex items-center gap-1 mt-1 px-1.5 py-0.5 rounded border text-[10px] font-medium',
-                        item.engagement_match.confidence === 'strong'
-                          ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
-                          : 'bg-amber-500/15 text-amber-300 border-amber-500/40')}
-                        title={item.engagement_match.summary}>
-                        <Target className="h-3 w-3" />
-                        {item.engagement_match.confidence === 'strong'
-                          ? `✓ Affects engagement (${item.engagement_match.match_count})`
-                          : `~ Possible match (${item.engagement_match.match_count})`}
-                      </div>
-                    )}
+                    {item.engagement_match && item.engagement_match.match_count > 0 && (() => {
+                      const em = item.engagement_match
+                      const strong = em.confidence === 'strong'
+                      const sigil = strong ? '✓' : '~'
+                      const unique = em.unique_assets ?? 0
+                      // Single affected host — name it (what the operator wants on
+                      // the chip itself, not just in the tooltip). Multi-host —
+                      // give the count so the chip stays short.
+                      const label =
+                        unique === 1 && em.primary_target
+                          ? `${sigil} ${em.primary_target}`
+                          : unique > 1
+                            ? `${sigil} ${unique} assets affected`
+                            : `${sigil} ${strong ? 'Affects engagement' : 'Possible match'} (${em.match_count})`
+                      return (
+                        <div className={cn(
+                          'inline-flex items-center gap-1 mt-1 px-1.5 py-0.5 rounded border text-[10px] font-medium',
+                          strong
+                            ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
+                            : 'bg-amber-500/15 text-amber-300 border-amber-500/40')}
+                          title={em.summary}>
+                          <Target className="h-3 w-3" />
+                          {label}
+                        </div>
+                      )
+                    })()}
                   </td>
                   <td className="px-3 py-2 text-xs">
                     {item.primary_cve
