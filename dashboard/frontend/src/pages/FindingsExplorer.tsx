@@ -3,7 +3,7 @@ import { useSearchParams } from 'react-router-dom'
 import PageHelp from '@/components/PageHelp'
 import InfoTip from '@/components/InfoTip'
 import { useInfiniteFindings, useUpdateFindingWorkflow, useFindingActivity, useAddFindingComment, useExploitMatches, useUpdateFindingTags, useTagSuggestions, useDeleteFindings, useAutoEvidence, type FindingsFilter, type AutoEvidenceItem } from '@/api/findings'
-import { useRunExploit } from '@/api/exploits'
+import { useRunExploit, useBuildPoc } from '@/api/exploits'
 import { ScopeAssignModal } from '@/components/common/ScopeAssignModal'
 import { WebScanImportPanel } from '@/components/common/WebScanImportPanel'
 import { useFindingEvidence, useUploadEvidence, useLinkEvidence } from '@/api/evidence'
@@ -906,15 +906,52 @@ function FindingDetailPanel({
   const [pocPayloads, setPocPayloads] = useState<WebPayload[]>([])
   const [selectedPayloads, setSelectedPayloads] = useState<Set<number>>(new Set())
   const [pocQueued, setPocQueued] = useState(false)
-  const [deepen, setDeepen] = useState<{ loading?: boolean; msg?: string; err?: boolean }>({})
+  // "Take action on this finding" — unified Deepen + Build-PoC surface.
+  // Both actions produce a stored exploit / queued probe that lands as an
+  // auto-evidence card in the panel above; sharing one notice area keeps the
+  // feedback consistent regardless of which engine the operator chose.
+  const [actionStatus, setActionStatus] = useState<{ loading?: 'deepen' | 'poc'; msg?: string; err?: boolean }>({})
+  const buildPoc = useBuildPoc()
   const handleDeepen = async () => {
-    setDeepen({ loading: true })
+    setActionStatus({ loading: 'deepen' })
     try {
       const r = await apiFetch<{ command?: string; why?: string }>(
         `/findings/${fSource}/${f.id}/deepen`, { method: 'POST', body: JSON.stringify({}) })
-      setDeepen({ msg: r?.command ? `Queued read-only probe: ${r.command}` : 'Deepen queued' })
+      setActionStatus({ msg: r?.command ? `Queued read-only probe: ${r.command}` : 'Deepen queued' })
     } catch (e: any) {
-      setDeepen({ msg: String(e?.message || e).slice(0, 160), err: true })
+      setActionStatus({ msg: String(e?.message || e).slice(0, 160), err: true })
+    }
+  }
+  // Pull the first CVE from the finding, if any. vulns.cve is a text[]; web
+  // findings may carry CVE ids via tags/refs (not materialized here, so we
+  // only enable Build PoC on CVE-tagged vuln findings for now).
+  const findingCve: string | undefined = Array.isArray(f.cve) ? f.cve[0]
+    : (typeof f.cve === 'string' ? (f.cve as string) : undefined)
+  // Build PoC: for a CVE-tagged finding, kick the full iterate loop (research
+  // → synthesize → run → refine). target_url pre-fills from the finding URL
+  // so synth aims at the right endpoint instead of guessing.
+  const canBuildPoc = Boolean(findingCve && (f.ip || f.url))
+  const handleBuildPoc = async () => {
+    if (!findingCve) return
+    setActionStatus({ loading: 'poc' })
+    try {
+      const payload: Record<string, unknown> = {
+        cve: findingCve,
+        recon_source: 'full',
+        max_iters: 5,
+        release: true,  // standing grant so the operator doesn't need a second click
+      }
+      if (f.url) payload.target_url = f.url
+      if (f.ip) payload.ip = f.ip
+      if (f.port) payload.port = f.port
+      const r = await buildPoc.mutateAsync(payload as any)
+      const verdict = r.verified ? 'VERIFIED' : 'FAILED — needs tweaking'
+      setActionStatus({
+        msg: `PoC build ${verdict} (iters=${r.iterations ?? '?'}, method=${r.verification_method ?? '?'}, store id=${r.exploit_store_id?.slice(0, 8) ?? '?'})`,
+        err: !r.verified,
+      })
+    } catch (e: any) {
+      setActionStatus({ msg: String(e?.message || e).slice(0, 200), err: true })
     }
   }
 
@@ -1222,26 +1259,60 @@ function FindingDetailPanel({
           </div>
         )}
 
-        {/* ── Deepen this finding (AI read-only probe) ── */}
-        {canGeneratePoc && (
+        {/* ── Take action on this finding — unified Deepen + Build PoC ──
+            Both engines overlap (same scope gate, same artifact store, same
+            auto-evidence surface above). Instead of two separate panels, the
+            operator sees ONE action bar and picks the depth they want:
+              - Deepen: ONE scoped probe queued to the pending-exploit lane
+              - Build PoC: full iterate loop (research/synth/refine ×5) that
+                lands in exploit_store directly, bypasses pending queue. */}
+        {(canGeneratePoc || canBuildPoc) && (
           <div className="border border-border rounded-md p-2.5 space-y-2">
             <h5 className="text-xs font-medium text-muted-foreground flex items-center gap-1">
-              <Zap className="h-3 w-3" /> Deepen
+              <Zap className="h-3 w-3" /> Take action on this finding
             </h5>
-            <p className="text-[10px] text-muted-foreground">
-              Synthesize ONE read-only probe that turns this finding into evidence and queue it
-              (scope-gated, pending approval). Useful for informational findings.
-            </p>
-            <button
-              onClick={handleDeepen}
-              disabled={deepen.loading}
-              className="px-3 py-1.5 text-xs rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 flex items-center gap-1"
-            >
-              {deepen.loading ? <Loader2 className="h-3 w-3 animate-spin" /> : <Zap className="h-3 w-3" />}
-              {deepen.loading ? 'Deepening…' : 'Deepen this finding'}
-            </button>
-            {deepen.msg && (
-              <p className={`text-[10px] ${deepen.err ? 'text-red-400' : 'text-green-400'} break-all`}>{deepen.msg}</p>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-[10px]">
+              {canGeneratePoc && (
+                <div className="border border-border rounded p-2 space-y-1.5">
+                  <div className="font-medium text-foreground inline-flex items-center gap-1">
+                    <Zap className="h-3 w-3" /> Deepen (quick probe)
+                  </div>
+                  <p className="text-muted-foreground">
+                    ONE scoped probe queued for approval. Fast — good for informational
+                    findings and GET-only confirmations.
+                  </p>
+                  <button
+                    onClick={handleDeepen}
+                    disabled={!!actionStatus.loading}
+                    className="w-full h-7 rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 inline-flex items-center justify-center gap-1 text-[11px]">
+                    {actionStatus.loading === 'deepen' ? <Loader2 className="h-3 w-3 animate-spin" /> : <Zap className="h-3 w-3" />}
+                    {actionStatus.loading === 'deepen' ? 'Deepening…' : 'Deepen'}
+                  </button>
+                </div>
+              )}
+              {canBuildPoc && (
+                <div className="border border-border rounded p-2 space-y-1.5">
+                  <div className="font-medium text-foreground inline-flex items-center gap-1">
+                    <Sparkles className="h-3 w-3" /> Build full PoC (iterate)
+                  </div>
+                  <p className="text-muted-foreground">
+                    Research → synthesize → run → refine ×5. Lands a verified or
+                    failed PoC in Exploit Store (5–10 min). CVE: <span className="font-mono text-amber-400">{findingCve}</span>
+                  </p>
+                  <button
+                    onClick={handleBuildPoc}
+                    disabled={!!actionStatus.loading}
+                    className="w-full h-7 rounded bg-purple-600 text-white hover:bg-purple-700 disabled:opacity-50 inline-flex items-center justify-center gap-1 text-[11px]">
+                    {actionStatus.loading === 'poc' ? <Loader2 className="h-3 w-3 animate-spin" /> : <Sparkles className="h-3 w-3" />}
+                    {actionStatus.loading === 'poc' ? 'Building…' : 'Build PoC'}
+                  </button>
+                </div>
+              )}
+            </div>
+            {actionStatus.msg && (
+              <p className={`text-[10px] ${actionStatus.err ? 'text-red-400' : 'text-green-400'} break-all pt-1 border-t border-border`}>
+                {actionStatus.msg}
+              </p>
             )}
           </div>
         )}
