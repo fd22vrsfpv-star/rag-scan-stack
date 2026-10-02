@@ -17811,27 +17811,64 @@ class ExploitPushBody(BaseModel):
 @app.get("/exploit-store", tags=["Exploit Store"])
 def list_exploit_store(cve: Optional[str] = None, kind: Optional[str] = None,
                        verified: Optional[bool] = None, limit: int = 200,
+                       engagement_id: Optional[str] = None,
+                       all_engagements: bool = False,
+                       scope_only: bool = False,
                        authorized: bool = Depends(auth)):
-    """List saved exploits (Exploit Store). Filter by cve/kind/verified."""
+    """List saved exploits (Exploit Store). Filter by cve/kind/verified.
+
+    ENGAGEMENT FILTERING (enforced read-time, matches the project's engagement-
+    isolation rule in CLAUDE.md):
+      - Resolves the current engagement from X-Engagement-Id (what every page
+        in the dashboard already sends via apiFetch).
+      - Returns ONLY exploits where engagement_id matches, PLUS rows where
+        engagement_id IS NULL (legacy/global rows that pre-date the attribution
+        rule — shown in every engagement so they remain reachable).
+      - `?engagement_id=` overrides the header.
+      - `?all_engagements=true` disables engagement filtering (operator-explicit
+        global view). Primarily for cross-engagement audits.
+
+    SCOPE FILTERING:
+      - `?scope_only=true` additionally restricts to exploits whose target_host
+        matches a scope_targets row for the current engagement — i.e. only
+        exploits targeting hosts the operator is authorized to touch right
+        now. Keeps the Exploit Workbench honest about what's actionable."""
     _ensure_exploit_store()
     where, args = [], []
     if cve:
-        where.append("cve = %s"); args.append(cve.strip().upper())
+        where.append("es.cve = %s"); args.append(cve.strip().upper())
     if kind:
-        where.append("kind = %s"); args.append(kind)
+        where.append("es.kind = %s"); args.append(kind)
     if verified is not None:
-        where.append("verified = %s"); args.append(verified)
-    sql = ("SELECT id, name, cve, kind, target_host, target_port, product, version, "
-           "verified, source, security_test_id, llm_model, built_at, engagement_id, "
-           "created_by, created_at, updated_at, "
-           "(python_code IS NOT NULL) AS has_python, (http_request IS NOT NULL) AS has_http "
-           "FROM exploit_store")
+        where.append("es.verified = %s"); args.append(verified)
+    eid = _resolve_engagement_id(engagement_id)
+    if eid and not all_engagements:
+        where.append("(es.engagement_id = %s OR es.engagement_id IS NULL)")
+        args.append(eid)
+    if scope_only and eid:
+        # Join to scope_targets for the current engagement — keep only rows
+        # whose target_host matches an in-scope entry. Uses the host(ip) +
+        # text equality the dispatch gate itself uses.
+        where.append(
+            "EXISTS (SELECT 1 FROM scope_targets st "
+            "WHERE (st.engagement_id = %s OR st.engagement_id IS NULL) "
+            "AND es.target_host = st.target)"
+        )
+        args.append(eid)
+    sql = ("SELECT es.id, es.name, es.cve, es.kind, es.target_host, es.target_port, "
+           "es.product, es.version, es.verified, es.source, es.security_test_id, "
+           "es.llm_model, es.built_at, es.engagement_id, es.created_by, es.created_at, "
+           "es.updated_at, "
+           "(es.python_code IS NOT NULL) AS has_python, (es.http_request IS NOT NULL) AS has_http "
+           "FROM exploit_store es")
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY updated_at DESC LIMIT %s"; args.append(max(1, min(1000, limit)))
+    sql += " ORDER BY es.updated_at DESC LIMIT %s"; args.append(max(1, min(1000, limit)))
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(sql, args)
-        return {"exploits": [dict(r) for r in cur.fetchall()]}
+        return {"exploits": [dict(r) for r in cur.fetchall()],
+                "engagement_id": eid, "all_engagements": bool(all_engagements),
+                "scope_only": bool(scope_only)}
 
 
 @app.get("/exploit-store/{exploit_id}", tags=["Exploit Store"])
