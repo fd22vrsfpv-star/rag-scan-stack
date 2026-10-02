@@ -3328,18 +3328,23 @@ function ExploitLookupModal({ product, version, cveFlags, onClose }: { product: 
           <div className="flex items-center gap-1">
             <button
               onClick={() => {
-                // Open the Workbench in a native resizable browser window.
-                // Same page + URL params that auto-open the modal — the
-                // operator keeps the current tab AND gets a resizable
-                // standalone window for the deep dive.
-                const url = `/assets?exploit_lookup=${encodeURIComponent(product)}`
-                  + (version ? `&elv=${encodeURIComponent(version)}` : '')
-                window.open(url, 'ExploitWorkbench',
-                  'noopener,noreferrer,resizable=yes,scrollbars=yes,width=1600,height=1000,menubar=no,toolbar=no,location=no,status=no')
+                // Open the FULL /exploits workbench (all its tabs — Pending,
+                // Results, Sessions, Credentials, Store, Build PoC, AI
+                // Research) in a SEPARATE OS browser window. ?tab=research
+                // lands on the Research tab with this product preloaded so
+                // the operator sees research + operational state in one
+                // combined window. `popup=yes` is the modern-browser hint
+                // that forces a true popup window (not a tab); `_blank`
+                // target makes each click an independent window.
+                const url = `/exploits?tab=research`
+                  + `&product=${encodeURIComponent(product)}`
+                  + (version ? `&version=${encodeURIComponent(version)}` : '')
+                window.open(url, '_blank',
+                  'popup=yes,resizable=yes,scrollbars=yes,width=1600,height=1000,left=100,top=100,menubar=no,toolbar=no,location=no,status=no,noopener,noreferrer')
               }}
               className="text-muted-foreground hover:text-foreground text-[11px] px-2 py-0.5 rounded border border-border inline-flex items-center gap-1"
-              title="Open this Workbench in a resizable native browser window (keeps the current page intact)">
-              <ExternalLink className="h-3 w-3" /> Pop out
+              title="Open the Exploit Workbench in a separate resizable browser window — all tabs available (Pending, Results, Sessions, Credentials, Store, Build PoC, Research)">
+              <ExternalLink className="h-3 w-3" /> Pop out workbench
             </button>
             <button onClick={onClose} className="text-muted-foreground hover:text-foreground"><X className="h-4 w-4" /></button>
           </div>
