@@ -14939,6 +14939,38 @@ def _poc_shell_syntax_check(command):
     return (True, "")
 
 
+def _parse_curl_time_total_ms(output):
+    """Extract `time_total` from curl -w output and return milliseconds.
+
+    When the PoC command includes `curl ... -w '%{time_total}\\n'` (or any
+    format carrying `time_total`), the target HTTP response time appears in
+    the command output as a float on its own line (seconds). This lets the
+    operator see per-exploit TARGET latency in bulk runs without any
+    listener-side instrumentation.
+
+    Returns None when no parseable timing line is found (most commands)."""
+    if not output or not isinstance(output, str):
+        return None
+    import re as _re
+    # Match a bare float on its own line (curl's default -w time_total output),
+    # OR a `__CURL_TIME:<float>s` marker we may inject in future.
+    m = _re.search(r"(?:^|\n)__CURL_TIME:\s*([0-9]+\.[0-9]+)s", output)
+    if m:
+        try: return int(float(m.group(1)) * 1000)
+        except Exception: return None  # noqa: BLE001
+    # Fall back: a bare float on its own line that's between 0.0 and 300s
+    # (upper bound guards against grep-false-matches on an unrelated number).
+    for line in output.splitlines()[-10:]:  # curl -w typically appends at end
+        s = line.strip()
+        try:
+            v = float(s)
+            if 0.0 <= v <= 300.0:
+                return int(v * 1000)
+        except ValueError:
+            continue
+    return None
+
+
 def _poc_assertion_passes(assertion, output, exit_code=None):
     """Boolean verdict — backwards-compatible with every existing caller. For
     the verdict REASON (method / confidence / tier), use _poc_assertion_verdict."""
@@ -18063,16 +18095,31 @@ def run_exploit(exploit_id: str, authorized: bool = Depends(auth)):
     listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
     vt = int(os.environ.get("VECTOR_RUN_TIMEOUT", "600"))
     t0 = _t.time()
+    # response_time_ms captures the listener HTTP round-trip SEPARATELY from
+    # total wall-clock (seconds) — in bulk runs the operator wants to spot
+    # slow targets vs slow setup. httpx `elapsed` is None until the request
+    # completes, so we read it off `lr` after the call. target_response_ms
+    # is best-effort: when the command is a curl with `-w %{time_total}`,
+    # we parse that line out — otherwise falls back to the listener RTT.
+    response_time_ms = None
+    target_response_ms = None
     try:
         lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
                        json={"command": row["command"], "target": str(row.get("target_host") or ""),
                               "port": row.get("target_port") or 80, "timeout": vt},
                        headers={"x-api-key": API_KEY}, verify=False, timeout=vt + 60)
+        try: response_time_ms = int(lr.elapsed.total_seconds() * 1000)
+        except Exception: pass  # noqa: BLE001
         d = lr.json() if lr.status_code < 400 else {}
         output = (d.get("output", "") if isinstance(d, dict) else "") or lr.text
         exit_code = d.get("exit_code") if isinstance(d, dict) else None
     except Exception as e:  # noqa: BLE001
         output, exit_code = f"listener error: {e}", None
+    # Parse curl -w timing out of the output if the command emitted it
+    try:
+        target_response_ms = _parse_curl_time_total_ms(output)
+    except Exception:  # noqa: BLE001
+        pass
     # Check the stored assertion against the fresh output to answer "does it STILL work?"
     still_works = False
     try:
@@ -18085,6 +18132,8 @@ def run_exploit(exploit_id: str, authorized: bool = Depends(auth)):
         "command": row["command"], "output": output[:20000],
         "exit_code": exit_code, "still_works": still_works,
         "seconds": round(_t.time() - t0, 2),
+        "response_time_ms": response_time_ms,
+        "target_response_ms": target_response_ms,
         "asserted_verified": bool(row.get("verified")),
     }
 
@@ -18363,16 +18412,28 @@ def run_exploit_version(exploit_id: str, version: int, authorized: bool = Depend
     listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
     vt = int(os.environ.get("VECTOR_RUN_TIMEOUT", "600"))
     t0 = _t.time()
+    # Per-version runs are the bulk-scan surface (Run-all / Run-selected in
+    # the Versions chart) — operator wants per-row response-time so a slow
+    # model-generated command stands out. response_time_ms = listener RTT;
+    # target_response_ms = parsed from curl -w %{time_total} when present.
+    response_time_ms = None
+    target_response_ms = None
     try:
         lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
                        json={"command": v["command"], "target": str(parent.get("target_host") or ""),
                               "port": parent.get("target_port") or 80, "timeout": vt},
                        headers={"x-api-key": API_KEY}, verify=False, timeout=vt + 60)
+        try: response_time_ms = int(lr.elapsed.total_seconds() * 1000)
+        except Exception: pass  # noqa: BLE001
         d = lr.json() if lr.status_code < 400 else {}
         output = (d.get("output", "") if isinstance(d, dict) else "") or lr.text
         exit_code = d.get("exit_code") if isinstance(d, dict) else None
     except Exception as e:  # noqa: BLE001
         output, exit_code = f"listener error: {e}", None
+    try:
+        target_response_ms = _parse_curl_time_total_ms(output)
+    except Exception:  # noqa: BLE001
+        pass
     still_works = False
     try:
         still_works = _poc_assertion_passes(v.get("assertion") or {}, output, exit_code)
@@ -18386,6 +18447,8 @@ def run_exploit_version(exploit_id: str, version: int, authorized: bool = Depend
         "command": v["command"], "output": output[:20000],
         "exit_code": exit_code, "still_works": still_works,
         "seconds": round(_t.time() - t0, 2),
+        "response_time_ms": response_time_ms,
+        "target_response_ms": target_response_ms,
     }
 
 
