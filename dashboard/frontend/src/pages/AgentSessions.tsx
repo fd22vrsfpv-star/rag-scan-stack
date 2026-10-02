@@ -1146,7 +1146,9 @@ function statusPill(status?: string | null) {
   )
 }
 
-function SecurityTestRunHistory({ testId }: { testId: string }) {
+function SecurityTestRunHistory({ testId, forceExpanded }: {
+  testId: string; forceExpanded?: boolean | null
+}) {
   const { data } = useSecurityTestRuns(testId)
   const runs = data?.runs ?? []
   if (runs.length === 0)
@@ -1154,16 +1156,22 @@ function SecurityTestRunHistory({ testId }: { testId: string }) {
   return (
     <div className="px-3 py-2 space-y-1">
       {runs.map(r => (
-        <SecurityTestRunRow key={r.id} run={r} />
+        <SecurityTestRunRow key={r.id} run={r} forceExpanded={forceExpanded} />
       ))}
     </div>
   )
 }
 
-function SecurityTestRunRow({ run: r }: { run: SecurityTestRun }) {
+function SecurityTestRunRow({ run: r, forceExpanded }: {
+  run: SecurityTestRun; forceExpanded?: boolean | null
+}) {
   // output + metadata are hidden by default — a tool scan can be 10 KB and
-  // every row stacking its output would hide the list. One-click per row.
-  const [open, setOpen] = useState(false)
+  // every row stacking its output would hide the list. One-click per row,
+  // or the parent panel's "Expand all" cascades through forceExpanded.
+  const [open, setOpen] = useState<boolean>(!!forceExpanded)
+  useEffect(() => {
+    if (forceExpanded !== null && forceExpanded !== undefined) setOpen(forceExpanded)
+  }, [forceExpanded])
   const hasBody = Boolean(r.output || r.command_run || (r.metadata && Object.keys(r.metadata).length))
   return (
     <div className="text-xs border-l-2 border-border pl-2">
@@ -1226,8 +1234,15 @@ function SecurityTestRunRow({ run: r }: { run: SecurityTestRun }) {
   )
 }
 
-function SecurityTestRow({ test, sessionId }: { test: SecurityTest; sessionId?: string }) {
-  const [expanded, setExpanded] = useState(false)
+function SecurityTestRow({ test, sessionId, forceExpanded }: {
+  test: SecurityTest; sessionId?: string; forceExpanded?: boolean | null
+}) {
+  const [expanded, setExpanded] = useState<boolean>(!!forceExpanded)
+  // Match the ScanCard behaviour: null means "row decides"; a true/false override
+  // from the parent panel wins and overrides local state until the next toggle.
+  useEffect(() => {
+    if (forceExpanded !== null && forceExpanded !== undefined) setExpanded(forceExpanded)
+  }, [forceExpanded])
   const [notice, setNotice] = useState<string | null>(null)
   const runTest = useRunSecurityTest(sessionId)
   const toggleTest = useToggleSecurityTest(sessionId)
@@ -1322,7 +1337,7 @@ function SecurityTestRow({ test, sessionId }: { test: SecurityTest; sessionId?: 
               $ {test.command}
             </p>
           )}
-          <SecurityTestRunHistory testId={test.id} />
+          <SecurityTestRunHistory testId={test.id} forceExpanded={forceExpanded} />
         </div>
       )}
     </div>
@@ -1559,6 +1574,13 @@ function SourceCompareForm({ sessionId }: { sessionId?: string }) {
 function SecurityTestsPanel({ sessionId, tests }: { sessionId?: string; tests: SecurityTest[] }) {
   const safe = tests.filter(t => t.tier === 'safe').length
   const impactful = tests.length - safe
+  const failedOrEmpty = tests.filter(
+    t => t.last_run_status === 'fail' || t.last_run_status === 'error' || t.run_count === 0,
+  ).length
+  // null = each row decides; true = force open; false = force closed; 'interesting'
+  // opens only tests that failed, errored, or have no runs yet. Mirrors the Tool
+  // Outputs tab's ScanCard bar so the two surfaces look + behave the same way.
+  const [expand, setExpand] = useState<null | boolean | 'interesting'>(null)
   return (
     <div className="space-y-2">
       <CustomPayloadForm sessionId={sessionId} />
@@ -1570,14 +1592,39 @@ function SecurityTestsPanel({ sessionId, tests }: { sessionId?: string; tests: S
         </p>
       ) : (
         <>
-          <div className="flex items-center gap-4 text-xs">
+          <div className="flex items-center gap-4 text-xs flex-wrap">
             <span className="text-muted-foreground">Total: <span className="text-foreground font-medium">{tests.length}</span></span>
             <span className="text-blue-400">Safe: {safe}</span>
             <span className="text-red-400">Impactful: {impactful}</span>
+            {failedOrEmpty > 0 && (
+              <span className="text-amber-400">Needs review: {failedOrEmpty}</span>
+            )}
+            <div className="flex-1" />
+            <button onClick={() => setExpand(true)}
+              className="h-6 px-2 rounded border border-border hover:bg-accent text-[11px]">
+              Expand all
+            </button>
+            <button onClick={() => setExpand(false)}
+              className="h-6 px-2 rounded border border-border hover:bg-accent text-[11px]">
+              Collapse all
+            </button>
+            <button onClick={() => setExpand('interesting')}
+              className="h-6 px-2 rounded border border-primary/40 text-primary hover:bg-primary/10 text-[11px]"
+              title="Open tests that failed, errored, or have no runs yet (the ones worth reviewing)">
+              Open interesting
+            </button>
           </div>
-          {tests.map(t => (
-            <SecurityTestRow key={t.id} test={t} sessionId={sessionId} />
-          ))}
+          {tests.map(t => {
+            let forced: boolean | null = null
+            if (expand === true) forced = true
+            else if (expand === false) forced = false
+            else if (expand === 'interesting') {
+              forced = t.last_run_status === 'fail'
+                || t.last_run_status === 'error'
+                || t.run_count === 0
+            }
+            return <SecurityTestRow key={t.id} test={t} sessionId={sessionId} forceExpanded={forced} />
+          })}
         </>
       )}
     </div>
