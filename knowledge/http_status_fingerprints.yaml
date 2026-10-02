@@ -1,0 +1,103 @@
+# HTTP status-code fingerprints for the hybrid PoC verifier.
+#
+# When every iteration of a PoC build returns the SAME kind of status response
+# (404 / 401 / 403), the model is on the wrong track and refine needs
+# tier-specific guidance, not a generic "regex didn't match" nudge. Each tier
+# below is checked AFTER the "has_2xx" short-circuit (so a successful 200 with
+# a canary isn't demoted because it happens to mention "404 Not Found" in
+# link text), BEFORE the regex-authoritative tier.
+#
+# Operators extend by adding new frameworks' error shapes (e.g. Django DEBUG
+# 404, Rails exception page, custom nginx error.html). No code change needed;
+# the loader embeds this file into rag_documents, and the verifier reads it
+# at process start.
+#
+# Shape per tier:
+#   method:        the verdict method name returned by _poc_assertion_verdict
+#   patterns:      case-sensitive substrings. ANY match triggers the tier.
+#                  Keep patterns specific — "status" alone is far too broad.
+#   lower_patterns: case-insensitive substrings. same semantics.
+#   remediation:   one-liner the refine prompt prepends when this tier trips
+#                  (combined with path_discovery for the escalation hook).
+
+tiers:
+  - method: all_404
+    patterns:
+      - "404 Not Found"
+      - "<title>404 Not Found</title>"
+      - "\"status\":404"
+      - "'status': 404"
+      - "\"status\": 404"
+      - "rest_no_route"             # WordPress REST
+    lower_patterns:
+      - "no route was found"        # Spring / generic REST
+    remediation: >-
+      The path(s) you chose do NOT exist on this host. Either the CVE's
+      advertised endpoint is mounted under a different route, or this
+      instance exposes a different app. Pick a REAL path from the live-path
+      list below. If none of the live paths are a plausible home for the
+      vuln, the vuln probably isn't reachable here — adapt the payload or
+      abandon this build.
+
+  - method: all_401
+    patterns:
+      - "401 Unauthorized"
+      - "<title>401"
+      - "\"status\":401"
+      - "'status': 401"
+      - "\"status\": 401"
+      - "WWW-Authenticate:"
+    lower_patterns:
+      - "authentication required"
+      - "unauthorized access"
+    remediation: >-
+      Every path tried returned 401 — the endpoint exists but requires
+      authentication. If credentials are supplied in the build context,
+      use them to log in and reuse the session cookie / bearer token in the
+      exploit request. If no credentials are supplied, the build cannot
+      proceed; mark the finding as "needs credentials" rather than guessing
+      a new path. For CSRF-token sites: fetch the login form, scrape the
+      token, POST credentials, THEN send the exploit with the resulting
+      session cookie.
+
+  - method: all_403
+    patterns:
+      - "403 Forbidden"
+      - "<title>403 Forbidden</title>"
+      - "\"status\":403"
+      - "'status': 403"
+      - "\"status\": 403"
+    lower_patterns:
+      - "access denied"
+      - "access is denied"
+      - "forbidden"
+    remediation: >-
+      Every path tried returned 403 — the endpoint exists but access is
+      blocked. Two paths forward: (1) WAF-evasion variants (case swap,
+      inline comments, encoded quotes, $IFS / backticks for RCE); (2) if
+      an authenticated session is available, retry WITH that session (403
+      often means "logged out — login required"). Do NOT keep probing the
+      same path with the same shape — the server will keep refusing.
+
+  - method: all_500
+    patterns:
+      - "500 Internal Server Error"
+      - "<title>500 Internal Server Error</title>"
+      - "\"status\":500"
+      - "'status': 500"
+      - "\"status\": 500"
+    lower_patterns:
+      - "internal server error"
+      - "unexpected error"
+      - "whitelabel error page"       # Spring Boot default
+    remediation: >-
+      Every attempt returned 500 — this is usually GOOD news: the payload
+      reached the vulnerable sink and tripped an internal error, meaning
+      you've found the right endpoint but the exact payload needs
+      refinement. For SQLi, switch to error-based (UPDATEXML / EXTRACTVALUE
+      / EXTRACT(xmltype(...)) ) so the DB engine echoes your canary IN the
+      error message. For command injection, add proper quoting / shell
+      escaping. For template injection, change delimiter style. Do NOT
+      change the path; the sink is here. Capture the FULL error body
+      (don't suppress stderr) and look for your canary inside it.
+
