@@ -18918,6 +18918,138 @@ def research_for_exploit(exploit_id: str, seed: bool = False, authorized: bool =
     return {"ok": True, "seeded": seeded, **out}
 
 
+class TweakWithBurpBody(BaseModel):
+    """Operator-driven tweak loop: the tester has been poking the target in
+    Burp Repeater and wants Claude to pull Burp context + the current PoC and
+    suggest a corrected command. All fields optional — endpoint fills in from
+    the exploit_store row + the discovered_params / web_findings tables when
+    the operator doesn't paste anything explicit."""
+    tweaked_request: Optional[str] = None   # raw HTTP from Repeater (operator's current attempt)
+    failure_output: Optional[str] = None    # last run output / Burp response body
+    operator_note: Optional[str] = None     # what the tester tried / wants
+    include_sitemap: bool = True            # pull discovered_params + web_findings for this host
+    model: Optional[str] = None
+
+
+@app.post("/exploit-store/{exploit_id}/tweak-with-burp", tags=["Exploit Store"])
+def tweak_with_burp(exploit_id: str, body: TweakWithBurpBody, authorized: bool = Depends(auth)):
+    """LLM-assisted tweak loop. The tester has been manually tweaking the PoC
+    in Burp Repeater (or watching an active scan land issues). This endpoint
+    pulls:
+      - the current stored PoC (command, http_request, assertion, metadata),
+      - Burp context: discovered_params + web_findings for the target host,
+      - the tester's tweaked request + failure output + free-text note,
+    assembles a focused prompt, and asks the configured LLM to suggest a
+    corrected command + updated assertion + rationale. Read-only — operator
+    reviews, then clicks Apply (which snapshots the current state and writes
+    the suggested command, same as the research-seed path).
+
+    This is the natural companion to the Burp assist panel: send to Repeater,
+    tweak manually, ask Claude to fix. Nothing dispatches here."""
+    _ensure_exploit_store()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM exploit_store WHERE id = %s", (exploit_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "exploit not found")
+        host = row.get("target_host") or ""
+        # Pull Burp context for this host — discovered_params (what Burp +
+        # arjun + katana have found) + the last 10 web_findings. Both carry
+        # the actual URLs/params Burp observed, which is the signal Claude
+        # needs to suggest a different parameter name or endpoint path.
+        discovered: list = []
+        findings: list = []
+        if body.include_sitemap and host:
+            try:
+                cur.execute("""
+                    SELECT url, http_method, param_name, param_location, source
+                    FROM discovered_params dp
+                    WHERE url ILIKE %s OR host = %s
+                    ORDER BY first_seen DESC NULLS LAST
+                    LIMIT 50
+                """, (f"%{host}%", host))
+                discovered = [dict(r) for r in cur.fetchall()]
+            except Exception as e:  # noqa: BLE001
+                logging.debug("discovered_params lookup failed: %s", e)
+            try:
+                cur.execute("""
+                    SELECT url, name, severity, evidence, method
+                    FROM web_findings
+                    WHERE url ILIKE %s
+                    ORDER BY last_seen DESC NULLS LAST
+                    LIMIT 10
+                """, (f"%{host}%",))
+                findings = [dict(r) for r in cur.fetchall()]
+            except Exception as e:  # noqa: BLE001
+                logging.debug("web_findings lookup failed: %s", e)
+    # Compose the prompt. Keep it structured so the model's JSON reply is
+    # parseable (same shape convention as research_exploit).
+    import json as _json
+    ctx = {
+        "cve": row.get("cve"),
+        "product": row.get("product"), "version": row.get("version"),
+        "target": f"{host}:{row.get('target_port') or ''}".strip(":"),
+        "current_command": row.get("command") or "",
+        "current_http_request": (row.get("http_request") or "")[:4000],
+        "current_assertion": row.get("assertion") or {},
+        "tester_tweaked_request": (body.tweaked_request or "")[:4000],
+        "last_failure_output": (body.failure_output or "")[:4000],
+        "tester_note": body.operator_note or "",
+        "burp_discovered_params": discovered[:30],
+        "burp_web_findings": findings[:10],
+    }
+    prompt = (
+        "You are helping a pentester fix a stored PoC. The tester has been "
+        "manually tweaking the request in Burp Repeater and has shared the "
+        "current state + what Burp has observed on this host. Your job is to "
+        "suggest a CORRECTED shell command (curl/python/etc.) that would make "
+        "the PoC succeed, plus an updated assertion that proves success. Do "
+        "NOT execute anything — just suggest.\n\n"
+        f"Context (JSON):\n{_json.dumps(ctx, default=str, indent=2)}\n\n"
+        "Reply with STRICT JSON only, no prose:\n"
+        '{\n'
+        '  "suggested_command": "<the full new shell command>",\n'
+        '  "suggested_assertion": {<same shape as current_assertion>},\n'
+        '  "rationale": "<2-4 sentences on what changed and why>",\n'
+        '  "burp_context_used": ["<which discovered_params/findings informed the fix>", ...]\n'
+        '}\n'
+    )
+    res = _llm_for_model(prompt, model=body.model, caller="exploit_tweak_with_burp",
+                         num_predict=1200, temperature=0.2)
+    suggestion: dict = {}
+    try:
+        text = res.get("response") or ""
+        # Strip code fences if the model wrapped it
+        import re as _re
+        text = _re.sub(r"^```(?:json)?\s*|\s*```\s*$", "", text.strip(), flags=_re.MULTILINE)
+        suggestion = _json.loads(text) if text else {}
+    except Exception as e:  # noqa: BLE001
+        logging.debug("tweak LLM reply parse failed: %s", e)
+    try:
+        emit_webhook("exploit_tweak_with_burp", "exploit_store", {
+            "id": exploit_id, "cve": row.get("cve"), "target": ctx["target"],
+            "has_suggestion": bool(suggestion.get("suggested_command")),
+            "discovered_params_seen": len(discovered), "web_findings_seen": len(findings),
+            "model": res.get("model"),
+        })
+    except Exception:  # noqa: BLE001
+        pass
+    return {
+        "ok": True,
+        "exploit_id": exploit_id,
+        "suggestion": suggestion,
+        "burp_context": {
+            "discovered_params_count": len(discovered),
+            "web_findings_count": len(findings),
+            "sample_discovered": discovered[:10],
+        },
+        "model": res.get("model"),
+        "latency_ms": res.get("latency_ms"),
+        "total_tokens": res.get("total_tokens"),
+        "raw": res.get("response") if not suggestion else None,  # expose raw only on parse fail
+    }
+
+
 def _bakeoff_one(cve, ip, port, store_id, model, eid, guidance=""):
     """Generate a canary PoC with ONE model, run it against the target, and save it as a
     labeled version of the store entry. Returns the per-model result. The verdict is the
