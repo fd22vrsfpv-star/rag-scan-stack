@@ -3337,7 +3337,9 @@ export function ExploitLookupModal({ product, version, cveFlags, onClose }: { pr
                 // operator sees research + operational state in one
                 // combined tab. New-tab semantics: the browser can drag
                 // the tab out to its own window if the operator wants.
-                const url = `/exploits?tab=research`
+                // Chromeless /exploits-popout route (no sidebar / topbar
+                // overlaid) — just the Workbench content in a new tab.
+                const url = `/exploits-popout?tab=research`
                   + `&product=${encodeURIComponent(product)}`
                   + (version ? `&version=${encodeURIComponent(version)}` : '')
                 window.open(url, '_blank', 'noopener,noreferrer')

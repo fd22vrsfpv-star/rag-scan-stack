@@ -166,6 +166,12 @@ export default function App() {
           <Route path="users-popout" element={<Suspense fallback={<Loading />}><UsersPopout /></Suspense>} />
           <Route path="users-popout/:id" element={<Suspense fallback={<Loading />}><UsersDetailPopout /></Suspense>} />
           <Route path="recon-popout" element={<Suspense fallback={<Loading />}><ReconPopout /></Suspense>} />
+          {/* Chromeless Exploit Workbench — the full ExploitManager page (all
+              seven tabs: Pending, Results, Sessions, Credentials, Store,
+              Build PoC, AI Research) rendered outside AppShell so the new-
+              tab popup from Assets→Software→View or /exploits header shows
+              ONLY the workbench, no sidebar / topbar / dashboard chrome. */}
+          <Route path="exploits-popout" element={<Suspense fallback={<Loading />}><ExploitManager /></Suspense>} />
           <Route element={<AppShell />}>
             <Route index element={<Suspense fallback={<Loading />}><Dashboard /></Suspense>} />
             <Route path="scans/launch" element={<Suspense fallback={<Loading />}><ScanLauncher /></Suspense>} />
