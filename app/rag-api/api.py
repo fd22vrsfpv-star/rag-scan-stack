@@ -8043,7 +8043,7 @@ def security_test_runs(test_id: str, limit: int = Query(default=50, le=500),
         cur.execute(
             """SELECT id, ran_at, completed_at, duration_ms, status, lane, command_run,
                       exit_code, result_summary, assertion_eval, tool_execution_id,
-                      exploit_result_id, triggered_by
+                      exploit_result_id, triggered_by, output, metadata
                  FROM public.security_test_runs
                 WHERE test_id = %s::uuid ORDER BY ran_at DESC LIMIT %s""",
             (test_id, limit),

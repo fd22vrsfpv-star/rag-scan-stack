@@ -29,7 +29,7 @@ import {
   useSynthesizeTest,
   useCompareSources,
 } from '@/api/securityTests'
-import type { SecurityTest, WstgGuide } from '@/api/securityTests'
+import type { SecurityTest, SecurityTestRun, WstgGuide } from '@/api/securityTests'
 import { useAddSkill } from '@/api/skills'
 import { apiFetch } from '@/api/client'
 import { useScopeNames, useScope } from '@/api/scope'
@@ -1154,22 +1154,74 @@ function SecurityTestRunHistory({ testId }: { testId: string }) {
   return (
     <div className="px-3 py-2 space-y-1">
       {runs.map(r => (
-        <div key={r.id} className="flex items-start gap-2 text-xs border-l-2 border-border pl-2">
-          {statusPill(r.status)}
-          <span className="px-1 rounded bg-muted text-muted-foreground uppercase text-[10px]">{r.lane}</span>
-          <div className="flex-1 min-w-0">
-            <p className="font-mono break-words" style={{ overflowWrap: 'anywhere' }}>
-              {r.result_summary || r.command_run || '(no summary)'}
-            </p>
-            <span className="text-muted-foreground">
-              {r.ran_at ? new Date(r.ran_at).toLocaleString() : ''}
-              {r.exit_code != null && ` · exit ${r.exit_code}`}
-              {r.tool_execution_id && ` · exec ${r.tool_execution_id.slice(0, 8)}`}
-              {r.exploit_result_id && ` · exploit ${r.exploit_result_id.slice(0, 8)}`}
-            </span>
-          </div>
-        </div>
+        <SecurityTestRunRow key={r.id} run={r} />
       ))}
+    </div>
+  )
+}
+
+function SecurityTestRunRow({ run: r }: { run: SecurityTestRun }) {
+  // output + metadata are hidden by default — a tool scan can be 10 KB and
+  // every row stacking its output would hide the list. One-click per row.
+  const [open, setOpen] = useState(false)
+  const hasBody = Boolean(r.output || r.command_run || (r.metadata && Object.keys(r.metadata).length))
+  return (
+    <div className="text-xs border-l-2 border-border pl-2">
+      <div className="flex items-start gap-2">
+        {statusPill(r.status)}
+        <span className="px-1 rounded bg-muted text-muted-foreground uppercase text-[10px]">{r.lane}</span>
+        <div className="flex-1 min-w-0">
+          <p className="font-mono break-words" style={{ overflowWrap: 'anywhere' }}>
+            {r.result_summary || r.command_run || '(no summary)'}
+          </p>
+          <span className="text-muted-foreground">
+            {r.ran_at ? new Date(r.ran_at).toLocaleString() : ''}
+            {r.exit_code != null && ` · exit ${r.exit_code}`}
+            {r.duration_ms != null && ` · ${r.duration_ms}ms`}
+            {r.triggered_by && ` · by ${r.triggered_by}`}
+            {r.tool_execution_id && ` · exec ${r.tool_execution_id.slice(0, 8)}`}
+            {r.exploit_result_id && ` · exploit ${r.exploit_result_id.slice(0, 8)}`}
+          </span>
+        </div>
+        {hasBody && (
+          <button
+            onClick={() => setOpen(o => !o)}
+            className="text-[10px] px-1.5 py-0.5 rounded border border-border hover:bg-muted shrink-0"
+            title={open ? 'Hide output' : 'Show command + output'}>
+            {open ? 'hide' : 'output'}
+          </button>
+        )}
+      </div>
+      {open && (
+        <div className="mt-1 space-y-1">
+          {r.command_run && (
+            <div>
+              <div className="text-[10px] text-muted-foreground uppercase tracking-wider">Command</div>
+              <pre className="text-[10px] bg-muted/40 rounded p-2 overflow-x-auto max-h-24 whitespace-pre-wrap break-all">{r.command_run}</pre>
+            </div>
+          )}
+          {r.output ? (
+            <div>
+              <div className="text-[10px] text-muted-foreground uppercase tracking-wider">Output ({r.output.length.toLocaleString()} chars)</div>
+              <pre className="text-[10px] bg-background/90 border border-border rounded p-2 overflow-x-auto max-h-96 whitespace-pre-wrap">{r.output}</pre>
+            </div>
+          ) : (
+            <div className="text-[10px] text-muted-foreground italic">No output recorded for this run.</div>
+          )}
+          {r.assertion_eval && Object.keys(r.assertion_eval).length > 0 && (
+            <div>
+              <div className="text-[10px] text-muted-foreground uppercase tracking-wider">Assertion eval</div>
+              <pre className="text-[10px] bg-muted/40 rounded p-2 overflow-x-auto max-h-24 whitespace-pre-wrap">{JSON.stringify(r.assertion_eval, null, 2)}</pre>
+            </div>
+          )}
+          {r.metadata && Object.keys(r.metadata).length > 0 && (
+            <div>
+              <div className="text-[10px] text-muted-foreground uppercase tracking-wider">Metadata</div>
+              <pre className="text-[10px] bg-muted/40 rounded p-2 overflow-x-auto max-h-24 whitespace-pre-wrap">{JSON.stringify(r.metadata, null, 2)}</pre>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
