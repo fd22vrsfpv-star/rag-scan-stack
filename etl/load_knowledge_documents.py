@@ -648,7 +648,43 @@ def _render_vuln_class_methodology(data: Dict[str, Any]) -> List[Doc]:
     return out
 
 
+def _render_common_web_paths(data: Dict[str, Any]) -> List[Doc]:
+    """Embed the common-web-paths seed list as ONE doc so retrievers can find
+    it when the operator asks "what paths should we probe?". The runtime
+    reader (api.load_common_web_paths) still reads the YAML directly for
+    speed; the embed is for RAG recall."""
+    paths = [p for p in (data.get("common_web_paths") or []) if isinstance(p, str)]
+    if not paths:
+        return []
+    body = ("Common web-path seeds probed by the 404-cluster escalation hook "
+            "when a PoC build hits consecutive 404s. These are the paths most "
+            "web apps expose; probing them finds the real attack surface when "
+            "the LLM is guessing paths that don't exist.\n\n" + "\n".join(paths))
+    return [("Common web paths — PoC 404-escalation seeds", body)]
+
+
+def _render_http_status_fingerprints(data: Dict[str, Any]) -> List[Doc]:
+    """Embed each HTTP status tier (404/401/403/500) as a doc so retrievers
+    can recall the remediation guidance by status code. api._match_http_status_tier
+    reads the YAML directly at verdict time."""
+    docs: List[Doc] = []
+    for t in (data.get("tiers") or []):
+        method = t.get("method")
+        rem = (t.get("remediation") or "").strip()
+        patterns = t.get("patterns") or []
+        if not method:
+            continue
+        body = (f"PoC verifier tier: {method}\n\n"
+                f"Fingerprint patterns (any match triggers the tier):\n  "
+                + "\n  ".join(patterns) + "\n\n"
+                f"Remediation guidance for refine:\n{rem}")
+        docs.append((f"HTTP status cluster — {method}", body))
+    return docs
+
+
 RENDERERS = {
+    "common_web_paths": _render_common_web_paths,
+    "http_status_fingerprints": _render_http_status_fingerprints,
     "vuln_class_methodology": _render_vuln_class_methodology,
     "msf_learned_options": _render_msf_learned_options,
     "ajax_spider_signals": _render_ajax_spider_signals,

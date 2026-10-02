@@ -14767,6 +14767,143 @@ def _poc_detect_llm_refusal(command):
     return (False, "")
 
 
+# ─── YAML-backed knowledge for the status-cluster escalation ────────────────
+# Two files: common_web_paths.yaml (seed probe list) and
+# http_status_fingerprints.yaml (per-tier patterns + remediation text). Loaded
+# once + cached. Operator extends either YAML without a code change.
+_HTTP_STATUS_TIERS_CACHE = None
+_COMMON_PATHS_CACHE = None
+# When one of these tiers trips, ALSO fire path discovery — these tiers are
+# "wrong path / blocked path" problems that benefit from a REAL path list.
+# The others (401 auth-needed, 500 payload-wrong) only need the text remediation.
+_TIERS_WITH_PATH_DISCOVERY = {"all_404", "all_403"}
+
+
+def _knowledge_yaml_path(name):
+    """Return the on-disk path of knowledge/<name>. Container mount is
+    /knowledge (bind of /opt/rag-scan-stack/knowledge); dev checkout path is
+    the repo-relative fallback."""
+    for candidate in ("/knowledge/" + name, "/opt/rag-scan-stack/knowledge/" + name):
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def load_http_status_tiers():
+    """knowledge/http_status_fingerprints.yaml → list of
+    {method, patterns, lower_patterns, remediation}. Cached on first use."""
+    global _HTTP_STATUS_TIERS_CACHE
+    if _HTTP_STATUS_TIERS_CACHE is not None:
+        return _HTTP_STATUS_TIERS_CACHE
+    import yaml as _yaml
+    path = _knowledge_yaml_path("http_status_fingerprints.yaml")
+    tiers = []
+    if path:
+        try:
+            with open(path) as fh:
+                data = _yaml.safe_load(fh) or {}
+            for t in (data.get("tiers") or []):
+                tiers.append({
+                    "method": t.get("method"),
+                    "patterns": tuple(t.get("patterns") or ()),
+                    "lower_patterns": tuple(t.get("lower_patterns") or ()),
+                    "remediation": (t.get("remediation") or "").strip(),
+                })
+        except Exception as e:  # noqa: BLE001
+            logging.warning("could not load http_status_fingerprints.yaml: %s", e)
+    _HTTP_STATUS_TIERS_CACHE = tiers
+    return tiers
+
+
+def load_common_web_paths():
+    """knowledge/common_web_paths.yaml → list[str]. Cached on first use."""
+    global _COMMON_PATHS_CACHE
+    if _COMMON_PATHS_CACHE is not None:
+        return _COMMON_PATHS_CACHE
+    import yaml as _yaml
+    path = _knowledge_yaml_path("common_web_paths.yaml")
+    paths = []
+    if path:
+        try:
+            with open(path) as fh:
+                data = _yaml.safe_load(fh) or {}
+            paths = [p for p in (data.get("common_web_paths") or []) if isinstance(p, str)]
+        except Exception as e:  # noqa: BLE001
+            logging.warning("could not load common_web_paths.yaml: %s", e)
+    _COMMON_PATHS_CACHE = paths
+    return paths
+
+
+def _match_http_status_tier(output):
+    """Scan output through load_http_status_tiers(). Returns (method, remediation)
+    for the FIRST tier whose patterns match, else (None, None). Caller is
+    responsible for the has_2xx short-circuit (don't demote a successful 200
+    that happens to mention the error text in link content)."""
+    low = (output or "").lower()
+    for t in load_http_status_tiers():
+        if any(p in output for p in t["patterns"]):
+            return (t["method"], t["remediation"])
+        if any(p in low for p in t["lower_patterns"]):
+            return (t["method"], t["remediation"])
+    return (None, None)
+
+
+def _discover_live_paths(ip, port, timeout=25, max_paths=25):
+    """Probe a seed list of common endpoints via the kali-listener (not direct
+    httpx) because lab targets live on isolated docker networks the listener
+    can reach but rag-api cannot. Returns a sorted list of (path, status)
+    tuples, capped at max_paths. Keeps anything 200/301/302/401/403; drops
+    404 (the point of this helper) and 000 (unreachable).
+
+    Seed list is pulled from load_common_web_paths() which reads
+    knowledge/common_web_paths.yaml (loader-embedded into rag_documents).
+    Operators extend the list by editing the YAML — no code change needed."""
+    import httpx as _hx
+    seeds = load_common_web_paths()
+    listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    # Build a single shell command that probes each path and emits one line
+    # per non-404 hit: "<status> <path>". Easier to parse than JSON.
+    paths_literal = " ".join(f"'{p}'" for p in seeds[:60] if p and len(p) < 120)
+    cmd = (
+        f"for p in {paths_literal}; do "
+        f"code=$(curl -sk -o /dev/null -w '%{{http_code}}' --max-time 3 "
+        f"\"http://{ip}:{port}$p\" 2>/dev/null); "
+        f"case $code in 404|000|'') ;; "
+        f"5*) ;; "
+        f"*) echo \"$code $p\" ;; "
+        f"esac; done"
+    )
+    try:
+        r = _hx.post(f"{listener.rstrip('/')}/vectors/run",
+                     json={"command": cmd, "target": str(ip), "port": int(port),
+                           "timeout": max(10, timeout)},
+                     headers={"x-api-key": API_KEY}, verify=False,
+                     timeout=max(15, timeout) + 10)
+        d = r.json() if r.status_code < 400 else {}
+        out = d.get("output", "") if isinstance(d, dict) else ""
+    except Exception as e:  # noqa: BLE001
+        logging.debug("path discovery listener call failed: %s", e)
+        return []
+    found = []
+    for line in (out or "").splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        try:
+            status = int(parts[0])
+        except ValueError:
+            continue
+        path = parts[1]
+        if 200 <= status < 500 and status != 404:
+            found.append((path, status))
+            if len(found) >= max_paths:
+                break
+    # Order: 200s first, then auth-required (401/403), then redirects
+    def _rank(s):
+        return (s != 200, s not in (401, 403), s)
+    return sorted(found, key=lambda kv: _rank(kv[1]))
+
+
 def _poc_shell_syntax_check(command):
     """Dry-parse a shell command via shlex to catch quote-balance / escape
     errors BEFORE dispatch. Returns (ok: bool, error: str). On error the
@@ -14834,6 +14971,21 @@ def _poc_assertion_verdict(assertion, output, exit_code=None,
     if any(m in low for m in ("/bin/sh:", "syntax error", "command not found")):
         return {"passed": False, "method": "rejected_error", "confidence": 1.0,
                 "reason": "output contains a shell-error marker; refused regardless of regex"}
+    # HTTP status-cluster detection (YAML-driven; see knowledge/
+    # http_status_fingerprints.yaml). Returns dedicated tiers all_404,
+    # all_401, all_403, all_500 so refine gets tier-specific guidance
+    # instead of a generic "regex didn't match" nudge. Short-circuited by a
+    # has_2xx check so a successful 200 (that happens to mention error text
+    # in link content or template) isn't demoted.
+    if out.strip():
+        has_2xx = _re.search(
+            r"HTTP/\d\.\d 2\d\d|\"status\"\s*:\s*2\d\d|'status'\s*:\s*2\d\d", out)
+        if not has_2xx:
+            tier_method, tier_remediation = _match_http_status_tier(out)
+            if tier_method:
+                return {"passed": False, "method": tier_method, "confidence": 1.0,
+                        "reason": tier_remediation
+                                   or f"output matched the {tier_method} tier"}
     canary = a.get("canary")
     canary_present = bool(canary and canary in out)
     # Canary-anchored verdicts: if the assertion names a canary and it's missing,
@@ -15135,6 +15287,16 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
     _already_zap_active = "active" in (str(recon_source_used or "").lower())
     escalation_guidance = ""
     escalated = False
+    # Status-cluster escalation state: when consecutive iters all return the
+    # same HTTP status tier (all_404 / all_401 / all_403 / all_500), fire
+    # tier-specific guidance once per build. For tiers in
+    # _TIERS_WITH_PATH_DISCOVERY, ALSO run live-path discovery and include a
+    # "pick from these REAL paths" list. For the others (401 auth-needed,
+    # 500 payload-wrong), inject text remediation only — path discovery
+    # wouldn't help.
+    _status_tier_streak = {"all_404": 0, "all_401": 0, "all_403": 0, "all_500": 0}
+    _status_escalation_done = False
+    path_discovery_note = ""
     for it in range(1, max(1, max_iters) + 1):
         iters = it
         fam = _poc_target_family(command)
@@ -15193,8 +15355,57 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                           "method": verification_method,
                           "confidence": verification_confidence,
                           "reason": _verdict.get("reason", "")})
+        # Track consecutive same-tier status iters so the escalation hook
+        # below can fire. Any OTHER verdict resets every tier counter.
+        if verification_method in _status_tier_streak:
+            for k in _status_tier_streak:
+                _status_tier_streak[k] = (_status_tier_streak[k] + 1
+                                           if k == verification_method else 0)
+        else:
+            for k in _status_tier_streak:
+                _status_tier_streak[k] = 0
         if success or it >= max_iters:
             break
+        # Status-cluster escalation: 2+ iters in a row returned the same
+        # non-success HTTP status. Fire tier-specific guidance ONCE per build.
+        # Pulls the remediation text from the YAML. For 404 / 403 also runs
+        # live-path discovery through the kali-listener and appends a REAL
+        # path list for the model to pick from.
+        _tripped_tier = next((k for k, n in _status_tier_streak.items()
+                              if n >= 2 and not _status_escalation_done), None)
+        if _tripped_tier and it < max_iters:
+            _status_escalation_done = True  # fail-closed: never re-fire this build
+            try:
+                # YAML remediation text (same string the verdict carried, but
+                # the model needs it ONCE in the refine prompt, not every iter)
+                remediation = ""
+                for t in load_http_status_tiers():
+                    if t["method"] == _tripped_tier:
+                        remediation = t["remediation"]
+                        break
+                path_block = ""
+                if _tripped_tier in _TIERS_WITH_PATH_DISCOVERY:
+                    _tp = _t.time()
+                    live = _discover_live_paths(ip, port)
+                    _poc_trace(run_id, "escalation:path_discovery", iteration=it,
+                               response=f"found {len(live)} live paths" if live else "none",
+                               extra={"seconds": round(_t.time() - _tp, 2),
+                                      "tier": _tripped_tier,
+                                      "paths": [f"{p} [{s}]" for p, s in live[:10]]})
+                    if live:
+                        rendered = "\n".join(f"  {s}  {p}" for p, s in live[:15])
+                        path_block = (
+                            f"\nLIVE PATHS on {ip}:{port} (status != 404, from a "
+                            f"listener probe just now — these are REAL):\n{rendered}")
+                else:
+                    _poc_trace(run_id, f"escalation:{_tripped_tier}",
+                               iteration=it, response="text-only remediation",
+                               extra={"tier": _tripped_tier})
+                path_discovery_note = (
+                    f"\nSTATUS CLUSTER DETECTED — tier={_tripped_tier} on 2+ "
+                    f"iterations in a row. {remediation}{path_block}")
+            except Exception as e:  # noqa: BLE001
+                logging.debug("status-cluster escalation failed: %s", e)
         # Escalation: once we've iterated ESCALATE_AFTER times without success and the
         # primary recon wasn't already zap-active, kick a zap-active scan and fold its
         # findings into the next refine. Fires exactly once per build.
@@ -15299,7 +15510,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             )
         rprompt = (f"AUTHORIZED lab pentest. The PoC for {cve} on http://{ip}:{port} did NOT "
                    f"succeed.\nCommand: {command}\nOutput:\n{(output or '')[:1500]}{precond}"
-                   f"{shell_syntax_note}{refusal_note}{waf_hit_note}{escalation_guidance}{anchor_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
+                   f"{shell_syntax_note}{refusal_note}{path_discovery_note}{waf_hit_note}{escalation_guidance}{anchor_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
                    f"appear. Return ONE JSON object only: {{\"command\": \"<better command, may "
                    f"chain curl calls with ; and shell vars to fetch a token first>\", "
                    f"\"assertion\": {{\"expect_regex\": \"{canary or '<regex>'}\"}}}}. No prose.")
