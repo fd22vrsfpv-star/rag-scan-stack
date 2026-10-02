@@ -3603,25 +3603,54 @@ def _match_news_item_against_engagement(item_row: dict, engagement_id: str) -> d
     match_count = (len(sources["vulns"]) + len(sources["follow_ups"])
                    + len(sources["software"]))
 
+    # Unique-asset count — operator cares "how many hosts does this touch"
+    # more than "how many rows total". A news item that lights up 25 rows
+    # across one Cloudflare IP is still ONE affected host.
+    unique_ips = set()
+    for s in sources["vulns"]:
+        if s.get("ip"): unique_ips.add(s["ip"])
+    for s in sources["follow_ups"]:
+        if s.get("ip"): unique_ips.add(s["ip"])
+    for s in sources["software"]:
+        if s.get("ip"): unique_ips.add(s["ip"])
+    unique_assets = len(unique_ips)
+
+    # Primary target — what the badge should SAY. Prefer software (gives us
+    # product+version context), then vulns, then follow-ups. "Apache 2.4.65 @
+    # 172.18.0.33" reads better than "CVE-2024-X @ 172.18.0.33" on a chip.
+    primary_target = None
+    if sources["software"]:
+        top = sources["software"][0]
+        pv = f"{top['product']}{(' ' + top['version']) if top.get('version') else ''}"
+        primary_target = f"{pv} @ {top['ip']}"
+    elif sources["vulns"]:
+        top = sources["vulns"][0]
+        label = top.get("hostname") or top.get("ip") or "unknown"
+        primary_target = f"{top['cve']} @ {label}"
+    elif sources["follow_ups"]:
+        top = sources["follow_ups"][0]
+        cve = (top.get("cves") or ["?"])[0]
+        primary_target = f"{cve} @ {top.get('ip') or 'unknown'}"
+
     # One-line summary — the operator reads this before expanding the drawer.
     if match_count == 0:
         summary = "No matches against current engagement data."
-    else:
-        bits = []
-        if sources["software"]:
-            top = sources["software"][0]
-            bits.append(f"{top['product']}{(' ' + top['version']) if top.get('version') else ''}"
-                        f" on {top['ip']}")
-        if sources["vulns"]:
-            bits.append(f"{len(sources['vulns'])} vuln row(s)")
-        if sources["follow_ups"]:
-            bits.append(f"{len(sources['follow_ups'])} open follow-up(s)")
+    elif unique_assets == 1 and primary_target:
+        # Single host: name it and quantify the row counts.
+        extras = []
+        if sources["vulns"]: extras.append(f"{len(sources['vulns'])} vuln(s)")
+        if sources["follow_ups"]: extras.append(f"{len(sources['follow_ups'])} follow-up(s)")
         verb = "Affects" if confidence == "strong" else "Possible match on"
-        summary = f"{verb} " + ", ".join(bits)
+        summary = f"{verb} {primary_target}" + (f" ({', '.join(extras)})" if extras else "")
+    else:
+        verb = "Affects" if confidence == "strong" else "Possible match on"
+        summary = f"{verb} {unique_assets} assets — e.g. {primary_target or 'see sources'}"
 
     return {
         "matched_at": datetime.now(timezone.utc).isoformat(),
         "match_count": match_count,
+        "unique_assets": unique_assets,
+        "primary_target": primary_target,
         "confidence": confidence,
         "summary": summary,
         "sources": sources,
@@ -3630,8 +3659,36 @@ def _match_news_item_against_engagement(item_row: dict, engagement_id: str) -> d
 
 def _store_news_engagement_match(item_id: str, engagement_id: str, block: dict) -> None:
     """Merge the match block into news_items.metadata.engagement_match.<eid>
-    and add/remove the 'affects-engagement' tag based on match_count."""
+    and sync compact tags:
+      - 'affects-engagement' when match_count > 0 (removed when it drops to 0)
+      - 'host:<ip>' per unique matched asset (so UIs can filter + group by host)
+      - 'sw:<product>' per unique matched software product (lowercased).
+
+    Previously stored engagement-match tags (same prefixes) are removed first
+    so a tag that no longer applies drops cleanly on re-analysis."""
+    # Collect compact per-match tags
+    tags_now = set()
+    for s in block.get("sources", {}).get("vulns", []):
+        if s.get("ip"): tags_now.add(f"host:{s['ip']}")
+    for s in block.get("sources", {}).get("follow_ups", []):
+        if s.get("ip"): tags_now.add(f"host:{s['ip']}")
+    for s in block.get("sources", {}).get("software", []):
+        if s.get("ip"): tags_now.add(f"host:{s['ip']}")
+        if s.get("product"): tags_now.add(f"sw:{s['product'].lower()}")
+    if block.get("match_count", 0) > 0:
+        tags_now.add("affects-engagement")
+
     with get_db() as conn, conn.cursor() as cur:
+        # Load existing tags, strip any stale host:/sw:/affects-engagement
+        # entries (so a resolved asset drops its tag), then union new.
+        cur.execute("SELECT tags FROM news_items WHERE id = %s::uuid", (item_id,))
+        row = cur.fetchone()
+        existing = set(row[0] or []) if row else set()
+        kept = {t for t in existing
+                if not (t.startswith("host:") or t.startswith("sw:")
+                        or t == "affects-engagement")}
+        merged = sorted(kept | tags_now)
+
         cur.execute("""
             UPDATE news_items
                SET metadata = COALESCE(metadata, '{}'::jsonb)
@@ -3639,16 +3696,9 @@ def _store_news_engagement_match(item_id: str, engagement_id: str, block: dict) 
                        'engagement_match',
                        COALESCE(metadata->'engagement_match', '{}'::jsonb)
                        || jsonb_build_object(%s::text, %s::jsonb)),
-                   tags = CASE
-                       WHEN %s > 0 AND NOT ('affects-engagement' = ANY(COALESCE(tags, '{}'::text[])))
-                            THEN array_append(COALESCE(tags, '{}'::text[]), 'affects-engagement')
-                       WHEN %s = 0 AND 'affects-engagement' = ANY(COALESCE(tags, '{}'::text[]))
-                            THEN array_remove(tags, 'affects-engagement')
-                       ELSE tags
-                   END
+                   tags = %s::text[]
              WHERE id = %s::uuid
-        """, (engagement_id, Json(block), block["match_count"],
-              block["match_count"], item_id))
+        """, (engagement_id, Json(block), merged, item_id))
         conn.commit()
 
 

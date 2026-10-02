@@ -574,6 +574,14 @@ export interface NewsEngagementMatchSource {
 export interface NewsEngagementMatch {
   matched_at: string
   match_count: number
+  /** Unique asset (ip) count across all source rows. "25 vuln rows on one
+   *  Cloudflare IP" is still ONE affected asset — this is what the badge
+   *  shows for the multi-match case. */
+  unique_assets?: number
+  /** Human-readable "<product> <version> @ <ip>" for the top hit, used as
+   *  the badge text when unique_assets=1 and in the "e.g." phrase otherwise.
+   *  null when no sources are present. */
+  primary_target?: string | null
   confidence: 'strong' | 'weak'
   summary: string
   sources: NewsEngagementMatchSource
