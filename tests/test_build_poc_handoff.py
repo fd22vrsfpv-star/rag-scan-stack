@@ -246,3 +246,49 @@ def test_cves_without_poc_accepts_scope_params():
         )
         assert r.returncode == 0 and r.stdout.strip() == "200", \
             f"query {q!r} → {r.stdout} / {r.stderr}"
+
+
+# ─── Response time captured on bulk/version runs ──────────────────────────
+# For bulk PoC testing (Run-all / Run-selected on the Versions chart),
+# per-row response time distinguishes "slow target" from "slow setup".
+# Backend adds response_time_ms (listener RTT) + target_response_ms
+# (parsed from curl -w %{time_total} when present).
+
+def test_parse_curl_time_total_ms_from_output():
+    """`_parse_curl_time_total_ms` parses `curl -w %{time_total}` output
+    into milliseconds. Handles bare-float lines (curl default) and the
+    __CURL_TIME:<float>s marker we may inject later."""
+    py = """
+import sys; sys.path.insert(0,'/app')
+from api import _parse_curl_time_total_ms
+# Bare float on its own line (curl -w '%{time_total}\\n' default).
+assert _parse_curl_time_total_ms('HTTP/1.1 200 OK\\nhi\\n0.173') == 173
+# Marker form (future-proofing for an injected format).
+assert _parse_curl_time_total_ms('output\\n__CURL_TIME:1.250s\\n') == 1250
+# Nothing timing-shaped → None (empty, big-number guard, non-string).
+assert _parse_curl_time_total_ms('just output, no timing') is None
+assert _parse_curl_time_total_ms('99999') is None   # above the 300s guard
+assert _parse_curl_time_total_ms(None) is None
+assert _parse_curl_time_total_ms('') is None
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and 'OK' in out, f"stderr: {err}"
+
+
+def test_run_endpoints_declare_response_time_fields():
+    """Grep both run_exploit and run_exploit_version to make sure
+    response_time_ms + target_response_ms are present in the return dict —
+    the UI depends on them being there in every run row for bulk scans."""
+    py = r"""
+import sys; sys.path.insert(0,'/app')
+import inspect, api
+for fn_name in ('run_exploit', 'run_exploit_version'):
+    src = inspect.getsource(getattr(api, fn_name))
+    assert 'response_time_ms' in src, f'{fn_name} missing response_time_ms'
+    assert 'target_response_ms' in src, f'{fn_name} missing target_response_ms'
+    assert 'lr.elapsed' in src, f'{fn_name} missing listener-RTT capture'
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and 'OK' in out, f"stderr: {err}"
