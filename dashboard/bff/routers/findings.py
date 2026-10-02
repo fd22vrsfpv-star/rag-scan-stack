@@ -455,6 +455,18 @@ async def get_activity(source: str, fid: str):
 
 # ── Exploit Matching (J2) ──
 
+@router.get("/api/findings/{source}/{fid}/auto-evidence")
+async def finding_auto_evidence(source: str, fid: str):
+    """Proxy — returns already-collected evidence for a finding (finding's own
+    output + matching exploit_store rows + raw_artifacts for the target)."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=30, verify=False) as c:
+        resp = await c.get(
+            f"{s.rag_api_url}/findings/{source}/{fid}/auto-evidence",
+            headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
 @router.get("/api/findings/{source}/{fid}/exploit-matches")
 async def get_exploit_matches(source: str, fid: str):
     s = get_settings()

@@ -26259,15 +26259,186 @@ def get_finding_exploit_matches(source: str, fid: str, _: bool = Depends(auth)):
         params["query"] = " ".join(query_parts)[:500]
     if finding.get("port"):
         params["port"] = finding["port"]
+    # ── Stored exploit_store rows that match this finding's CVE+target ──
+    # These rank above generic exploitdb/metasploit hits because they are
+    # curated for this engagement, often already verified, and runnable with
+    # one click via POST /exploit-store/{id}/run. A VERIFIED row is the
+    # strongest match — put it first.
+    stored_matches: list[dict] = []
+    try:
+        with get_db() as conn2, conn2.cursor(cursor_factory=RealDictCursor) as cur2:
+            # Resolve target IP from the finding's asset (vuln -> ports.asset_id,
+            # web/playwright -> asset_id or URL host).
+            target_ip = None
+            if table == "vulns":
+                cur2.execute("""SELECT host(a.ip) AS ip FROM vulns v
+                                 JOIN ports p ON p.id = v.port_id
+                                 JOIN assets a ON a.id = p.asset_id
+                                WHERE v.id = %s""", (fid,))
+                r = cur2.fetchone()
+                target_ip = r["ip"] if r else None
+            elif table == "web_findings":
+                cur2.execute("""SELECT host(a.ip) AS ip FROM web_findings w
+                                 JOIN assets a ON a.id = w.asset_id
+                                WHERE w.id = %s""", (fid,))
+                r = cur2.fetchone()
+                target_ip = r["ip"] if r else None
+            # Build the where clause: match CVE OR same target host
+            where_bits, where_args = [], []
+            if cves:
+                where_bits.append("upper(es.cve) = ANY(%s::text[])")
+                where_args.append([c.upper() for c in cves if c])
+            if target_ip:
+                where_bits.append("es.target_host = %s")
+                where_args.append(target_ip)
+            if where_bits:
+                cur2.execute(f"""
+                    SELECT es.id, es.name, es.cve, es.target_host, es.target_port,
+                           es.verified, es.command, es.rationale, es.built_at,
+                           es.llm_model, es.engagement_id
+                      FROM exploit_store es
+                     WHERE ({' OR '.join(where_bits)})
+                     ORDER BY es.verified DESC, es.updated_at DESC
+                     LIMIT 10
+                """, where_args)
+                for r in cur2.fetchall():
+                    stored_matches.append({
+                        "source": "exploit_store",
+                        "exploit_store_id": str(r["id"]),
+                        "title": r["name"],
+                        "cve": r["cve"],
+                        "target_host": r["target_host"],
+                        "target_port": r["target_port"],
+                        "verified": bool(r["verified"]),
+                        "command_preview": (r["command"] or "")[:400],
+                        "rationale": (r["rationale"] or "")[:500],
+                        "built_at": r["built_at"].isoformat() if r["built_at"] else None,
+                        "llm_model": r["llm_model"],
+                        "runnable": True,  # UI: show a Run button
+                        "match_confidence": 1.0 if r["verified"] else 0.7,
+                    })
+    except Exception as e:  # noqa: BLE001
+        logging.debug("exploit_store match lookup failed: %s", e)
+
     try:
         resp = requests.get(f"{SCAN_RECOMMENDER_URL}/rag/search/enhanced", params=params, verify=False, timeout=15)
         if resp.status_code == 200:
             data = resp.json()
-            matches = data.get("exploitdb", [])[:5] + data.get("metasploit", [])[:5]
-            return {"matches": matches, "finding": finding}
+            rag_matches = data.get("exploitdb", [])[:5] + data.get("metasploit", [])[:5]
+            # Stored exploits first; RAG matches after.
+            return {"matches": stored_matches + rag_matches, "finding": finding}
     except Exception:
         pass
-    return {"matches": [], "finding": finding}
+    return {"matches": stored_matches, "finding": finding}
+
+
+@app.get("/findings/{source}/{fid}/auto-evidence", tags=["Findings"])
+def get_finding_auto_evidence(source: str, fid: str, _: bool = Depends(auth)):
+    """Already-collected material related to this finding — what the operator
+    sees under "Add Evidence" BEFORE they upload anything. Three source types:
+
+      (1) finding_evidence: the finding's own `evidence`/`output` text column
+      (2) stored_exploits: every exploit_store row matching the finding's
+          CVE or target_host. Includes command + rationale + verified flag
+          so the operator can see the proven technique without digging.
+      (3) target_artifacts: raw_artifacts rows for the finding's target_ip
+          (last 10, newest first) — nmap/nuclei/zap/cve_poc_builder output
+          already captured against this host.
+
+    Each item has a shared shape {kind, title, body/preview, created_at,
+    link{type,id}} so the UI can render them uniformly as evidence cards."""
+    table = _WORKFLOW_TABLES.get(source)
+    if not table:
+        raise HTTPException(400, f"Invalid source: {source}. Use: vuln, web, playwright")
+    items: list[dict] = []
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # (1) finding's own evidence/output column — tier-by-source
+        target_ip = None
+        cves: list[str] = []
+        if table == "vulns":
+            cur.execute("""SELECT v.cve, v.output, v.script,
+                                 host(a.ip) AS ip
+                            FROM vulns v
+                            LEFT JOIN ports p ON p.id = v.port_id
+                            LEFT JOIN assets a ON a.id = p.asset_id
+                           WHERE v.id = %s""", (fid,))
+            r = cur.fetchone()
+            if r:
+                target_ip = r.get("ip")
+                cves = list(r.get("cve") or [])
+                if r.get("output"):
+                    items.append({"kind": "finding_output", "title": r.get("script") or "scanner output",
+                                  "body": r["output"][:4000], "created_at": None,
+                                  "link": {"type": "vuln", "id": fid}})
+        elif table == "web_findings":
+            cur.execute("""SELECT w.name, w.evidence, w.description, w.url,
+                                 host(a.ip) AS ip
+                            FROM web_findings w
+                            LEFT JOIN assets a ON a.id = w.asset_id
+                           WHERE w.id = %s""", (fid,))
+            r = cur.fetchone()
+            if r:
+                target_ip = r.get("ip")
+                if r.get("evidence"):
+                    items.append({"kind": "finding_evidence", "title": r.get("name") or "web evidence",
+                                  "body": r["evidence"][:4000], "created_at": None,
+                                  "link": {"type": "web_finding", "id": fid}})
+        else:
+            cur.execute("""SELECT title, description, url FROM playwright_findings WHERE id = %s""", (fid,))
+            r = cur.fetchone()
+            if r and r.get("description"):
+                items.append({"kind": "finding_description", "title": r.get("title") or "playwright finding",
+                              "body": r["description"][:4000], "created_at": None,
+                              "link": {"type": "playwright_finding", "id": fid}})
+
+        # (2) stored exploit_store rows matching CVE or target host
+        where_bits, where_args = [], []
+        if cves:
+            where_bits.append("upper(es.cve) = ANY(%s::text[])")
+            where_args.append([c.upper() for c in cves if c])
+        if target_ip:
+            where_bits.append("es.target_host = %s")
+            where_args.append(target_ip)
+        if where_bits:
+            cur.execute(f"""
+                SELECT id, name, cve, target_host, target_port, verified,
+                       command, rationale, built_at
+                  FROM exploit_store es
+                 WHERE ({' OR '.join(where_bits)})
+                 ORDER BY verified DESC, updated_at DESC LIMIT 10
+            """, where_args)
+            for e in cur.fetchall():
+                items.append({
+                    "kind": "stored_exploit",
+                    "title": f"{'✓ VERIFIED' if e['verified'] else 'unverified'} — {e['name']}",
+                    "body": (f"CVE: {e['cve']}\n"
+                             f"Target: {e['target_host']}:{e['target_port']}\n"
+                             f"Verified: {e['verified']}\n\n"
+                             f"RATIONALE:\n{(e['rationale'] or '(none)')[:600]}\n\n"
+                             f"COMMAND:\n{(e['command'] or '')[:1200]}"),
+                    "created_at": e["built_at"].isoformat() if e["built_at"] else None,
+                    "link": {"type": "exploit_store", "id": str(e["id"])},
+                    "verified": bool(e["verified"]),
+                    "runnable": True,
+                })
+
+        # (3) raw_artifacts rows for this target — scans the operator ran
+        if target_ip:
+            cur.execute("""SELECT id, tool, source, note, byte_size, first_seen,
+                                 substring(content, 1, 600) AS preview
+                            FROM raw_artifacts
+                           WHERE target = %s
+                           ORDER BY first_seen DESC LIMIT 10""", (target_ip,))
+            for a in cur.fetchall():
+                items.append({
+                    "kind": "target_artifact",
+                    "title": f"[{a['tool']}] {a.get('note') or ''}".strip(),
+                    "body": (a["preview"] or "")[:1800],
+                    "created_at": a["first_seen"].isoformat() if a["first_seen"] else None,
+                    "link": {"type": "artifact", "id": str(a["id"])},
+                    "byte_size": a["byte_size"],
+                })
+    return {"items": items, "count": len(items), "target_ip": target_ip, "cves": cves}
 
 
 # ── Web PoC Generation + Queueing ─────────────────────────────────────────

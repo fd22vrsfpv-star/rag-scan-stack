@@ -2,7 +2,8 @@ import { useState, useMemo, useEffect } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import PageHelp from '@/components/PageHelp'
 import InfoTip from '@/components/InfoTip'
-import { useInfiniteFindings, useUpdateFindingWorkflow, useFindingActivity, useAddFindingComment, useExploitMatches, useUpdateFindingTags, useTagSuggestions, useDeleteFindings, type FindingsFilter } from '@/api/findings'
+import { useInfiniteFindings, useUpdateFindingWorkflow, useFindingActivity, useAddFindingComment, useExploitMatches, useUpdateFindingTags, useTagSuggestions, useDeleteFindings, useAutoEvidence, type FindingsFilter, type AutoEvidenceItem } from '@/api/findings'
+import { useRunExploit } from '@/api/exploits'
 import { ScopeAssignModal } from '@/components/common/ScopeAssignModal'
 import { WebScanImportPanel } from '@/components/common/WebScanImportPanel'
 import { useFindingEvidence, useUploadEvidence, useLinkEvidence } from '@/api/evidence'
@@ -21,7 +22,7 @@ import { SourceBadge } from '@/components/common/SourceBadge'
 import { CustomerBadge } from '@/components/common/CustomerBadge'
 import { SEVERITY_LEVELS, PREDEFINED_TAGS, TAG_COLORS, TAG_COLOR_DEFAULT } from '@/lib/constants'
 import type { Finding, WorkflowStatus } from '@/lib/types'
-import { X, ThumbsUp, ThumbsDown, Check, ChevronRight, ChevronDown, Upload, MessageSquare, Swords, Tag, Crosshair, Zap, Loader2, Globe, Trash2, Flag } from 'lucide-react'
+import { X, ThumbsUp, ThumbsDown, Check, ChevronRight, ChevronDown, Upload, MessageSquare, Swords, Tag, Crosshair, Zap, Loader2, Globe, Trash2, Flag, Sparkles, Play } from 'lucide-react'
 import { useGeneratePocs, useQueuePoc, type WebPayload } from '@/api/exploits'
 import { cn, formatDate } from '@/lib/utils'
 
@@ -786,6 +787,7 @@ function FindingDetailPanel({
   const { data: activityData } = useFindingActivity(fSource, f.id)
   const { data: evidenceData } = useFindingEvidence(fSource, f.id)
   const { data: exploitData } = useExploitMatches(fSource, f.id)
+  const { data: autoEvidenceData } = useAutoEvidence(fSource, f.id)
   const { data: suggestionsData } = useTagSuggestions()
   const scopeNames = useScopeNames()
   const addToScope = useAddToScope()
@@ -1303,11 +1305,30 @@ function FindingDetailPanel({
           </div>
         )}
 
+        {/* ── Auto-collected Evidence ── */}
+        {autoEvidenceData && autoEvidenceData.count > 0 && (
+          <div className="border-t border-border pt-3">
+            <h5 className="text-xs font-medium text-muted-foreground mb-2 flex items-center gap-1">
+              <Sparkles className="h-3 w-3" /> Already collected ({autoEvidenceData.count})
+              {autoEvidenceData.target_ip && (
+                <span className="text-[10px] text-muted-foreground font-normal">
+                  — target {autoEvidenceData.target_ip}
+                </span>
+              )}
+            </h5>
+            <div className="space-y-1.5">
+              {autoEvidenceData.items.map((it: AutoEvidenceItem, i: number) => (
+                <AutoEvidenceCard key={i} item={it} />
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* ── Evidence Gallery (B1) ── */}
         <div className="border-t border-border pt-3">
           <div className="flex items-center justify-between mb-2">
             <h5 className="text-xs font-medium text-muted-foreground flex items-center gap-1">
-              <Upload className="h-3 w-3" /> Evidence ({evidenceList.length})
+              <Upload className="h-3 w-3" /> Uploaded evidence ({evidenceList.length})
             </h5>
             <label className="px-2 py-0.5 text-[10px] rounded bg-primary/10 text-primary cursor-pointer hover:bg-primary/20">
               Add Evidence
@@ -1464,6 +1485,78 @@ function FindingDetailPanel({
           )}
         </div>
       </div>
+    </div>
+  )
+}
+
+
+// ─── Auto-evidence card ─────────────────────────────────────────────────
+// Renders one AutoEvidenceItem from /findings/{src}/{id}/auto-evidence —
+// uniform shape, kind-specific affordances. The stored_exploit kind gets a
+// Run button that fires /exploit-store/{id}/run and shows output inline so
+// the operator can prove the exploit still works without leaving the panel.
+function AutoEvidenceCard({ item }: { item: AutoEvidenceItem }) {
+  const [expanded, setExpanded] = useState(false)
+  const [runOutput, setRunOutput] = useState<string | null>(null)
+  const runExploit = useRunExploit()
+  const isExploit = item.kind === 'stored_exploit'
+  const kindBadge = {
+    finding_output: { label: 'scanner output', color: 'bg-blue-500/10 text-blue-300' },
+    finding_evidence: { label: 'finding evidence', color: 'bg-blue-500/10 text-blue-300' },
+    finding_description: { label: 'description', color: 'bg-blue-500/10 text-blue-300' },
+    stored_exploit: { label: item.verified ? 'verified exploit' : 'unverified exploit',
+                      color: item.verified ? 'bg-emerald-500/15 text-emerald-300' : 'bg-amber-500/15 text-amber-300' },
+    target_artifact: { label: 'scan artifact', color: 'bg-purple-500/10 text-purple-300' },
+  }[item.kind]
+  const run = async () => {
+    if (!isExploit) return
+    setRunOutput('running…')
+    try {
+      const r = await runExploit.mutateAsync(item.link.id)
+      setRunOutput(
+        `exit=${r.exit_code ?? '?'}  still_works=${r.still_works}  asserted=${r.asserted_verified}  (${r.seconds}s)\n` +
+        '─── output ───\n' + (r.output || '(empty)'),
+      )
+    } catch (e) {
+      setRunOutput(`ERROR: ${(e as Error).message}`)
+    }
+  }
+  return (
+    <div className="border border-border rounded p-2 bg-muted/20">
+      <div className="flex items-center justify-between gap-2 mb-1">
+        <div className="flex items-center gap-1.5 min-w-0">
+          <span className={cn('px-1.5 py-0.5 rounded text-[9px] font-medium', kindBadge.color)}>
+            {kindBadge.label}
+          </span>
+          <span className="text-xs font-medium truncate" title={item.title}>{item.title}</span>
+        </div>
+        <div className="flex items-center gap-1">
+          {isExploit && (
+            <button
+              onClick={run}
+              disabled={runExploit.isPending}
+              className="px-2 py-0.5 text-[10px] rounded bg-blue-600/80 hover:bg-blue-600 text-white disabled:opacity-40 inline-flex items-center gap-1"
+              title={`Run POST /exploit-store/${item.link.id}/run and show output`}>
+              {runExploit.isPending ? <Loader2 className="h-3 w-3 animate-spin" /> : <Play className="h-3 w-3" />}
+              Run
+            </button>
+          )}
+          <button onClick={() => setExpanded(e => !e)}
+            className="px-1.5 py-0.5 text-[10px] rounded border border-border hover:bg-muted">
+            {expanded ? 'hide' : 'show'}
+          </button>
+        </div>
+      </div>
+      {expanded && item.body && (
+        <pre className="text-[10px] bg-background/70 rounded p-2 overflow-x-auto max-h-48 whitespace-pre-wrap">
+          {item.body}
+        </pre>
+      )}
+      {runOutput !== null && (
+        <pre className="mt-1 text-[10px] bg-background/90 border border-blue-500/40 rounded p-2 overflow-x-auto max-h-64 whitespace-pre-wrap">
+          {runOutput}
+        </pre>
+      )}
     </div>
   )
 }
