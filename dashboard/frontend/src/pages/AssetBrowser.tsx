@@ -2411,17 +2411,19 @@ export default function AssetBrowser() {
                                                     {resolveMsg[rk] && <span className="text-[9px] text-muted-foreground mr-1">{resolveMsg[rk]}</span>}
                                                     <button
                                                       onClick={() => {
-                                                        setPocMsg(m => ({ ...m, [rk]: 'building… (may take a minute)' }))
-                                                        buildPoc.mutate(
-                                                          { cve: cid, ip: sw.ip, port: sw.port ?? undefined, product: sw.product, version: sw.version || undefined, max_iters: 3, release: true },
-                                                          {
-                                                            onSuccess: (r) => setPocMsg(m => ({ ...m, [rk]: r.success ? `✓ PoC converged (${r.iterations} it)` : `no converge (${r.iterations} it) — see log` })),
-                                                            onError: () => setPocMsg(m => ({ ...m, [rk]: 'build failed' })),
-                                                          },
-                                                        )
+                                                        // Navigate into the Exploit Workbench with the Build-PoC
+                                                        // form pre-seeded, instead of fire-and-forget. Operator
+                                                        // reviews + clicks Build inside the Workbench.
+                                                        const qs = new URLSearchParams()
+                                                        qs.set('tab', 'workbench')
+                                                        qs.set('cve', cid)
+                                                        if (sw.product) qs.set('product', sw.product)
+                                                        if (sw.version) qs.set('version', sw.version)
+                                                        if (sw.ip) qs.set('target_url', `http://${sw.ip}${sw.port ? ':' + sw.port : ''}/`)
+                                                        window.open(`/exploits-popout?${qs.toString()}`, '_blank', 'noopener,noreferrer')
                                                       }}
                                                       className="ml-0.5 mr-1 px-1 py-0.5 rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 text-[9px] whitespace-nowrap"
-                                                      title="Build & run a PoC for this CVE (research → synthesize → run-and-refine, auto nonce fetch). Approval-gated; may take a minute."
+                                                      title="Open this CVE in the Exploit Workbench with the Build-PoC form pre-filled. Review + click Build to kick the loop."
                                                     >🔨 Build PoC</button>
                                                     {pocMsg[rk] && <span className="text-[9px] text-muted-foreground mr-1">{pocMsg[rk]}</span>}
                                                   </span>
