@@ -15767,7 +15767,7 @@ class BuildPocBody(BaseModel):
     # folded into the operator hint channel so synth + refine aim there first.
     target_url: Optional[str] = None
     endpoint_hint: Optional[str] = None   # free-text operator note about the endpoint
-    max_iters: int = 5
+    max_iters: int = 20
     recon_first: bool = True    # do a fast target recon (fetch page/robots/forms) and feed
                                 # what's found to synth; catches shape/params synth would miss.
     recon_source: Optional[str] = "basic"    # 'basic' (self-fetch, ~2s) | 'arjun' (param names, ~30s)
@@ -17761,7 +17761,7 @@ def software_cves_without_poc(limit: int = 100,
                     "build_poc_payload": {
                         "cve": cve, "ip": ip, "port": port,
                         "product": product, "version": version,
-                        "recon_source": "full", "max_iters": 5,
+                        "recon_source": "full", "max_iters": 20,
                     },
                 })
     # Sort by severity, then first_seen desc
