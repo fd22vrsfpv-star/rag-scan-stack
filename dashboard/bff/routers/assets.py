@@ -287,11 +287,15 @@ async def bulk_dismiss_software(request: Request):
 
 @router.get("/api/software/cves-without-poc")
 async def list_cves_without_poc(limit: int = 100, severity: str = None,
-                                 engagement_id: str = None):
+                                 engagement_id: str = None,
+                                 all_engagements: bool = False,
+                                 scope_only: bool = True):
     """Asset-software CVEs with no stored PoC — powers the Build-PoC tab's
-    one-click surface. Thin proxy to rag-api."""
+    one-click surface. Thin proxy to rag-api. Engagement + scope filters
+    apply on reads (CLAUDE.md rule); scope_only defaults to true."""
     s = get_settings()
-    params: dict = {"limit": limit}
+    params: dict = {"limit": limit, "all_engagements": str(all_engagements).lower(),
+                    "scope_only": str(scope_only).lower()}
     if severity:
         params["severity"] = severity
     if engagement_id:
