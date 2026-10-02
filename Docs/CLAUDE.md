@@ -215,6 +215,40 @@ large change. Add the test in the same commit as the rule.
   after the engagement was cleared. Attribution is what makes engagement isolation,
   reporting, and cleanup work — for the data that belongs to one engagement.
 
+### Engagement + scope filters apply on READS (not just writes)
+- Attribution covers the WRITE path; this rule covers the READ path. Every
+  listing endpoint that returns engagement-attributable data MUST honor the
+  active engagement + the scope filter the operator is working in. Otherwise
+  the dashboard shows cross-engagement data under the current engagement
+  header and the operator thinks they're looking at scope.
+- The frontend's `apiFetch` attaches `X-Engagement-Id` on every call. Every
+  listing endpoint MUST read that header (via `_resolve_engagement_id()`)
+  and filter — the standard pattern is `WHERE engagement_id = %s OR
+  engagement_id IS NULL` (NULL rows are legacy/global, intentionally shown
+  in every engagement so pre-attribution data remains reachable).
+- An operator-explicit `?all_engagements=true` override is allowed (cross-
+  engagement audits need it); UI MUST label the active mode so the operator
+  cannot mistake "all engagements" for "this engagement".
+- Scope-aware views that list exploits / scans / findings tied to a target
+  host SHOULD support `?scope_only=true` to additionally restrict to
+  `scope_targets` entries for the current engagement. The default is
+  engagement-only (no scope restriction) so the operator can still see
+  out-of-scope collected data to review it; a scope filter is opt-in.
+- **Check after every change** that touches a listing endpoint OR a frontend
+  page that renders a list of exploits / scans / findings / credentials:
+  does it respect `X-Engagement-Id`, does it offer the scope toggle, does
+  it label the active mode? If the answer to any is no, fix it in the same
+  change.
+- *Enforced by:* `tests/test_engagement_attribution.py` already covers the
+  write path; the read-path audit is informal — add a per-endpoint test as
+  each one gets touched. Known-fixed: `/exploit-store`,
+  `/software/cves-without-poc`. The rest of the listing surface is a
+  ratchet to improve, not break.
+- *Why:* the Exploit Store listing used to show every exploit in the
+  database regardless of the operator's engagement — a global view
+  masquerading as per-engagement. An engagement-only listing is now the
+  default; the operator opts in to `all_engagements` explicitly.
+
 ### Authorization gates
 - Every code path that sends traffic to a host MUST pass the scope gate before
   dispatch. **Fail closed**: no configured scope means nothing runs, because the
