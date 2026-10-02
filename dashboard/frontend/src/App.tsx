@@ -14,6 +14,7 @@ const ScanResults = lazy(() => import('@/pages/ScanResults'))
 const AssetBrowser = lazy(() => import('@/pages/AssetBrowser'))
 const FindingsExplorer = lazy(() => import('@/pages/FindingsExplorer'))
 const ExploitManager = lazy(() => import('@/pages/ExploitManager'))
+const ExploitPopout = lazy(() => import('@/pages/ExploitPopout'))
 const Reports = lazy(() => import('@/pages/Reports'))
 const Feedback = lazy(() => import('@/pages/Feedback'))
 const Maintenance = lazy(() => import('@/pages/Maintenance'))
@@ -170,8 +171,10 @@ export default function App() {
               seven tabs: Pending, Results, Sessions, Credentials, Store,
               Build PoC, AI Research) rendered outside AppShell so the new-
               tab popup from Assets→Software→View or /exploits header shows
-              ONLY the workbench, no sidebar / topbar / dashboard chrome. */}
-          <Route path="exploits-popout" element={<Suspense fallback={<Loading />}><ExploitManager /></Suspense>} />
+              ONLY the workbench, no sidebar / topbar / dashboard chrome.
+              Wrapped in min-h-screen + bg-background so content fills the
+              tab's viewport (same pattern as /recon-popout). */}
+          <Route path="exploits-popout" element={<Suspense fallback={<Loading />}><ExploitPopout /></Suspense>} />
           <Route element={<AppShell />}>
             <Route index element={<Suspense fallback={<Loading />}><Dashboard /></Suspense>} />
             <Route path="scans/launch" element={<Suspense fallback={<Loading />}><ScanLauncher /></Suspense>} />
