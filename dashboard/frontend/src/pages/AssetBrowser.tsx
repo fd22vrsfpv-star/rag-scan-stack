@@ -3206,7 +3206,13 @@ function AssetReconIntel({ hostname, ip, asset }: { hostname?: string | null; ip
 
 // Exported so /exploits Research tab can render the same lookup/research
 // surface inline — one combined window, one component, no iframe.
-export function ExploitLookupModal({ product, version, cveFlags, onClose }: { product: string; version: string; cveFlags?: any[]; onClose: () => void }) {
+export function ExploitLookupModal({ product, version, cveFlags, onClose, embedded }: {
+  product: string; version: string; cveFlags?: any[]; onClose: () => void;
+  // When true, suppress the "Open workbench in new tab" header button —
+  // the modal is already rendered INSIDE the Workbench pane, so the
+  // operator doesn't need a second pop-out trigger. Keeps the close [X].
+  embedded?: boolean
+}) {
   // Load previous research from cache
   const queryClient = useQueryClient()
   const { data: cacheData } = useResearchCache(product, version || undefined)
@@ -3337,29 +3343,24 @@ export function ExploitLookupModal({ product, version, cveFlags, onClose }: { pr
             Exploit Workbench: {product} {version || ''}
           </h3>
           <div className="flex items-center gap-1">
-            <button
-              onClick={() => {
-                // Open the FULL /exploits workbench in a new browser tab
-                // (all tabs — Pending, Results, Sessions, Credentials,
-                // Store, Build PoC, AI Research). ?tab=research lands on
-                // the Research tab with THIS product pre-filled so the
-                // operator sees research + operational state in one
-                // combined tab. New-tab semantics: the browser can drag
-                // the tab out to its own window if the operator wants.
-                // Chromeless /exploits-popout route (no sidebar / topbar
-                // overlaid) — just the Workbench content in a new tab.
-                // Lands on the unified PoC Exploit Workbench tab with
-                // product + version pre-filled; the Research surface
-                // opens from the Open-Research button inside.
-                const url = `/exploits-popout?tab=workbench`
-                  + `&product=${encodeURIComponent(product)}`
-                  + (version ? `&version=${encodeURIComponent(version)}` : '')
-                window.open(url, '_blank', 'noopener,noreferrer')
-              }}
-              className="text-muted-foreground hover:text-foreground text-[11px] px-2 py-0.5 rounded border border-border inline-flex items-center gap-1"
-              title="Open the Exploit Workbench in a new browser tab — all /exploits tabs available (drag the tab out for a separate window)">
-              <ExternalLink className="h-3 w-3" /> Open workbench in new tab
-            </button>
+            {!embedded && (
+              <button
+                onClick={() => {
+                  // Chromeless /exploits-popout route (no sidebar / topbar
+                  // overlaid) — just the Workbench content in a new tab.
+                  // Lands on the unified PoC Exploit Workbench tab with
+                  // product + version pre-filled; the Research surface
+                  // opens from the Open-Research button inside.
+                  const url = `/exploits-popout?tab=workbench`
+                    + `&product=${encodeURIComponent(product)}`
+                    + (version ? `&version=${encodeURIComponent(version)}` : '')
+                  window.open(url, '_blank', 'noopener,noreferrer')
+                }}
+                className="text-muted-foreground hover:text-foreground text-[11px] px-2 py-0.5 rounded border border-border inline-flex items-center gap-1"
+                title="Open the Exploit Workbench in a new browser tab — all /exploits tabs available">
+                <ExternalLink className="h-3 w-3" /> Open workbench in new tab
+              </button>
+            )}
             <button onClick={onClose} className="text-muted-foreground hover:text-foreground"><X className="h-4 w-4" /></button>
           </div>
         </div>
