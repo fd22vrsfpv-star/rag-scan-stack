@@ -15452,8 +15452,15 @@ def _extract_discovered_facts(command, output, product, version, cve, run_id,
     for converged builds (verified=True).
     """
     import re as _re
-    if not product:
+    # Product-key fallback: a build invoked with just cve+ip+port has no
+    # product, but the knowledge is still worth keeping. Key by product when
+    # known, else by the CVE id (so re-running the SAME CVE benefits), else
+    # by the host. Prefixed so the reader can tell a real product key from a
+    # fallback and weight accordingly.
+    key_product = product or (f"cve:{cve}" if cve else None) or (f"host:{ip}" if ip else None)
+    if not key_product:
         return  # nothing to attach the fact to
+    product = key_product
     _ensure_discovered_app_knowledge_table()
     conf = 0.9 if verified else (0.6 if converged else 0.3)
     facts = []
@@ -18068,6 +18075,160 @@ def _scout_arjun(ip, port, path="/", timeout=60, threads=25):
     except Exception as e:  # noqa: BLE001
         logging.debug("arjun recon failed: %s", e)
         return ""
+
+
+def _identify_product_from_target(ip, port, timeout=8, run_deep_dive=False,
+                                    cve=None, eid=None, model=None):
+    """Early product/version identification from the live target.
+
+    Fetches the landing page + a couple of well-known metadata endpoints and
+    fingerprints the PRODUCT and a VERSION HINT from:
+      - Server / X-Powered-By / X-Generator headers
+      - <meta name="generator" content="Product X.Y.Z">
+      - <title> product names + common app fingerprints
+      - version strings in asset URLs (?ver=, /vX.Y.Z/, bundle names)
+      - copyright / "© 2023" year ranges → bounds the plausible version era
+      - Last-Modified + Date headers → another release-era signal
+      - favicon / login-page fingerprints for headless apps
+
+    Also extracts candidate DATES (copyright years, changelog dates, header
+    dates) which narrow which versions are plausible — a 2024 copyright
+    rules out a 2019 release line.
+
+    When run_deep_dive=True AND a product is identified, kicks the existing
+    AI deep-dive research (_research_exploit) so the advisory / public-PoC
+    info is pulled in EARLY — right after recon — instead of waiting for
+    the synth loop to need it.
+
+    Returns a dict:
+      {product, version, version_confidence, dates: [...], fingerprints: [...],
+       evidence: str, deep_dive: {...}|None}
+    All best-effort; returns {} on total failure.
+    """
+    import httpx as _hx, re as _re
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    product = None
+    version = None
+    version_conf = 0.0
+    dates = []
+    fingerprints = []
+    evidence_bits = []
+
+    # Known product fingerprints: (regex on html|header, product name,
+    # optional version-capture group index). Ordered most-specific first.
+    # Extend by appending — this is the deterministic fast path; the deep
+    # dive + RAG handle the long tail.
+    _FP = [
+        (r"<title>[^<]*Zabbix", "Zabbix", None),
+        (r'name=["\']generator["\'][^>]+content=["\']Zabbix\s*([0-9.]+)', "Zabbix", 1),
+        (r"Grafana", "Grafana", None),
+        (r'content=["\']WordPress\s*([0-9.]+)', "WordPress", 1),
+        (r"<title>[^<]*WordPress", "WordPress", None),
+        (r'name=["\']generator["\'][^>]+content=["\']Joomla', "Joomla", None),
+        (r'name=["\']generator["\'][^>]+content=["\']Drupal\s*([0-9.]+)', "Drupal", 1),
+        (r"X-Drupal", "Drupal", None),
+        (r"Prefect", "Prefect", None),
+        (r"PrestaShop", "PrestaShop", None),
+        (r"phpMyAdmin\s*([0-9.]+)?", "phpMyAdmin", 1),
+        (r"Jenkins", "Jenkins", None),
+        (r"GitLab", "GitLab", None),
+        (r"Confluence", "Confluence", None),
+        (r"Jira", "Jira", None),
+        (r'name=["\']generator["\'][^>]+content=["\']([A-Za-z][A-Za-z0-9 ._-]{2,40}?)\s*([0-9]+\.[0-9][0-9.]*)',
+         None, "generator"),  # generic generator with version
+    ]
+    try:
+        with _hx.Client(verify=False, follow_redirects=True, timeout=timeout) as cli:
+            try:
+                r = cli.get(base + "/")
+            except Exception:  # noqa: BLE001
+                r = None
+            html = (r.text or "")[:80000] if r is not None else ""
+            headers = dict(r.headers) if r is not None else {}
+            blob = html + "\n" + "\n".join(f"{k}: {v}" for k, v in headers.items())
+
+            # Record header evidence always, but DON'T let the web-server
+            # (Apache/nginx) or language (PHP) win over the APPLICATION
+            # product — the app is what we're exploiting. Header-derived
+            # product/version is a fallback only (applied after fingerprints).
+            _hdr_product = _hdr_version = None
+            for hk in ("server", "x-powered-by", "x-generator", "x-drupal-cache"):
+                hv = headers.get(hk) or headers.get(hk.title()) or ""
+                if hv:
+                    evidence_bits.append(f"{hk}={hv}")
+                    mv = _re.search(r"([A-Za-z][A-Za-z0-9._-]*?)[/ ]([0-9]+\.[0-9][0-9.]*)", hv)
+                    if mv and not _hdr_product:
+                        _hdr_product, _hdr_version = mv.group(1), mv.group(2)
+
+            # App fingerprint scan — HIGHER priority than the server header.
+            for pat, prod, vgrp in _FP:
+                m = _re.search(pat, blob, _re.I)
+                if not m:
+                    continue
+                if prod:
+                    product = product or prod
+                    fingerprints.append(prod)
+                    if vgrp and isinstance(vgrp, int) and m.lastindex and m.lastindex >= vgrp and m.group(vgrp):
+                        version = version or m.group(vgrp)
+                        version_conf = max(version_conf, 0.8)
+                    break
+                elif vgrp == "generator" and m.lastindex and m.lastindex >= 2:
+                    product = product or m.group(1).strip()
+                    version = version or m.group(2)
+                    version_conf = max(version_conf, 0.75)
+                    fingerprints.append(f"generator:{product}")
+                    break
+
+            # Fall back to the header-derived product ONLY if no app
+            # fingerprint matched (bare Apache/nginx server with no app).
+            if not product and _hdr_product:
+                product = _hdr_product
+                version = version or _hdr_version
+                version_conf = max(version_conf, 0.55)
+            # If we identified the APP but have no app version, the server
+            # header version is NOT the app version — leave version None so
+            # the deep-dive / date-range narrows it instead of mislabeling.
+
+            # Version strings in asset URLs: ?ver=X.Y, /vX.Y.Z/, bundle-X.Y.js
+            if not version:
+                mv = _re.search(r"[?&]ver=([0-9]+\.[0-9][0-9.]*)", blob)
+                if mv:
+                    version = mv.group(1); version_conf = max(version_conf, 0.4)
+                    evidence_bits.append(f"asset ?ver={version}")
+
+            # Date extraction — copyright years, Last-Modified, Date header
+            for yr in _re.findall(r"(?:©|&copy;|copyright)[^0-9]{0,20}((?:19|20)\d{2})(?:\s*[-–]\s*((?:19|20)\d{2}))?",
+                                   blob, _re.I):
+                y1, y2 = yr
+                if y2: dates.append(f"{y1}-{y2}")
+                elif y1: dates.append(y1)
+            lm = headers.get("last-modified") or headers.get("Last-Modified")
+            if lm:
+                dates.append(f"Last-Modified: {lm}")
+            # changelog / release-note date patterns in html
+            for d in _re.findall(r"\b((?:19|20)\d{2}-\d{2}-\d{2})\b", html)[:3]:
+                dates.append(d)
+            dates = list(dict.fromkeys(dates))[:6]
+    except Exception as e:  # noqa: BLE001
+        logging.debug("product identification failed: %s", e)
+
+    evidence = "; ".join(evidence_bits[:8])
+    deep = None
+    if run_deep_dive and product:
+        # Kick the existing AI deep-dive research EARLY so advisory info is
+        # available to synth. Bounded — single call; failures are non-fatal.
+        try:
+            deep = _research_exploit(cve, ip, port, product, version, eid=eid, model=model)
+        except Exception as e:  # noqa: BLE001
+            logging.debug("early deep-dive failed: %s", e)
+            deep = None
+    return {
+        "product": product, "version": version,
+        "version_confidence": round(version_conf, 2),
+        "dates": dates, "fingerprints": fingerprints,
+        "evidence": evidence, "deep_dive": deep,
+    }
 
 
 def _scout_url_recon(ip, port, timeout=8):
