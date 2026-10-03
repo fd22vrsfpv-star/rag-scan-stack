@@ -14642,7 +14642,15 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
               f"\"rationale\": \"<why this proves {cve}, and how the exploit injects {canary}>\"}}. "
               f"If the vuln needs a CSRF nonce/token or session, FETCH it inline first (GET the "
               f"page, extract the token with grep/sed, keep the cookie) then use it — chain curl "
-              f"calls with ; and shell vars. No prose.")
+              f"calls with ; and shell vars. "
+              f"TIMING-BASED EXPLOITS (blind time-based SQLi with SLEEP/pg_sleep/WAITFOR DELAY, "
+              f"timing side-channels, slow-loris) often cannot inject a visible marker. For those, "
+              f"set assertion to {{\"min_seconds\": N, \"max_seconds\": M, \"canary\": \"{canary}\"}} "
+              f"where N is the sleep duration you inject (e.g. 5) and M is a sane upper bound "
+              f"(e.g. 30). The verdict will pass when the shell command actually blocked for >=N "
+              f"seconds — proving the server executed the timing payload. STILL inject the canary "
+              f"somewhere a visible marker CAN land (reflected param, error message) when you can; "
+              f"it strengthens the verdict to latency_anchored. No prose.")
     command = None
     # Default assertion IS the anchor: proof requires the injected canary.
     assertion = {"expect_regex": canary, "canary": canary, "cve_anchored": True}
@@ -14971,15 +14979,16 @@ def _parse_curl_time_total_ms(output):
     return None
 
 
-def _poc_assertion_passes(assertion, output, exit_code=None):
+def _poc_assertion_passes(assertion, output, exit_code=None, elapsed_seconds=None):
     """Boolean verdict — backwards-compatible with every existing caller. For
-    the verdict REASON (method / confidence / tier), use _poc_assertion_verdict."""
-    v = _poc_assertion_verdict(assertion, output, exit_code)
+    the verdict REASON (method / confidence / tier), use _poc_assertion_verdict.
+    elapsed_seconds is optional and only consulted for latency-based assertions."""
+    v = _poc_assertion_verdict(assertion, output, exit_code, elapsed_seconds=elapsed_seconds)
     return v["passed"]
 
 
 def _poc_assertion_verdict(assertion, output, exit_code=None,
-                             rationale=None, model=None):
+                             rationale=None, model=None, elapsed_seconds=None):
     """Return a structured verdict: {passed, method, confidence, reason}.
     Methods, in order of attempt + strongest first:
       - 'regex'            — canary-anchored regex matched outright (strongest)
@@ -15000,6 +15009,60 @@ def _poc_assertion_verdict(assertion, output, exit_code=None,
     a = assertion or {}
     out = output or ""
     low = out.lower()
+    # Latency-based assertion (NEW): some exploits can only be proved by timing
+    # — blind time-based SQLi (SLEEP), slow-loris, timing side-channels on auth,
+    # heavy SSRF — where no useful marker appears in the output. The assertion
+    # carries one of:
+    #   {"min_seconds": 5}          — pass if elapsed >= 5s (strict)
+    #   {"min_seconds": 5, "max_seconds": 30} — pass if 5 <= elapsed <= 30s
+    #                                   (upper bound avoids false-passing on
+    #                                   a target that happens to be always slow)
+    #   {"min_seconds": 5, "canary_in_timing": true}
+    #                               — pass only if the elapsed matches AND
+    #                                 a canary marker appears, so a BOTH-check
+    #                                 anchors the latency to the exploit's effect.
+    # Runs BEFORE the shell-error short-circuit so a `curl SLEEP(5)` that
+    # returns an error page but genuinely blocked for 5s still passes.
+    try:
+        min_s = a.get("min_seconds")
+        max_s = a.get("max_seconds")
+        if min_s is not None:
+            # Operator opted into a timing assertion — it is now AUTHORITATIVE.
+            # Pass only on real timing match; do NOT fall through to the regex
+            # / default_truthy path for a run that was too fast (that would
+            # false-pass on any non-empty output).
+            if elapsed_seconds is None:
+                return {"passed": False, "method": "latency_missing",
+                        "confidence": 1.0,
+                        "reason": "assertion requires min_seconds but caller "
+                                  "did not supply elapsed_seconds"}
+            e_f = float(elapsed_seconds)
+            if e_f < float(min_s):
+                return {"passed": False, "method": "latency_too_fast",
+                        "confidence": 1.0,
+                        "reason": f"elapsed {e_f:.1f}s below min_seconds {min_s} "
+                                  "(timing payload did not block the server)"}
+            if max_s is not None and e_f > float(max_s):
+                return {"passed": False, "method": "latency_too_slow",
+                        "confidence": 1.0,
+                        "reason": f"elapsed {e_f:.1f}s above max_seconds {max_s} "
+                                  "(request may be timing out, not sleeping)"}
+            # Timing matched. If anchored to canary, canary MUST also appear.
+            if a.get("canary_in_timing") and a.get("canary"):
+                if a["canary"] in out:
+                    return {"passed": True, "method": "latency_anchored",
+                            "confidence": 0.95,
+                            "reason": f"elapsed {e_f:.1f}s in [{min_s},{max_s}] "
+                                      "AND canary present"}
+                return {"passed": False, "method": "latency_unanchored",
+                        "confidence": 1.0,
+                        "reason": "timing matched but canary_in_timing requires "
+                                  "canary to also appear in output"}
+            return {"passed": True, "method": "latency", "confidence": 0.9,
+                    "reason": f"elapsed {e_f:.1f}s >= min_seconds {min_s} "
+                              "(timing-based verdict)"}
+    except (TypeError, ValueError) as _le:  # noqa: BLE001
+        logging.debug("latency assertion coerce failed: %s", _le)
     if any(m in low for m in ("/bin/sh:", "syntax error", "command not found")):
         return {"passed": False, "method": "rejected_error", "confidence": 1.0,
                 "reason": "output contains a shell-error marker; refused regardless of regex"}
@@ -15059,12 +15122,14 @@ def _poc_assertion_verdict(assertion, output, exit_code=None,
 
 
 def _poc_assertion_verdict_with_semantic(assertion, output, exit_code=None,
-                                           rationale=None, model=None):
+                                           rationale=None, model=None,
+                                           elapsed_seconds=None):
     """Full verdict including semantic fallback. Call this from _run_refine_poc
     when the raw verdict returns passed=False — it tries the LLM pass as a
     secondary signal, bounded by the canary-grounded safety check."""
     v = _poc_assertion_verdict(assertion, output, exit_code,
-                                 rationale=rationale, model=model)
+                                 rationale=rationale, model=model,
+                                 elapsed_seconds=elapsed_seconds)
     if v["passed"]:
         return v
     if not _poc_semantic_verify_enabled():
@@ -15378,12 +15443,17 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             except Exception as e:  # noqa: BLE001
                 output = f"listener error: {e}"; ec = None
             metrics["target_runs"] += 1
-        metrics["run_seconds"] = round(metrics["run_seconds"] + (_t.time() - _r0), 3)
+        _this_iter_seconds = round(_t.time() - _r0, 3)
+        metrics["run_seconds"] = round(metrics["run_seconds"] + _this_iter_seconds, 3)
         # Hybrid verdict: regex-anchored first, then canary-loose, then semantic
         # LLM pass (only when canary is present in output — grounded). Store the
         # method so downstream can distinguish regex-verified from semantic-verified.
+        # elapsed_seconds is handed to the verdict so latency-based assertions
+        # (blind time-based SQLi, SLEEP, etc.) can verify without a visible
+        # marker in output.
         _verdict = _poc_assertion_verdict_with_semantic(
-            assertion, output, ec, rationale=rationale, model=model)
+            assertion, output, ec, rationale=rationale, model=model,
+            elapsed_seconds=_this_iter_seconds)
         success = _verdict["passed"]
         verification_method = _verdict["method"]
         verification_confidence = _verdict["confidence"]
@@ -15767,7 +15837,7 @@ class BuildPocBody(BaseModel):
     # folded into the operator hint channel so synth + refine aim there first.
     target_url: Optional[str] = None
     endpoint_hint: Optional[str] = None   # free-text operator note about the endpoint
-    max_iters: int = 20
+    max_iters: int = 30
     recon_first: bool = True    # do a fast target recon (fetch page/robots/forms) and feed
                                 # what's found to synth; catches shape/params synth would miss.
     recon_source: Optional[str] = "basic"    # 'basic' (self-fetch, ~2s) | 'arjun' (param names, ~30s)
@@ -16929,22 +16999,27 @@ def _openapi_discover(ip, port, auth=None, timeout=8):
 
 def _playwright_sitemap(ip, port, auth=None, timeout=180, max_pages=50, max_depth=3):
     """Headless-browser crawl via playwright-scanner for SPAs the ZAP spider
-    cannot see. Logs in (when auth is supplied), navigates, follows links +
-    captures XHR URLs, and returns the discovered URL list + a compact
-    guidance string. Fails CLOSED to ('', []) on any error.
+    cannot see. Routes browser traffic THROUGH ZAP's proxy so every XHR the
+    browser fires lands in ZAP's site tree + gets passive-scanned. After the
+    crawl finishes, re-pulls ZAP's URL tree (`/JSON/core/view/urls/`) to
+    get the FULL set of URLs the browser actually touched — including XHRs
+    that fire late and were missed by the browser's own request listener.
 
-    Rationale: ZAP's spider only follows anchors in rendered HTML. Modern
-    SPAs render links in JS AFTER load; the spider sees `/_next/static/*`
-    and `/robots.txt` and calls it a day. Playwright drives a real browser,
-    so it SEES the rendered app and the XHRs it fires.
+    Fails CLOSED to ('', []) on any error.
+
+    Rationale: ZAP's HTML spider only follows anchors — SPAs expose their
+    routes through fetch()/XHR triggered by JS. Playwright + ZAP-proxy
+    captures them all, then ZAP's passive scan has a full tree to work on.
     """
-    import httpx as _hx, time as _t
+    import httpx as _hx, time as _t, urllib.parse as _up
     scanner = os.environ.get("PLAYWRIGHT_SCANNER_URL", "https://playwright-scanner:8014")
     scheme = "https" if int(port or 80) in (443, 8443) else "http"
     target = f"{scheme}://{ip}:{port or 80}/"
     body = {
+        # Route through ZAP proxy so the browser's every XHR populates ZAP's
+        # site tree. We re-pull from ZAP after the crawl completes.
         "url": target, "max_depth": max_depth, "max_pages": max_pages,
-        "use_zap_proxy": False, "timeout_per_page": 15, "same_origin_only": True,
+        "use_zap_proxy": True, "timeout_per_page": 20, "same_origin_only": True,
         "capture_screenshots": False,
     }
     if auth and isinstance(auth, dict):
@@ -16978,23 +17053,49 @@ def _playwright_sitemap(ip, port, auth=None, timeout=180, max_pages=50, max_dept
                     break
     except Exception as e:  # noqa: BLE001
         logging.debug("playwright sitemap failed: %s", e)
+    # Pull ZAP's full URL tree for this host — catches every XHR the browser
+    # actually fired through the proxy, even late-firing ones the browser's
+    # own request listener may have missed.
+    zap_url = os.environ.get("ZAP_URL", "http://zap:8090").rstrip("/")
+    zap_key = os.environ.get("ZAP_API_KEY", "changeme")
+    zap_tree = []
+    try:
+        with _hx.Client(timeout=15, verify=False) as cli:
+            r = cli.get(f"{zap_url}/JSON/core/view/urls/?"
+                        + _up.urlencode({"apikey": zap_key, "baseurl": target.rstrip("/")}))
+            if r.status_code == 200:
+                zap_tree = r.json().get("urls") or []
+    except Exception as _ze:  # noqa: BLE001
+        logging.debug("zap tree fetch failed: %s", _ze)
+    all_urls = list(discovered or []) + list(zap_tree or [])
+    if not all_urls:
         return "", []
-    if not discovered:
-        return "", []
-    # Dedup, cap, build guidance
-    seen = set(); dedup = []
-    for u in discovered:
+    # Dedup preserving order; cap. Prefer non-static URLs so the LLM sees
+    # app routes first, not every JS bundle.
+    static_markers = ("_next", "/static/", "/chunks/", "/assets/",
+                       ".js", ".css", ".map", ".woff", ".ttf", ".svg")
+    def _is_static(u):
+        try:
+            path = _up.urlparse(u).path.lower()
+        except Exception:  # noqa: BLE001
+            return False
+        return any(m in path for m in static_markers)
+    seen = set(); dynamic = []; static = []
+    for u in all_urls:
         if u and u not in seen:
-            seen.add(u); dedup.append(u)
-    dedup = dedup[:40]
-    # Pull out path-only for readability
+            seen.add(u)
+            (static if _is_static(u) else dynamic).append(u)
+    dedup = dynamic[:30] + static[:10]  # dynamic first so synth sees real routes
     def _rel(u):
         if u.startswith(target): return u[len(target.rstrip('/')):]
         return u
     lines = [f"  - {_rel(u)}" for u in dedup[:30]]
-    guidance = (f"Playwright SPA crawl discovered {len(dedup)} URLs the ZAP "
-                "spider could not reach (JS-rendered routes + XHRs):\n"
-                + "\n".join(lines))
+    guidance = (
+        f"Playwright SPA crawl discovered {len(dedup)} URLs through ZAP's "
+        f"proxy ({len(dynamic)} dynamic routes, {len(static)} static). "
+        "Dynamic routes are the real attack surface — the HTML spider never "
+        "sees them because they fire via JS/XHR after page load:\n"
+        + "\n".join(lines))
     return guidance, dedup
 
 
@@ -17974,7 +18075,7 @@ def software_cves_without_poc(limit: int = 100,
                     "build_poc_payload": {
                         "cve": cve, "ip": ip, "port": port,
                         "product": product, "version": version,
-                        "recon_source": "full", "max_iters": 20,
+                        "recon_source": "full", "max_iters": 30,
                     },
                 })
     # Sort by severity, then first_seen desc
