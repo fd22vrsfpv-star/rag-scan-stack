@@ -25,6 +25,11 @@ export interface Asset {
   // Open login services with no valid credential yet — a small default-cred
   // spray is the acceptable first credential step. Same source; drives a badge.
   spray_ready?: number
+  // Built PoCs / exploits scoped to this host (from exploit_store.target_host).
+  // Answers "is there a saved exploit for this host?" at the list level so the
+  // operator doesn't have to click through to ExploitManager to find out.
+  poc_count?: number
+  verified_poc_count?: number
 }
 
 export interface Port {
@@ -554,6 +559,32 @@ export interface NewsItem {
   asset_matched_at: string | null
   notes: string | null
   tags: string[]
+  /** Cached match of this news item against the CURRENT engagement's data —
+   *  populated by _ser_news_item from metadata.engagement_match.<eid>.
+   *  null = never analysed for this engagement; match_count=0 = analysed, no hits. */
+  engagement_match?: NewsEngagementMatch | null
+}
+
+export interface NewsEngagementMatchSource {
+  vulns: Array<{ cve: string; severity: string | null; asset_id: string; ip: string | null; hostname: string | null }>
+  follow_ups: Array<{ id: string; ip: string | null; severity: string | null; title: string; cves: string[] }>
+  software: Array<{ ip: string; port: number | null; product: string; version: string | null; source: string }>
+}
+
+export interface NewsEngagementMatch {
+  matched_at: string
+  match_count: number
+  /** Unique asset (ip) count across all source rows. "25 vuln rows on one
+   *  Cloudflare IP" is still ONE affected asset — this is what the badge
+   *  shows for the multi-match case. */
+  unique_assets?: number
+  /** Human-readable "<product> <version> @ <ip>" for the top hit, used as
+   *  the badge text when unique_assets=1 and in the "e.g." phrase otherwise.
+   *  null when no sources are present. */
+  primary_target?: string | null
+  confidence: 'strong' | 'weak'
+  summary: string
+  sources: NewsEngagementMatchSource
 }
 
 export interface NewsSource {

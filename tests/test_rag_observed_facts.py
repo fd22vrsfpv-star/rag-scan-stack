@@ -1,0 +1,390 @@
+"""Executes the observed-fact + enum-fact RAG round-trip.
+
+Verifies: load (embed + upsert + dedup), recall (self-target + cross-target),
+purge (age / engagement / ip / source filters), and the DELETE endpoint.
+Skips cleanly when rag-api isn't reachable; sabotage-proven per project
+CLAUDE.md (rename any helper and the test fails).
+"""
+import json
+import os
+import subprocess
+import uuid
+import pytest
+
+
+def _rag_api_up():
+    try:
+        r = subprocess.run(
+            ["docker", "exec", "rag-api", "sh", "-lc",
+             "curl -sk https://localhost:8000/health -o /dev/null -w '%{http_code}'"],
+            capture_output=True, text=True, timeout=6,
+        )
+        return r.returncode == 0 and r.stdout.strip() == "200"
+    except Exception:
+        return False
+
+
+pytestmark = pytest.mark.skipif(not _rag_api_up(), reason="rag-api container not reachable")
+
+
+def _call(method, path, body=None):
+    args = ["docker", "exec", "rag-api", "sh", "-lc",
+            f'curl -sk -X {method} https://localhost:8000{path} '
+            f'-H "x-api-key: $API_KEY" -H "Content-Type: application/json"'
+            + (f" -d '{json.dumps(body)}'" if body else "")]
+    r = subprocess.run(args, capture_output=True, text=True, timeout=15)
+    try:
+        return r.returncode, json.loads(r.stdout or "{}")
+    except Exception:
+        return r.returncode, {"raw": r.stdout[:400]}
+
+
+def _in_container(py_snippet):
+    """Run a python snippet inside rag-api and return stdout."""
+    r = subprocess.run(
+        ["docker", "exec", "-e", "RAG_OBSERVED_FACTS=1", "rag-api", "python3", "-c", py_snippet],
+        capture_output=True, text=True, timeout=30,
+    )
+    return r.stdout.strip(), r.stderr.strip(), r.returncode
+
+
+def test_observed_fact_load_dedup_and_recall():
+    """Load same (source, ip, kind, value) twice — exactly one row remains — recall
+    returns it. Flag ON required."""
+    test_ip = f"192.0.2.{__import__('random').randint(10, 200)}"
+    py = f"""
+import sys; sys.path.insert(0, '/app')
+from api import (_load_observed_fact_into_rag, _recall_observed_facts,
+                 purge_observed_facts, RAG_OBSERVED_FACTS_SOURCE)
+# Twice — dedup should collapse to one
+a = _load_observed_fact_into_rag(RAG_OBSERVED_FACTS_SOURCE, '{test_ip}',
+                                  'framework', 'LyLme Spage', product='LyLme Spage')
+b = _load_observed_fact_into_rag(RAG_OBSERVED_FACTS_SOURCE, '{test_ip}',
+                                  'framework', 'LyLme Spage', product='LyLme Spage')
+recalled = _recall_observed_facts('{test_ip}', product='LyLme Spage')
+n = purge_observed_facts(ip='{test_ip}')
+print(a, b, len(recalled), n)
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0, f"stderr: {err}"
+    parts = out.split()
+    # Both loads succeeded, exactly 1 row recalled, purge removed exactly 1
+    assert parts == ["True", "True", "1", "1"], f"got: {out!r}"
+
+
+def test_observed_fact_flag_off_no_op():
+    """When RAG_OBSERVED_FACTS is not set, _load_observed_fact_into_rag returns
+    False and writes nothing. Guards against silent DB writes in default config."""
+    py = """
+import os
+os.environ.pop('RAG_OBSERVED_FACTS', None)
+import sys; sys.path.insert(0, '/app')
+from api import _load_observed_fact_into_rag, RAG_OBSERVED_FACTS_SOURCE
+r = _load_observed_fact_into_rag(RAG_OBSERVED_FACTS_SOURCE, '192.0.2.99',
+                                  'framework', 'Test', product='Test')
+print(r)
+"""
+    r = subprocess.run(
+        ["docker", "exec", "rag-api", "python3", "-c", py],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert r.returncode == 0
+    assert r.stdout.strip() == "False", f"expected False (flag off), got {r.stdout!r}"
+
+
+def test_purge_by_ip_scoped():
+    """Purge for one ip removes only that ip's rows; other ips untouched."""
+    ip_a = f"192.0.2.{__import__('random').randint(1, 100)}"
+    ip_b = f"192.0.2.{__import__('random').randint(150, 250)}"
+    py = f"""
+import sys; sys.path.insert(0, '/app')
+from api import (_load_observed_fact_into_rag, _recall_observed_facts,
+                 purge_observed_facts, RAG_OBSERVED_FACTS_SOURCE)
+_load_observed_fact_into_rag(RAG_OBSERVED_FACTS_SOURCE, '{ip_a}', 'framework', 'A')
+_load_observed_fact_into_rag(RAG_OBSERVED_FACTS_SOURCE, '{ip_b}', 'framework', 'B')
+purge_observed_facts(ip='{ip_a}')
+after_a = len(_recall_observed_facts('{ip_a}'))
+after_b = len(_recall_observed_facts('{ip_b}'))
+purge_observed_facts(ip='{ip_b}')  # clean up
+print(after_a, after_b)
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0, f"stderr: {err}"
+    assert out.strip() == "0 1", f"purge should have removed only ip_a (got: {out!r})"
+
+
+def test_delete_endpoint_round_trip():
+    """DELETE /rag/observed-facts?ip=X removes that ip's rows and reports count."""
+    test_ip = f"192.0.2.{__import__('random').randint(1, 254)}"
+    # Seed via python (flag ON required)
+    py = f"""
+import sys; sys.path.insert(0, '/app')
+from api import _load_observed_fact_into_rag, RAG_OBSERVED_FACTS_SOURCE
+for k in ('framework', 'credential', 'admin_path'):
+    _load_observed_fact_into_rag(RAG_OBSERVED_FACTS_SOURCE, '{test_ip}', k,
+                                  f'test-value-{{k}}')
+print('seeded')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and "seeded" in out, f"seed failed: {err}"
+    # DELETE via HTTP
+    rc, resp = _call("DELETE", f"/rag/observed-facts?ip={test_ip}")
+    assert rc == 0, f"delete failed: {resp}"
+    assert resp.get("ok") is True
+    assert resp.get("deleted") == 3, f"expected 3 deleted, got {resp}"
+    # Second call is idempotent
+    rc, resp2 = _call("DELETE", f"/rag/observed-facts?ip={test_ip}")
+    assert resp2.get("deleted") == 0, f"second call should return 0, got {resp2}"
+
+
+def test_recall_format_prior_observations():
+    """_format_recall_block returns a PRIOR OBSERVATIONS block when facts present."""
+    py = """
+import sys; sys.path.insert(0, '/app')
+from api import _format_recall_block
+# Empty -> empty
+assert _format_recall_block([]) == ''
+# One fact
+facts = [{'scope': 'self', 'ip': '192.0.2.1', 'kind': 'framework',
+          'value': 'LyLme Spage', 'source': 'observed_target_fact'}]
+out = _format_recall_block(facts)
+assert out.startswith('PRIOR OBSERVATIONS')
+assert 'framework' in out and 'LyLme Spage' in out
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and "OK" in out, f"stderr: {err}"
+
+
+def test_credential_into_rag_load_and_recall():
+    """A credential_findings-shaped dict embeds one row that _recall_credentials
+    finds back. Marker <known> is stored — actual secret is NOT in RAG."""
+    ip = f"198.51.100.{__import__('random').randint(1, 254)}"
+    py = f"""
+import sys; sys.path.insert(0, '/app')
+from api import (_load_credential_into_rag, _recall_credentials,
+                 purge_observed_facts, RAG_CREDENTIAL_SOURCE)
+row = {{'ip': '{ip}', 'port': 22, 'protocol': 'ssh',
+        'username': 'root', 'valid_cred': True, 'auth_type': 'password',
+        'secret_type': 'password', 'source': 'brutus',
+        'engagement_id': None}}
+loaded = _load_credential_into_rag(row, product='openssh')
+r = _recall_credentials(target_ip='{ip}')
+purge_observed_facts(ip='{ip}', source=RAG_CREDENTIAL_SOURCE)
+# Marker <known> present, plaintext password NOT in the recall
+val = r[0]['value'] if r else ''
+print(loaded, len(r), '<known>' in val, 'plaintext' not in val)
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0, f"stderr: {err}"
+    assert out.split() == ["True", "1", "True", "True"], f"got: {out!r}"
+
+
+def test_identity_into_rag_admin_flagged():
+    """An admin identity is recalled with 'ADMIN' in the value string."""
+    py = """
+import sys; sys.path.insert(0, '/app')
+from api import (_load_identity_into_rag, _recall_credentials,
+                 purge_observed_facts, RAG_IDENTITY_SOURCE)
+ident = {'provider': 'azure', 'identifier': 'admin@example.onmicrosoft.com',
+         'principal_type': 'user', 'status': 'active', 'mfa_state': 'disabled',
+         'is_admin': True, 'tenant_id': 't-123', 'engagement_id': None}
+loaded = _load_identity_into_rag(ident)
+r = _recall_credentials(product='azure')
+purge_observed_facts(source=RAG_IDENTITY_SOURCE)
+has_admin = any('ADMIN' in row.get('value', '') and 'admin@' in row.get('value', '') for row in r)
+print(loaded, len(r) >= 1, has_admin)
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0, f"stderr: {err}"
+    assert out.split() == ["True", "True", "True"], f"got: {out!r}"
+
+
+def test_backfill_endpoint_returns_counts():
+    """POST /rag/backfill-credentials returns credentials_embedded + identities_embedded
+    counts (may be 0 if the tables are empty for this engagement) and requires the flag."""
+    r = subprocess.run(
+        ["docker", "exec", "-e", "RAG_OBSERVED_FACTS=1", "rag-api", "sh", "-lc",
+         'curl -sk -X POST https://localhost:8000/rag/backfill-credentials '
+         '-H "x-api-key: $API_KEY"'],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert r.returncode == 0
+    try:
+        d = json.loads(r.stdout)
+    except Exception:
+        pytest.fail(f"non-JSON response: {r.stdout[:400]}")
+    assert d.get("ok") is True
+    assert "credentials_embedded" in d and "identities_embedded" in d
+
+
+def test_tier1_verified_technique_and_compose():
+    """Verified exploit_store row embeds as verified_exploit_technique; compose
+    helper returns a KNOWN-WORKING TECHNIQUES block that appears first."""
+    ip = f"203.0.113.{__import__('random').randint(1, 254)}"
+    py = f"""
+import sys; sys.path.insert(0, '/app')
+from api import (_load_verified_technique_into_rag, _compose_recall_context,
+                 purge_observed_facts, RAG_VERIFIED_TECHNIQUE_SOURCE)
+row = {{'verified': True, 'target_host': '{ip}', 'cve': 'CVE-2099-TEST',
+        'product': 'TestProduct', 'version': '1.0',
+        'command': "curl -X GET 'http://{ip}/exploit'"}}
+loaded = _load_verified_technique_into_rag(row)
+ctx = _compose_recall_context('{ip}', product='TestProduct')
+purge_observed_facts(ip='{ip}', source=RAG_VERIFIED_TECHNIQUE_SOURCE)
+print(loaded, 'KNOWN-WORKING TECHNIQUES' in ctx, 'CVE-2099-TEST' in ctx)
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0, f"stderr: {err}"
+    assert out.split() == ["True", "True", "True"], f"got: {out!r}"
+
+
+def test_tier1_service_fingerprint_load():
+    """A ports-shaped dict embeds one service_fingerprint row with port+banner."""
+    ip = f"203.0.113.{__import__('random').randint(1, 254)}"
+    py = f"""
+import sys; sys.path.insert(0, '/app')
+from api import (_load_service_fingerprint_into_rag, purge_observed_facts,
+                 RAG_SERVICE_FINGERPRINT_SOURCE)
+row = {{'port': 443, 'service': 'https', 'banner': 'nginx/1.18.0',
+        'product': 'nginx', 'version': '1.18.0'}}
+loaded = _load_service_fingerprint_into_rag(row, ip='{ip}')
+purge_observed_facts(ip='{ip}', source=RAG_SERVICE_FINGERPRINT_SOURCE)
+print(loaded)
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0, f"stderr: {err}"
+    assert out.strip() == "True", f"got: {out!r}"
+
+
+def test_tier1_discovered_endpoint_normalization():
+    """URL passed to _load_discovered_endpoint_into_rag is normalized to path+query."""
+    ip = f"203.0.113.{__import__('random').randint(1, 254)}"
+    py = f"""
+import sys; sys.path.insert(0, '/app')
+from api import (_load_discovered_endpoint_into_rag, _recall_observed_facts,
+                 purge_observed_facts, RAG_DISCOVERED_ENDPOINT_SOURCE)
+loaded = _load_discovered_endpoint_into_rag('{ip}', 'https://{ip}:8443/admin/login.php',
+                                              method='POST', status_code=200)
+# recall via generic observed-facts (same table)
+from api import _recall_credentials
+purge_observed_facts(ip='{ip}', source=RAG_DISCOVERED_ENDPOINT_SOURCE)
+print(loaded)
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0, f"stderr: {err}"
+    assert out.strip() == "True", f"got: {out!r}"
+
+
+def test_backfill_tier1_endpoint():
+    """POST /rag/backfill/tier1 returns per-source counts (may be 0 in a clean DB)."""
+    rc, resp = _call("POST", "/rag/backfill/tier1")
+    assert rc == 0
+    assert resp.get("ok") is True
+    assert "counts" in resp
+    assert set(resp["counts"].keys()) >= {"verified_technique", "vuln_finding",
+                                           "service_fingerprint", "discovered_endpoint"}
+
+
+def test_tier2_info_disclosure_classification():
+    """_classify_info_disclosure correctly tags known-sensitive paths."""
+    py = """
+import sys; sys.path.insert(0, '/app')
+from api import _classify_info_disclosure
+assert _classify_info_disclosure('/.env') == 'config_file'
+assert _classify_info_disclosure('/.git/config') == 'vcs_metadata'
+assert _classify_info_disclosure('/README.md') == 'docs_leaked'
+assert _classify_info_disclosure('/phpinfo.php') == 'phpinfo'
+assert _classify_info_disclosure('/backup.zip') == 'backup_file'
+assert _classify_info_disclosure('/server-status') == 'server_diagnostic'
+assert _classify_info_disclosure('/random/path') == 'other_disclosure'
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and "OK" in out, f"stderr: {err}"
+
+
+def test_tier2_web_finding_load_and_recall():
+    """A web_findings-shaped dict embeds one row that shows up in compose block."""
+    ip = f"198.51.100.{__import__('random').randint(1, 254)}"
+    py = f"""
+import sys; sys.path.insert(0, '/app')
+from api import (_load_web_finding_into_rag, _compose_recall_context,
+                 purge_observed_facts, RAG_WEB_FINDING_SOURCE)
+row = {{'issue_type': 'SQL Injection', 'url': 'http://{ip}/pwd/?id=1',
+        'method': 'GET', 'param': 'id', 'severity': 'high',
+        'payload': "1' OR 1=1--", 'source': 'nuclei'}}
+loaded = _load_web_finding_into_rag(row, ip='{ip}')
+ctx = _compose_recall_context('{ip}')
+purge_observed_facts(ip='{ip}', source=RAG_WEB_FINDING_SOURCE)
+print(loaded, 'WEB VULNERABILITY FINDINGS' in ctx, 'SQL Injection' in ctx)
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0, f"stderr: {err}"
+    assert out.split() == ["True", "True", "True"], f"got: {out!r}"
+
+
+def test_backfill_all_endpoint():
+    """POST /rag/backfill/all returns counts for every source."""
+    rc, resp = _call("POST", "/rag/backfill/all")
+    assert rc == 0
+    assert resp.get("ok") is True
+    c = resp.get("counts", {})
+    assert set(c.keys()) >= {"verified_technique", "vuln_finding",
+                              "service_fingerprint", "discovered_endpoint",
+                              "web_finding", "info_disclosure",
+                              "credentials", "identities"}
+
+
+def test_tier3_failed_technique_compose_last():
+    """Failed techniques appear in the compose block LAST (negative signal)
+    and use the '[<kind>]' prefix format."""
+    ip = f"198.51.100.{__import__('random').randint(1, 254)}"
+    py = f"""
+import sys; sys.path.insert(0, '/app')
+from api import (_load_failed_technique_into_rag, _compose_recall_context,
+                 purge_observed_facts, RAG_FAILED_TECHNIQUE_SOURCE)
+row = {{'verified': False, 'target_host': '{ip}', 'cve': 'CVE-2099-FAIL',
+        'product': 'TestProduct', 'command': "curl bogus",
+        'metadata': {{'off_target': True}}}}
+loaded = _load_failed_technique_into_rag(row)
+ctx = _compose_recall_context('{ip}', product='TestProduct')
+purge_observed_facts(ip='{ip}', source=RAG_FAILED_TECHNIQUE_SOURCE)
+print(loaded, 'PREVIOUSLY-FAILED' in ctx, 'off_target' in ctx)
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0, f"stderr: {err}"
+    assert out.split() == ["True", "True", "True"], f"got: {out!r}"
+
+
+def test_tier3_session_scheme_shell_access():
+    """Session cookie + shell access embed together and show up in the
+    SESSION + SHELL ACCESS compose section."""
+    ip = f"198.51.100.{__import__('random').randint(1, 254)}"
+    py = f"""
+import sys; sys.path.insert(0, '/app')
+from api import (_load_session_scheme_into_rag, _load_shell_access_into_rag,
+                 _compose_recall_context, purge_observed_facts,
+                 RAG_SESSION_SCHEME_SOURCE, RAG_SHELL_ACCESS_SOURCE)
+a = _load_session_scheme_into_rag('{ip}', 'JSESSIONID', product='tomcat')
+b = _load_shell_access_into_rag('{ip}', 'meterpreter', port=4444, source='msf',
+                                  session_id='1')
+ctx = _compose_recall_context('{ip}')
+purge_observed_facts(ip='{ip}', source=RAG_SESSION_SCHEME_SOURCE)
+purge_observed_facts(ip='{ip}', source=RAG_SHELL_ACCESS_SOURCE)
+print(a, b, 'SESSION + SHELL ACCESS' in ctx, 'JSESSIONID' in ctx,
+      'meterpreter' in ctx)
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0, f"stderr: {err}"
+    assert out.split() == ["True", "True", "True", "True", "True"], f"got: {out!r}"
+
+
+def test_tier3_backfill_and_all_source_recognized():
+    """POST /rag/backfill/tier3 returns per-source counts."""
+    rc, resp = _call("POST", "/rag/backfill/tier3")
+    assert rc == 0
+    assert resp.get("ok") is True
+    c = resp.get("counts", {})
+    assert set(c.keys()) >= {"failed_technique", "subdomain_pattern",
+                              "session_scheme", "shell_access"}

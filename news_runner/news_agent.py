@@ -861,14 +861,23 @@ def _match_assets(conn, item_id: str) -> int:
             conn.commit()
             return 0
 
-        # vulns.cve is a text column carrying the raw CVE id; ANY-match against our list.
+        # vulns.cve is text[] (GIN-indexed); array-overlap against our CVE list.
+        # The original `v.cve = ANY(%s)` was a type mismatch (left side is an
+        # array, right is a list) that returned zero rows against every real
+        # database — causing _match_assets to silently never report hits.
+        # Unnest so each hit carries the single CVE that fired, not the whole
+        # row's `cve` array (which would read as "CVE-2024-X on this asset"
+        # even when the overlap was on a different CVE in the row).
         cur.execute(
-            """SELECT DISTINCT v.cve, v.severity, a.id AS asset_id, a.ip::text AS ip,
+            """SELECT DISTINCT c.cve, v.severity, a.id AS asset_id, a.ip::text AS ip,
                               a.hostname, a.engagement_id
-                 FROM vulns v JOIN assets a ON a.id = v.asset_id
-                WHERE v.cve = ANY(%s)
-                ORDER BY v.cve""",
-            (cves,),
+                 FROM vulns v
+                 JOIN assets a ON a.id = v.asset_id
+                 CROSS JOIN LATERAL unnest(v.cve) AS c(cve)
+                WHERE v.cve && %s::text[]
+                  AND c.cve = ANY(%s)
+                ORDER BY c.cve""",
+            (cves, cves),
         )
         for r in cur.fetchall():
             hits.append({

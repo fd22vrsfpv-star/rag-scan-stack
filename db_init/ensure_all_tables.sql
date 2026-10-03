@@ -1464,6 +1464,25 @@ CREATE TABLE IF NOT EXISTS public.poc_grants (
 );
 CREATE INDEX IF NOT EXISTS ix_poc_grants_target ON public.poc_grants(target) WHERE active;
 
+-- poc_hints: persistent operator hints prepended to synth guidance on every future
+-- build-poc run. Highest-priority guidance (ahead of recon/research/auth). Scope is
+-- most-specific first: exact (cve, host, port) -> host-only -> CVE global. This is
+-- how the operator injects knowledge the pipeline can't derive: injection point,
+-- table/column names, alt ports, non-obvious auth, the exact endpoint that triggers.
+CREATE TABLE IF NOT EXISTS public.poc_hints (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    cve           text NOT NULL,
+    target_host   text,
+    target_port   integer,
+    hint          text NOT NULL,
+    active        boolean NOT NULL DEFAULT true,
+    engagement_id uuid,
+    created_by    text,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_poc_hints_cve ON public.poc_hints(cve, active);
+
 -- poc_synthesis_log: reviewable request/response trail for the CVE PoC-builder
 -- (research -> synthesize -> run -> refine). A person reads this to tweak prompts.
 CREATE TABLE IF NOT EXISTS public.poc_synthesis_log (
