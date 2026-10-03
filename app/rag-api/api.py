@@ -20324,11 +20324,57 @@ def restore_exploit_version(exploit_id: str, version: int, authorized: bool = De
     return dict(row)
 
 
+def _fetch_jira_ticket_text(url, timeout=8, max_bytes=12000):
+    """Vendor bug-trackers (Zabbix, Apache, Jenkins, Atlassian, many others)
+    run Atlassian Jira. The /browse/<KEY> page is a JS shell useless to a
+    plain fetch, but the REST API /rest/api/2/issue/<KEY> returns structured
+    JSON with the full description + comments — which for a security ticket
+    routinely contains the ENTIRE PoC + reproduction steps (ZBX-24505 for
+    CVE-2024-22120 literally ships the exploit recipe).
+
+    Returns a compact text block, or "" when the URL isn't a Jira browse URL
+    or the API doesn't answer.
+    """
+    import httpx as _hx, re as _re
+    m = _re.match(r"(https?://[^/]+)/browse/([A-Z][A-Z0-9]+-\d+)", url or "")
+    if not m:
+        return ""
+    base, key = m.group(1), m.group(2)
+    try:
+        with _hx.Client(verify=False, follow_redirects=True, timeout=timeout,
+                         headers={"User-Agent": "Mozilla/5.0 (compatible; PentestBot/1)",
+                                  "Accept": "application/json"}) as cli:
+            r = cli.get(f"{base}/rest/api/2/issue/{key}"
+                        "?fields=summary,description,comment")
+        if r.status_code >= 400:
+            return ""
+        j = r.json() or {}
+        f = j.get("fields") or {}
+        bits = [f"JIRA {key}: {f.get('summary','')}"]
+        if f.get("description"):
+            bits.append(str(f["description"])[:max_bytes])
+        # Comments often carry the operator's clarified repro / the patch note
+        cmts = ((f.get("comment") or {}).get("comments")) or []
+        for c in cmts[:3]:
+            body = (c.get("body") or "")[:1500]
+            if body:
+                bits.append(f"[comment] {body}")
+        return "\n".join(bits)[:max_bytes + 4000]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _fetch_advisory_text(url, timeout=6, max_bytes=40000):
     """Fetch a URL body and reduce it to plain text (strip scripts/styles, collapse HTML
     tags). Size-capped, timeout-capped, failure-quiet — this feeds LLM context, so a
-    dead or huge URL should never break the pipeline."""
+    dead or huge URL should never break the pipeline. Jira /browse/ URLs are
+    routed to the REST API (the HTML page is a useless JS shell)."""
     import httpx as _hx, re as _re
+    # Vendor bug-tracker tickets: fetch via REST (the browse page is JS-only).
+    if "/browse/" in (url or ""):
+        jira = _fetch_jira_ticket_text(url, timeout=max(timeout, 8), max_bytes=min(max_bytes, 12000))
+        if jira:
+            return jira
     try:
         with _hx.Client(verify=False, follow_redirects=True, timeout=timeout,
                          headers={"User-Agent": "Mozilla/5.0 (compatible; PentestBot/1)"}) as cli:
@@ -20384,13 +20430,18 @@ def _fetch_cve_advisories_from_apis(cve, timeout=8):
                 # Fetch each referenced repo/issue/PR/commit (often the exact
                 # PoC or the patch diff). Prioritize commit/pull URLs — the
                 # diff names the vulnerable sink.
-                _patchy = [u for u in ref_urls if any(s in u for s in ("/commit/", "/pull/", "/compare/"))]
+                # Prioritize patch commits/PRs AND vendor bug-tracker tickets
+                # (/browse/<KEY> Jira) — the latter often carry the full PoC.
+                _patchy = [u for u in ref_urls
+                           if any(s in u for s in ("/commit/", "/pull/", "/compare/", "/browse/"))]
                 _other = [u for u in ref_urls if u not in _patchy]
-                for url in (_patchy + _other)[:4]:
-                    if any(h in url for h in ("github.com/", "gitee.com/")):
-                        body = _fetch_advisory_text(url, timeout=5, max_bytes=4000)
+                for url in (_patchy + _other)[:5]:
+                    # github/gitee repos + any Jira browse URL get fetched;
+                    # Jira routes to the REST API inside _fetch_advisory_text.
+                    if any(h in url for h in ("github.com/", "gitee.com/")) or "/browse/" in url:
+                        body = _fetch_advisory_text(url, timeout=8, max_bytes=12000)
                         if body:
-                            chunks.append(f"--- REF ({url}) ---\n{body[:3500]}")
+                            chunks.append(f"--- REF ({url}) ---\n{body[:8000]}")
     except Exception:  # noqa: BLE001
         pass
     # 2. CIRCL CVE Search — mirrors NVD + references as JSON
