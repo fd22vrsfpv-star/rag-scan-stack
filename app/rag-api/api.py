@@ -14671,10 +14671,29 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
             command = str(obj["command"]).strip()
             # Keep the anchor unless the LLM's own assertion also requires the canary.
             la = obj.get("assertion")
-            if isinstance(la, dict) and la.get("expect_regex") and canary in la["expect_regex"]:
-                assertion = {"expect_regex": la["expect_regex"], "canary": canary, "cve_anchored": True}
-            elif isinstance(la, dict) and la.get("expect_regex"):
-                assertion["expect_regex_hint"] = la["expect_regex"]  # non-anchored suggestion, not used to verify
+            if isinstance(la, dict):
+                # LATENCY assertion from synth — accept it the same way the
+                # refine loop does, so iter 1 can run with the correct
+                # (timing-based) verdict shape instead of expect_regex.
+                # Without this, a blind-timing exploit's first run falls
+                # back to expect_regex, which can't fire on blind timing,
+                # and the reflection-risk pattern mis-fires on iter 1.
+                # The refine loop already accepts min_seconds; this makes
+                # the synth-time path symmetric.
+                if la.get("min_seconds") is not None:
+                    new_a = {"min_seconds": la["min_seconds"]}
+                    if la.get("max_seconds") is not None:
+                        new_a["max_seconds"] = la["max_seconds"]
+                    if canary:
+                        new_a["canary"] = canary
+                        new_a["cve_anchored"] = True
+                        if la.get("canary_in_timing"):
+                            new_a["canary_in_timing"] = True
+                    assertion = new_a
+                elif la.get("expect_regex") and canary in la["expect_regex"]:
+                    assertion = {"expect_regex": la["expect_regex"], "canary": canary, "cve_anchored": True}
+                elif la.get("expect_regex"):
+                    assertion["expect_regex_hint"] = la["expect_regex"]  # non-anchored suggestion, not used to verify
             rationale = str(obj.get("rationale", ""))[:500]
             break
     synth_kind = "llm_poc"
@@ -14983,16 +15002,22 @@ def _match_refine_patterns(output, assertion, canary, command):
     every iter, so new patterns take effect without a rag-api restart.
 
     Trigger shape:
-      output_contains:    list of case-insensitive substrings; ANY match fires
-      prev_assertion_has: list of keys the previous iter's assertion must have
-      canary_in_request:  bool — require canary presence in the issued command
-      canary_in_output:   bool — require canary presence (or absence) in output
+      output_contains:       list of case-insensitive substrings on run output; ANY match fires
+      prev_assertion_has:    list of keys the previous iter's assertion must have
+      prev_assertion_lacks:  list of keys the previous iter's assertion must NOT have
+      canary_in_request:     bool — require canary presence in the issued command
+      canary_in_output:      bool — require canary presence (or absence) in output
+      command_contains:      list of case-insensitive substrings on command;
+                             EVERY string must appear (AND semantics)
+      command_contains_any:  list of case-insensitive substrings on command;
+                             ANY match fires (OR semantics)
 
     Returns a list of {"id", "title", "guidance"} for every matched pattern."""
     out = output or ""
     out_lc = out.lower()
     a = assertion if isinstance(assertion, dict) else {}
     cmd = command or ""
+    cmd_lc = cmd.lower()
     matched = []
     for row in _load_refine_patterns():
         trig = row.get("triggers") or {}
@@ -15024,6 +15049,19 @@ def _match_refine_patterns(output, assertion, canary, command):
         if "canary_in_output" in trig and canary:
             want = bool(trig["canary_in_output"])
             if (canary in out) != want:
+                continue
+        # command_contains — EVERY listed substring must appear in the
+        # command (AND). Lets a pattern require a specific combination
+        # (e.g. action= AND /index.php).
+        cmd_all = trig.get("command_contains")
+        if cmd_all:
+            if not all(s.lower() in cmd_lc for s in cmd_all if s):
+                continue
+        # command_contains_any — ANY listed substring triggers (OR). Used
+        # with command_contains to require (fixed set) AND (one-of a list).
+        cmd_any = trig.get("command_contains_any")
+        if cmd_any:
+            if not any(s.lower() in cmd_lc for s in cmd_any if s):
                 continue
         matched.append({"id": row.get("id"), "title": row.get("title"),
                          "guidance": row.get("guidance") or "",
