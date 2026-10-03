@@ -223,6 +223,78 @@ def node_basic_recon(state: BuildPocState) -> Dict[str, Any]:
             "recon_metrics": {**state.get("recon_metrics", {}), **metrics}}
 
 
+def node_product_identification(state: BuildPocState) -> Dict[str, Any]:
+    """EARLY product/version identification — runs right after basic_recon so
+    the rest of the pipeline (discovered-knowledge recall, research, synth)
+    knows WHAT it's attacking. Fingerprints the product + version from the
+    live HTML/headers, extracts plausible release dates, and BACK-FILLS
+    state.product / state.version when the build was invoked without them
+    (cve+ip+port only). When a product is identified and the build has a
+    real CVE, also kicks the AI deep-dive research early so advisory +
+    public-PoC intel is available to synth instead of discovered late.
+
+    Operator ask: 'a skill to help review the content for the product, even
+    looking through the html, pull possible dates for versions, and kick off
+    the ai deep dive — earlier in the process, right after scans and recon.'
+    """
+    from api import _identify_product_from_target, _poc_trace
+    _t0 = time.time()
+    had_product = bool(state.get("product"))
+    # Only run the (slower) deep dive when we DON'T already have research in
+    # hand and the build carries a real CVE to research.
+    want_deep = (bool(state.get("research", True))
+                 and bool(state.get("cve"))
+                 and not str(state.get("cve", "")).startswith("NOCVE-"))
+    info = _identify_product_from_target(
+        state["ip"], state["port"],
+        run_deep_dive=want_deep,
+        cve=state.get("cve"), eid=state.get("eid"), model=state.get("model"))
+    upd: Dict[str, Any] = {}
+    seg = []
+    if info.get("product") and not had_product:
+        upd["product"] = info["product"]
+        if info.get("version") and not state.get("version"):
+            upd["version"] = info["version"]
+    # Build a guidance segment describing what we identified.
+    bits = []
+    if info.get("product"):
+        v = f" {info['version']}" if info.get("version") else ""
+        conf = info.get("version_confidence", 0)
+        bits.append(f"Identified product: {info['product']}{v} "
+                    f"(version confidence {conf}).")
+    if info.get("dates"):
+        bits.append("Release-era dates found: " + ", ".join(info["dates"])
+                    + " — use these to rule out implausible version lines.")
+    if info.get("evidence"):
+        bits.append("Fingerprint evidence: " + info["evidence"])
+    # Fold the early deep-dive analysis into guidance + research_out so synth
+    # and the research node reuse it instead of re-fetching.
+    deep = info.get("deep_dive")
+    if deep and isinstance(deep, dict):
+        analysis = deep.get("analysis") or {}
+        if analysis.get("summary"):
+            bits.append("EARLY DEEP-DIVE (AI research, pre-synth): "
+                        + str(analysis["summary"])[:600])
+        upd["research_out"] = deep  # research node will see it's already done
+    if bits:
+        g = "\n".join(bits)
+        seg.append(g)
+        _poc_trace(state["run_id"], "recon:product_identification",
+                   response=g[:1600],
+                   extra={"product": info.get("product"),
+                          "version": info.get("version"),
+                          "dates": info.get("dates"),
+                          "backfilled": not had_product and bool(info.get("product")),
+                          "deep_dive_fired": bool(deep)})
+    metrics = {"product_identification": {
+        "seconds": round(time.time() - _t0, 2),
+        "chars_added": len("\n".join(bits)),
+        "signal": f"product={info.get('product')} version={info.get('version')}"}}
+    upd["segments"] = seg
+    upd["recon_metrics"] = {**state.get("recon_metrics", {}), **metrics}
+    return upd
+
+
 def node_response_mine(state: BuildPocState) -> Dict[str, Any]:
     from api import _scout_response_mine, _poc_trace
     _t0 = time.time()
@@ -524,6 +596,11 @@ def node_research(state: BuildPocState) -> Dict[str, Any]:
     dict but does NOT compose the guidance string — that's assemble_guidance's job."""
     if not state.get("research"):
         return {"research_out": None}
+    # If the early product-identification node already ran the deep-dive
+    # research (research_out populated), reuse it — don't pay for a second
+    # identical _research_exploit call.
+    if state.get("research_out"):
+        return {}
     from api import _research_exploit
     try:
         research_out = _research_exploit(
@@ -813,6 +890,7 @@ def build_graph():
     g.add_node("waf_detect", node_waf_detect)
     g.add_node("waf_characterize", node_waf_characterize)
     g.add_node("basic_recon", node_basic_recon)
+    g.add_node("product_identification", node_product_identification)
     g.add_node("response_mine", node_response_mine)
     g.add_node("auto_login", node_auto_login)
     g.add_node("framework_deep_enum", node_framework_deep_enum)
@@ -858,7 +936,8 @@ def build_graph():
                               "post_mine": "_post_mine_hub"})
 
     # basic_recon -> response_mine -> (auto_login if creds, deep_enum if fw, else post_mine hub)
-    g.add_edge("basic_recon", "response_mine")
+    g.add_edge("basic_recon", "product_identification")
+    g.add_edge("product_identification", "response_mine")
     g.add_conditional_edges("response_mine", _route_after_response_mine,
                              {"auto_login": "auto_login",
                               "framework_deep_enum": "framework_deep_enum",
