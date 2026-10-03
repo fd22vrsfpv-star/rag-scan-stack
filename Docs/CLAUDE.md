@@ -267,6 +267,35 @@ large change. Add the test in the same commit as the rule.
   third-party addresses were queued against this engagement — several already
   executed.
 
+### Blind-timing verdicts must be confirmed with a scaled payload
+- A latency-based verdict on a PoC (`method=latency` or `latency_anchored`,
+  from `assertion.min_seconds`) is NEVER accepted on a single run. A target
+  that takes 5s to respond on every request looks identical to a verified
+  blind SQLi `SLEEP(5)` when only one elapsed is observed.
+- The refine loop MUST re-run the command with a scaled payload (SLEEP(N)
+  → SLEEP(N+7) by default, `TIMING_CONFIRM_DELTA_SEC` configurable) and
+  verify the second run's elapsed scales with the payload (within a 2.5s
+  tolerance). If it scales, the verdict is upgraded to `latency_confirmed`
+  / `latency_confirmed_anchored`. If it does NOT scale, the first run was
+  a false positive — downgrade to `latency_unconfirmed` and let the loop
+  keep refining.
+- A command with no recognizable timing payload (no SLEEP / pg_sleep /
+  WAITFOR / BENCHMARK) cannot be confirmed → `latency_unconfirmable`,
+  advisory only.
+- The confirmation runs INLINE, deterministically, no LLM involved — can't
+  be subverted by model whims or by the operator forgetting to double-check.
+- *Enforced by:* `tests/test_timing_confirmation.py` (scaling for each
+  payload type, bail-out when nothing to scale, AST-grep that the refine
+  loop still calls `_timing_confirmation_rerun` and emits the three
+  downstream verdict methods).
+- *Why:* sqlmap's own confirmation is the standard; without it, a slow
+  target or a WAF with a fixed delay-response reads as "exploited" and
+  gets stored as a verified PoC. On CVE-2024-22120 (Zabbix script.execute
+  SQLi) the first run blocked for 5s because the server was handling the
+  CSRF+session establishment; the exploit itself didn't trigger. A second
+  run with `SLEEP(12)` would have blocked only 5s if the server wasn't
+  actually executing the payload — immediate downgrade.
+
 ### Scan volume
 - Any component that initiates OR triggers a scan MUST bound itself by
   `MAX_CONCURRENT_SCANS`. No component invents a private concurrency number.

@@ -15242,6 +15242,126 @@ def _mine_refine_pattern_candidates(limit=200, min_hits=3):
     return promoted
 
 
+def _timing_payload_scale(command, delta=7):
+    """Scale blind-timing payloads in a shell command by +delta seconds.
+
+    Recognizes common blind-SQLi + timing-side-channel idioms:
+      SLEEP(N)           — MySQL/MariaDB
+      pg_sleep(N)        — PostgreSQL (both quoted and bare)
+      WAITFOR DELAY 'HH:MM:SS'  — MSSQL
+      BENCHMARK(N, ...)  — MySQL (not sleep but similar timing primitive;
+                           scale the iteration count by *2 instead)
+
+    Returns (new_command, found_pattern, old_seconds, new_seconds) when a
+    pattern was replaced; (command, None, None, None) when nothing matched.
+    Only the FIRST match is scaled — enough to prove the server executes
+    the payload (both runs scaling in step is the signal).
+    """
+    import re as _re
+    # SLEEP(N) / pg_sleep(N) — N may be int or float
+    for pat_name, pat in (
+        ("SLEEP",    r"\bSLEEP\s*\(\s*(\d+(?:\.\d+)?)\s*\)"),
+        ("pg_sleep", r"\bpg_sleep\s*\(\s*(\d+(?:\.\d+)?)\s*\)"),
+    ):
+        m = _re.search(pat, command, _re.I)
+        if m:
+            old = float(m.group(1))
+            new = old + delta
+            # Preserve int-ness when original had no decimal
+            new_str = str(int(new)) if "." not in m.group(1) else f"{new:.1f}"
+            new_cmd = command[:m.start(1)] + new_str + command[m.end(1):]
+            return new_cmd, pat_name, old, new
+    # WAITFOR DELAY '0:0:N'  (MSSQL)
+    m = _re.search(r"WAITFOR\s+DELAY\s+'0:0:(\d+)'", command, _re.I)
+    if m:
+        old = int(m.group(1))
+        new = old + delta
+        new_cmd = (command[:m.start()] + f"WAITFOR DELAY '0:0:{new}'"
+                   + command[m.end():])
+        return new_cmd, "WAITFOR", float(old), float(new)
+    # BENCHMARK(N, expr) — scale iteration count by delta/5 (so a +7s delta
+    # roughly doubles the work on a baseline that took ~5s)
+    m = _re.search(r"\bBENCHMARK\s*\(\s*(\d+)\s*,", command, _re.I)
+    if m:
+        old = int(m.group(1))
+        new = old * 2  # BENCHMARK scales linearly with iteration count
+        new_cmd = command[:m.start(1)] + str(new) + command[m.end(1):]
+        return new_cmd, "BENCHMARK", float(old), float(new)
+    return command, None, None, None
+
+
+def _timing_confirmation_rerun(command, assertion, ip, port, listener,
+                                 api_key, vt, delta=7, tolerance=2.5):
+    """Confirm a blind-timing exploit by re-running with a larger payload.
+
+    A blind SQLi SLEEP(5) that lands in a target just happens to be slow
+    looks IDENTICAL to a verified exploit from the first run's elapsed
+    alone. The classic sqlmap-style confirmation is to re-run with a
+    DIFFERENT sleep (e.g. SLEEP(12)) and verify the new elapsed scales
+    accordingly. If it does, the server IS executing the payload; if it
+    doesn't, the target was just slow (false positive).
+
+    Returns:
+      {
+        "confirmed":   bool,
+        "pattern":     'SLEEP' | 'pg_sleep' | 'WAITFOR' | 'BENCHMARK' | None,
+        "first_s":     original run elapsed (seconds)
+        "second_s":    confirmation run elapsed (seconds)
+        "expected_s":  what the second run should block for
+        "scaled_cmd":  the command that was re-run
+        "reason":      human-readable explanation
+      }
+    When no timing pattern is found in the command, returns
+    confirmed=False with pattern=None — caller should treat as "cannot
+    confirm" rather than failure.
+    """
+    import httpx as _hx, time as _t
+    min_s = (assertion or {}).get("min_seconds")
+    if min_s is None:
+        return {"confirmed": False, "pattern": None,
+                "reason": "no min_seconds assertion to confirm"}
+    scaled_cmd, pattern, old_n, new_n = _timing_payload_scale(command, delta)
+    if pattern is None:
+        return {"confirmed": False, "pattern": None,
+                "reason": "no timing payload found in command to scale"}
+    try:
+        t0 = _t.time()
+        lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
+                      json={"command": scaled_cmd, "target": str(ip),
+                            "port": port, "timeout": vt},
+                      headers={"x-api-key": api_key}, verify=False,
+                      timeout=vt + 60)
+        elapsed = round(_t.time() - t0, 2)
+        _out_sample = (lr.json().get("output","")[:120]
+                       if lr.status_code < 400 else "")[:120]
+    except Exception as e:  # noqa: BLE001
+        return {"confirmed": False, "pattern": pattern,
+                "first_s": None, "second_s": None,
+                "expected_s": float(min_s) + delta,
+                "scaled_cmd": scaled_cmd,
+                "reason": f"confirmation run failed: {e}"}
+    expected = float(min_s) + delta
+    # Signal: second run should block ~delta seconds longer than the first
+    # (within tolerance). If elapsed < expected - tolerance, the server
+    # is NOT scaling with the payload → false positive.
+    confirmed = elapsed >= (expected - tolerance)
+    return {
+        "confirmed": confirmed,
+        "pattern": pattern,
+        "first_s": None,  # caller fills from the original run
+        "second_s": elapsed,
+        "expected_s": expected,
+        "scaled_cmd": scaled_cmd,
+        "scaled_payload_old": old_n,
+        "scaled_payload_new": new_n,
+        "output_sample": _out_sample,
+        "reason": (f"confirmation run elapsed {elapsed:.1f}s "
+                   f"(expected >= {expected - tolerance:.1f}s "
+                   f"after scaling {pattern}({old_n})→{pattern}({new_n})) → "
+                   f"{'CONFIRMED' if confirmed else 'UNCONFIRMED (target may be slow, not exploitable)'}")
+    }
+
+
 def _poc_shell_syntax_check(command):
     """Dry-parse a shell command via shlex to catch quote-balance / escape
     errors BEFORE dispatch. Returns (ok: bool, error: str). On error the
@@ -15792,6 +15912,50 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                           "method": verification_method,
                           "confidence": verification_confidence,
                           "reason": _verdict.get("reason", "")})
+        # BLIND-TIMING CONFIRMATION — PROJECT RULE: a latency verdict is
+        # ALWAYS re-run with a scaled payload (SLEEP(N) → SLEEP(N+7)) to
+        # distinguish actual time-based SQLi from a target that is just
+        # slow. If the second run blocks for ~N+7s, the server IS executing
+        # the payload (CONFIRMED). If it blocks for roughly the same N
+        # seconds as the first run, the first run was a false positive and
+        # the verdict is DOWNGRADED to latency_unconfirmed.
+        # See tests/test_timing_confirmation.py + CLAUDE.md.
+        if success and verification_method in ("latency", "latency_anchored"):
+            try:
+                _conf = _timing_confirmation_rerun(
+                    command, assertion, ip, port, listener, API_KEY, _vt,
+                    delta=int(os.environ.get("TIMING_CONFIRM_DELTA_SEC", "7") or "7"))
+                _conf["first_s"] = _this_iter_seconds
+                _poc_trace(run_id, "latency_confirmation", iteration=it,
+                           extra=_conf)
+                if _conf.get("pattern") is None:
+                    # No timing payload found in command — can't confirm.
+                    # Treat the first-run latency as advisory, not proof.
+                    success = False
+                    verification_method = "latency_unconfirmable"
+                    verification_confidence = 0.3
+                elif not _conf.get("confirmed"):
+                    # Second run didn't scale — target is just slow, not
+                    # exploitable. Downgrade so the loop keeps refining
+                    # instead of stopping on a false positive.
+                    success = False
+                    verification_method = "latency_unconfirmed"
+                    verification_confidence = 0.2
+                else:
+                    # Confirmed — strengthen the verdict + add to the output
+                    # so downstream (semantic verify, store summary) sees it.
+                    verification_method = (
+                        "latency_confirmed_anchored"
+                        if verification_method == "latency_anchored"
+                        else "latency_confirmed")
+                    verification_confidence = 0.98
+                    output = (output or "") + (
+                        f"\n[LATENCY-CONFIRMED] re-ran with {_conf['pattern']}"
+                        f"({_conf.get('scaled_payload_new')}) and target "
+                        f"blocked for {_conf['second_s']}s (vs {_this_iter_seconds}s "
+                        f"on the first run) — server IS executing the timing payload")
+            except Exception as _ce:  # noqa: BLE001
+                logging.debug("timing confirmation failed: %s", _ce)
         # Credit any pending patterns injected on the PREVIOUS iter if THIS
         # iter converged. The guidance helped the LLM write a working
         # command; after enough successes the auto-approve pass promotes
