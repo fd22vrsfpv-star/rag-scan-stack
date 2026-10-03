@@ -356,6 +356,27 @@ def node_zap_recon(state: BuildPocState) -> Dict[str, Any]:
             "recon_metrics": {**state.get("recon_metrics", {}), **metrics}}
 
 
+def node_discovered_knowledge_recon(state: BuildPocState) -> Dict[str, Any]:
+    """Pull previously-discovered app facts for this (product, version) so
+    iter 1 starts with knowledge from past builds instead of rediscovering.
+    Zero-cost DB read; empty when no prior builds for this product."""
+    from api import _recon_discovered_knowledge, _poc_trace
+    _t0 = time.time()
+    g = _recon_discovered_knowledge(state.get("product"), state.get("version"))
+    metrics = {"discovered_knowledge": {
+        "seconds": round(time.time() - _t0, 2),
+        "chars_added": len(g or ""),
+        "signal": "prior-build facts for this product"
+                   if g else "no prior facts recorded for this product"}}
+    seg = []
+    if g:
+        seg.append(g)
+        _poc_trace(state["run_id"], "recon:discovered_knowledge",
+                   response=g[:1600])
+    return {"segments": seg,
+            "recon_metrics": {**state.get("recon_metrics", {}), **metrics}}
+
+
 def node_openapi_recon(state: BuildPocState) -> Dict[str, Any]:
     """Probe common OpenAPI/Swagger paths and parse the first spec we find.
     When present, this is the REAL attack surface for API-first apps the
@@ -797,6 +818,7 @@ def build_graph():
     g.add_node("framework_deep_enum", node_framework_deep_enum)
     g.add_node("zap_recon", node_zap_recon)
     g.add_node("openapi_recon", node_openapi_recon)
+    g.add_node("discovered_knowledge_recon", node_discovered_knowledge_recon)
     g.add_node("playwright_recon", node_playwright_recon)
     g.add_node("arjun_recon", node_arjun_recon)
 
@@ -861,7 +883,8 @@ def build_graph():
     g.add_conditional_edges("zap_recon", _route_post_zap,
                              {"arjun_recon": "openapi_recon",
                               "auth_establish": "openapi_recon"})
-    g.add_edge("openapi_recon", "playwright_recon")
+    g.add_edge("openapi_recon", "discovered_knowledge_recon")
+    g.add_edge("discovered_knowledge_recon", "playwright_recon")
     # playwright_recon → arjun_recon (if _want arjun) else auth_establish.
     def _route_post_playwright(state):
         return "arjun_recon" if _want(state.get("recon_source", "basic"), "arjun") \
