@@ -20567,6 +20567,129 @@ def _research_cve_advisories(cve, max_results=3, per_url_bytes=6000,
     return "\n\n".join(merged)
 
 
+def _enumerate_exploit_preconditions(ip, port, analysis, session_cookie=None,
+                                      product=None, timeout=10):
+    """Confirm + RESOLVE the concrete prerequisites an exploit needs, instead
+    of letting synth guess them. The advisory/research names preconditions in
+    prose ("the user must have access to a host to run a script against");
+    this step turns that into VERIFIED, concrete values the exploit can use
+    (a real hostid the authenticated user can actually operate on).
+
+    Operator ask: "did we confirm access to a host to run a script? that
+    should be an enumeration step."
+
+    General pattern: scan the research analysis.preconditions for object-ID
+    requirements (host/hostid, user/userid, group, item, trigger, template,
+    etc.), then — using the authenticated session — hit the app's listing
+    surface and extract REAL ids the user can see. Returns:
+      {resolved: {<kind>: [ids...]}, confirmed: [str...], unmet: [str...],
+       guidance: str}
+
+    App-aware resolvers (extend as needed); falls back to generic sitemap/
+    discovered_params ID extraction for unknown apps.
+    """
+    import httpx as _hx, re as _re
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    preconds = []
+    a = analysis or {}
+    if isinstance(a.get("preconditions"), list):
+        preconds = [str(p) for p in a["preconditions"]]
+    pre_blob = " ".join(preconds).lower() + " " + str(a.get("summary", "")).lower()
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; PentestBot/1)"}
+    if session_cookie:
+        headers["Cookie"] = session_cookie
+    resolved, confirmed, unmet = {}, [], []
+
+    def _grab_ids(text, keys):
+        ids = []
+        for k in keys:
+            for m in _re.finditer(rf'["\']?{k}["\']?\s*[:=]\s*["\']?(\d+)', text, _re.I):
+                v = m.group(1)
+                if v not in ids and v not in ("0",):
+                    ids.append(v)
+        return ids[:10]
+
+    prod_l = (product or "").lower()
+    try:
+        with _hx.Client(verify=False, follow_redirects=True, timeout=timeout,
+                         headers=headers) as cli:
+            # ── Zabbix: "host to run a script against" → enumerate hostids ──
+            if "host" in pre_blob or "script" in pre_blob or "zabbix" in prod_l:
+                hostids = []
+                # UI host list (authenticated) — hostids appear in the HTML/JSON
+                for path in ("/zabbix.php?action=host.view",
+                             "/zabbix.php?action=host.list",
+                             "/hosts.php"):
+                    try:
+                        r = cli.get(base + path)
+                        if r.status_code == 200 and r.text:
+                            hostids += _grab_ids(r.text, ["hostid"])
+                    except Exception:  # noqa: BLE001
+                        continue
+                # Zabbix JSON-RPC host.get (needs API auth token, but the web
+                # session sometimes works via the frontend proxy) — best effort
+                try:
+                    rpc = cli.post(base + "/api_jsonrpc.php",
+                                   json={"jsonrpc": "2.0", "method": "host.get",
+                                         "params": {"output": ["hostid", "name"],
+                                                    "limit": 10},
+                                         "id": 1},
+                                   headers={**headers, "Content-Type": "application/json-rpc"})
+                    if rpc.status_code == 200:
+                        hostids += _grab_ids(rpc.text, ["hostid"])
+                except Exception:  # noqa: BLE001
+                    pass
+                hostids = list(dict.fromkeys(hostids))[:10]
+                if hostids:
+                    resolved["hostid"] = hostids
+                    confirmed.append(f"user can see {len(hostids)} host(s); "
+                                     f"usable hostid(s): {', '.join(hostids[:5])}")
+                else:
+                    unmet.append("could not enumerate a hostid the user can "
+                                 "operate on — the exploit's script-execution "
+                                 "precondition may not be met (user needs host "
+                                 "access). Confirm the account has >=1 host.")
+            # ── Generic: any "<thing>id" precondition → sitemap/discovered ──
+            generic_keys = []
+            for kw in ("userid", "groupid", "itemid", "triggerid", "templateid",
+                       "graphid", "mapid", "screenid", "dashboardid"):
+                if kw in pre_blob or kw[:-2] in pre_blob:
+                    generic_keys.append(kw)
+            if generic_keys:
+                try:
+                    r = cli.get(base + "/")
+                    ids = _grab_ids(r.text or "", generic_keys)
+                    if ids:
+                        for k in generic_keys:
+                            kv = _grab_ids(r.text or "", [k])
+                            if kv:
+                                resolved[k] = kv
+                                confirmed.append(f"{k}: {', '.join(kv[:5])}")
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception as e:  # noqa: BLE001
+        logging.debug("precondition enumeration failed: %s", e)
+
+    # Build guidance
+    bits = []
+    if confirmed:
+        bits.append("PRECONDITIONS CONFIRMED (enumerated from the authenticated "
+                    "target — USE these real values, do NOT invent ids):")
+        for c in confirmed:
+            bits.append(f"  - {c}")
+    if resolved:
+        kv = "; ".join(f"{k}={v[0]}" for k, v in resolved.items() if v)
+        if kv:
+            bits.append(f"  Use concretely: {kv}")
+    if unmet:
+        bits.append("PRECONDITIONS NOT MET / UNRESOLVED:")
+        for u in unmet:
+            bits.append(f"  - {u}")
+    return {"resolved": resolved, "confirmed": confirmed, "unmet": unmet,
+            "guidance": "\n".join(bits)}
+
+
 def _gather_cve_intel(cve, product=None, version=None, ip=None, port=None,
                        include_msf_edb=True):
     """SHARED CVE-intel engine — the single source both the build-poc research
