@@ -19483,6 +19483,36 @@ def mine_refine_patterns(min_hits: int = 3,
     return {"ok": True, "promoted": promoted, "count": len(promoted)}
 
 
+@app.get("/confirmed-facts", tags=["Exploit Store"])
+def list_confirmed_facts(target: Optional[str] = None, cve: Optional[str] = None,
+                          product: Optional[str] = None, status: Optional[str] = None,
+                          fresh_only: bool = False, authorized: bool = Depends(auth)):
+    """The confirmed-facts ledger — durable record of what's been verified
+    (session validity, endpoint existence, version applicability, resolved
+    object-ids, vendor-doc answers) with evidence, method, and freshness.
+    Operators + the readiness gate read this so a confirmation is never lost.
+    Filter by target (ip:port), cve, product, status (confirmed|refuted|
+    unverified). fresh_only drops rows whose TTL has elapsed."""
+    _ensure_confirmed_facts_table()
+    where, args = [], []
+    if target: where.append("target = %s"); args.append(target)
+    if cve: where.append("cve = %s"); args.append(cve)
+    if product: where.append("lower(product) = lower(%s)"); args.append(product)
+    if status: where.append("status = %s"); args.append(status)
+    sql = ("SELECT *, EXTRACT(EPOCH FROM (now()-last_checked_at)) AS age_s "
+           "FROM public.confirmed_facts")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY last_checked_at DESC LIMIT 500"
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, args)
+        rows = [dict(r) for r in cur.fetchall()]
+    if fresh_only:
+        rows = [r for r in rows
+                if not r.get("ttl_seconds") or (r.get("age_s") or 0) <= r["ttl_seconds"]]
+    return {"count": len(rows), "facts": rows}
+
+
 @app.post("/software/poc-grants", tags=["Assets"])
 def grant_poc_endpoint(body: PocGrantBody, authorized: bool = Depends(auth)):
     """Release (grant) an endpoint for PoC building — standing until revoked/stopped."""
@@ -20787,6 +20817,181 @@ def _enumerate_exploit_preconditions(ip, port, analysis, session_cookie=None,
             "guidance": "\n".join(bits)}
 
 
+def _ensure_confirmed_facts_table():
+    """Durable ledger of CONFIRMED (and refuted) readiness facts so a
+    confirmation is never silently lost between iterations or builds.
+
+    Operator ask: "how do we track that something is confirmed so we don't
+    lose that status."
+
+    Each row records WHAT was checked, the VERDICT, the EVIDENCE, HOW it was
+    confirmed, WHEN, and a freshness TTL (session validity goes stale fast;
+    'endpoint exists' is durable). The readiness gate writes every
+    satisfied→confirmed and every blocker→refuted/unverified, and reads
+    fresh prior confirmations first to avoid re-proving what's still known."""
+    try:
+        with get_db() as c, c.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS public.confirmed_facts (
+                    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                    engagement_id uuid,
+                    target        text NOT NULL,     -- ip:port
+                    product       text,
+                    version       text,
+                    cve           text,
+                    claim_type    text NOT NULL,     -- session_valid | endpoint_exists
+                                                     -- | version_applies | object_id
+                                                     -- | precondition | vendor_doc | target_reachable
+                    claim_key     text NOT NULL,     -- e.g. 'auth', '/zabbix.php', 'hostid'
+                    claim_value   text,              -- concrete value when applicable
+                    status        text NOT NULL,     -- confirmed | refuted | unverified
+                    evidence      text,
+                    method        text,              -- probe | enumeration | vendor_doc | run | advisory
+                    confidence    real NOT NULL DEFAULT 0.9,
+                    ttl_seconds   int  NOT NULL DEFAULT 0,  -- 0 = durable, >0 = re-verify after
+                    source_run_id text,
+                    confirmed_at  timestamptz NOT NULL DEFAULT now(),
+                    last_checked_at timestamptz NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_confirmed_fact
+                ON public.confirmed_facts
+                (target, claim_type, claim_key, COALESCE(claim_value,''),
+                 COALESCE(cve,''))""")
+            cur.execute("""CREATE INDEX IF NOT EXISTS idx_confirmed_target
+                ON public.confirmed_facts (target)""")
+            c.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("ensure confirmed_facts failed: %s", e)
+
+
+# TTL defaults per claim type (seconds). Session validity expires fast;
+# structural facts (endpoint exists, version applies) are durable (0).
+_CONFIRM_TTL = {
+    "session_valid": 900,       # 15 min — session cookies expire
+    "target_reachable": 300,
+    "object_id": 3600,          # ids can change but rarely mid-engagement
+    "endpoint_exists": 0,
+    "version_applies": 0,
+    "precondition": 1800,
+    "vendor_doc": 0,            # vendor docs don't change
+}
+
+
+def _register_web_session_access(ip, port, username, cookie, product=None,
+                                   engagement_id=None):
+    """A CONFIRMED, valid authenticated web session IS held access — register
+    it in obtained_access so it shows up as a foothold on the asset (next to
+    ssh/msf/bind/credential access), not just in the confirmed-facts ledger.
+
+    Operator ask: "will this show up as a foothold on the asset?"
+
+    kind='web_session', handle=user@product, transport='http_cookie',
+    status='live'. Durable (a valid session is real access); the foothold
+    watcher re-probes it via the same session-validity check."""
+    if not username:
+        return
+    try:
+        eid = _validate_engagement_uuid(engagement_id) if engagement_id else None
+        handle = f"{username}@{product or 'webapp'}"
+        whoami = username
+        with get_db() as c, c.cursor() as cur:
+            cur.execute("""
+                INSERT INTO public.obtained_access
+                  (target, port, kind, handle, transport, whoami, uid, is_root,
+                   os_info, probes, probes_ok, last_probe_at, last_error, score,
+                   status, engagement_id)
+                VALUES (%s,%s,'web_session',%s,'http_cookie',%s,NULL,false,
+                        %s,1,1,now(),'',60,'live',%s)
+                ON CONFLICT (target, kind, handle) DO UPDATE SET
+                  whoami = EXCLUDED.whoami, last_probe_at = now(),
+                  probes = public.obtained_access.probes + 1,
+                  probes_ok = public.obtained_access.probes_ok + 1,
+                  status = CASE WHEN public.obtained_access.status = 'rejected'
+                                THEN 'rejected' ELSE 'live' END
+            """, (str(ip), port or 80, handle, whoami,
+                  f"authenticated web session ({product or 'web'})", eid))
+            c.commit()
+        try:
+            emit_webhook("foothold_web_session", "access",
+                         {"target": str(ip), "port": port, "user": username,
+                          "product": product, "engagement_id": eid})
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception as e:  # noqa: BLE001
+        logging.debug("register web session access failed: %s", e)
+
+
+def _record_confirmation(target, claim_type, claim_key, status, evidence="",
+                          method="probe", claim_value=None, confidence=0.9,
+                          product=None, version=None, cve=None,
+                          engagement_id=None, run_id=None, ttl_seconds=None):
+    """Upsert one confirmation into the ledger. status: confirmed|refuted|
+    unverified. A later check UPDATES the same (target, claim, cve) row —
+    so a refutation overwrites a stale confirmation and vice versa, and the
+    timestamps track when we last knew."""
+    _ensure_confirmed_facts_table()
+    if ttl_seconds is None:
+        ttl_seconds = _CONFIRM_TTL.get(claim_type, 0)
+    try:
+        with get_db() as c, c.cursor() as cur:
+            cur.execute("""
+                INSERT INTO public.confirmed_facts
+                    (engagement_id, target, product, version, cve, claim_type,
+                     claim_key, claim_value, status, evidence, method,
+                     confidence, ttl_seconds, source_run_id, confirmed_at,
+                     last_checked_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),now())
+                ON CONFLICT (target, claim_type, claim_key,
+                             COALESCE(claim_value,''), COALESCE(cve,''))
+                DO UPDATE SET status = EXCLUDED.status,
+                              evidence = EXCLUDED.evidence,
+                              method = EXCLUDED.method,
+                              confidence = EXCLUDED.confidence,
+                              ttl_seconds = EXCLUDED.ttl_seconds,
+                              source_run_id = EXCLUDED.source_run_id,
+                              last_checked_at = now(),
+                              confirmed_at = CASE
+                                  WHEN public.confirmed_facts.status = EXCLUDED.status
+                                  THEN public.confirmed_facts.confirmed_at
+                                  ELSE now() END
+            """, (_validate_engagement_uuid(engagement_id) if engagement_id else None,
+                  target, product, version, cve, claim_type, claim_key,
+                  claim_value, status, evidence[:2000], method, confidence,
+                  ttl_seconds, run_id))
+            c.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("record confirmation failed: %s", e)
+
+
+def _get_confirmation(target, claim_type, claim_key, cve=None, claim_value=None,
+                       fresh_only=True):
+    """Return the prior confirmation row for this exact claim, or None. When
+    fresh_only, a row whose TTL has elapsed is treated as stale (returns None)
+    so the caller re-verifies instead of trusting an expired confirmation."""
+    _ensure_confirmed_facts_table()
+    try:
+        with get_db() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT *, EXTRACT(EPOCH FROM (now() - last_checked_at)) AS age_s
+                FROM public.confirmed_facts
+                WHERE target = %s AND claim_type = %s AND claim_key = %s
+                  AND COALESCE(cve,'') = COALESCE(%s,'')
+                  AND COALESCE(claim_value,'') = COALESCE(%s,'')
+                ORDER BY last_checked_at DESC LIMIT 1
+            """, (target, claim_type, claim_key, cve, claim_value))
+            row = cur.fetchone()
+            if not row:
+                return None
+            if fresh_only and row.get("ttl_seconds"):
+                if (row.get("age_s") or 0) > row["ttl_seconds"]:
+                    return None  # stale → re-verify
+            return dict(row)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("get confirmation failed: %s", e)
+        return None
+
+
 def _probe_session_valid(ip, port, cookie, product=None, timeout=8):
     """Is the authenticated session actually valid? Many apps return 200 with a
     login/warning/redirect page when the session is dead — which looks like
@@ -21125,6 +21330,56 @@ def _assess_exploit_readiness(ip, port, analysis, session_info=None,
     total = len(blockers) + len(satisfied)
     score = round(len(satisfied) / total, 2) if total else 0.0
     ready = (not hard_blocked) and (len(blockers) == 0 or not needs_auth and score >= 0.5)
+    # PERSIST every verdict to the confirmed-facts ledger so a confirmation is
+    # never lost — reused across iterations/builds, with evidence + freshness.
+    # satisfied → confirmed; blocker → refuted (hard) / unverified (soft).
+    tgt = f"{ip}:{port or 80}"
+    # Scope rule: TARGET-level facts (session validity, a resolved hostid, an
+    # endpoint's existence, reachability, the running version) are properties
+    # of the TARGET/user — NOT of this CVE — so they're stored cve=NULL and
+    # ANY other attack against the same target reuses them. Only CVE-specific
+    # judgements (does version X have THIS cve, this cve's preconditions,
+    # vendor-doc answers for this cve) are scoped to the cve.
+    TARGET_LEVEL = {"session_valid", "target_reachable", "endpoint_exists", "object_id"}
+    try:
+        for s in satisfied:
+            ct, ck = "precondition", s[:60]
+            low = s.lower()
+            if "session is valid" in low: ct, ck = "session_valid", "auth"
+            elif "target reachable" in low: ct, ck = "target_reachable", "/"
+            elif "endpoint" in low and "exists" in low: ct, ck = "endpoint_exists", (a.get("target_endpoint") or "/")
+            elif "version" in low and "advisory" in low: ct, ck = "version_applies", (version or "")
+            elif "vendor-doc confirmed" in low: ct, ck = "vendor_doc", s[:60]
+            _cve = None if ct in TARGET_LEVEL else cve
+            _record_confirmation(tgt, ct, ck, "confirmed", evidence=s,
+                                 method="probe", product=product, version=version,
+                                 cve=_cve, engagement_id=None, run_id=None)
+            # A confirmed valid session → register as a foothold on the asset.
+            if ct == "session_valid":
+                _uname = (si.get("username") if isinstance(si, dict) else None)
+                _register_web_session_access(ip, port, _uname, cookie,
+                                             product=product, engagement_id=None)
+        # Resolved object-ids: durable, concrete, TARGET-level (cve=NULL) so a
+        # hostid confirmed for one CVE is usable by every other attack.
+        for k, vals in (resolved or {}).items():
+            for v in (vals or [])[:5]:
+                _record_confirmation(tgt, "object_id", k, "confirmed",
+                                     evidence=f"enumerated {k}={v}",
+                                     method="enumeration", claim_value=str(v),
+                                     product=product, version=version, cve=None)
+        for b in blockers:
+            st = "refuted" if ("NOT valid" in b or "NO session" in b
+                               or "404" in b or "CONTRADICTS" in b
+                               or "did not respond" in b) else "unverified"
+            # A refuted session/reachability is target-level; refuted
+            # preconditions are cve-specific.
+            _bt = "session_valid" if ("NOT valid" in b or "NO session" in b) else "precondition"
+            _bcve = None if _bt in TARGET_LEVEL else cve
+            _record_confirmation(tgt, _bt, b[:60] if _bt == "precondition" else "auth",
+                                 st, evidence=b, method="probe",
+                                 product=product, version=version, cve=_bcve)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("persist confirmations failed: %s", e)
     return {"ready": ready, "hard_blocked": hard_blocked,
             "blockers": blockers, "satisfied": satisfied,
             "score": score, "llm_verdict": llm_verdict}

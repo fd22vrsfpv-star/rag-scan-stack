@@ -6666,3 +6666,44 @@ WHERE script LIKE 'ssh-audit:%' AND port_id IS NULL AND (metadata->>'port') IS N
 UPDATE public.vulns SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{port}', '443'::jsonb)
 WHERE script LIKE ANY(ARRAY['sslscan:%','testssl:%','sslyze:%']) AND port_id IS NULL AND (metadata->>'port') IS NULL;
 
+
+-- ── Exploit-intel persistence (runtime-ensured too; here for clean installs) ──
+-- Confirmed-facts ledger: durable record of verified target/exploit state
+-- (session validity, endpoint existence, resolved object-ids, version
+-- applicability, vendor-doc answers) reused across attacks. TARGET-level
+-- facts carry cve=NULL so any attack against the same target reuses them.
+CREATE TABLE IF NOT EXISTS public.confirmed_facts (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id uuid, target text NOT NULL, product text, version text, cve text,
+    claim_type text NOT NULL, claim_key text NOT NULL, claim_value text,
+    status text NOT NULL, evidence text, method text,
+    confidence real NOT NULL DEFAULT 0.9, ttl_seconds int NOT NULL DEFAULT 0,
+    source_run_id text,
+    confirmed_at timestamptz NOT NULL DEFAULT now(),
+    last_checked_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_confirmed_fact ON public.confirmed_facts
+    (target, claim_type, claim_key, COALESCE(claim_value,''), COALESCE(cve,''));
+CREATE INDEX IF NOT EXISTS idx_confirmed_target ON public.confirmed_facts (target);
+
+-- Discovered app knowledge: per-product/version facts the build loop learns
+-- (endpoints, params, csrf source, cookie shape, secondary products).
+CREATE TABLE IF NOT EXISTS public.discovered_app_knowledge (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    product text NOT NULL, version text, fact_type text NOT NULL, fact_value text NOT NULL,
+    confidence real NOT NULL DEFAULT 0.5, discovered_from text, source_run_id text,
+    engagement_id uuid, hits int NOT NULL DEFAULT 1,
+    last_seen_at timestamptz NOT NULL DEFAULT now(),
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_dak_product ON public.discovered_app_knowledge (lower(product));
+
+-- Refine-error patterns: operator-extensible + learned refine-time fix guidance.
+CREATE TABLE IF NOT EXISTS public.refine_error_patterns (
+    id text PRIMARY KEY, title text NOT NULL, guidance text NOT NULL, triggers jsonb NOT NULL,
+    source text NOT NULL DEFAULT 'yaml',
+    created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(),
+    approved_by text, approved_at timestamptz,
+    trial_count int NOT NULL DEFAULT 0, success_count int NOT NULL DEFAULT 0,
+    last_trial_at timestamptz
+);
