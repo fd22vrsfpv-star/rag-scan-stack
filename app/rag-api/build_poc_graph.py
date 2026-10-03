@@ -1046,7 +1046,11 @@ def node_run_refine(state: BuildPocState) -> Dict[str, Any]:
         # per-URL ZAP active scan on them in addition to the generic
         # host-level scan. Catches URLs ZAP's own spider would never reach.
         arjun_discovered=state.get("arjun_discovered"),
-        focused_urls_from_body=state.get("focused_urls"))
+        focused_urls_from_body=state.get("focused_urls"),
+        # Resolved object-ids from the login's post-access inventory /
+        # precondition enumeration — enforced into every command so the model
+        # can't substitute an invented id for one the login actually proved.
+        resolved_ids=(state.get("precond_result") or {}).get("resolved"))
     return {"result": result,
             "verified": bool(result.get("verified")),
             "reflection": bool(result.get("reflection")),

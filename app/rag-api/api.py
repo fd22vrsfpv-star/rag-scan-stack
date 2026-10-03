@@ -16121,11 +16121,53 @@ def _flag_precondition(cve, ip, pc, eid):
         logging.debug("flag precondition failed: %s", e)
 
 
+def _enforce_resolved_object_ids(command, resolved):
+    """Deterministically rewrite object-id params in a PoC command to the values
+    the login actually enumerated. The refine prompt is GIVEN the resolved ids
+    ("Use concretely: hostid=10084"), but the model sometimes invents a
+    different value (observed on CVE-2024-22120: the login proved hostid=10084,
+    yet qwen3-coder emitted hostid=1001). The login's enumeration is ground
+    truth — no assumptions — so for any id-kind with EXACTLY ONE resolved value,
+    rewrite every differing <kind>=<digits> occurrence to the enumerated value.
+
+    Conservative by design: acts only on id-shaped kinds (name ends in 'id')
+    that resolved to a single unambiguous value; ambiguous kinds (several
+    candidates) are left to the LLM. Matches the common form `<kind>=<digits>`,
+    which covers query-string and url-encoded body params (`hostid=1001`,
+    `&hostid=1001`, `hostid%3D1001` after decode is handled by callers that
+    url-encode the value, not the key). Returns (new_command, changes) where
+    changes is a list of (kind, old, new)."""
+    import re as _re
+    if not command or not isinstance(resolved, dict) or not resolved:
+        return command, []
+    changes = []
+    out = command
+    for kind, vals in resolved.items():
+        if not isinstance(kind, str) or not kind.endswith("id"):
+            continue
+        uniq = list(dict.fromkeys(str(v) for v in (vals or []) if str(v).strip()))
+        if len(uniq) != 1:
+            continue  # ambiguous — leave it to the model
+        want = uniq[0]
+        if not want.isdigit():
+            continue
+        pat = _re.compile(rf'({_re.escape(kind)}=)(\d+)')
+
+        def _sub(m, _want=want, _kind=kind):
+            if m.group(2) != _want:
+                changes.append((_kind, m.group(2), _want))
+                return m.group(1) + _want
+            return m.group(0)
+
+        out = pat.sub(_sub, out)
+    return out, changes
+
+
 def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale="",
                     product=None, version=None, max_iters=3, canary=None,
                     origin_family=None, llm_model=None, metrics=None, model=None,
                     recon_source_used=None, arjun_discovered=None,
-                    focused_urls_from_body=None):
+                    focused_urls_from_body=None, resolved_ids=None):
     """Increment 2: run the PoC against the target; on failure, refine via the LLM,
     re-run — up to max_iters. Verbose trail -> filesystem.
 
@@ -16196,6 +16238,16 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
     _model_fallback_fired = False
     for it in range(1, max(1, max_iters) + 1):
         iters = it
+        # Enforce enumerated object-ids BEFORE running: the login proved these
+        # (hostid, scriptid, …); the model is only allowed to vary what the
+        # enumeration left ambiguous. Rewrites e.g. an invented hostid=1001 back
+        # to the enumerated hostid=10084 so a wrong id never wastes an iteration.
+        if resolved_ids:
+            command, _id_changes = _enforce_resolved_object_ids(command, resolved_ids)
+            if _id_changes:
+                _poc_trace(run_id, "enforced_resolved_ids", iteration=it,
+                           extra={"changes": [{"kind": k, "from": o, "to": n}
+                                              for (k, o, n) in _id_changes]})
         fam = _poc_target_family(command)
         if orig and orig[1] and fam[1] and fam[1] != orig[1]:
             drifted = True
@@ -21100,6 +21152,17 @@ def _record_confirmation(target, claim_type, claim_key, status, evidence="",
     refutation overwrites a stale confirmation and the timestamps track when
     we last knew."""
     _ensure_confirmed_facts_table()
+    # Target-level facts are NOT CVE-specific: an enumerated hostid, a valid
+    # session, a reachable target, an installed version or an existing endpoint
+    # are true for the (target, product) regardless of which CVE prompted the
+    # check. Store them cve-agnostic so they dedup into ONE reusable row instead
+    # of one row per CVE (the Confirmed Facts panel was showing hostid/session
+    # twice — once cve=NULL from access-enum, once cve=<build cve> from the
+    # gate). Only genuinely exploit-specific claims keep the cve in their key.
+    _TARGET_LEVEL_CLAIMS = {"object_id", "session_valid", "target_reachable",
+                            "endpoint_exists", "version_applies"}
+    if claim_type in _TARGET_LEVEL_CLAIMS:
+        cve = None
     if ttl_seconds is None:
         ttl_seconds = _CONFIRM_TTL.get(claim_type, 0)
     try:
