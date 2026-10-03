@@ -15621,17 +15621,33 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         # parse the command (either our pre-dispatch check or the listener's
         # sh), give refine a specific "fix the quote balance" directive — a
         # generic rewrite often just re-breaks it a slightly different way.
+        # Includes the EXACT shlex error message so the LLM can target the
+        # fix (operator ask: inject the exact "No closing quotation" into
+        # the refine prompt so the LLM knows WHAT to simplify).
         shell_syntax_note = ""
         _o_lc = (output or "").lower()
         if ("/bin/sh:" in _o_lc and "syntax error" in _o_lc) or "unmatched quote" in _o_lc:
+            # Extract the exact error after "syntax error" marker (pre-dispatch
+            # path writes "/bin/sh: syntax error (pre-dispatch dry-parse
+            # refused to run): <shlex msg>").
+            _exact = ""
+            try:
+                import re as _rx
+                m = _rx.search(r"syntax error[^:]*:\s*(.+?)(?:$|\n)", output or "", _rx.I)
+                if m: _exact = m.group(1).strip()[:200]
+            except Exception:  # noqa: BLE001
+                pass
             shell_syntax_note = (
-                "\nSHELL SYNTAX ERROR — the shell refused to parse the previous command "
-                "(mismatched quotes, unterminated string, or stray backslash). Fix the "
-                "QUOTE BALANCE first: pair every \" and ', escape embedded quotes with "
-                "\\\" or switch to single-quote wrapping, and don't end on a bare \\. "
-                "Prefer: single-quote the outer payload and use $'...' or heredoc for "
-                "literal content with quotes. Keep it to ONE line; don't add newlines "
-                "inside quoted strings."
+                f"\nSHELL SYNTAX ERROR — the shell refused to parse the previous command. "
+                f"Exact lexer complaint: `{_exact or '(no detail)'}`. "
+                "ROOT CAUSE on `No closing quotation` / unterminated string: nested "
+                "double-quotes inside a double-quoted string (e.g. "
+                "`grep -o \"csrf-token.*value=\\\"[^\"]*\\\"\"` — the `[^\"]*` has a bare "
+                "`\"` that closes the OUTER quote). Fix pattern: wrap the outer value "
+                "in SINGLE quotes and use `[^\\\"]*` inside (no shell escapes needed), "
+                "OR use python/perl for complex regex. Example GOOD: "
+                "`grep -oP 'csrf-token[^\"]+value=\"\\K[^\"]+'`. Keep it to ONE line; "
+                "don't nest the same quote char."
             )
         # Model-refusal nudge: when the previous command WAS prose like
         # "REFUSE: I cannot provide..." (model safety guardrail misfiring on
@@ -15652,12 +15668,42 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                 "start with an executable (curl/bash/sh/python3/...), never with "
                 "English prose."
             )
+        # Latency-sticky nudge: if the PREVIOUS iter's assertion carried
+        # min_seconds, the exploit is proving by TIMING (blind SQLi SLEEP,
+        # timing side-channel) — the output will NEVER contain the canary.
+        # Operator ask ("refine prompt stickiness"): remind the LLM to KEEP
+        # the latency assertion instead of silently reverting to expect_regex,
+        # which can't fire on blind timing. Also change the JSON template so
+        # the suggested shape matches the exploit kind.
+        latency_sticky_note = ""
+        _prev_had_latency = bool(isinstance(assertion, dict) and assertion.get("min_seconds") is not None)
+        if _prev_had_latency:
+            _ms = assertion.get("min_seconds"); _xs = assertion.get("max_seconds")
+            latency_sticky_note = (
+                f"\nTIMING-BASED EXPLOIT — your previous assertion was "
+                f"{{min_seconds: {_ms}, max_seconds: {_xs or 'None'}, canary: ...}}. "
+                "Blind time-based SQLi (SLEEP/pg_sleep/WAITFOR DELAY) does NOT "
+                "produce a visible canary in output — expect_regex can never "
+                "fire on it. KEEP the latency assertion in your reply; do NOT "
+                "switch to expect_regex. If the previous timing payload didn't "
+                "block, the SQL likely errored out BEFORE SLEEP ran — fix the "
+                "injection syntax (comment chars, quote escape, column context) "
+                "but keep the SLEEP structure and the latency assertion."
+            )
+        # Pick the assertion shape in the JSON template based on what the
+        # previous iter used — so the LLM doesn't revert the proof model.
+        if _prev_had_latency:
+            _assert_template = (f"{{\"min_seconds\": {assertion.get('min_seconds')}, "
+                                f"\"max_seconds\": {assertion.get('max_seconds') or 30}, "
+                                f"\"canary\": \"{canary or ''}\"}}")
+        else:
+            _assert_template = f"{{\"expect_regex\": \"{canary or '<regex>'}\"}}"
         rprompt = (f"AUTHORIZED lab pentest. The PoC for {cve} on http://{ip}:{port} did NOT "
                    f"succeed.\nCommand: {command}\nOutput:\n{(output or '')[:1500]}{precond}"
-                   f"{shell_syntax_note}{refusal_note}{path_discovery_note}{waf_hit_note}{escalation_guidance}{anchor_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
+                   f"{shell_syntax_note}{refusal_note}{latency_sticky_note}{path_discovery_note}{waf_hit_note}{escalation_guidance}{anchor_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
                    f"appear. Return ONE JSON object only: {{\"command\": \"<better command, may "
                    f"chain curl calls with ; and shell vars to fetch a token first>\", "
-                   f"\"assertion\": {{\"expect_regex\": \"{canary or '<regex>'}\"}}}}. No prose.")
+                   f"\"assertion\": {_assert_template}}}. No prose.")
         try:
             res = _llm_for_model(rprompt, model=model, caller="cve_poc_refine")
             rtext = res.get("response", "") if isinstance(res, dict) else str(res or "")
@@ -15697,8 +15743,25 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             break
         command = str(obj["command"]).strip()
         la = obj.get("assertion")
-        if isinstance(la, dict) and la.get("expect_regex"):
-            assertion = _reanchor(la["expect_regex"])  # re-anchor: canary stays load-bearing
+        if isinstance(la, dict):
+            if la.get("expect_regex"):
+                assertion = _reanchor(la["expect_regex"])  # re-anchor: canary stays load-bearing
+            # LATENCY assertion — accept it with canary anchor so timing is
+            # the authoritative proof for blind time-based exploits (SQLi
+            # SLEEP, timing side-channels). canary stays load-bearing so
+            # the stored PoC is still CVE-anchored.
+            if la.get("min_seconds") is not None:
+                new_a = {"min_seconds": la["min_seconds"]}
+                if la.get("max_seconds") is not None:
+                    new_a["max_seconds"] = la["max_seconds"]
+                if canary:
+                    new_a["canary"] = canary
+                    new_a["cve_anchored"] = True
+                    # If LLM asked for canary_in_timing, honor it so we require
+                    # BOTH timing + canary — strongest timing verdict.
+                    if la.get("canary_in_timing"):
+                        new_a["canary_in_timing"] = True
+                assertion = new_a
 
     anchored = _poc_assertion_is_anchored(assertion, canary)
     # VERIFIED = the assertion passed AND it was anchored to the exploit's own effect.
