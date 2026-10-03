@@ -175,3 +175,17 @@ approval path, gated behind an explicit policy flag (Tier 3).
 - **Done when:** a deep authenticated active scan of testfire completes without ZAP recycling and ingests /bank findings (showAccount IDOR, transfer/transaction business-logic, queryxpath injection).
 - **Likely fix:** reduce the active-scan footprint — scope the active scan to the authenticated area (/bank) rather than the whole tree, lower thread_per_host, cap max_scan_duration, and/or disable the ajax spider during the authenticated active scan; or give ZAP exclusive memory headroom. The authenticated crawl/seeding (the capability built this session) is unaffected and verified.
 - **Enforced by:** not enforced (live-scan/infra behavior).
+
+## build-poc exploit uses a hardcoded Zabbix `sid` instead of the extracted CSRF token
+- **Found:** 2026-10-03, verifying CVE-2024-22120 (Zabbix) after the access-enumeration + id-enforcement fixes landed.
+- **Evidence:** v2 run log `CVE-2024-22120_172.18.0.40_1791066352.jsonl` — the generated command extracts a fresh token into `$CSRF_TOKEN` but the POST body hardcodes `sid=a6094b4f052fd133adc335382f0297f6` (127 occurrences across 30 iters; `grep -o "csrf-token=\$CSRF_TOKEN\|sid=a6094b4f[0-9a-f]*"` returns 127× the hardcoded sid, 0× the extracted token). Zabbix's `sid` IS the per-request CSRF token; a stale one makes `script.execute` reject every request BEFORE the time-based SQLi in `clientip` runs — so no latency signal is ever produced. hostid enforcement worked (hostid=10084 throughout); auth succeeded (supplied_variant).
+- **Where:** synth/refine prompt builder in `app/rag-api/api.py` (session establishment bakes a `sid` into guidance that the model copies verbatim); the fix belongs near `_enforce_resolved_object_ids` — a session-token (sid/CSRF) must be extracted live per request and substituted, not pinned to a captured value.
+- **Done when:** the generated CVE-2024-22120 PoC sends the freshly-extracted token (`sid=$CSRF_TOKEN`) and the blind-timing SQLi produces a confirmed latency verdict (`latency_confirmed`).
+- **Enforced by:** not enforced (exploit-generation quality; live run).
+
+## build-poc refine drifts a blind-timing SQLi from a latency assertion to expect_regex
+- **Found:** 2026-10-03, same CVE-2024-22120 v2 run.
+- **Evidence:** synth starts with a latency assertion (`final_assertion {min_seconds:5}` in v1), but v2's final assertion is `{"expect_regex":"POCz04dba0158e"}` with `verification_method: regex_missed`. CVE-2024-22120 is a BLIND time-based SQLi — the canary never appears in the response, so an expect_regex proof can never fire. The `timing_assertion_regressed` refine pattern (`knowledge/refine_error_patterns.yaml`) triggers on `prev_assertion_has: ["min_seconds"]`, so once the model has already dropped min_seconds the pattern can't re-assert it.
+- **Where:** `app/rag-api/api.py` `_run_refine_poc` assertion handling + `knowledge/refine_error_patterns.yaml` (`timing_assertion_regressed`).
+- **Done when:** for a CVE whose origin_family/synth is blind-timing, the refine loop keeps the latency assertion shape across iterations (deterministically re-anchored), never silently switching to expect_regex.
+- **Enforced by:** not enforced.

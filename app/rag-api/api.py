@@ -16149,9 +16149,13 @@ def _enforce_resolved_object_ids(command, resolved):
         if len(uniq) != 1:
             continue  # ambiguous — leave it to the model
         want = uniq[0]
-        if not want.isdigit():
+        # Value is numeric for object-ids (hostid=10084) OR a hex/alnum token
+        # for session-derived ids (Zabbix sid/CSRF = c34588cf8d9f5004). Accept
+        # both; only act when `want` is itself a clean alnum token so we never
+        # splice an odd value into the command.
+        if not want.isalnum():
             continue
-        pat = _re.compile(rf'({_re.escape(kind)}=)(\d+)')
+        pat = _re.compile(rf'({_re.escape(kind)}=)([A-Za-z0-9]+)')
 
         def _sub(m, _want=want, _kind=kind):
             if m.group(2) != _want:
@@ -20988,6 +20992,31 @@ def _enumerate_exploit_preconditions(ip, port, analysis, session_cookie=None,
                                  "operate on — the exploit's script-execution "
                                  "precondition may not be met (user needs host "
                                  "access). Confirm the account has >=1 host.")
+            # ── Zabbix `sid` (anti-CSRF token) — REQUIRED on POST actions or
+            #    script.execute is rejected BEFORE the SQLi runs. It's session-
+            #    derived (the live page's <meta name="csrf-token" content="...">,
+            #    = sessionid[16:]), NOT a guessable value. Runs INDEPENDENTLY of
+            #    the hostid branch (which is skipped when the access-inventory
+            #    already seeded hostid) so the token is always extracted. Flows
+            #    through resolved → _enforce_resolved_object_ids, which rewrites
+            #    any stale/hardcoded `sid=<...>` the model emits.
+            if ("zabbix" in prod_l or "host" in pre_blob or "script" in pre_blob) \
+                    and session_cookie and not resolved.get("sid"):
+                for _pth in ("/zabbix.php?action=dashboard.view",
+                             "/zabbix.php?action=host.list", "/"):
+                    try:
+                        _pr = cli.get(base + _pth)
+                        _mt = _re.search(
+                            r'name=["\']csrf-token["\']\s+content=["\']([A-Za-z0-9]+)',
+                            _pr.text or "", _re.I)
+                        if _mt:
+                            resolved["sid"] = [_mt.group(1)]
+                            confirmed.append(
+                                f"sid (live Zabbix CSRF token, required on POST "
+                                f"actions): {_mt.group(1)}")
+                            break
+                    except Exception:  # noqa: BLE001
+                        continue
             # ── Generic: any "<thing>id" precondition → sitemap/discovered ──
             generic_keys = []
             for kw in ("userid", "groupid", "itemid", "triggerid", "templateid",
