@@ -706,6 +706,53 @@ def node_load_hints(state: BuildPocState) -> Dict[str, Any]:
     return {"hint_guidance": hint_guidance, "hint_parts": hint_parts}
 
 
+def node_precondition_enumeration(state: BuildPocState) -> Dict[str, Any]:
+    """FIND-FIRST precondition enumeration. Operator ask: 'did we confirm
+    access to a host to run a script? that should be an enumeration step —
+    this should be a step to find first.'
+
+    Runs after auth + research (so we have both an authenticated session AND
+    the advisory-derived preconditions) but BEFORE synth — so the exploit is
+    built with VERIFIED, concrete prerequisite values (a real hostid the user
+    can operate on) instead of invented ones. If a precondition can't be met
+    (e.g. the account has no host access), that's surfaced to synth too so it
+    doesn't waste iterations on an impossible path."""
+    from api import _enumerate_exploit_preconditions, _poc_trace
+    research_out = state.get("research_out") or {}
+    analysis = research_out.get("analysis") if isinstance(research_out, dict) else None
+    if not analysis:
+        return {}  # nothing to resolve without research preconditions
+    session_info = state.get("session_info") or {}
+    cookie = session_info.get("cookie_header") if isinstance(session_info, dict) else None
+    if not cookie:
+        # auto-login cookie fallback
+        auth = state.get("auth") or {}
+        cookie = auth.get("_auto_cookie")
+    _t0 = time.time()
+    try:
+        pre = _enumerate_exploit_preconditions(
+            state["ip"], state["port"], analysis, session_cookie=cookie,
+            product=state.get("product"))
+    except Exception as e:  # noqa: BLE001
+        logging.debug("precondition enumeration node failed: %s", e)
+        return {}
+    seg = []
+    if pre.get("guidance"):
+        seg.append(pre["guidance"])
+        _poc_trace(state["run_id"], "recon:precondition_enumeration",
+                   response=pre["guidance"][:1600],
+                   extra={"resolved": pre.get("resolved"),
+                          "confirmed_count": len(pre.get("confirmed") or []),
+                          "unmet_count": len(pre.get("unmet") or [])})
+    metrics = {"precondition_enum": {
+        "seconds": round(time.time() - _t0, 2),
+        "chars_added": len(pre.get("guidance") or ""),
+        "signal": f"resolved={list((pre.get('resolved') or {}).keys())} "
+                   f"unmet={len(pre.get('unmet') or [])}"}}
+    return {"segments": seg,
+            "recon_metrics": {**state.get("recon_metrics", {}), **metrics}}
+
+
 def node_research(state: BuildPocState) -> Dict[str, Any]:
     """Fetch reference-PoC material from MSF/ExploitDB/NVD. Returns the analysis
     dict but does NOT compose the guidance string — that's assemble_guidance's job."""
@@ -1020,6 +1067,7 @@ def build_graph():
     g.add_node("auth_establish", node_auth_establish)
     g.add_node("load_hints", node_load_hints)
     g.add_node("research", node_research)
+    g.add_node("precondition_enumeration", node_precondition_enumeration)
 
     # Guidance assembly + strategy
     g.add_node("assemble_guidance", node_assemble_guidance)
@@ -1093,7 +1141,8 @@ def build_graph():
     # Non-recon spine
     g.add_edge("auth_establish", "load_hints")
     g.add_edge("load_hints", "research")
-    g.add_edge("research", "assemble_guidance")
+    g.add_edge("research", "precondition_enumeration")
+    g.add_edge("precondition_enumeration", "assemble_guidance")
     g.add_edge("assemble_guidance", "strategist")
     g.add_edge("strategist", "plan_verify")
     g.add_edge("plan_verify", "synth")
