@@ -52,6 +52,10 @@ RAG_LOADED_OTHER = {
     # load_rules() merges enumeration_rules.yaml, and sync_flows_to_rag /
     # _load_flow_into_rag embed every merged flow into rag_documents.
     "enumeration_rules.yaml": "app/rag-api/api.py",
+    # Refine-time error patterns + fix guidance: operator-extensible YAML, a
+    # dedicated loader embeds (title + guidance) into rag_documents and copies
+    # the structured triggers into refine_error_patterns table.
+    "refine_error_patterns.yaml": "etl/load_refine_patterns.py",
 }
 
 # YAMLs that ARE embedded into rag_documents, mapped to the loader that does it.
