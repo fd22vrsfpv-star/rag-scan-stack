@@ -115,3 +115,44 @@ print('OK')
 """
     out, err, rc = _in_container(py)
     assert rc == 0 and 'OK' in out, f"out={out} err={err}"
+
+
+def test_enforce_resolved_ids_rewrites_invented_hostid():
+    # The exact CVE-2024-22120 failure: login proved hostid=10084 but the model
+    # emitted hostid=1001. Enforcement must rewrite it; scriptid (already right)
+    # stays; an ambiguous kind (several candidates) is left alone.
+    py = """
+import sys; sys.path.insert(0,'/app')
+from api import _enforce_resolved_object_ids
+cmd = "curl 'http://t/zabbix.php?action=script.execute&scriptid=1&hostid=1001&ip=127.0.0.1'"
+resolved = {'hostid': ['10084'], 'scriptid': ['1','2','3'], 'userid': ['1']}
+out, changes = _enforce_resolved_object_ids(cmd, resolved)
+assert 'hostid=10084' in out, out
+assert 'hostid=1001' not in out, out
+assert 'scriptid=1' in out, out          # single-candidate-but-correct: unchanged value
+assert any(k=='hostid' and o=='1001' and n=='10084' for (k,o,n) in changes), changes
+# scriptid has 3 candidates -> ambiguous -> never rewritten even if wrong
+cmd2 = "curl 't?scriptid=9&hostid=1001'"
+out2, _ = _enforce_resolved_object_ids(cmd2, resolved)
+assert 'scriptid=9' in out2, out2        # left to the model (ambiguous)
+assert 'hostid=10084' in out2, out2
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and 'OK' in out, f"out={out} err={err}"
+
+
+def test_enforce_resolved_ids_noop_when_correct_or_empty():
+    py = """
+import sys; sys.path.insert(0,'/app')
+from api import _enforce_resolved_object_ids
+# already correct -> no changes
+out, changes = _enforce_resolved_object_ids("x?hostid=10084", {'hostid':['10084']})
+assert changes == [], changes
+# no resolved ids -> command untouched
+out2, changes2 = _enforce_resolved_object_ids("x?hostid=1001", {})
+assert out2 == "x?hostid=1001" and changes2 == [], (out2, changes2)
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and 'OK' in out, f"out={out} err={err}"
