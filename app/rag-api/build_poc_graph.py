@@ -56,6 +56,7 @@ class BuildPocState(TypedDict, total=False):
     focused_urls: List[str]           # operator-supplied URLs (BuildPocBody.focused_urls)
     precond_result: Dict[str, Any]    # resolved/confirmed/unmet from precondition enumeration
     access_inventory: Dict[str, Any]  # objects enumerated post-login (hosts, scripts, users…)
+    tool_handoff: Dict[str, Any]      # derived specialist tool(s) + test result (sqlmap…)
     readiness_blocked: bool           # strict-gate: hard blocker → skip the run-refine loop
     readiness_blockers: List[str]     # why it was blocked (for the result)
     cred_hints: List[str]
@@ -1140,6 +1141,80 @@ def node_save_store(state: BuildPocState) -> Dict[str, Any]:
     return {"exploit_store_id": store_id}
 
 
+def node_tool_handoff(state: BuildPocState) -> Dict[str, Any]:
+    """POST-POC TOOL DERIVATION + TEST. Once a PoC exists, look up which
+    specialist tool can take it further (SQLi → sqlmap), BUILD the call, and —
+    scope-gated + bounded — RUN it to confirm the tool reproduces the finding.
+    Operator ask: "once we have a poc it should look up what tools could do this,
+    derive sqlmap, create that call and test it." Results persist on the stored
+    exploit row (metadata.tool_handoff) and emit a webhook."""
+    if (os.environ.get("BUILD_POC_TOOL_HANDOFF", "on") or "on").lower() == "off":
+        return {}
+    from api import _derive_tools_for_poc, _run_tool_validation, _poc_trace
+    from webhooks import emit_webhook
+    result = state.get("result") or {}
+    cmd = result.get("final_command")
+    if not cmd:
+        return {}
+    try:
+        tools = _derive_tools_for_poc(cmd, assertion=result.get("final_assertion"),
+                                      product=state.get("product"), cve=state["cve"])
+    except Exception as e:  # noqa: BLE001
+        logging.debug("tool derivation failed: %s", e)
+        return {}
+    if not tools:
+        return {}
+    tested = []
+    for te in tools:
+        entry = {"tool": te["tool"], "class": te["class"],
+                 "command": te.get("command"), "available": None,
+                 "ran": False, "confirmed": False}
+        if te.get("command"):
+            try:
+                v = _run_tool_validation(state["ip"], state["port"], te,
+                                         eid=state.get("eid"))
+                entry.update({"available": v.get("available"), "ran": v.get("ran"),
+                              "confirmed": v.get("confirmed"),
+                              "seconds": v.get("seconds"), "refusal": v.get("refusal"),
+                              "command": v.get("command")})
+            except Exception as e:  # noqa: BLE001
+                entry["refusal"] = f"validation error: {e}"
+            tested.append(entry)
+            break  # bounded: test ONE tool per build
+        tested.append(entry)
+    handoff = {"derived": [{"tool": t["tool"], "class": t["class"],
+                            "command": t.get("command")} for t in tools],
+               "tested": tested}
+    _poc_trace(state["run_id"], "tool_handoff",
+               response=(f"derived {[t['tool'] for t in tools]}; "
+                         f"tested={[(e['tool'], e.get('confirmed')) for e in tested]}")[:800],
+               extra=handoff)
+    try:
+        emit_webhook("poc_tool_handoff", "cve_poc_builder", {
+            "cve": state["cve"], "target": state["ip"],
+            "derived_tools": [t["tool"] for t in tools],
+            "tested": [{"tool": e["tool"], "confirmed": e.get("confirmed"),
+                        "ran": e.get("ran"), "available": e.get("available")}
+                       for e in tested],
+            "exploit_store_id": state.get("exploit_store_id")})
+    except Exception:  # noqa: BLE001
+        pass
+    store_id = state.get("exploit_store_id")
+    if store_id:
+        try:
+            from api import get_db
+            import json as _json
+            with get_db() as c, c.cursor() as cur:
+                cur.execute("UPDATE exploit_store SET metadata = jsonb_set("
+                            "COALESCE(metadata,'{}'::jsonb), '{tool_handoff}', %s::jsonb), "
+                            "updated_at=now() WHERE id=%s",
+                            (_json.dumps(handoff), store_id))
+                c.commit()
+        except Exception:  # noqa: BLE001
+            pass
+    return {"tool_handoff": handoff}
+
+
 # ── conditional edges (routers) ────────────────────────────────────────────────
 def _route_after_start(state: BuildPocState) -> str:
     """recon_first? -> port_sweep, else -> auth_establish (skip recon)."""
@@ -1229,6 +1304,7 @@ def build_graph():
     g.add_node("synth", node_synth)
     g.add_node("run_refine", node_run_refine)
     g.add_node("save_store", node_save_store)
+    g.add_node("tool_handoff", node_tool_handoff)
 
     # Edges — the spine
     g.add_conditional_edges(START, _route_after_start,
@@ -1301,7 +1377,8 @@ def build_graph():
     g.add_edge("plan_verify", "synth")
     g.add_edge("synth", "run_refine")
     g.add_edge("run_refine", "save_store")
-    g.add_edge("save_store", END)
+    g.add_edge("save_store", "tool_handoff")
+    g.add_edge("tool_handoff", END)
 
     return g.compile()
 

@@ -19817,6 +19817,138 @@ def _snapshot_exploit_version(cur, row, label, created_by="operator"):
     return ver, str(_one(cur.fetchone()))
 
 
+_EXPLOIT_TOOLS_CACHE = None
+
+
+def _load_exploitation_tools():
+    """Load knowledge/exploitation_tools.yaml (cached) — the vuln-class →
+    specialist-tool map used to derive which tool can take a PoC further."""
+    global _EXPLOIT_TOOLS_CACHE
+    if _EXPLOIT_TOOLS_CACHE is not None:
+        return _EXPLOIT_TOOLS_CACHE
+    import yaml as _yaml
+    _kd = os.environ.get("KNOWLEDGE_DIR", "/knowledge")
+    for p in (os.path.join(_kd, "exploitation_tools.yaml"),
+              os.path.join(os.path.dirname(__file__), "..", "knowledge", "exploitation_tools.yaml"),
+              "knowledge/exploitation_tools.yaml"):
+        try:
+            with open(p, encoding="utf-8") as f:
+                _EXPLOIT_TOOLS_CACHE = (_yaml.safe_load(f) or {}).get("tools") or []
+                return _EXPLOIT_TOOLS_CACHE
+        except Exception:  # noqa: BLE001
+            continue
+    _EXPLOIT_TOOLS_CACHE = []
+    return _EXPLOIT_TOOLS_CACHE
+
+
+_TOOL_GENERATORS = {"curl_to_sqlmap": "curl_to_sqlmap"}
+
+
+def _derive_tools_for_poc(command, assertion=None, product=None, cve=""):
+    """Once a PoC exists, DERIVE which specialist tool(s) can exploit it further.
+
+    Operator ask: "once we have a poc it should then look up what tools could do
+    this — it should derive sqlmap and create that call."
+
+    Matches the PoC command/assertion against knowledge/exploitation_tools.yaml
+    (vuln-class markers) and, where a generator exists, builds the ready-to-run
+    tool invocation (sqlmap via common.exploit_artifacts.curl_to_sqlmap). Returns
+    a list of {class, tool, binary, command, confirm_markers, test_args, notes}."""
+    import re as _re
+    from urllib.parse import unquote as _unq
+    out = []
+    if not command:
+        return out
+    blob = _unq(str(command)).lower()
+    akeys = set((assertion or {}).keys())
+    try:
+        from common import exploit_artifacts as _ea
+    except Exception:  # noqa: BLE001
+        _ea = None
+    for t in _load_exploitation_tools():
+        m = t.get("match") or {}
+        hit = any(s in blob for s in (m.get("payload_contains") or [])) or \
+            any(k in akeys for k in (m.get("assertion_has") or []))
+        if not hit:
+            continue
+        invocation = ""
+        gen = t.get("generator") or ""
+        if gen == "curl_to_sqlmap" and _ea is not None:
+            try:
+                block = _ea.curl_to_sqlmap(command, assertion=assertion, cve=cve)
+                # extract the actual command line (drop the leading # comments)
+                invocation = next((ln for ln in block.splitlines()
+                                   if ln.strip().startswith(t.get("tool", ""))), "")
+            except Exception as e:  # noqa: BLE001
+                logging.debug("tool gen %s failed: %s", gen, e)
+        out.append({
+            "class": t.get("class"), "tool": t.get("tool"),
+            "binary": t.get("binary") or t.get("tool"),
+            "command": invocation,
+            "confirm_markers": t.get("confirm_markers") or [],
+            "test_args": t.get("test_args") or "",
+            "notes": (t.get("notes") or "").strip(),
+        })
+    return out
+
+
+def _run_tool_validation(ip, port, tool_entry, eid=None, timeout=150):
+    """TEST a derived tool call: run it (scope-gated, bounded) on the runner and
+    report whether the tool CONFIRMS the finding. Operator ask: "create that call
+    and test it." Returns {ran, available, confirmed, seconds, command, output,
+    refusal}."""
+    import httpx as _hx, time as _t
+    res = {"tool": tool_entry.get("tool"), "ran": False, "available": None,
+           "confirmed": False, "seconds": 0.0, "command": "", "output": "",
+           "refusal": None}
+    cmd = (tool_entry.get("command") or "").strip()
+    if not cmd:
+        res["refusal"] = "no generator produced a command for this tool"
+        return res
+    # confirm-only test args (fast; just prove the tool reproduces the finding)
+    test_cmd = cmd + ((" " + tool_entry["test_args"]) if tool_entry.get("test_args") else "")
+    res["command"] = test_cmd
+    # Scope gate — fail closed (CLAUDE.md: every path that sends traffic is gated).
+    try:
+        from etl.scope_gate import enforce_target_scope
+        refusal = enforce_target_scope(str(ip), test_cmd, engagement_id=eid)
+    except Exception as e:  # noqa: BLE001
+        refusal = f"scope check error: {e}"
+    if refusal:
+        res["refusal"] = refusal
+        return res
+    listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    # Is the tool present on the runner?
+    try:
+        chk = _hx.post(f"{listener.rstrip('/')}/vectors/run",
+                       json={"command": f"command -v {tool_entry.get('binary','')} || echo __MISSING__",
+                             "target": str(ip), "port": port, "timeout": 15},
+                       headers={"x-api-key": API_KEY}, verify=False, timeout=30)
+        cd = chk.json() if chk.status_code < 400 else {}
+        res["available"] = "__MISSING__" not in ((cd.get("output") or "") if isinstance(cd, dict) else "")
+    except Exception:  # noqa: BLE001
+        res["available"] = None
+    if res["available"] is False:
+        res["refusal"] = f"{tool_entry.get('binary')} not installed on the runner"
+        return res
+    _t0 = _t.time()
+    try:
+        lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
+                      json={"command": test_cmd, "target": str(ip), "port": port,
+                            "timeout": timeout},
+                      headers={"x-api-key": API_KEY}, verify=False, timeout=timeout + 60)
+        d = lr.json() if lr.status_code < 400 else {}
+        out = (d.get("output", "") if isinstance(d, dict) else "") or lr.text
+        res["ran"] = True
+        res["output"] = (out or "")[-4000:]
+        low = (out or "").lower()
+        res["confirmed"] = any(mk.lower() in low for mk in (tool_entry.get("confirm_markers") or []))
+    except Exception as e:  # noqa: BLE001
+        res["refusal"] = f"tool run error: {e}"
+    res["seconds"] = round(_t.time() - _t0, 1)
+    return res
+
+
 def _exploit_store_artifacts(kind, command, name, cve, rationale, assertion):
     """Generate {python_code, http_request, sqlmap} for a web/curl PoC. `sqlmap`
     is a ready-to-run sqlmap command for SQLi PoCs (empty for non-SQLi) so the

@@ -705,8 +705,31 @@ def _render_app_request_contracts(data: Dict[str, Any]) -> List[Doc]:
     return docs
 
 
+def _render_exploitation_tools(data: Dict[str, Any]) -> List[Doc]:
+    """Embed the vuln-class → specialist-tool map so the planner (and the build-
+    poc tool-handoff) can recall which tool takes a PoC further (SQLi → sqlmap,
+    command-injection → commix, SSTI → tplmap, …)."""
+    docs: List[Doc] = []
+    for t in (data.get("tools") or []):
+        cls = _s(t.get("class"))
+        tool = _s(t.get("tool"))
+        if not cls or not tool:
+            continue
+        m = t.get("match") or {}
+        body = (f"Vulnerability class: {cls}\nSpecialist tool: {tool} "
+                f"(binary: {_s(t.get('binary')) or tool})\n"
+                f"Recognized by payload markers: "
+                f"{', '.join(m.get('payload_contains') or []) or 'n/a'}\n"
+                f"Confirm markers (tool output proves it): "
+                f"{', '.join(t.get('confirm_markers') or []) or 'n/a'}\n\n"
+                f"{_s(t.get('notes'))}")
+        docs.append((f"Exploitation tool — {cls} → {tool}", body))
+    return docs
+
+
 RENDERERS = {
     "app_request_contracts": _render_app_request_contracts,
+    "exploitation_tools": _render_exploitation_tools,
     "common_web_paths": _render_common_web_paths,
     "http_status_fingerprints": _render_http_status_fingerprints,
     "vuln_class_methodology": _render_vuln_class_methodology,
