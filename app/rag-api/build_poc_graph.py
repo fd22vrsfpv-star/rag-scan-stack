@@ -787,11 +787,26 @@ def node_readiness_gate(state: BuildPocState) -> Dict[str, Any]:
     # by re-running the lightweight assess with what state carries.
     _t0 = time.time()
     try:
+        # Vendor-doc validation is a slow (DDG+fetch+LLM) rigor add-on — run it
+        # only in strict mode (operator opted into max rigor). The deterministic
+        # checks (session probe, endpoint existence, version-in-advisory,
+        # reachability, enumerated ids) already enforce "no assumptions" fast.
+        # Reuse the advisory already gathered by the research/deep-dive node so
+        # the version check doesn't re-fetch it.
+        _ro = state.get("research_out") or {}
+        _adv = ""
+        if isinstance(_ro, dict):
+            _adv = (_ro.get("advisory_text")
+                    or (_ro.get("sources") or {}).get("advisory_text") or "")
         rd = _assess_exploit_readiness(
             state["ip"], state["port"], analysis or {},
             session_info=state.get("session_info"),
             precond_result=state.get("precond_result"),
-            product=state.get("product"), model=state.get("model"))
+            product=state.get("product"), model=state.get("model"),
+            version=state.get("version"), cve=state.get("cve"),
+            validate_vendor_docs=(mode == "strict"),
+            advisory_text=_adv,
+            llm_challenge=(mode == "strict"))
     except Exception as e:  # noqa: BLE001
         logging.debug("readiness gate failed: %s", e)
         return {}
