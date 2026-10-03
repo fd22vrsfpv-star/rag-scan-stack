@@ -15400,6 +15400,192 @@ def _timing_confirmation_rerun(command, assertion, ip, port, listener,
     }
 
 
+def _ensure_discovered_app_knowledge_table():
+    """Per-product/version facts the build-poc loop discovers during a run —
+    endpoint paths that respond, params that matter, CSRF-token locations,
+    cookie-shape conventions. Written on any successful target run (not
+    just verified builds); confidence scales with convergence outcome.
+    Read by _recon_discovered_knowledge in future builds for the SAME
+    product so iter 1 starts with the knowledge instead of rediscovering."""
+    try:
+        with get_db() as c, c.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS public.discovered_app_knowledge (
+                    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                    product         text NOT NULL,
+                    version         text,
+                    fact_type       text NOT NULL,
+                        -- 'endpoint' | 'param' | 'csrf_token_source' | 'cookie_shape'
+                        -- | 'auth_flow' | 'response_marker' | 'free_text'
+                    fact_value      text NOT NULL,
+                    confidence      real NOT NULL DEFAULT 0.5,
+                    discovered_from text,  -- cve id, run_id, operator tag
+                    source_run_id   text,
+                    engagement_id   uuid,  -- NULL = cross-engagement shared
+                    hits            int NOT NULL DEFAULT 1,
+                    last_seen_at    timestamptz NOT NULL DEFAULT now(),
+                    created_at      timestamptz NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_dak_product
+                  ON public.discovered_app_knowledge (lower(product))
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_dak_type
+                  ON public.discovered_app_knowledge (fact_type)
+            """)
+            c.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("ensure discovered_app_knowledge failed: %s", e)
+
+
+def _extract_discovered_facts(command, output, product, version, cve, run_id,
+                                 verified, converged, eid=None):
+    """Parse a successful (ran-against-target) iter's command + output into
+    structured facts and upsert them under this product. We extract:
+      - endpoint URL path (first POST/PUT/PATCH target)
+      - vulnerable param name (if the command carried action=X or similar)
+      - CSRF token name (from the fetch step)
+      - cookie name (zbx_session, PHPSESSID, _laravel_session, etc.)
+    Facts stored under source='learned_from_build'. Confidence is boosted
+    for converged builds (verified=True).
+    """
+    import re as _re
+    if not product:
+        return  # nothing to attach the fact to
+    _ensure_discovered_app_knowledge_table()
+    conf = 0.9 if verified else (0.6 if converged else 0.3)
+    facts = []
+    # 1) endpoint — the FIRST POST/PUT/PATCH URL in the command
+    m = _re.search(r"-X\s+(POST|PUT|PATCH|DELETE)[^\n]*?['\"]?(https?://[^\s'\"]+)",
+                   command, _re.I)
+    if m:
+        facts.append(("endpoint", f"{m.group(1).upper()} {m.group(2)}"))
+    # 2) action= body param (classic PHP MVC)
+    m = _re.search(r"[&?]action=([A-Za-z0-9_.-]+)", command)
+    if m:
+        facts.append(("param", f"action={m.group(1)}"))
+    # 3) CSRF token source — grep/sed pattern pulling a token name
+    m = _re.search(r"(csrf[-_]?token|_token|authenticity_token|X-CSRF[A-Za-z-]*)",
+                   command, _re.I)
+    if m:
+        facts.append(("csrf_token_source", m.group(1).lower()))
+    # 4) cookie name from -b/-c jar + a specific Cookie header
+    m = _re.search(r"Cookie:\s*([a-zA-Z0-9_.-]+)=", command)
+    if m:
+        facts.append(("cookie_shape", m.group(1)))
+    # 5) response marker — SQL error text, framework fingerprint in output
+    for sig_name, sig_pat in (
+        ("sql_error", r"(You have an error in your SQL syntax|PG::SyntaxError|SQLSTATE)"),
+        ("stack_trace", r"(Traceback \(most recent call last\)|at [a-zA-Z0-9_.]+\([^)]+\):\d+)"),
+    ):
+        if _re.search(sig_pat, output or "", _re.I):
+            facts.append(("response_marker", f"{sig_name}: {sig_pat}"))
+    if not facts:
+        return
+    try:
+        with get_db() as c, c.cursor() as cur:
+            for ftype, fval in facts:
+                # Upsert on (product, version, fact_type, fact_value) — bump
+                # hits + confidence toward 1.0 across repeat observations.
+                cur.execute("""
+                    INSERT INTO public.discovered_app_knowledge
+                        (product, version, fact_type, fact_value, confidence,
+                         discovered_from, source_run_id, engagement_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """, (product, version, ftype, fval[:500], conf,
+                      cve, run_id, eid))
+            c.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("record discovered facts failed: %s", e)
+    # Also push to rag_documents so search_knowledge_base can retrieve by
+    # natural-language query. Keep it lightweight — one row per fact.
+    try:
+        _rag_embed_discovered_facts(product, version, facts, cve, run_id, conf)
+    except Exception as _re:  # noqa: BLE001
+        logging.debug("rag embed discovered facts failed: %s", _re)
+
+
+def _rag_embed_discovered_facts(product, version, facts, cve, run_id, conf):
+    """Embed each discovered fact into rag_documents under
+    source='discovered_app_knowledge' so the planner's search_knowledge_base
+    retrieves them in future builds for the same product."""
+    import httpx as _hx
+    embedder = os.environ.get("EMBEDDER_URL", "https://embedder:8030").rstrip("/")
+    titles, texts = [], []
+    for ftype, fval in facts:
+        v = f" {version}" if version else ""
+        titles.append(f"{product}{v}: {ftype}")
+        texts.append(
+            f"Discovered during build-poc for {cve}: {product}{v} uses "
+            f"{ftype} = `{fval}`. Confidence {conf:.2f}. Reuse in future "
+            f"PoC builds for {product}."
+        )
+    if not titles:
+        return
+    try:
+        r = _hx.post(f"{embedder}/embed", json={"texts": [f"{t}\n{x}" for t, x in zip(titles, texts)]},
+                     timeout=30, verify=False)
+        if r.status_code != 200:
+            return
+        vectors = r.json().get("embeddings") or []
+    except Exception as e:  # noqa: BLE001
+        logging.debug("embedder call failed: %s", e)
+        return
+    try:
+        with get_db() as c, c.cursor() as cur:
+            for (title, text), vec in zip(zip(titles, texts), vectors):
+                vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+                cur.execute("""
+                    INSERT INTO rag_documents (title, text_chunk, metadata, embedding)
+                    VALUES (%s, %s, %s::jsonb, %s::vector)
+                """, (title, text,
+                      json.dumps({"source": "discovered_app_knowledge",
+                                   "kind": "app_fact", "cve": cve,
+                                   "run_id": run_id, "confidence": conf}),
+                      vec_str))
+            c.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("rag_documents insert failed: %s", e)
+
+
+def _recon_discovered_knowledge(product, version, limit=20):
+    """Reader: pull previously-discovered facts for this product so a NEW
+    build can start with the knowledge instead of rediscovering it from
+    scratch. Returns a compact guidance string the synth prompt consumes
+    the same way _zap_recon / _openapi_discover output is consumed."""
+    if not product:
+        return ""
+    _ensure_discovered_app_knowledge_table()
+    rows = []
+    try:
+        with get_db() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT fact_type, fact_value, confidence, hits, last_seen_at
+                  FROM public.discovered_app_knowledge
+                 WHERE lower(product) = lower(%s)
+                   AND (version IS NULL OR %s IS NULL OR version = %s)
+                 ORDER BY confidence DESC, hits DESC, last_seen_at DESC
+                 LIMIT %s
+            """, (product, version, version, limit))
+            rows = [dict(r) for r in cur.fetchall()]
+    except Exception as e:  # noqa: BLE001
+        logging.debug("recon discovered knowledge failed: %s", e)
+        return ""
+    if not rows:
+        return ""
+    v = f" {version}" if version else ""
+    lines = [f"Previously discovered facts about {product}{v} "
+             "(from past build-poc runs — reuse these, don't rediscover):"]
+    for r in rows[:limit]:
+        lines.append(
+            f"  - [{r['fact_type']}] {r['fact_value']} "
+            f"(conf {r['confidence']:.2f}, seen {r['hits']}×)"
+        )
+    return "\n".join(lines)
+
+
 def _poc_shell_syntax_check(command):
     """Dry-parse a shell command via shlex to catch quote-balance / escape
     errors BEFORE dispatch. Returns (ok: bool, error: str). On error the
@@ -15887,6 +16073,23 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
     _status_tier_streak = {"all_404": 0, "all_401": 0, "all_403": 0, "all_500": 0}
     _status_escalation_done = False
     path_discovery_note = ""
+    # Never-regress: when the shell-syntax guard rejects N consecutive
+    # commands, the refine prompt has demonstrated it can't recover the LLM
+    # on its own. Keep the LAST KNOWN GOOD command (one that parsed AND
+    # actually ran against the target) in metrics so the refine prompt can
+    # tell the LLM "revert to this working base and tweak only <param>".
+    _last_valid_command = None
+    _last_valid_iter = None
+    _consecutive_syntax_fails = 0
+    _REGRESS_FALLBACK_AT = int(os.environ.get("REFINE_REGRESS_FALLBACK_AT", "2") or "2")
+    # Model fallback: when a model gets stuck in a shell-quoting death
+    # spiral, switch to a backup (BUILD_POC_MODEL_FALLBACK env, else
+    # routed cloud default). Fallback fires once per build; subsequent
+    # refines use the backup model until the end.
+    _MODEL_FALLBACK_AT = int(os.environ.get("REFINE_MODEL_FALLBACK_AT", "3") or "3")
+    _MODEL_FALLBACK_TO = os.environ.get("BUILD_POC_MODEL_FALLBACK", "") or None
+    _active_model = model  # may be swapped after fallback
+    _model_fallback_fired = False
     for it in range(1, max(1, max_iters) + 1):
         iters = it
         fam = _poc_target_family(command)
@@ -15920,6 +16123,23 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                            response=_syn_err[:400],
                            extra={"command_preview": command[:200]})
             ec = 2  # convention: shell parse errors exit 2
+            # Never-regress tracking: this iter FAILED the syntax check.
+            # Bump the consecutive-fail counter so the refine prompt below
+            # can inject the last-known-good command as a recovery base.
+            _consecutive_syntax_fails += 1
+            # Model fallback: this model is clearly stuck. After N fails
+            # swap to BUILD_POC_MODEL_FALLBACK (or routed cloud default) —
+            # once per build; subsequent iters stay on the backup.
+            if (not _model_fallback_fired
+                    and _consecutive_syntax_fails >= _MODEL_FALLBACK_AT):
+                _fallback_target = _MODEL_FALLBACK_TO  # None → routed cloud default
+                _poc_trace(run_id, "model_fallback", iteration=it,
+                           extra={"from": _active_model, "to": _fallback_target,
+                                  "reason": f"{_consecutive_syntax_fails}× consecutive shell_syntax_refused"})
+                _active_model = _fallback_target
+                _model_fallback_fired = True
+                metrics.setdefault("model_fallback_fired", 0)
+                metrics["model_fallback_fired"] += 1
         else:
             try:
                 lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
@@ -15931,6 +16151,29 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             except Exception as e:  # noqa: BLE001
                 output = f"listener error: {e}"; ec = None
             metrics["target_runs"] += 1
+            # Never-regress tracking: this iter's command passed the syntax
+            # check AND actually ran against the target. Capture it as the
+            # last-known-good base — the refine prompt will show it to the
+            # LLM when the next N iters' commands won't parse.
+            _last_valid_command = command
+            _last_valid_iter = it
+            _consecutive_syntax_fails = 0  # reset streak
+            # Auto-discovery: this command actually hit the target. Extract
+            # product-specific knowledge (endpoint path, action= param,
+            # CSRF-token source, cookie shape) and persist to
+            # discovered_app_knowledge + rag_documents under source=
+            # 'discovered_app_knowledge'. Future PoC builds for the SAME
+            # product retrieve it via _recon_discovered_knowledge and the
+            # planner's search_knowledge_base. Fires per-iter (not just
+            # per-build) so partial progress isn't lost when a loop times
+            # out before verification.
+            try:
+                _extract_discovered_facts(command, output, product, version,
+                                          cve, run_id,
+                                          verified=False, converged=False,
+                                          eid=eid)
+            except Exception as _edf:  # noqa: BLE001
+                logging.debug("extract discovered facts failed: %s", _edf)
         _this_iter_seconds = round(_t.time() - _r0, 3)
         metrics["run_seconds"] = round(metrics["run_seconds"] + _this_iter_seconds, 3)
         # Hybrid verdict: regex-anchored first, then canary-loose, then semantic
@@ -16221,14 +16464,45 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                                 f"\"canary\": \"{canary or ''}\"}}")
         else:
             _assert_template = f"{{\"expect_regex\": \"{canary or '<regex>'}\"}}"
+        # Never-regress note: when the LLM has broken the command N times
+        # in a row, REMIND it there was a working base and show it. This
+        # breaks the quote-death-spiral where every refine tries a slightly
+        # different wrong quoting approach. Fires at REFINE_REGRESS_FALLBACK_AT
+        # (default 2) consecutive syntax failures.
+        regress_note = ""
+        if (_last_valid_command is not None
+                and _consecutive_syntax_fails >= _REGRESS_FALLBACK_AT):
+            regress_note = (
+                f"\nNEVER-REGRESS — your last {_consecutive_syntax_fails} commands "
+                f"all failed /bin/sh parse. REVERT to this LAST KNOWN GOOD command "
+                f"(iter {_last_valid_iter}, actually ran against the target):\n"
+                f"```\n{_last_valid_command}\n```\n"
+                f"Change ONE thing — the specific param, path, or payload that "
+                f"needs to differ to EXPLOIT {cve}. Do NOT rewrite the quote "
+                f"structure, header shape, or shell var usage; those parsed. "
+                f"Keep the exact same wrapping and only vary the attack-surface "
+                f"token."
+            )
+        # Model-fallback note: when we've switched models due to a stuck
+        # LLM, tell the new one the previous commands' quote style broke so
+        # it doesn't try to copy them.
+        model_switch_note = ""
+        if _model_fallback_fired and _active_model != model:
+            model_switch_note = (
+                f"\nMODEL FALLBACK — the previous model got stuck in a "
+                f"shell-quoting loop. You are the backup. Write POSIX-safe "
+                f"shell: wrap curl bodies in single quotes, URL-encode any "
+                f"literal `'` as %27, keep each curl on ONE line, no "
+                f"backslash-escape of single quotes inside single-quoted strings."
+            )
         rprompt = (f"AUTHORIZED lab pentest. The PoC for {cve} on http://{ip}:{port} did NOT "
                    f"succeed.\nCommand: {command}\nOutput:\n{(output or '')[:1500]}{precond}"
-                   f"{shell_syntax_note}{refusal_note}{rag_pattern_notes}{path_discovery_note}{waf_hit_note}{escalation_guidance}{anchor_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
+                   f"{shell_syntax_note}{refusal_note}{rag_pattern_notes}{regress_note}{model_switch_note}{path_discovery_note}{waf_hit_note}{escalation_guidance}{anchor_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
                    f"appear. Return ONE JSON object only: {{\"command\": \"<better command, may "
                    f"chain curl calls with ; and shell vars to fetch a token first>\", "
                    f"\"assertion\": {_assert_template}}}. No prose.")
         try:
-            res = _llm_for_model(rprompt, model=model, caller="cve_poc_refine")
+            res = _llm_for_model(rprompt, model=_active_model, caller="cve_poc_refine")
             rtext = res.get("response", "") if isinstance(res, dict) else str(res or "")
             if isinstance(res, dict) and res.get("model"):
                 llm_model = res["model"]
