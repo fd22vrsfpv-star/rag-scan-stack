@@ -55,6 +55,7 @@ class BuildPocState(TypedDict, total=False):
     arjun_discovered: List[str]       # arjun's live-found URLs for the focused ZAP active scan
     focused_urls: List[str]           # operator-supplied URLs (BuildPocBody.focused_urls)
     precond_result: Dict[str, Any]    # resolved/confirmed/unmet from precondition enumeration
+    access_inventory: Dict[str, Any]  # objects enumerated post-login (hosts, scripts, users…)
     readiness_blocked: bool           # strict-gate: hard blocker → skip the run-refine loop
     readiness_blockers: List[str]     # why it was blocked (for the result)
     cred_hints: List[str]
@@ -710,6 +711,49 @@ def node_load_hints(state: BuildPocState) -> Dict[str, Any]:
     return {"hint_guidance": hint_guidance, "hint_parts": hint_parts}
 
 
+def node_access_enumeration(state: BuildPocState) -> Dict[str, Any]:
+    """BASIC post-access enumeration — runs right after auth is established.
+    Once we have a confirmed session, inventory WHAT that access gives us
+    (hosts, scripts, users, dashboards, datasources…) app-aware. The result
+    feeds the precondition check + synth + is persisted to confirmed_facts so
+    every attack and the operator see the foothold's reach. Operator ask:
+    'that should have been a basic step to enumerate available info after
+    confirming access.'"""
+    from api import _enumerate_access_inventory, _poc_trace
+    si = state.get("session_info") or {}
+    cookie = si.get("cookie_header") if isinstance(si, dict) else None
+    auth = state.get("auth") or {}
+    # Only enumerate when we actually have access (a session or creds).
+    if not cookie and not (auth.get("username") and auth.get("password")):
+        return {}
+    _t0 = time.time()
+    try:
+        inv = _enumerate_access_inventory(
+            state["ip"], state["port"], product=state.get("product"),
+            auth=auth, session_cookie=cookie)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("access enumeration node failed: %s", e)
+        return {}
+    if not inv:
+        return {}
+    bits = ["POST-ACCESS INVENTORY (objects this authenticated account can use "
+            "— USE these real ids, don't invent):"]
+    for otype, items in inv.items():
+        sample = ", ".join(f"{it['id']}({it.get('name','')})" if it.get('name') else str(it['id'])
+                           for it in items[:8])
+        bits.append(f"  - {otype}: {sample}")
+    g = "\n".join(bits)
+    _poc_trace(state["run_id"], "recon:access_enumeration", response=g[:1600],
+               extra={"object_types": list(inv.keys()),
+                      "counts": {k: len(v) for k, v in inv.items()}})
+    return {"segments": [g],
+            "access_inventory": inv,
+            "recon_metrics": {**state.get("recon_metrics", {}),
+                              "access_enum": {"seconds": round(time.time() - _t0, 2),
+                                              "chars_added": len(g),
+                                              "signal": f"{sum(len(v) for v in inv.values())} objects"}}}
+
+
 def node_precondition_enumeration(state: BuildPocState) -> Dict[str, Any]:
     """FIND-FIRST precondition enumeration. Operator ask: 'did we confirm
     access to a host to run a script? that should be an enumeration step —
@@ -736,7 +780,8 @@ def node_precondition_enumeration(state: BuildPocState) -> Dict[str, Any]:
     try:
         pre = _enumerate_exploit_preconditions(
             state["ip"], state["port"], analysis, session_cookie=cookie,
-            product=state.get("product"), auth=state.get("auth"))
+            product=state.get("product"), auth=state.get("auth"),
+            access_inventory=state.get("access_inventory"))
     except Exception as e:  # noqa: BLE001
         logging.debug("precondition enumeration node failed: %s", e)
         return {}
@@ -806,6 +851,7 @@ def node_readiness_gate(state: BuildPocState) -> Dict[str, Any]:
             version=state.get("version"), cve=state.get("cve"),
             validate_vendor_docs=(mode == "strict"),
             advisory_text=_adv,
+            access_inventory=state.get("access_inventory"),
             llm_challenge=(mode == "strict"))
     except Exception as e:  # noqa: BLE001
         logging.debug("readiness gate failed: %s", e)
@@ -1166,6 +1212,7 @@ def build_graph():
     g.add_node("auth_establish", node_auth_establish)
     g.add_node("load_hints", node_load_hints)
     g.add_node("research", node_research)
+    g.add_node("access_enumeration", node_access_enumeration)
     g.add_node("precondition_enumeration", node_precondition_enumeration)
     g.add_node("readiness_gate", node_readiness_gate)
 
@@ -1241,7 +1288,8 @@ def build_graph():
     # Non-recon spine
     g.add_edge("auth_establish", "load_hints")
     g.add_edge("load_hints", "research")
-    g.add_edge("research", "precondition_enumeration")
+    g.add_edge("research", "access_enumeration")
+    g.add_edge("access_enumeration", "precondition_enumeration")
     g.add_edge("precondition_enumeration", "readiness_gate")
     g.add_edge("readiness_gate", "assemble_guidance")
     g.add_edge("assemble_guidance", "strategist")

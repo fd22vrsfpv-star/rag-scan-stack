@@ -877,6 +877,164 @@ function EnumerationSection({ ip }: { ip: string }) {
 }
 
 
+interface ConfirmedFact {
+  id: string
+  target: string
+  host: string | null
+  product: string | null
+  version: string | null
+  cve: string | null
+  claim_type: string
+  claim_key: string
+  claim_value: string | null
+  status: string
+  evidence: string | null
+  method: string | null
+  ttl_seconds: number | null
+  last_checked_at: string | null
+  age_s: number | null
+}
+
+// Confirmed Facts / Foothold panel for a host. Reads the durable confirmed_facts
+// ledger (session validity, resolved object-ids, endpoint existence, version
+// applicability, vendor-doc answers) + the live foothold, and groups them BY
+// PRODUCT — so Zabbix and Apache on the same ip:port read as distinct footholds,
+// matching the ledger's (target, product, host) identity. Operator ask: the
+// confirmed facts / foothold should show on the asset for the host.
+function ConfirmedFactsSection({ ip, hostname }: { ip: string; hostname?: string }) {
+  const { data, isLoading } = useQuery({
+    queryKey: ['confirmed-facts', ip, hostname],
+    queryFn: () => apiFetch<{ count: number; facts: ConfirmedFact[] }>('/confirmed-facts'),
+    refetchInterval: 30000,
+  })
+  const { data: access } = useAssetAccess(ip, false)
+
+  // Client-filter to this host: target is "ip:port", so match the ip prefix, OR
+  // the stored hostname matches the asset's hostname (vhost-distinct facts).
+  const facts = useMemo(() => {
+    const all = data?.facts ?? []
+    const hn = (hostname || '').toLowerCase()
+    return all.filter(f =>
+      (f.target || '').startsWith(`${ip}:`) ||
+      (f.target || '') === ip ||
+      (!!hn && (f.host || '').toLowerCase() === hn))
+  }, [data, ip, hostname])
+
+  // Group by product (the application identity), then by claim_type.
+  const byProduct = useMemo(() => {
+    const groups: Record<string, ConfirmedFact[]> = {}
+    for (const f of facts) {
+      const k = f.product || '(unattributed)'
+      ;(groups[k] = groups[k] || []).push(f)
+    }
+    return groups
+  }, [facts])
+
+  const footholds = (access?.access ?? []).filter((a: ObtainedAccess) =>
+    a.kind === 'web_session' || a.transport === 'http' || a.transport === 'https')
+
+  const isStale = (f: ConfirmedFact) =>
+    !!f.ttl_seconds && f.ttl_seconds > 0 && (f.age_s ?? 0) > f.ttl_seconds
+  const fmtAge = (s: number | null) => {
+    if (s == null) return '—'
+    if (s < 90) return `${Math.round(s)}s ago`
+    if (s < 5400) return `${Math.round(s / 60)}m ago`
+    if (s < 172800) return `${Math.round(s / 3600)}h ago`
+    return `${Math.round(s / 86400)}d ago`
+  }
+  const statusBadge = (st: string, stale: boolean) => {
+    if (stale) return <span className="px-1.5 py-0.5 rounded text-[10px] bg-amber-500/10 text-amber-400 inline-flex items-center gap-1" title="TTL elapsed — re-verify before relying on it"><ShieldQuestion className="h-3 w-3" />stale</span>
+    if (st === 'confirmed') return <span className="px-1.5 py-0.5 rounded text-[10px] bg-green-500/15 text-green-300 inline-flex items-center gap-1"><ShieldCheck className="h-3 w-3" />confirmed</span>
+    if (st === 'refuted') return <span className="px-1.5 py-0.5 rounded text-[10px] bg-red-500/15 text-red-300 inline-flex items-center gap-1"><ShieldX className="h-3 w-3" />refuted</span>
+    return <span className="px-1.5 py-0.5 rounded text-[10px] bg-gray-500/10 text-gray-400 inline-flex items-center gap-1"><ShieldQuestion className="h-3 w-3" />{st}</span>
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <h4 className="text-xs font-medium text-muted-foreground flex items-center gap-1.5">
+          <ShieldCheck className="h-3.5 w-3.5" /> Confirmed Facts &amp; Footholds
+          ({facts.length} fact{facts.length === 1 ? '' : 's'})
+        </h4>
+      </div>
+      <p className="text-[11px] text-muted-foreground">
+        Durable, evidence-backed verification reusable across attacks — grouped by
+        application, because <span className="font-mono">Zabbix</span> and{' '}
+        <span className="font-mono">Apache</span> on the same <span className="font-mono">ip:port</span>{' '}
+        are distinct footholds. A <em>stale</em> fact's freshness window (TTL) has elapsed; re-verify before relying on it.
+      </p>
+
+      {footholds.length > 0 && (
+        <div className="rounded-md border border-green-500/30 bg-green-500/5 p-3">
+          <div className="text-[11px] font-medium text-green-300 mb-1.5 flex items-center gap-1">
+            <Key className="h-3 w-3" /> Live foothold{footholds.length === 1 ? '' : 's'}
+          </div>
+          <div className="space-y-1">
+            {footholds.map((a: ObtainedAccess) => (
+              <div key={a.id} className="text-xs font-mono flex items-center gap-2 flex-wrap">
+                <span className="text-green-300">{a.handle}</span>
+                <span className="text-[10px] text-muted-foreground">
+                  {a.transport || a.kind}{a.whoami ? ` · ${a.whoami}` : ''} · score {a.score} · {a.status}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {isLoading ? (
+        <p className="text-xs text-muted-foreground">Loading…</p>
+      ) : facts.length === 0 ? (
+        <p className="text-xs text-muted-foreground">
+          No confirmed facts for this host yet. The build-PoC challenge/readiness gate records
+          verified session validity, enumerated object-ids (hosts, scripts, users), endpoint
+          existence and version applicability here as it confirms them.
+        </p>
+      ) : (
+        Object.entries(byProduct).map(([product, pfacts]) => (
+          <div key={product} className="rounded-md border border-border">
+            <div className="px-3 py-2 border-b border-border bg-muted/40 flex items-center justify-between flex-wrap gap-2">
+              <span className="text-xs font-medium">{product}</span>
+              <span className="text-[10px] text-muted-foreground font-mono">
+                {pfacts[0]?.version ? `v${pfacts[0].version} · ` : ''}{pfacts.length} fact{pfacts.length === 1 ? '' : 's'}
+              </span>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[720px] text-xs">
+                <thead className="text-muted-foreground">
+                  <tr className="border-b border-border">
+                    <th className="text-left py-1 px-2">Claim</th>
+                    <th className="text-left px-2">Value</th>
+                    <th className="text-left px-2">Status</th>
+                    <th className="text-left px-2">Evidence</th>
+                    <th className="text-left px-2">Method</th>
+                    <th className="text-right px-2">Checked</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pfacts.map(f => (
+                    <tr key={f.id} className="border-b border-border/40 align-top">
+                      <td className="py-1 px-2">
+                        <div className="font-mono">{f.claim_type}</div>
+                        <div className="text-[10px] text-muted-foreground font-mono">{f.claim_key}</div>
+                      </td>
+                      <td className="px-2 font-mono">{f.claim_value || '—'}</td>
+                      <td className="px-2">{statusBadge(f.status, isStale(f))}</td>
+                      <td className="px-2 text-[10px] text-muted-foreground max-w-[280px]">{f.evidence || '—'}</td>
+                      <td className="px-2 text-[10px] text-muted-foreground font-mono">{f.method || '—'}</td>
+                      <td className="px-2 text-right text-[10px] text-muted-foreground whitespace-nowrap">{fmtAge(f.age_s)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ))
+      )}
+    </div>
+  )
+}
+
 function AccessSection({ ip }: { ip: string }) {
   const [includeDead, setIncludeDead] = useState(false)
   const { data, isLoading } = useAssetAccess(ip, includeDead)
@@ -1372,7 +1530,7 @@ export default function AssetBrowser() {
   const [selectedIp, setSelectedIp] = useState<string | null>(null)
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null)
   const [selectedPort, setSelectedPort] = useState<Port | null>(null)
-  const [detailTab, setDetailTab] = useState<'ports' | 'credentials' | 'access' | 'enumeration' | 'screenshots' | 'recon'>('ports')
+  const [detailTab, setDetailTab] = useState<'ports' | 'credentials' | 'access' | 'facts' | 'enumeration' | 'screenshots' | 'recon'>('ports')
   const [search, setSearch] = useState('')
   const [credStatusFilter, setCredStatusFilter] = useState<string>('')
   // Track which credential rows have their audit panel expanded.  Keyed by
@@ -2649,6 +2807,10 @@ export default function AssetBrowser() {
               className={`px-3 py-1.5 text-xs font-medium rounded-t-md border border-b-0 ${detailTab === 'access' ? 'bg-card text-foreground border-border' : 'bg-muted/50 text-muted-foreground border-transparent hover:text-foreground'}`}
             ><Terminal className="h-3 w-3 inline mr-1" />Current Access</button>
             <button
+              onClick={() => setDetailTab('facts')}
+              className={`px-3 py-1.5 text-xs font-medium rounded-t-md border border-b-0 ${detailTab === 'facts' ? 'bg-card text-foreground border-border' : 'bg-muted/50 text-muted-foreground border-transparent hover:text-foreground'}`}
+            ><ShieldCheck className="h-3 w-3 inline mr-1" />Confirmed Facts</button>
+            <button
               onClick={() => setDetailTab('enumeration')}
               className={`px-3 py-1.5 text-xs font-medium rounded-t-md border border-b-0 ${detailTab === 'enumeration' ? 'bg-card text-foreground border-border' : 'bg-muted/50 text-muted-foreground border-transparent hover:text-foreground'}`}
             >Enumeration</button>
@@ -2660,6 +2822,7 @@ export default function AssetBrowser() {
 
           <div className="p-4 space-y-6">
             {detailTab === 'access' && <AccessSection ip={selectedIp} />}
+            {detailTab === 'facts' && <ConfirmedFactsSection ip={selectedIp} hostname={assets.find(a => a.ip === selectedIp)?.hostname} />}
             {detailTab === 'enumeration' && <EnumerationSection ip={selectedIp} />}
             {detailTab === 'ports' && (
               <div>
