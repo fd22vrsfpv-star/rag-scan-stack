@@ -200,3 +200,30 @@ print('OK')
 """
     out, err, rc = _in_container(py)
     assert rc == 0 and 'OK' in out, f"out={out} err={err}"
+
+
+def test_refine_assertion_blocks_timing_drift_to_regex():
+    # A blind-timing proof must NEVER drift to expect_regex (canary never shows
+    # in a blind exploit's output). The refine loop keeps the latency assertion.
+    py = r"""
+import sys; sys.path.insert(0,'/app')
+from api import _resolve_refine_assertion as R
+cmd = "curl -d 'ip=1%27 AND SLEEP(5)-- -'"
+# timing mode + LLM tries expect_regex -> blocked, latency kept from prev
+a, d = R({'expect_regex':'POChit'}, {'min_seconds':5,'max_seconds':30}, cmd, 'POCc', True)
+assert d is True and a.get('min_seconds')==5 and 'expect_regex' not in a, (a,d)
+# no prev min_seconds -> derive from command SLEEP(5)
+a2, _ = R({'expect_regex':'x'}, {}, cmd, 'POCc', True)
+assert a2.get('min_seconds')==5.0, a2
+# LLM supplies min_seconds -> accepted, not a drift
+a3, d3 = R({'min_seconds':12}, {'min_seconds':5}, cmd, 'POCc', True)
+assert d3 is False and a3.get('min_seconds')==12, (a3,d3)
+# non-timing: expect_regex honored; min_seconds wins when both present
+a4, _ = R({'expect_regex':'POChit'}, {}, 'curl x', 'POCc', False)
+assert a4.get('expect_regex')=='POChit', a4
+a5, _ = R({'expect_regex':'x','min_seconds':5}, {}, 'curl x', 'POCc', False)
+assert 'expect_regex' not in a5 and a5.get('min_seconds')==5, a5
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and 'OK' in out, f"out={out} err={err}"
