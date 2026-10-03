@@ -20696,8 +20696,48 @@ def _research_cve_advisories(cve, max_results=3, per_url_bytes=6000,
     return "\n\n".join(merged)
 
 
+def _zabbix_api_hostids(ip, port, username, password, timeout=12):
+    """Enumerate hostids the user can operate on via the Zabbix JSON-RPC API
+    (user.login → host.get). The web session cookie can't list hosts (the UI
+    loads them via AJAX), but the documented API does — and CVE-2024-22120's
+    script-execution precondition needs a real hostid. Returns [{hostid,name}]."""
+    import httpx as _hx
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    out = []
+    try:
+        with _hx.Client(verify=False, timeout=timeout) as c:
+            r = c.post(base + "/api_jsonrpc.php",
+                       json={"jsonrpc": "2.0", "method": "user.login",
+                             "params": {"username": username, "password": password},
+                             "id": 1},
+                       headers={"Content-Type": "application/json-rpc"})
+            tok = (r.json() or {}).get("result") if r.status_code == 200 else None
+            # Older Zabbix used 'user'/'password' param names.
+            if not tok:
+                r = c.post(base + "/api_jsonrpc.php",
+                           json={"jsonrpc": "2.0", "method": "user.login",
+                                 "params": {"user": username, "password": password},
+                                 "id": 1},
+                           headers={"Content-Type": "application/json-rpc"})
+                tok = (r.json() or {}).get("result") if r.status_code == 200 else None
+            if not tok:
+                return []
+            h = c.post(base + "/api_jsonrpc.php",
+                       json={"jsonrpc": "2.0", "method": "host.get",
+                             "params": {"output": ["hostid", "name", "status"]},
+                             "auth": tok, "id": 2},
+                       headers={"Content-Type": "application/json-rpc"})
+            for host in ((h.json() or {}).get("result") or []):
+                if host.get("hostid"):
+                    out.append({"hostid": host["hostid"], "name": host.get("name", "")})
+    except Exception as e:  # noqa: BLE001
+        logging.debug("zabbix api host enum failed: %s", e)
+    return out
+
+
 def _enumerate_exploit_preconditions(ip, port, analysis, session_cookie=None,
-                                      product=None, timeout=10):
+                                      product=None, timeout=10, auth=None):
     """Confirm + RESOLVE the concrete prerequisites an exploit needs, instead
     of letting synth guess them. The advisory/research names preconditions in
     prose ("the user must have access to a host to run a script against");
@@ -20746,34 +20786,31 @@ def _enumerate_exploit_preconditions(ip, port, analysis, session_cookie=None,
             # ── Zabbix: "host to run a script against" → enumerate hostids ──
             if "host" in pre_blob or "script" in pre_blob or "zabbix" in prod_l:
                 hostids = []
-                # UI host list (authenticated) — hostids appear in the HTML/JSON
-                for path in ("/zabbix.php?action=host.view",
-                             "/zabbix.php?action=host.list",
-                             "/hosts.php"):
-                    try:
-                        r = cli.get(base + path)
-                        if r.status_code == 200 and r.text:
-                            hostids += _grab_ids(r.text, ["hostid"])
-                    except Exception:  # noqa: BLE001
-                        continue
-                # Zabbix JSON-RPC host.get (needs API auth token, but the web
-                # session sometimes works via the frontend proxy) — best effort
-                try:
-                    rpc = cli.post(base + "/api_jsonrpc.php",
-                                   json={"jsonrpc": "2.0", "method": "host.get",
-                                         "params": {"output": ["hostid", "name"],
-                                                    "limit": 10},
-                                         "id": 1},
-                                   headers={**headers, "Content-Type": "application/json-rpc"})
-                    if rpc.status_code == 200:
-                        hostids += _grab_ids(rpc.text, ["hostid"])
-                except Exception:  # noqa: BLE001
-                    pass
+                host_names = {}
+                # Zabbix JSON-RPC API (user.login → host.get) — the authoritative
+                # way to list hosts the user can operate on. Needs the creds, so
+                # auth is threaded in. The UI host-list is AJAX and leaks no
+                # hostid to a static fetch.
+                if auth and auth.get("username") and auth.get("password"):
+                    for h in _zabbix_api_hostids(ip, port, auth["username"], auth["password"]):
+                        if h["hostid"] not in hostids:
+                            hostids.append(h["hostid"]); host_names[h["hostid"]] = h.get("name", "")
+                # UI fallback (older versions sometimes render hostids inline).
+                if not hostids:
+                    for path in ("/zabbix.php?action=host.view", "/hosts.php"):
+                        try:
+                            r = cli.get(base + path)
+                            if r.status_code == 200 and r.text:
+                                hostids += _grab_ids(r.text, ["hostid"])
+                        except Exception:  # noqa: BLE001
+                            continue
                 hostids = list(dict.fromkeys(hostids))[:10]
                 if hostids:
                     resolved["hostid"] = hostids
-                    confirmed.append(f"user can see {len(hostids)} host(s); "
-                                     f"usable hostid(s): {', '.join(hostids[:5])}")
+                    _named = ", ".join(f"{h}({host_names.get(h,'')})" if host_names.get(h) else h
+                                       for h in hostids[:5])
+                    confirmed.append(f"user can operate on {len(hostids)} host(s) "
+                                     f"(via Zabbix API); usable hostid(s): {_named}")
                 else:
                     unmet.append("could not enumerate a hostid the user can "
                                  "operate on — the exploit's script-execution "

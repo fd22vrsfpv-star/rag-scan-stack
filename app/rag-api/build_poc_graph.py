@@ -736,7 +736,7 @@ def node_precondition_enumeration(state: BuildPocState) -> Dict[str, Any]:
     try:
         pre = _enumerate_exploit_preconditions(
             state["ip"], state["port"], analysis, session_cookie=cookie,
-            product=state.get("product"))
+            product=state.get("product"), auth=state.get("auth"))
     except Exception as e:  # noqa: BLE001
         logging.debug("precondition enumeration node failed: %s", e)
         return {}
