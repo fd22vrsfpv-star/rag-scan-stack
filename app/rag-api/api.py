@@ -15328,6 +15328,61 @@ def _timing_payload_scale(command, delta=7):
     return command, None, None, None
 
 
+def _resolve_refine_assertion(la, prev_assertion, command, canary, timing_mode):
+    """Decide the next-iteration PoC assertion from the LLM's proposed `la`.
+
+    BLIND-TIMING ANTI-DRIFT: in timing mode (the proof is a blind time-based
+    exploit — SLEEP/pg_sleep/WAITFOR/BENCHMARK), the injected canary NEVER
+    appears in the response, so an `expect_regex` assertion can never fire. The
+    refine loop must NOT let the LLM drift the proof to expect_regex; keep a
+    latency assertion (LLM's min_seconds if given, else the previous one, else
+    derived from the command's payload). Canary stays load-bearing so the stored
+    PoC is still CVE-anchored.
+
+    Returns (new_assertion_or_None, drift_blocked: bool). None means "no usable
+    assertion in `la` — keep the current one" (non-timing only)."""
+    if not isinstance(la, dict):
+        return None, False
+    if timing_mode:
+        prev = prev_assertion or {}
+        mn = la.get("min_seconds")
+        if mn is None:
+            mn = prev.get("min_seconds")
+        if mn is None:
+            _os = _timing_payload_scale(command or "", delta=0)[2]
+            mn = _os if _os else 5
+        new_a = {"min_seconds": mn}
+        mx = la.get("max_seconds")
+        if mx is None:
+            mx = prev.get("max_seconds")
+        if mx is not None:
+            new_a["max_seconds"] = mx
+        if canary:
+            new_a["canary"] = canary
+            new_a["cve_anchored"] = True
+            if la.get("canary_in_timing") or prev.get("canary_in_timing"):
+                new_a["canary_in_timing"] = True
+        drift = la.get("expect_regex") is not None and la.get("min_seconds") is None
+        return new_a, drift
+    # Non-timing: honor expect_regex, then min_seconds (min_seconds wins if both).
+    new_a = None
+    if la.get("expect_regex"):
+        new_a = {"expect_regex": la["expect_regex"]}
+        if canary:
+            new_a["canary"] = canary
+            new_a["cve_anchored"] = True
+    if la.get("min_seconds") is not None:
+        new_a = {"min_seconds": la["min_seconds"]}
+        if la.get("max_seconds") is not None:
+            new_a["max_seconds"] = la["max_seconds"]
+        if canary:
+            new_a["canary"] = canary
+            new_a["cve_anchored"] = True
+            if la.get("canary_in_timing"):
+                new_a["canary_in_timing"] = True
+    return new_a, False
+
+
 def _timing_confirmation_rerun(command, assertion, ip, port, listener,
                                  api_key, vt, delta=7, tolerance=2.5):
     """Confirm a blind-timing exploit by re-running with a larger payload.
@@ -16231,6 +16286,14 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
     _last_valid_command = None
     _last_valid_iter = None
     _consecutive_syntax_fails = 0
+    # BLIND-TIMING MODE (sticky): a blind time-based proof's canary never appears
+    # in the response, so an expect_regex assertion can NEVER fire on it. Once
+    # this build is a timing proof (initial assertion carried min_seconds, or any
+    # command carries a SLEEP/pg_sleep/WAITFOR/BENCHMARK payload), we REFUSE to
+    # let the refine loop drift the assertion to expect_regex. Set once, never
+    # cleared — the model dropping min_seconds is the exact regression we block.
+    _timing_mode = bool((assertion or {}).get("min_seconds")) or \
+        (_timing_payload_scale(command or "", delta=0)[1] is not None)
     _REGRESS_FALLBACK_AT = int(os.environ.get("REFINE_REGRESS_FALLBACK_AT", "2") or "2")
     # Model fallback: when a model gets stuck in a shell-quoting death
     # spiral, switch to a backup (BUILD_POC_MODEL_FALLBACK env, else
@@ -16700,25 +16763,23 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             break
         command = str(obj["command"]).strip()
         la = obj.get("assertion")
-        if isinstance(la, dict):
-            if la.get("expect_regex"):
-                assertion = _reanchor(la["expect_regex"])  # re-anchor: canary stays load-bearing
-            # LATENCY assertion — accept it with canary anchor so timing is
-            # the authoritative proof for blind time-based exploits (SQLi
-            # SLEEP, timing side-channels). canary stays load-bearing so
-            # the stored PoC is still CVE-anchored.
-            if la.get("min_seconds") is not None:
-                new_a = {"min_seconds": la["min_seconds"]}
-                if la.get("max_seconds") is not None:
-                    new_a["max_seconds"] = la["max_seconds"]
-                if canary:
-                    new_a["canary"] = canary
-                    new_a["cve_anchored"] = True
-                    # If LLM asked for canary_in_timing, honor it so we require
-                    # BOTH timing + canary — strongest timing verdict.
-                    if la.get("canary_in_timing"):
-                        new_a["canary_in_timing"] = True
-                assertion = new_a
+        # Keep timing mode sticky: if the (new) command still carries a timing
+        # payload, this stays a timing proof even if the LLM omitted min_seconds.
+        if _timing_payload_scale(command or "", delta=0)[1] is not None:
+            _timing_mode = True
+        # Resolve the next assertion; in timing mode this REFUSES a drift to
+        # expect_regex and keeps the latency shape (deterministic — the LLM can't
+        # be trusted to self-correct, same as the invented-hostid case).
+        _new_a, _drift = _resolve_refine_assertion(
+            la, assertion, command, canary, _timing_mode)
+        if _drift:
+            _poc_trace(run_id, "timing_assertion_drift_blocked", iteration=it,
+                       extra={"llm_wanted": "expect_regex",
+                              "kept_latency_min_seconds": (_new_a or {}).get("min_seconds"),
+                              "reason": "blind-timing proof: canary never appears "
+                                        "in output, expect_regex can't fire"})
+        if _new_a is not None:
+            assertion = _new_a
 
     anchored = _poc_assertion_is_anchored(assertion, canary)
     # VERIFIED = the assertion passed AND it was anchored to the exploit's own effect.
