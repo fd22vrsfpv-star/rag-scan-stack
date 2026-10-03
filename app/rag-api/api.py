@@ -20567,6 +20567,72 @@ def _research_cve_advisories(cve, max_results=3, per_url_bytes=6000,
     return "\n\n".join(merged)
 
 
+def _gather_cve_intel(cve, product=None, version=None, ip=None, port=None,
+                       include_msf_edb=True):
+    """SHARED CVE-intel engine — the single source both the build-poc research
+    path (_research_exploit) and the operator deep-dive (cve_deep_search) draw
+    from, so a fix to intel gathering lands in BOTH automatically.
+
+    Gathers, in priority order:
+      1. Structured advisory APIs — GitHub GHSA (+ its referenced patch
+         commits + vendor Jira tickets via REST) + CIRCL + Nuclei templates.
+      2. DDG-scraped advisory / patch-commit / vendor-changelog pages
+         (Jira-aware fetch).
+      3. (optional) Metasploit module search + ExploitDB PoC text + NVD
+         description — the build path wants these; the applicability check
+         doesn't need them.
+
+    Returns {cve, nvd, msf, edb, poc_text, advisory_text, combined} where
+    `combined` is the single prompt-ready text block.
+    """
+    import requests as _rq
+    cve = (cve or "").strip().upper()
+    nvd = {}
+    msf, edb, poc_text = [], [], ""
+    if include_msf_edb:
+        er = EXPLOIT_RUNNER_URL.rstrip("/")
+        hdr = {"x-api-key": API_KEY}
+        try:
+            r = _rq.get(f"{er}/msf/search", params={"cve": cve, "limit": 3},
+                        headers=hdr, verify=False, timeout=45)
+            msf = (r.json() or {}).get("results") or [] if r.ok else []
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            r = _rq.get(f"{er}/exploitdb/search",
+                        params={"cve": cve, "limit": 3, "with_poc": "true"},
+                        headers=hdr, verify=False, timeout=60)
+            edb = (r.json() or {}).get("results") or [] if r.ok else []
+        except Exception:  # noqa: BLE001
+            pass
+        nvd = _fetch_cve_details(cve) or {}
+        for e in edb:
+            if e.get("poc"):
+                poc_text += f"\n--- EDB-{e.get('edb_id')}: {e.get('title', '')} ---\n{str(e['poc'])[:4000]}\n"
+    # Advisory + patch + changelog — ALWAYS (the highest-value vector source).
+    advisory_text = ""
+    try:
+        advisory_text = _research_cve_advisories(
+            cve, max_results=4, per_url_bytes=6000, product=product, version=version)
+    except Exception:  # noqa: BLE001
+        advisory_text = ""
+    msf_text = "\n".join(f"- MSF module {m.get('module')} (rank {m.get('rank')})" for m in msf)
+    combined_parts = []
+    if nvd.get("description"):
+        combined_parts.append(f"CVE description: {nvd['description']}")
+    if msf_text:
+        combined_parts.append(f"Metasploit module(s):\n{msf_text}")
+    if poc_text:
+        combined_parts.append(f"Public reference (ExploitDB):{poc_text}")
+    if advisory_text:
+        combined_parts.append(advisory_text)
+    return {
+        "cve": cve, "nvd": nvd, "msf": msf, "edb": edb,
+        "poc_text": poc_text, "advisory_text": advisory_text,
+        "combined": "\n\n".join(combined_parts),
+    }
+
+
 def _research_exploit(cve, ip=None, port=None, product=None, version=None, eid=None, model=None):
     """Reference-PoC research: pull public exploit material for a CVE (Metasploit module,
     ExploitDB PoC text, NVD refs, GitHub/Gitee advisories via DDG) and have the LLM
@@ -20574,44 +20640,14 @@ def _research_exploit(cve, ip=None, port=None, product=None, version=None, eid=N
     payload, success signal — plus a seed command to reproduce it on the target. This
     is the material that makes a synthesized PoC land (vs a description-only guess).
     Returns {cve, analysis, sources, reference_poc, llm_model}."""
-    import requests as _rq
     cve = (cve or "").strip().upper()
-    er = EXPLOIT_RUNNER_URL.rstrip("/")
-    hdr = {"x-api-key": API_KEY}
-    msf, edb = [], []
-    try:
-        r = _rq.get(f"{er}/msf/search", params={"cve": cve, "limit": 3}, headers=hdr, verify=False, timeout=45)
-        msf = (r.json() or {}).get("results") or [] if r.ok else []
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        r = _rq.get(f"{er}/exploitdb/search", params={"cve": cve, "limit": 3, "with_poc": "true"},
-                    headers=hdr, verify=False, timeout=60)
-        edb = (r.json() or {}).get("results") or [] if r.ok else []
-    except Exception:  # noqa: BLE001
-        pass
-    nvd = _fetch_cve_details(cve) or {}
-    poc_text = ""
-    for e in edb:
-        if e.get("poc"):
-            poc_text += f"\n--- EDB-{e.get('edb_id')}: {e.get('title', '')} ---\n{str(e['poc'])[:4000]}\n"
+    # SHARED intel engine (same source the operator deep-dive uses) — GHSA +
+    # patch commit + vendor Jira ticket + DDG advisory + MSF/EDB/NVD.
+    intel = _gather_cve_intel(cve, product=product, version=version,
+                              ip=ip, port=port, include_msf_edb=True)
+    msf, edb, nvd = intel["msf"], intel["edb"], intel["nvd"]
+    poc_text, advisory_text = intel["poc_text"], intel["advisory_text"]
     msf_text = "\n".join(f"- MSF module {m.get('module')} (rank {m.get('rank')})" for m in msf)
-    # Advisory retrieval: for novel CVEs where MSF/ExploitDB have nothing, pull the
-    # top DDG-searched GitHub/Gitee/NVD advisory bodies. Often names the exact endpoint
-    # + param — the vector-level detail that unblocks description-only synth.
-    # ALWAYS pull advisories + patch/changelog records — not only when MSF/EDB
-    # are empty. The GitHub Security Advisory (GHSA) and the PATCH COMMIT that
-    # fixed the CVE routinely name the exact vulnerable endpoint + parameter —
-    # the single most valuable vector-level source. Gating this behind "EDB
-    # found nothing" skipped it for products like Zabbix where ExploitDB
-    # matches the NAME broadly but has no PoC for THIS CVE. (operator ask:
-    # "did we look at the patch notes and change records")
-    advisory_text = ""
-    try:
-        advisory_text = _research_cve_advisories(
-            cve, max_results=4, per_url_bytes=6000, product=product, version=version)
-    except Exception:  # noqa: BLE001
-        advisory_text = ""
     tgt = f"http://{ip}:{port}" if ip else "the target"
     # Documentation posture: a defender/tester on an AUTHORIZED engagement writing up how the
     # vuln works and how to VALIDATE it. This framing gets a substantive answer where a
@@ -20621,10 +20657,7 @@ def _research_exploit(cve, ip=None, port=None, product=None, version=None, eid=N
               f"it on {tgt} ({product or ''} {version or ''}) and the owner can remediate. Base it "
               f"strictly on the reference material below; this is a structured writeup, not novel "
               f"malware.\n"
-              f"CVE description: {nvd.get('description') or '(none)'}\n"
-              f"Metasploit module(s): {msf_text or '(none)'}\n"
-              f"Public reference (ExploitDB):{poc_text or ' (none)'}\n"
-              f"{advisory_text or ''}\n"
+              f"{intel['combined'] or '(no reference material found)'}\n"
               f"Return ONE JSON object documenting the vulnerability's mechanics: {{"
               f'"summary": "<2-3 sentences: what the weakness is and how it is triggered>", '
               f'"components": ["<the moving parts: endpoint, auth, input, etc.>"], '
@@ -23090,6 +23123,19 @@ def cve_deep_search(body: CveDeepSearchBody, authorized: bool = Depends(auth)):
 
     for cve_id in cve_ids:
         entry = {"cve_id": cve_id, "pages": [], "context": "", "applies": None, "probability": None, "reason": ""}
+        # SHARED intel engine — identical source the build-poc research path
+        # uses (_research_exploit also calls _gather_cve_intel). GHSA API +
+        # patch commit + vendor Jira ticket + DDG advisory/changelog. One
+        # engine → a fix to intel gathering lands in BOTH features. MSF/EDB
+        # skipped here: applicability doesn't need the PoC text, just the
+        # advisory/version context.
+        _struct_ctx = ""
+        try:
+            _intel = _gather_cve_intel(cve_id, product=product, version=version,
+                                       include_msf_edb=False)
+            _struct_ctx = _intel.get("advisory_text") or ""
+        except Exception:  # noqa: BLE001
+            _struct_ctx = ""
         # Search DDG for this specific CVE + product
         search_queries = [
             f'{cve_id} {_ps}',
@@ -23097,6 +23143,14 @@ def cve_deep_search(body: CveDeepSearchBody, authorized: bool = Depends(auth)):
         ]
         pages_checked = []
         best_context = ""
+        # Seed best_context with the shared-engine advisory so the LLM gets it
+        # even when the DDG scrape returns weak pages.
+        if _struct_ctx.strip():
+            best_context = _struct_ctx[:4000]
+            entry["pages"].append({"url": "github-advisories-api + vendor-ticket",
+                                   "title": f"Structured advisory for {cve_id}",
+                                   "has_cve": True, "has_product": True,
+                                   "context": _struct_ctx[:1500]})
         for sq in search_queries:
             for r in ddg_search(sq, max_results=5):
                 url = r["url"]
@@ -23104,11 +23158,13 @@ def cve_deep_search(body: CveDeepSearchBody, authorized: bool = Depends(auth)):
                     continue
                 page_info = {"url": url, "title": r.get("title", ""), "has_cve": False, "has_product": False, "context": ""}
                 try:
-                    resp = requests.get(url, headers=_hdr, timeout=10, verify=False)
-                    if resp.status_code != 200:
+                    # Route through the Jira-aware fetcher so vendor bug-tracker
+                    # URLs resolve to their REST API (the /browse/ HTML is a JS
+                    # shell), and patch/commit pages get proper extraction.
+                    text = _fetch_advisory_text(url, timeout=10, max_bytes=40000)
+                    if not text:
                         pages_checked.append(page_info)
                         continue
-                    text = _dsr.sub(r'<[^>]+>', ' ', resp.text)
                     text = _dsr.sub(r'\s+', ' ', text)
                     text_lower = text.lower()
 
@@ -23146,12 +23202,13 @@ def cve_deep_search(body: CveDeepSearchBody, authorized: bool = Depends(auth)):
         if best_context:
             _prompt = (
                 f"Does {cve_id} affect {product} version {version}?\n\n"
-                f"Evidence from advisory pages:\n{best_context[:1500]}\n\n"
+                f"Evidence from advisory pages, GHSA + vendor ticket + patch notes:\n"
+                f"{best_context[:3500]}\n\n"
                 f"Answer with JSON: {{\"applies\": true/false/\"likely\", \"probability\": 0-100, "
-                f"\"reason\": \"brief explanation\"}}\n"
+                f"\"reason\": \"brief explanation — cite the vulnerable endpoint/param if named\"}}\n"
                 f"Consider multi-track versioning (LTS vs feature releases). Return ONLY the JSON."
             )
-            llm_result = llm_generate(_prompt, caller="cve_deep_search", num_predict=256)
+            llm_result = llm_generate(_prompt, caller="cve_deep_search", num_predict=320)
             if llm_result["ok"]:
                 try:
                     _match = _dsr.search(r'\{[^}]+\}', llm_result["response"])
