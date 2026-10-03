@@ -15008,6 +15008,13 @@ def _match_refine_patterns(output, assertion, canary, command):
         if req_keys:
             if not all(a.get(k) is not None for k in req_keys):
                 continue
+        # prev_assertion_lacks — require every listed key to be ABSENT. Lets
+        # a pattern say "fire unless this is a timing-based proof" without
+        # inverse logic in the trigger expression.
+        forbid_keys = trig.get("prev_assertion_lacks")
+        if forbid_keys:
+            if any(a.get(k) is not None for k in forbid_keys):
+                continue
         # canary_in_request — the exploit sent canary in the command
         if trig.get("canary_in_request") is True:
             if not (canary and canary in cmd):

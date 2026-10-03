@@ -36,14 +36,37 @@ patterns:
         - "syntax error: unexpected end of file"
     guidance: |
       SHELL SYNTAX ERROR — the shell refused to parse the previous command.
-      ROOT CAUSE on `No closing quotation` / unterminated string: nested
-      double-quotes inside a double-quoted string (e.g.
-      `grep -o "csrf-token.*value=\"[^"]*\""` — the `[^"]*` has a bare `"`
-      that closes the OUTER quote). FIX pattern: wrap the outer value in
-      SINGLE quotes and use `[^\"]*` inside, OR use python/perl for complex
-      regex. GOOD example:
-      `grep -oP 'csrf-token[^"]+value="\K[^"]+'`.
-      Keep it to ONE line; don't nest the same quote char.
+
+      TWO common root causes — identify which one YOU hit before rewriting:
+
+      (A) Nested DOUBLE quotes inside a double-quoted string:
+          BAD : `grep -o "csrf-token.*value=\"[^"]*\""`
+                — the `[^"]*` has a bare `"` that closes the OUTER quote.
+          FIX : single-quote the outer wrapper + no escapes inside, OR use
+                perl's `\K`:
+          GOOD: `grep -oP 'csrf-token[^"]+value="\K[^"]+'`
+
+      (B) SINGLE quote inside a SINGLE-quoted string (POSIX forbids this —
+          `\'` does NOT escape; the shell closes the string at the first `'`
+          then treats the rest as unquoted text):
+          BAD : `-d 'clientip=127.0.0.1\' AND SLEEP(5)-- -'`
+                — the `\` is literal, the first `'` CLOSES the string, the
+                stuff after is unquoted → "No closing quotation" when the
+                lexer finds a stray `'` later.
+          FIX 1 (close-escape-reopen):
+          GOOD: `-d 'clientip=127.0.0.1'"'"' AND SLEEP(5)-- -'`
+                — pattern is `'"'"'` which reads as:
+                close ' + escaped " embedded ' + reopen '
+          FIX 2 (switch outer to double-quote + URL-encode internals):
+          GOOD: `-d "clientip=127.0.0.1%27%20AND%20SLEEP(5)--%20-"`
+                — URL-encode `'` as %27, space as %20; no shell escape needed.
+          FIX 3 (use ANSI-C quoting):
+          GOOD: `-d $'clientip=127.0.0.1\\' AND SLEEP(5)-- -'`
+                — `$'...'` DOES honor `\'`; use only ONCE as the outer.
+
+      For curl SQLi payloads SPECIFICALLY: prefer FIX 2 — URL-encode the
+      quote so no shell escape is needed at all. SQL still sees `'`.
+      Keep the command to ONE line; don't nest the same quote char.
 
   - id: timing_assertion_regressed
     title: "Blind timing: keep latency assertion"
@@ -82,6 +105,7 @@ patterns:
     triggers:
       canary_in_request: true
       canary_in_output: false
+      prev_assertion_lacks: ["min_seconds"]  # skip for timing-based proofs
     guidance: |
       REFLECTION RISK — your canary appears in the REQUEST but NOT the response.
       That proves nothing new: either the server is reflecting your input
@@ -90,6 +114,9 @@ patterns:
       filesystem file, session attribute, mail queue) and then READ IT BACK
       in a separate request. The stored read confirms server-side execution
       beyond mere reflection.
+      EXCEPTION: for a BLIND TIMING exploit (SLEEP, pg_sleep, WAITFOR), the
+      canary is a TAG not a proof — proof is the latency. If your assertion
+      carries min_seconds, keep the shape; the latency verdict proves exec.
 
   - id: csrf_token_required
     title: "CSRF-protected endpoint"
