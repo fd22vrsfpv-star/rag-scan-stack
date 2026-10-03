@@ -20833,8 +20833,123 @@ def _probe_session_valid(ip, port, cookie, product=None, timeout=8):
     return False, "no authenticated endpoint confirmed"
 
 
+def _validate_against_vendor_docs(product, version, questions, cve=None,
+                                    model=None, max_pages=3):
+    """Pull VENDOR documentation to validate specific readiness questions that
+    can't be answered from what's already in hand — instead of assuming.
+
+    Operator ask: "the challenge skill should look at everything and not allow
+    assumptions, pull vendor docs to validate if required."
+
+    For each question (e.g. "is version X in the affected range?", "what
+    permission does script execution require?", "what is the exact login
+    endpoint + fields?") this searches the vendor's official docs / security
+    page / release notes, fetches the top hits (Jira-aware), and asks the LLM
+    to ANSWER WITH A CITATION or say UNKNOWN — never guess.
+
+    Returns {answers: [{question, verdict, evidence, source}], unresolved: [...]}.
+    """
+    if not product or not questions:
+        return {"answers": [], "unresolved": list(questions or [])}
+    pv = f"{product} {version}" if version else product
+    # Cache by (product, version, cve) — vendor docs don't change build-to-
+    # build, so the expensive DDG+fetch+LLM pass runs ONCE per target then
+    # serves instantly (rigor without a 4-minute gate every run).
+    _ck = f"vendor_doc_validation:{(product or '').lower()}:{version or ''}:{cve or ''}"
+    try:
+        _cached = _get_setting(_ck, "")
+        if _cached:
+            import json as _cj
+            return _cj.loads(_cached)
+    except Exception:  # noqa: BLE001
+        pass
+    # Bounded to 2 queries (the CVE affected-versions query is highest value)
+    # so the gate stays fast.
+    queries = [f"{product} {cve} affected versions" if cve else f"{pv} security advisory",
+               f"{pv} documentation"]
+    seen, docs = set(), []
+    for q in queries:
+        try:
+            for r in (ddg_search(q, max_results=4, timeout=6) or []):
+                url = (r.get("url") or "").strip()
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                # Prefer official-looking docs/vendor domains.
+                low = url.lower()
+                weight = 0
+                if any(s in low for s in ("docs.", "/docs/", "documentation",
+                                           "/manual", "support.", "/security",
+                                           "release-notes", "changelog", "wiki")):
+                    weight += 3
+                prod_tok = (product.split()[0].lower() if product else "")
+                if prod_tok and prod_tok in low:
+                    weight += 2
+                if weight > 0:
+                    r["_w"] = weight
+                    docs.append(r)
+        except Exception:  # noqa: BLE001
+            pass
+    docs.sort(key=lambda x: -x.get("_w", 0))
+    corpus = []
+    for r in docs[:max_pages]:
+        body = _fetch_advisory_text(r["url"], timeout=8, max_bytes=5000)
+        if body:
+            corpus.append(f"--- {r.get('title','')[:100]}\nURL: {r['url']}\n{body[:4000]}")
+    corpus_text = "\n\n".join(corpus)
+    if not corpus_text:
+        return {"answers": [], "unresolved": list(questions)}
+    qlist = "\n".join(f"{i+1}. {q}" for i, q in enumerate(questions))
+    prompt = (
+        f"You are validating readiness facts for an AUTHORIZED pentest of "
+        f"{pv}. Answer EACH question ONLY from the vendor documentation below. "
+        f"Do NOT guess — if the docs don't answer it, say verdict 'unknown'. "
+        f"No assumptions.\n\nVENDOR DOCS:\n{corpus_text[:12000]}\n\n"
+        f"QUESTIONS:\n{qlist}\n\n"
+        'Return JSON only: {"answers": [{"n": <num>, "verdict": '
+        '"yes"|"no"|"unknown", "evidence": "<quote/paraphrase from docs>", '
+        '"source": "<url>"}]}')
+    answers, unresolved = [], []
+    try:
+        res = _llm_for_model(prompt, model=model, caller="vendor_doc_validation",
+                             num_predict=600)
+        txt = res.get("response", "") if isinstance(res, dict) else str(res or "")
+        obj = _poc_extract_json(txt) or {}
+        for ans in (obj.get("answers") or []):
+            n = ans.get("n")
+            q = questions[n - 1] if isinstance(n, int) and 1 <= n <= len(questions) else ""
+            if ans.get("verdict") == "unknown":
+                unresolved.append(q or str(ans))
+            answers.append({"question": q, "verdict": ans.get("verdict"),
+                            "evidence": ans.get("evidence", ""),
+                            "source": ans.get("source", "")})
+    except Exception as e:  # noqa: BLE001
+        logging.debug("vendor doc validation failed: %s", e)
+        unresolved = list(questions)
+    out = {"answers": answers, "unresolved": unresolved}
+    # Cache the result so repeat builds for this (product, version, cve) are
+    # instant — cache even an empty answer set (the scrape ran and found
+    # nothing usable; re-running it on the next iter won't help and costs
+    # ~50s). A later manual cache-clear or a new product/version re-runs it.
+    if True:
+        try:
+            import json as _cj
+            with get_db() as _c, _c.cursor() as _cur:
+                _cur.execute(
+                    "INSERT INTO app_settings (key, value, category) "
+                    "VALUES (%s,%s,'vendor_doc_cache') "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                    (_ck, _cj.dumps(out)))
+                _c.commit()
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
 def _assess_exploit_readiness(ip, port, analysis, session_info=None,
-                               precond_result=None, product=None, model=None):
+                               precond_result=None, product=None, model=None,
+                               version=None, cve=None, validate_vendor_docs=True,
+                               advisory_text=None, llm_challenge=None):
     """CHALLENGE SKILL — before the build loop hammers iterations, review every
     precondition and judge whether all the pieces are actually in hand.
 
@@ -20895,28 +21010,104 @@ def _assess_exploit_readiness(ip, port, analysis, session_info=None,
                             "from the target — value would be guessed")
 
     # 3. TARGET reachability (cheap sanity).
+    import httpx as _hx
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
     try:
-        import httpx as _hx
-        scheme = "https" if int(port or 80) in (443, 8443) else "http"
         with _hx.Client(verify=False, timeout=6) as cli:
-            r = cli.get(f"{scheme}://{ip}:{port or 80}/")
+            r = cli.get(f"{base}/")
             satisfied.append(f"target reachable (HTTP {r.status_code})")
     except Exception:  # noqa: BLE001
         blockers.append("target did not respond to a basic HTTP probe")
 
-    # 4. LLM challenge review — a second opinion. Only when we have analysis.
+    # 4. ENDPOINT EXISTENCE — don't ASSUME the vulnerable endpoint is there.
+    #    Probe the advisory-named target_endpoint; a 404 means the exploit
+    #    aims at a path this install doesn't expose (wrong version, disabled
+    #    feature, different router).
+    tep = (a.get("target_endpoint") or "").strip()
+    if tep and tep.startswith("/"):
+        try:
+            with _hx.Client(verify=False, timeout=6, follow_redirects=True,
+                             headers={"Cookie": cookie} if cookie else {}) as cli:
+                er = cli.get(base + tep)
+                if er.status_code == 404:
+                    blockers.append(f"advisory endpoint {tep} returns 404 — not "
+                                    "present on this target (wrong version / "
+                                    "feature disabled / different router path)")
+                else:
+                    satisfied.append(f"endpoint {tep} exists (HTTP {er.status_code})")
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 5. VERSION APPLICABILITY — confirm the detected version is actually in
+    #    the affected range, from the advisory text we already gathered. Not
+    #    confirmable there → defer to the vendor-doc validation below.
+    version_unconfirmed = bool(version)
+    if version:
+        # Reuse the advisory the build already gathered (research_out) — don't
+        # re-fetch GHSA/Jira/DDG here (that was making the gate a ~minute step).
+        adv = advisory_text or ""
+        if not adv and cve and validate_vendor_docs:
+            # Only pay for a fresh gather in strict mode (vendor validation on).
+            try:
+                intel = _gather_cve_intel(cve, product=product, version=version,
+                                          include_msf_edb=False)
+                adv = intel.get("advisory_text") or "" if isinstance(intel, dict) else ""
+            except Exception:  # noqa: BLE001
+                adv = ""
+        if adv and version in adv:
+            satisfied.append(f"version {version} appears in the advisory text")
+            version_unconfirmed = False
+
+    # 6. VENDOR-DOC VALIDATION — for anything we could NOT confirm, pull vendor
+    #    docs and validate rather than assume. No assumptions is the rule.
+    vendor = {"answers": [], "unresolved": []}
+    if validate_vendor_docs and product:
+        vq = []
+        if version_unconfirmed and version:
+            vq.append(f"Is {product} version {version} affected by {cve}? "
+                      "What is the exact affected version range?")
+        # Ask the docs to pin any precondition prose into a concrete requirement.
+        for p in preconds[:3]:
+            vq.append(f"For {cve} on {product}, validate this precondition and "
+                      f"state the concrete requirement: {p}")
+        if vq:
+            try:
+                vendor = _validate_against_vendor_docs(
+                    product, version, vq, cve=cve, model=model)
+                for ans in vendor.get("answers", []):
+                    if ans.get("verdict") == "yes" and ans.get("evidence"):
+                        satisfied.append(f"vendor-doc confirmed: {ans['evidence'][:140]}")
+                    elif ans.get("verdict") == "no":
+                        blockers.append(f"vendor-doc CONTRADICTS a requirement: "
+                                        f"{ans.get('question','')[:80]} — {ans.get('evidence','')[:120]}")
+                # Unresolved questions are NOT assumed satisfied — they're gaps.
+                for u in vendor.get("unresolved", []):
+                    blockers.append(f"UNVERIFIED (vendor docs silent, not assumed met): {u[:120]}")
+            except Exception as e:  # noqa: BLE001
+                logging.debug("vendor validation in readiness failed: %s", e)
+
+    # 4. LLM challenge review — a second opinion. Opt-in (strict mode / explicit
+    #    llm_challenge=True) since it adds an LLM round-trip; the deterministic
+    #    checks already enforce "no assumptions".
+    want_llm = llm_challenge if llm_challenge is not None else validate_vendor_docs
     llm_verdict = ""
-    if preconds and _poc_semantic_verify_enabled():
+    if want_llm and preconds and _poc_semantic_verify_enabled():
         try:
             prompt = (
-                "You are reviewing whether an AUTHORIZED pentest PoC is READY to "
-                "attempt, or whether required pieces are missing. Do NOT write an "
-                "exploit — just judge readiness.\n"
+                "You are a STRICT readiness reviewer for an AUTHORIZED pentest "
+                "PoC. RULE: allow NO assumptions. Every precondition is either "
+                "CONFIRMED by concrete evidence below, or it is MISSING — there "
+                "is no 'probably fine'. If a precondition is not explicitly "
+                "backed by the confirmed-evidence list, it is MISSING. Do NOT "
+                "write an exploit — only judge readiness.\n"
                 f"Exploit preconditions (from the advisory):\n- "
                 + "\n- ".join(preconds) + "\n\n"
-                f"What we have confirmed:\n- " + ("\n- ".join(satisfied) or "(nothing)") + "\n\n"
+                f"CONFIRMED by evidence (probes / vendor docs / enumeration):\n- "
+                + ("\n- ".join(satisfied) or "(nothing)") + "\n\n"
                 f"Known gaps:\n- " + ("\n- ".join(blockers) or "(none)") + "\n\n"
-                'Return JSON only: {"ready": true/false, "missing": ["..."], '
+                'Return JSON only: {"ready": true/false, "missing": ["every '
+                'precondition NOT backed by confirmed evidence"], '
                 '"reason": "<one sentence>"}')
             res = _llm_for_model(prompt, model=model, caller="exploit_readiness_challenge",
                                  num_predict=256)
