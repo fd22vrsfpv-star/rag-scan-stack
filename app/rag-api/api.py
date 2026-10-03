@@ -15963,7 +15963,65 @@ def _establish_web_session(ip, port, username, password, login_url=None, timeout
     return {"ok": False, "cookies": [], "cookie_header": "", "login_url": None, "note": "no login form found"}
 
 
-def _establish_session_for_build(ip, port, auth, eid=None):
+def _login_field_variants(ip, port, username, password, login_url=None, timeout=12):
+    """Explicit-field-name login fallback for apps the generic form detector
+    mis-maps. Tries known (user-field, pass-field, submit-field) tuples with a
+    live CSRF/sid grab, forwarding cookies by name. Returns the same shape as
+    _establish_web_session; first variant that sets a cookie wins (caller
+    validates). Covers Zabbix (name/password/enter), and login/user/email
+    variants common elsewhere."""
+    import httpx as _hx, re as _re
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    login_paths = [login_url] if login_url else ["/index.php", "/login", "/user/login", "/"]
+    # (user_field, pass_field, extra_fields)
+    VARIANTS = [
+        ("name", "password", {"enter": "Sign in", "autologin": "1"}),   # Zabbix
+        ("username", "password", {"login": "Login"}),
+        ("login", "password", {}),
+        ("user", "pass", {}),
+        ("email", "password", {}),
+        ("j_username", "j_password", {}),                                # JavaEE
+    ]
+    for lp in login_paths:
+        if not lp:
+            continue
+        url = lp if str(lp).startswith("http") else base + lp
+        for uf, pf, extra in VARIANTS:
+            jar = {}
+            try:
+                with _hx.Client(verify=False, follow_redirects=True, timeout=timeout) as cli:
+                    g = cli.get(url)
+                    for k, v in g.headers.multi_items():
+                        if k.lower() == "set-cookie" and "=" in v.split(";", 1)[0]:
+                            n, val = v.split(";", 1)[0].split("=", 1)
+                            if val.strip(): jar[n.strip()] = val.strip()
+                    # Harvest a CSRF/sid token from the login form, forward it.
+                    tok = {}
+                    for m in _re.finditer(r'<input[^>]+type=["\']hidden["\'][^>]*>', g.text or "", _re.I):
+                        nm = _re.search(r'name=["\']([^"\']+)', m.group(0))
+                        vl = _re.search(r'value=["\']([^"\']*)', m.group(0))
+                        if nm and vl:
+                            tok[nm.group(1)] = vl.group(1)
+                    data = {uf: username, pf: password, **extra, **tok}
+                    ck_hdr = "; ".join(f"{k}={v}" for k, v in jar.items())
+                    r = cli.post(url, data=data,
+                                 headers={"Cookie": ck_hdr} if ck_hdr else {})
+                    for k, v in r.headers.multi_items():
+                        if k.lower() == "set-cookie" and "=" in v.split(";", 1)[0]:
+                            n, val = v.split(";", 1)[0].split("=", 1)
+                            if val.strip(): jar[n.strip()] = val.strip()
+                if jar:
+                    return {"ok": True, "cookies": [f"{k}={v}" for k, v in jar.items()],
+                            "cookie_header": "; ".join(f"{k}={v}" for k, v in jar.items()),
+                            "login_url": url, "note": f"variant {uf}/{pf}"}
+            except Exception:  # noqa: BLE001
+                continue
+    return {"ok": False, "cookies": [], "cookie_header": "", "login_url": None,
+            "note": "no field variant logged in"}
+
+
+def _establish_session_for_build(ip, port, auth, eid=None, product=None):
     """Get an authenticated session for the build. SUPPLIED creds -> log in directly.
     bruteforce=true and no password -> reuse default_cred_check to find a documented default
     credential, then log in with it. Returns {ok, cookie_header, username, method, note}."""
@@ -15972,6 +16030,24 @@ def _establish_session_for_build(ip, port, auth, eid=None):
     login_url = auth.get("login_url")
     if username and password:
         s = _establish_web_session(ip, port, username, password, login_url=login_url)
+        # VALIDATE the session actually logged in — a cookie being set is NOT
+        # proof (Zabbix sets zbx_session even on the "not logged in" page). If
+        # the generic form-detection used the wrong field names, retry with
+        # explicit field-name variants (Zabbix wants name/password/enter; some
+        # apps want login/user/email). This self-corrects the 14-run dead-
+        # session failure the readiness gate surfaced.
+        try:
+            ch = (s or {}).get("cookie_header")
+            valid, _why = _probe_session_valid(ip, port, ch, product=product, timeout=6) if ch else (False, "no cookie")
+            if not valid:
+                s2 = _login_field_variants(ip, port, username, password, login_url=login_url)
+                if s2 and s2.get("cookie_header"):
+                    v2, _ = _probe_session_valid(ip, port, s2["cookie_header"], product=product, timeout=6)
+                    if v2:
+                        return {**s2, "username": username, "method": "supplied_variant",
+                                "validated": True}
+        except Exception as e:  # noqa: BLE001
+            logging.debug("session validate/retry failed: %s", e)
         return {**s, "username": username, "method": "supplied"}
     if auth.get("bruteforce"):
         try:
@@ -20688,6 +20764,158 @@ def _enumerate_exploit_preconditions(ip, port, analysis, session_cookie=None,
             bits.append(f"  - {u}")
     return {"resolved": resolved, "confirmed": confirmed, "unmet": unmet,
             "guidance": "\n".join(bits)}
+
+
+def _probe_session_valid(ip, port, cookie, product=None, timeout=8):
+    """Is the authenticated session actually valid? Many apps return 200 with a
+    login/warning/redirect page when the session is dead — which looks like
+    success to a naive fetch. Probe an authenticated endpoint and check for
+    not-logged-in markers. Returns (valid: bool, reason: str)."""
+    import httpx as _hx
+    if not cookie:
+        return False, "no session cookie"
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    # Not-logged-in / access-denied markers across common apps.
+    DEAD = ["please log in", "sign in to continue", "session expired",
+            "you are not logged in", "login to continue", "access denied",
+            "warning [refreshed", "<title>warning", "zbx_messages",
+            "please re-login", "authentication required"]
+    # App-aware authenticated probe path.
+    prod_l = (product or "").lower()
+    paths = ["/"]
+    if "zabbix" in prod_l:
+        paths = ["/zabbix.php?action=dashboard.view", "/zabbix.php?action=host.view"]
+    elif "grafana" in prod_l:
+        paths = ["/api/user"]
+    elif "wordpress" in prod_l:
+        paths = ["/wp-admin/"]
+    try:
+        with _hx.Client(verify=False, follow_redirects=True, timeout=timeout,
+                         headers={"Cookie": cookie, "User-Agent": "Mozilla/5.0"}) as cli:
+            for p in paths:
+                try:
+                    r = cli.get(base + p)
+                except Exception:  # noqa: BLE001
+                    continue
+                body_l = (r.text or "").lower()
+                # A tiny body (<2KB) on an app page is almost always a
+                # login/warning shell, not the real authenticated view.
+                if len(r.text or "") < 2000 and any(m in body_l for m in DEAD):
+                    return False, f"{p} returned a not-logged-in page ({len(r.text)}b)"
+                if any(m in body_l for m in DEAD):
+                    return False, f"{p} contains a not-logged-in marker"
+                # Looks like real authenticated content.
+                return True, f"{p} returned authenticated content ({len(r.text)}b)"
+    except Exception as e:  # noqa: BLE001
+        return False, f"probe error: {e}"
+    return False, "no authenticated endpoint confirmed"
+
+
+def _assess_exploit_readiness(ip, port, analysis, session_info=None,
+                               precond_result=None, product=None, model=None):
+    """CHALLENGE SKILL — before the build loop hammers iterations, review every
+    precondition and judge whether all the pieces are actually in hand.
+
+    Operator ask: "we need a challenge skill to review and check for
+    preconditions to ensure that all of the pieces are available before
+    hammering away on incomplete data."
+
+    Combines:
+      - deterministic checks: auth/session validity (real probe, not just
+        "a cookie exists"), object-ids resolved by the enumeration step,
+        target reachability.
+      - an LLM 'challenge' review of the advisory preconditions vs what we
+        actually have — a second opinion that catches gaps the deterministic
+        rules don't model.
+
+    Returns {ready: bool, blockers: [...], satisfied: [...], score: 0..1,
+             llm_verdict: str}. A HARD blocker (auth-required exploit with a
+             dead session) sets ready=False so the gate can short-circuit
+             instead of wasting 30 iters on data that can't work.
+    """
+    a = analysis or {}
+    preconds = [str(p) for p in (a.get("preconditions") or [])]
+    pre_blob = (" ".join(preconds) + " " + str(a.get("summary", ""))).lower()
+    si = session_info or {}
+    pr = precond_result or {}
+    blockers, satisfied = [], []
+
+    needs_auth = any(k in pre_blob for k in
+                     ("auth", "login", "session", "logged", "credential", "cookie",
+                      "privilege", "user ", "account"))
+    cookie = si.get("cookie_header") if isinstance(si, dict) else None
+
+    # 1. AUTH/SESSION — the #1 silent killer. If the exploit needs auth,
+    #    confirm the session is REALLY valid (probe), not just present.
+    if needs_auth:
+        if not cookie:
+            blockers.append("exploit requires authentication but NO session "
+                            "cookie was established")
+        else:
+            valid, why = _probe_session_valid(ip, port, cookie, product=product)
+            if valid:
+                satisfied.append(f"authenticated session is valid ({why})")
+            else:
+                blockers.append(f"authenticated session is NOT valid — {why}. "
+                                "Fix the login flow before attempting the "
+                                "exploit (it needs a live session).")
+
+    # 2. OBJECT-ID preconditions — resolved by the enumeration step?
+    resolved = pr.get("resolved") or {}
+    for unmet in (pr.get("unmet") or []):
+        blockers.append(unmet)
+    for conf in (pr.get("confirmed") or []):
+        satisfied.append(conf)
+    # Detect id-shaped preconditions the enumeration didn't resolve.
+    for idkind in ("hostid", "userid", "groupid", "itemid", "templateid"):
+        if idkind in pre_blob and idkind not in resolved and not any(idkind in u for u in (pr.get("unmet") or [])):
+            blockers.append(f"exploit references {idkind} but none was enumerated "
+                            "from the target — value would be guessed")
+
+    # 3. TARGET reachability (cheap sanity).
+    try:
+        import httpx as _hx
+        scheme = "https" if int(port or 80) in (443, 8443) else "http"
+        with _hx.Client(verify=False, timeout=6) as cli:
+            r = cli.get(f"{scheme}://{ip}:{port or 80}/")
+            satisfied.append(f"target reachable (HTTP {r.status_code})")
+    except Exception:  # noqa: BLE001
+        blockers.append("target did not respond to a basic HTTP probe")
+
+    # 4. LLM challenge review — a second opinion. Only when we have analysis.
+    llm_verdict = ""
+    if preconds and _poc_semantic_verify_enabled():
+        try:
+            prompt = (
+                "You are reviewing whether an AUTHORIZED pentest PoC is READY to "
+                "attempt, or whether required pieces are missing. Do NOT write an "
+                "exploit — just judge readiness.\n"
+                f"Exploit preconditions (from the advisory):\n- "
+                + "\n- ".join(preconds) + "\n\n"
+                f"What we have confirmed:\n- " + ("\n- ".join(satisfied) or "(nothing)") + "\n\n"
+                f"Known gaps:\n- " + ("\n- ".join(blockers) or "(none)") + "\n\n"
+                'Return JSON only: {"ready": true/false, "missing": ["..."], '
+                '"reason": "<one sentence>"}')
+            res = _llm_for_model(prompt, model=model, caller="exploit_readiness_challenge",
+                                 num_predict=256)
+            txt = res.get("response", "") if isinstance(res, dict) else str(res or "")
+            obj = _poc_extract_json(txt) or {}
+            llm_verdict = obj.get("reason", "")
+            for m in (obj.get("missing") or []):
+                if m and m not in blockers:
+                    blockers.append(f"(LLM) {m}")
+        except Exception as e:  # noqa: BLE001
+            logging.debug("readiness LLM challenge failed: %s", e)
+
+    hard_blocked = any("NOT valid" in b or "NO session" in b
+                       or "did not respond" in b for b in blockers)
+    total = len(blockers) + len(satisfied)
+    score = round(len(satisfied) / total, 2) if total else 0.0
+    ready = (not hard_blocked) and (len(blockers) == 0 or not needs_auth and score >= 0.5)
+    return {"ready": ready, "hard_blocked": hard_blocked,
+            "blockers": blockers, "satisfied": satisfied,
+            "score": score, "llm_verdict": llm_verdict}
 
 
 def _gather_cve_intel(cve, product=None, version=None, ip=None, port=None,

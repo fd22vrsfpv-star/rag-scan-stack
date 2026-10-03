@@ -54,6 +54,9 @@ class BuildPocState(TypedDict, total=False):
     zap_paths: List[str]
     arjun_discovered: List[str]       # arjun's live-found URLs for the focused ZAP active scan
     focused_urls: List[str]           # operator-supplied URLs (BuildPocBody.focused_urls)
+    precond_result: Dict[str, Any]    # resolved/confirmed/unmet from precondition enumeration
+    readiness_blocked: bool           # strict-gate: hard blocker → skip the run-refine loop
+    readiness_blockers: List[str]     # why it was blocked (for the result)
     cred_hints: List[str]
     admin_paths_mined: List[str]
     detected_frameworks: List[str]
@@ -670,7 +673,8 @@ def node_auth_establish(state: BuildPocState) -> Dict[str, Any]:
     if auth and (auth.get("username") or auth.get("bruteforce")):
         try:
             session_info = _establish_session_for_build(
-                state["ip"], state["port"], auth, state.get("eid"))
+                state["ip"], state["port"], auth, state.get("eid"),
+                product=state.get("product"))
             ch = (session_info or {}).get("cookie_header")
             if ch:
                 auth_guidance = (f"AUTH: an authenticated session exists — send this cookie in "
@@ -736,6 +740,9 @@ def node_precondition_enumeration(state: BuildPocState) -> Dict[str, Any]:
     except Exception as e:  # noqa: BLE001
         logging.debug("precondition enumeration node failed: %s", e)
         return {}
+    # Stash the structured result so the readiness gate can judge it without
+    # re-enumerating.
+    _precond_result = pre
     seg = []
     if pre.get("guidance"):
         seg.append(pre["guidance"])
@@ -750,7 +757,69 @@ def node_precondition_enumeration(state: BuildPocState) -> Dict[str, Any]:
         "signal": f"resolved={list((pre.get('resolved') or {}).keys())} "
                    f"unmet={len(pre.get('unmet') or [])}"}}
     return {"segments": seg,
+            "precond_result": _precond_result,
             "recon_metrics": {**state.get("recon_metrics", {}), **metrics}}
+
+
+def node_readiness_gate(state: BuildPocState) -> Dict[str, Any]:
+    """CHALLENGE SKILL — the readiness gate. After preconditions are enumerated
+    (and session validated), review whether ALL the pieces are actually in
+    hand before the run-refine loop hammers iterations. Operator ask: 'a
+    challenge skill to review and check for preconditions to ensure all the
+    pieces are available before hammering away on incomplete data.'
+
+    Behaviour (env BUILD_POC_PRECONDITION_GATE: strict|warn|off, default warn):
+      - strict: a HARD blocker (dead session on an auth-required exploit,
+        unreachable target) sets state.readiness_blocked so run_refine
+        short-circuits with a BLOCKED result instead of looping.
+      - warn (default): never blocks the loop, but injects the blockers
+        prominently into synth guidance so the LLM/operator sees what's
+        missing — and records the verdict in metrics + trace.
+      - off: skip entirely.
+    """
+    mode = (os.environ.get("BUILD_POC_PRECONDITION_GATE", "warn") or "warn").lower()
+    if mode == "off":
+        return {}
+    from api import _assess_exploit_readiness, _poc_trace
+    research_out = state.get("research_out") or {}
+    analysis = research_out.get("analysis") if isinstance(research_out, dict) else None
+    # precond result was folded into segments; re-derive the structured bits
+    # by re-running the lightweight assess with what state carries.
+    _t0 = time.time()
+    try:
+        rd = _assess_exploit_readiness(
+            state["ip"], state["port"], analysis or {},
+            session_info=state.get("session_info"),
+            precond_result=state.get("precond_result"),
+            product=state.get("product"), model=state.get("model"))
+    except Exception as e:  # noqa: BLE001
+        logging.debug("readiness gate failed: %s", e)
+        return {}
+    seg = []
+    guidance = ""
+    if rd.get("blockers"):
+        guidance = ("EXPLOIT READINESS CHALLENGE — the following preconditions "
+                    "are NOT satisfied; resolve them or the exploit cannot "
+                    "land:\n  - " + "\n  - ".join(rd["blockers"]))
+        if rd.get("satisfied"):
+            guidance += ("\nAlready satisfied:\n  - " + "\n  - ".join(rd["satisfied"]))
+        seg.append(guidance)
+    _poc_trace(state["run_id"], "readiness_gate",
+               response=(guidance or "all preconditions satisfied")[:1200],
+               extra={"ready": rd.get("ready"), "hard_blocked": rd.get("hard_blocked"),
+                      "score": rd.get("score"), "blockers": rd.get("blockers"),
+                      "mode": mode})
+    upd = {"segments": seg,
+           "recon_metrics": {**state.get("recon_metrics", {}),
+                             "readiness": {"seconds": round(time.time() - _t0, 2),
+                                           "chars_added": len(guidance),
+                                           "signal": f"ready={rd.get('ready')} "
+                                                     f"blockers={len(rd.get('blockers') or [])}"}}}
+    # Strict mode: a hard blocker short-circuits the loop.
+    if mode == "strict" and rd.get("hard_blocked"):
+        upd["readiness_blocked"] = True
+        upd["readiness_blockers"] = rd.get("blockers")
+    return upd
 
 
 def node_research(state: BuildPocState) -> Dict[str, Any]:
@@ -884,7 +953,22 @@ def node_run_refine(state: BuildPocState) -> Dict[str, Any]:
     fires from inside _run_refine_poc.
     Recon-source-used is threaded in so the zap-active escalation knows whether
     zap-active already ran as primary recon."""
-    from api import _run_refine_poc
+    from api import _run_refine_poc, _poc_trace
+    # Readiness short-circuit (strict gate): a hard precondition blocker means
+    # the exploit cannot land no matter how many iterations we run. Refuse to
+    # hammer — return a BLOCKED result naming what's missing so the operator
+    # resolves it (fix login, grant host access) rather than burning the loop.
+    if state.get("readiness_blocked"):
+        blockers = state.get("readiness_blockers") or []
+        _poc_trace(state["run_id"], "run_refine_skipped_blocked",
+                   extra={"blockers": blockers})
+        return {"result": {"ok": True, "success": False, "verified": False,
+                           "blocked": True, "blockers": blockers,
+                           "reason": "readiness gate: preconditions not met — "
+                                     + "; ".join(blockers),
+                           "iterations": 0, "metrics": state.get("built", {}).get("metrics") or {}},
+                "verified": False, "success": False, "iters": 0,
+                "off_target": False, "reflection": False}
     built = state.get("built") or {}
     result = _run_refine_poc(
         state["cve"], state["ip"], state["port"],
@@ -1068,6 +1152,7 @@ def build_graph():
     g.add_node("load_hints", node_load_hints)
     g.add_node("research", node_research)
     g.add_node("precondition_enumeration", node_precondition_enumeration)
+    g.add_node("readiness_gate", node_readiness_gate)
 
     # Guidance assembly + strategy
     g.add_node("assemble_guidance", node_assemble_guidance)
@@ -1142,7 +1227,8 @@ def build_graph():
     g.add_edge("auth_establish", "load_hints")
     g.add_edge("load_hints", "research")
     g.add_edge("research", "precondition_enumeration")
-    g.add_edge("precondition_enumeration", "assemble_guidance")
+    g.add_edge("precondition_enumeration", "readiness_gate")
+    g.add_edge("readiness_gate", "assemble_guidance")
     g.add_edge("assemble_guidance", "strategist")
     g.add_edge("strategist", "plan_verify")
     g.add_edge("plan_verify", "synth")
