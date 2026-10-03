@@ -16785,6 +16785,219 @@ def _arjun_worth_probing(path):
     return True
 
 
+def _openapi_discover(ip, port, auth=None, timeout=8):
+    """Probe common OpenAPI/Swagger paths and parse the first spec we hit.
+
+    API-first apps (Prefect, FastAPI, Zabbix post-6.4, half of the Python
+    ecosystem) publish a machine-readable OpenAPI spec at a well-known path.
+    When the ZAP spider only turns up static chunks (classic SPA problem),
+    the spec is the real attack surface — every endpoint, every param, every
+    request body schema in one GET. Feeding that to synth closes the gap
+    between "crawler saw nothing" and "LLM knows every endpoint".
+
+    Returns (guidance_str, api_urls:list). guidance_str is the compact text
+    folded into the synth prompt; api_urls is handed to focused_active_scan
+    + arjun so the dispatcher can target the actual API paths.
+
+    Fails CLOSED to ('', []) on any error — never breaks the build path.
+    """
+    import httpx as _hx
+    import re as _re
+    # Common paths — merged list from knowledge/common_web_paths.yaml +
+    # vendor-specific defaults. Keep in sync with knowledge YAML.
+    candidate_paths = [
+        "/openapi.json", "/api/openapi.json",
+        "/api/v1/openapi.json", "/api/v2/openapi.json", "/api/v3/openapi.json",
+        "/swagger.json", "/api/swagger.json", "/v2/api-docs", "/v3/api-docs",
+        "/api-docs", "/api/docs/swagger.json", "/docs/openapi.json",
+    ]
+    headers = {"accept": "application/json, */*"}
+    if auth and isinstance(auth, dict):
+        if auth.get("bearer"):
+            headers["authorization"] = f"Bearer {auth['bearer']}"
+        if auth.get("cookie"):
+            headers["cookie"] = auth["cookie"]
+    # Scheme heuristic: use port to guess default, but FALL BACK to the
+    # other scheme if the first attempt gets Server-disconnected (TLS
+    # listener on a non-443 port, or plain HTTP on 8443). Many apps serve
+    # TLS on 8000/8080 or plain on 8443 — the port alone isn't a reliable
+    # signal.
+    port_i = int(port or 80)
+    guess = "https" if port_i in (443, 8443) else "http"
+    schemes = [guess, ("http" if guess == "https" else "https")]
+    spec = None
+    hit_path = None
+    hit_scheme = None
+    try:
+        with _hx.Client(timeout=timeout, verify=False, follow_redirects=True) as cli:
+            for scheme in schemes:
+                if spec: break
+                base = f"{scheme}://{ip}:{port_i}"
+                scheme_dead = False
+                for p in candidate_paths:
+                    try:
+                        r = cli.get(base + p, headers=headers)
+                    except Exception as _pe:  # noqa: BLE001
+                        # If the first probe on this scheme can't even connect,
+                        # the whole scheme is dead — bail and let the other
+                        # scheme try (don't waste 11 more TCP handshakes).
+                        if p == candidate_paths[0]:
+                            scheme_dead = True
+                            break
+                        continue
+                    if r.status_code != 200:
+                        continue
+                    ct = (r.headers.get("content-type") or "").lower()
+                    if "json" not in ct and not (r.text or "").lstrip().startswith("{"):
+                        continue
+                    try:
+                        j = r.json()
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if not isinstance(j, dict):
+                        continue
+                    # OpenAPI 3.x has 'openapi', Swagger 2.x has 'swagger'.
+                    if "paths" in j and ("openapi" in j or "swagger" in j):
+                        spec = j; hit_path = p; hit_scheme = scheme; break
+    except Exception as e:  # noqa: BLE001
+        logging.debug("openapi probe failed: %s", e)
+        return "", []
+    # Rebuild base from the scheme that actually worked
+    base = f"{hit_scheme or schemes[0]}://{ip}:{port_i}"
+    if not spec:
+        return "", []
+    # Extract endpoints + methods + param hints. Keep each entry under one
+    # line so synth can see 20+ endpoints without blowing the prompt.
+    api_urls = []
+    endpoint_lines = []
+    paths_obj = spec.get("paths") or {}
+    # OpenAPI uses {var} path templates; keep as-is for operator reference,
+    # but build URLs for focused active scan by stripping them to the
+    # non-templated prefix (ZAP can't attack a template directly).
+    for raw_path, methods in list(paths_obj.items())[:60]:
+        if not isinstance(methods, dict):
+            continue
+        for method, op in methods.items():
+            if method.lower() not in ("get", "post", "put", "patch", "delete"):
+                continue
+            if not isinstance(op, dict):
+                continue
+            op_id = op.get("operationId") or op.get("summary") or ""
+            params = op.get("parameters") or []
+            param_names = []
+            for pr in params[:8]:
+                if isinstance(pr, dict) and pr.get("name"):
+                    loc = pr.get("in", "")
+                    param_names.append(f"{pr['name']}{'(' + loc + ')' if loc else ''}")
+            body_hint = ""
+            rb = op.get("requestBody") or {}
+            if isinstance(rb, dict):
+                content = rb.get("content") or {}
+                if isinstance(content, dict):
+                    for ctype, cschema in content.items():
+                        if isinstance(cschema, dict):
+                            sch = cschema.get("schema") or {}
+                            if isinstance(sch, dict):
+                                props = (sch.get("properties") or {}) if sch.get("type") == "object" else {}
+                                if props:
+                                    body_hint = f" body={ctype}:{','.join(list(props.keys())[:6])}"
+                                else:
+                                    body_hint = f" body={ctype}"
+                                break
+            # Line: METHOD /path  op_id  params=[a,b]  body=application/json:field1,field2
+            line = f"{method.upper():6s} {raw_path}"
+            if op_id: line += f"  op={op_id[:40]}"
+            if param_names: line += f"  params=[{','.join(param_names)}]"
+            if body_hint: line += body_hint
+            endpoint_lines.append(line)
+            # Build a concrete URL (strip {templated} parts for the focused scan)
+            concrete = _re.sub(r"\{[^}]+\}", "1", raw_path)
+            api_urls.append(base + concrete)
+    if not endpoint_lines:
+        return "", []
+    # Dedup + cap
+    seen = set(); dedup = []
+    for u in api_urls:
+        if u not in seen:
+            seen.add(u); dedup.append(u)
+    api_urls = dedup[:30]
+    header = f"OpenAPI spec FOUND at {hit_path} ({len(endpoint_lines)} operations). " \
+             "The crawler would NOT have reached these — they are the REAL attack surface:\n"
+    guidance = header + "\n".join(f"  - {ln}" for ln in endpoint_lines[:40])
+    return guidance, api_urls
+
+
+def _playwright_sitemap(ip, port, auth=None, timeout=180, max_pages=50, max_depth=3):
+    """Headless-browser crawl via playwright-scanner for SPAs the ZAP spider
+    cannot see. Logs in (when auth is supplied), navigates, follows links +
+    captures XHR URLs, and returns the discovered URL list + a compact
+    guidance string. Fails CLOSED to ('', []) on any error.
+
+    Rationale: ZAP's spider only follows anchors in rendered HTML. Modern
+    SPAs render links in JS AFTER load; the spider sees `/_next/static/*`
+    and `/robots.txt` and calls it a day. Playwright drives a real browser,
+    so it SEES the rendered app and the XHRs it fires.
+    """
+    import httpx as _hx, time as _t
+    scanner = os.environ.get("PLAYWRIGHT_SCANNER_URL", "https://playwright-scanner:8014")
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    target = f"{scheme}://{ip}:{port or 80}/"
+    body = {
+        "url": target, "max_depth": max_depth, "max_pages": max_pages,
+        "use_zap_proxy": False, "timeout_per_page": 15, "same_origin_only": True,
+        "capture_screenshots": False,
+    }
+    if auth and isinstance(auth, dict):
+        a = {}
+        for k in ("login_url", "login_data", "username", "password"):
+            if auth.get(k): a[k] = auth[k]
+        if a:
+            body["auth"] = a
+    discovered = []
+    try:
+        with _hx.Client(timeout=20, verify=False) as cli:
+            r = cli.post(f"{scanner.rstrip('/')}/crawl", json=body,
+                         headers={"x-api-key": API_KEY})
+            if r.status_code != 200:
+                return "", []
+            job_id = r.json().get("job_id")
+            if not job_id:
+                return "", []
+            t0 = _t.time()
+            while _t.time() - t0 < timeout:
+                _t.sleep(5)
+                st = cli.get(f"{scanner.rstrip('/')}/crawl/{job_id}",
+                             headers={"x-api-key": API_KEY})
+                if st.status_code != 200:
+                    continue
+                j = st.json()
+                if j.get("status") in ("completed", "finished", "done"):
+                    discovered = j.get("discovered_urls") or []
+                    break
+                if j.get("status") in ("failed", "error"):
+                    break
+    except Exception as e:  # noqa: BLE001
+        logging.debug("playwright sitemap failed: %s", e)
+        return "", []
+    if not discovered:
+        return "", []
+    # Dedup, cap, build guidance
+    seen = set(); dedup = []
+    for u in discovered:
+        if u and u not in seen:
+            seen.add(u); dedup.append(u)
+    dedup = dedup[:40]
+    # Pull out path-only for readability
+    def _rel(u):
+        if u.startswith(target): return u[len(target.rstrip('/')):]
+        return u
+    lines = [f"  - {_rel(u)}" for u in dedup[:30]]
+    guidance = (f"Playwright SPA crawl discovered {len(dedup)} URLs the ZAP "
+                "spider could not reach (JS-rendered routes + XHRs):\n"
+                + "\n".join(lines))
+    return guidance, dedup
+
+
 def _extract_zap_paths(zap_guidance):
     """Pull the distinct paths out of a `_zap_recon` guidance string. Returns [] on
     empty input. The string format is stable — 'ZAP-spidered paths: /a, /b, /c'."""

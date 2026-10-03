@@ -70,6 +70,18 @@ common_web_paths:
   - /swagger
   - /swagger-ui.html
   - /openapi.json
+  - /api/openapi.json
+  - /api/v1/openapi.json
+  - /api/v2/openapi.json
+  - /api/v3/openapi.json
+  - /swagger.json
+  - /api/swagger.json
+  - /v2/api-docs
+  - /v3/api-docs
+  - /api-docs
+  - /api/docs
+  - /docs
+  - /redoc
   - /v1/
   - /v2/
 

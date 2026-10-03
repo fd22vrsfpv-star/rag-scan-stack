@@ -356,6 +356,71 @@ def node_zap_recon(state: BuildPocState) -> Dict[str, Any]:
             "recon_metrics": {**state.get("recon_metrics", {}), **metrics}}
 
 
+def node_openapi_recon(state: BuildPocState) -> Dict[str, Any]:
+    """Probe common OpenAPI/Swagger paths and parse the first spec we find.
+    When present, this is the REAL attack surface for API-first apps the
+    HTML spider can't see (SPAs, FastAPI, Prefect, Zabbix, etc.). Discovered
+    endpoints feed synth guidance + the escalation's focused ZAP active
+    scan via arjun_discovered."""
+    from api import _openapi_discover, _poc_trace
+    _t0 = time.time()
+    guidance, api_urls = _openapi_discover(state["ip"], state["port"],
+                                           auth=state.get("auth"))
+    metrics = {"openapi": {"seconds": round(time.time() - _t0, 2),
+                           "chars_added": len(guidance or ""),
+                           "signal": "machine-readable API surface"
+                                     if api_urls else "no OpenAPI spec published"}}
+    seg = []
+    if guidance:
+        seg.append(guidance)
+        _poc_trace(state["run_id"], "recon:openapi", response=guidance[:1600])
+    # Merge discovered API URLs into arjun_discovered so the focused active
+    # scan escalation attacks them specifically (not just the HTML spider's
+    # static-chunk haul).
+    merged_arjun = list(state.get("arjun_discovered") or [])
+    for u in api_urls:
+        if u and u not in merged_arjun:
+            merged_arjun.append(u)
+    return {"segments": seg,
+            "arjun_discovered": merged_arjun,
+            "recon_metrics": {**state.get("recon_metrics", {}), **metrics}}
+
+
+def node_playwright_recon(state: BuildPocState) -> Dict[str, Any]:
+    """Headless-browser crawl when ZAP spider only turned up static assets
+    (classic SPA problem). Logs in (when auth supplied), navigates, captures
+    the XHR URLs the SPA fires — discovers the real app routes. Discovered
+    URLs feed synth guidance + the focused active scan via arjun_discovered.
+    Skipped when the HTML spider already found rich dynamic surface."""
+    from api import _playwright_sitemap, _poc_trace
+    # Heuristic: ZAP spider saw mostly static chunks → SPA → run Playwright.
+    # Also run when ZAP found nothing at all (dead spider).
+    zap_paths = state.get("zap_paths") or []
+    static_markers = ("_next", "/static/", "/chunks/", "/assets/", "/dist/", ".js", ".css", ".map")
+    static_count = sum(1 for p in zap_paths if any(m in p for m in static_markers))
+    is_spa = (len(zap_paths) == 0) or (static_count / max(1, len(zap_paths)) > 0.5)
+    if not is_spa:
+        return {}
+    _t0 = time.time()
+    guidance, discovered = _playwright_sitemap(state["ip"], state["port"],
+                                                auth=state.get("auth"))
+    metrics = {"playwright": {"seconds": round(time.time() - _t0, 2),
+                              "chars_added": len(guidance or ""),
+                              "signal": "SPA XHR routes + JS-rendered links"
+                                        if discovered else "playwright found nothing"}}
+    seg = []
+    if guidance:
+        seg.append(guidance)
+        _poc_trace(state["run_id"], "recon:playwright", response=guidance[:1600])
+    merged_arjun = list(state.get("arjun_discovered") or [])
+    for u in discovered:
+        if u and u not in merged_arjun:
+            merged_arjun.append(u)
+    return {"segments": seg,
+            "arjun_discovered": merged_arjun,
+            "recon_metrics": {**state.get("recon_metrics", {}), **metrics}}
+
+
 def node_arjun_recon(state: BuildPocState) -> Dict[str, Any]:
     from api import _scout_arjun, _scout_arjun_paths, _poc_trace
     _t0 = time.time()
@@ -696,12 +761,15 @@ def _route_post_waf(state: BuildPocState) -> str:
 
 
 def _route_post_mine(state: BuildPocState) -> str:
-    """After basic/mine/auto-login/deep-enum block, branch on want_zap then want_arjun."""
+    """After basic/mine/auto-login/deep-enum block, branch on want_zap then want_arjun.
+    When neither is wanted we STILL route via openapi_recon so API-first apps
+    (where the HTML spider is useless) get their spec parsed and the real
+    attack surface fed to synth."""
     if _want(state.get("recon_source", "basic"), "zap"):
         return "zap_recon"
     if _want(state.get("recon_source", "basic"), "arjun"):
-        return "arjun_recon"
-    return "auth_establish"
+        return "openapi_recon"
+    return "openapi_recon"
 
 
 def _route_post_zap(state: BuildPocState) -> str:
@@ -728,6 +796,8 @@ def build_graph():
     g.add_node("auto_login", node_auto_login)
     g.add_node("framework_deep_enum", node_framework_deep_enum)
     g.add_node("zap_recon", node_zap_recon)
+    g.add_node("openapi_recon", node_openapi_recon)
+    g.add_node("playwright_recon", node_playwright_recon)
     g.add_node("arjun_recon", node_arjun_recon)
 
     # Auth / hints / research
@@ -780,9 +850,23 @@ def build_graph():
     g.add_node("_post_mine_hub", _post_waf_passthrough)
     g.add_conditional_edges("_post_mine_hub", _route_post_mine,
                              {"zap_recon": "zap_recon",
-                              "arjun_recon": "arjun_recon",
-                              "auth_establish": "auth_establish"})
+                              "arjun_recon": "openapi_recon",
+                              "openapi_recon": "openapi_recon",
+                              "auth_establish": "openapi_recon"})
+    # After zap_recon, run openapi_recon unconditionally (cheap — ~12 well-
+    # known paths probed once each; most hit on the first match or none at
+    # all). Then run playwright_recon, which short-circuits unless the ZAP
+    # paths look like an SPA haul. Both merge their discoveries into
+    # arjun_discovered so the focused-active-scan escalation attacks them.
     g.add_conditional_edges("zap_recon", _route_post_zap,
+                             {"arjun_recon": "openapi_recon",
+                              "auth_establish": "openapi_recon"})
+    g.add_edge("openapi_recon", "playwright_recon")
+    # playwright_recon → arjun_recon (if _want arjun) else auth_establish.
+    def _route_post_playwright(state):
+        return "arjun_recon" if _want(state.get("recon_source", "basic"), "arjun") \
+                             else "auth_establish"
+    g.add_conditional_edges("playwright_recon", _route_post_playwright,
                              {"arjun_recon": "arjun_recon",
                               "auth_establish": "auth_establish"})
     g.add_edge("arjun_recon", "auth_establish")
