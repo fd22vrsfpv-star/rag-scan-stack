@@ -15954,12 +15954,33 @@ def _establish_web_session(ip, port, username, password, login_url=None, timeout
                             ("logged_in", "sess", "auth", "token", "sid", "remember"))
                             for n in jar)
             low = (pr.text or "").lower()
+            # Expanded failure markers — the old list missed "not logged in" /
+            # "must login" (Zabbix's exact rejection wording), so a failed
+            # login read as success. Cookie presence ALSO lied: apps (Zabbix's
+            # zbx_session) set a session cookie for ANONYMOUS visitors too.
             failed = any(x in low for x in ("incorrect", "invalid", "denied", "try again",
                                             "not registered", "wrong ", "cookies are blocked",
-                                            "authentication failed"))
+                                            "authentication failed", "not logged in",
+                                            "must login", "must log in", "you must sign in",
+                                            "please log in", "login name or password",
+                                            "sign in to continue"))
             ok = (auth_hint or 300 <= pr.status_code < 400) and not failed
+            # POSITIVE CONFIRMATION — don't trust "cookie set + no failure word".
+            # Actually probe an authenticated endpoint; a set cookie that still
+            # lands on a login/warning page is NOT a session. This is the real
+            # fix for the false-positive that sent 14 build runs at a dead
+            # session. Only downgrade a claimed success (never upgrade a
+            # failure — the probe is a stricter gate, not a looser one).
+            if ok and _ck_header():
+                try:
+                    _valid, _pwhy = _probe_session_valid(ip, port, _ck_header(), timeout=6)
+                    if not _valid:
+                        ok = False
+                except Exception:  # noqa: BLE001
+                    pass
             return {"ok": ok, "cookies": cookies, "cookie_header": _ck_header(),
-                    "login_url": post_url, "note": ("logged in" if ok else "login attempted (unverified)")}
+                    "login_url": post_url,
+                    "note": ("logged in" if ok else "login attempted (verification failed)")}
     return {"ok": False, "cookies": [], "cookie_header": "", "login_url": None, "note": "no login form found"}
 
 
