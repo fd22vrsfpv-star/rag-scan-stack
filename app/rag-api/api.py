@@ -16176,6 +16176,100 @@ def _flag_precondition(cve, ip, pc, eid):
         logging.debug("flag precondition failed: %s", e)
 
 
+_APP_CONTRACTS_CACHE = None
+
+
+def _load_app_request_contracts():
+    """Load knowledge/app_request_contracts.yaml (cached). KNOWN per-product
+    request-shape facts so the model is TOLD the contract (action endpoint,
+    anti-CSRF param name + token source, injection param) instead of guessing."""
+    global _APP_CONTRACTS_CACHE
+    if _APP_CONTRACTS_CACHE is not None:
+        return _APP_CONTRACTS_CACHE
+    import yaml as _yaml
+    _kd = os.environ.get("KNOWLEDGE_DIR", "/knowledge")
+    for p in (os.path.join(_kd, "app_request_contracts.yaml"),
+              os.path.join(os.path.dirname(__file__), "..", "knowledge", "app_request_contracts.yaml"),
+              "/app/knowledge/app_request_contracts.yaml",
+              "knowledge/app_request_contracts.yaml"):
+        try:
+            with open(p, encoding="utf-8") as f:
+                _APP_CONTRACTS_CACHE = (_yaml.safe_load(f) or {}).get("contracts") or []
+                return _APP_CONTRACTS_CACHE
+        except Exception:  # noqa: BLE001
+            continue
+    _APP_CONTRACTS_CACHE = []
+    return _APP_CONTRACTS_CACHE
+
+
+def _app_request_contract(product):
+    """Return the request contract matching a product name, or None."""
+    if not product:
+        return None
+    pl = str(product).lower()
+    for c in _load_app_request_contracts():
+        cp = str(c.get("product", "")).lower()
+        if cp and (cp in pl or pl in cp):
+            return c
+    return None
+
+
+def _enforce_request_contract(command, product, resolved_ids):
+    """Deterministically apply a product's KNOWN request contract to a command:
+    rename a wrong-named anti-CSRF param to the contract's param and set its live
+    value (from resolved_ids / precondition enumeration), injecting it when
+    missing on a matching action request. Mirrors _enforce_resolved_object_ids —
+    the model shouldn't have to (and reliably can't) determine the Zabbix `sid`
+    param name or token source, so we supply it. Returns (new_command, changes)."""
+    import re as _re
+    c = _app_request_contract(product)
+    if not c or not command:
+        return command, []
+    csrf = c.get("csrf") or {}
+    param = (csrf.get("param") or "").strip()
+    if not param:
+        return command, []
+    # Only act on a command that matches this contract (endpoint/body markers).
+    match = c.get("match") or {}
+    uc = match.get("url_contains") or []
+    bc = match.get("body_contains") or []
+    if uc and not any(u in command for u in uc):
+        return command, []
+    if bc and not any(b in command for b in bc):
+        return command, []
+    rk = (csrf.get("resolved_key") or param).strip()
+    vals = (resolved_ids or {}).get(rk) or []
+    live = str(vals[0]) if vals else None
+    changes = []
+    out = command
+    # 1. Rename wrong-named CSRF params (csrf-token= → sid=). Require the '='
+    #    so a grep pattern like 'csrf-token.*' in the extraction is untouched.
+    for alias in (csrf.get("aliases") or []):
+        if alias == param:
+            continue
+        pat = _re.compile(rf'(?<![A-Za-z0-9_-]){_re.escape(alias)}=')
+        if pat.search(out):
+            out = pat.sub(f'{param}=', out)
+            changes.append((f'{alias}=', f'{param}='))
+    # 2. Ensure the param carries the live token value (rewrite or inject).
+    if live:
+        pat_val = _re.compile(rf'({_re.escape(param)}=)([^&\'"\s]*)')
+        if pat_val.search(out):
+            def _sub(m, _p=param, _l=live):
+                if m.group(2) != _l:
+                    changes.append((f'{_p}={m.group(2)[:12]}', f'{_p}={_l}'))
+                    return m.group(1) + _l
+                return m.group(0)
+            out = pat_val.sub(_sub, out)
+        else:
+            inj = _re.search(r'(?:-d|--data(?:-raw|-binary|-ascii)?)\s+([\'"])', out)
+            if inj:
+                qpos = inj.end()  # just after the opening quote of the body
+                out = out[:qpos] + f'{param}={live}&' + out[qpos:]
+                changes.append(("(missing)", f'{param}={live} injected'))
+    return out, changes
+
+
 def _enforce_resolved_object_ids(command, resolved):
     """Deterministically rewrite object-id params in a PoC command to the values
     the login actually enumerated. The refine prompt is GIVEN the resolved ids
@@ -16315,6 +16409,14 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                 _poc_trace(run_id, "enforced_resolved_ids", iteration=it,
                            extra={"changes": [{"kind": k, "from": o, "to": n}
                                               for (k, o, n) in _id_changes]})
+        # Apply the product's KNOWN request contract (e.g. Zabbix: the anti-CSRF
+        # param is `sid`, not `csrf-token`) — rename/inject deterministically so
+        # the model doesn't have to get the request shape right.
+        command, _ct_changes = _enforce_request_contract(command, product, resolved_ids)
+        if _ct_changes:
+            _poc_trace(run_id, "enforced_request_contract", iteration=it,
+                       extra={"product": product,
+                              "changes": [{"from": o, "to": n} for (o, n) in _ct_changes]})
         fam = _poc_target_family(command)
         if orig and orig[1] and fam[1] and fam[1] != orig[1]:
             drifted = True
@@ -21191,6 +21293,26 @@ def _enumerate_exploit_preconditions(ip, port, analysis, session_cookie=None,
 
     # Build guidance
     bits = []
+    # KNOWN REQUEST CONTRACT — supply the product's request shape as fact so the
+    # model doesn't guess it (anti-CSRF param name, token source, action
+    # endpoint, injection param). Operator: "fields like this should be part of
+    # the known info the model can use instead of trying to determine it."
+    _contract = _app_request_contract(product)
+    if _contract:
+        _csrf = _contract.get("csrf") or {}
+        _cbits = ["KNOWN REQUEST CONTRACT (established facts for this product — "
+                  "USE these, do NOT guess the request shape):",
+                  f"  - action endpoint: {_contract.get('action_endpoint','?')} "
+                  f"({_contract.get('method','POST')})"]
+        if _csrf.get("param"):
+            _cbits.append(f"  - anti-CSRF param is named `{_csrf['param']}` "
+                          f"(NOT {', '.join(_csrf.get('aliases') or []) or 'other names'}); "
+                          f"value = {_csrf.get('token_source','the live session token')}")
+        if _contract.get("injection_param"):
+            _cbits.append(f"  - typical injection param: {_contract['injection_param']}")
+        if _contract.get("notes"):
+            _cbits.append("  " + str(_contract["notes"]).strip().replace("\n", "\n  "))
+        bits.append("\n".join(_cbits))
     if confirmed:
         bits.append("PRECONDITIONS CONFIRMED (enumerated from the authenticated "
                     "target — USE these real values, do NOT invent ids):")
