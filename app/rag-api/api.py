@@ -20736,8 +20736,106 @@ def _zabbix_api_hostids(ip, port, username, password, timeout=12):
     return out
 
 
+def _enumerate_access_inventory(ip, port, product=None, auth=None,
+                                 session_cookie=None, timeout=12):
+    """BASIC post-access enumeration: once a session is confirmed, inventory
+    WHAT that access gives you — the objects/resources the account can see and
+    use (hosts, users, scripts, dashboards, datasources, etc.). This is a
+    standard step after gaining access, not a per-exploit afterthought: the
+    inventory feeds any exploit's preconditions AND the operator's view of the
+    foothold's reach.
+
+    Operator ask: "that should have been a basic step to enumerate available
+    info after confirming access."
+
+    App-aware (Zabbix / Grafana / WordPress) with a generic fallback. Returns
+    {object_type: [{id, name}]}. Every item is also persisted to
+    confirmed_facts as an object_id so it's reusable across attacks.
+    """
+    import httpx as _hx
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    prod_l = (product or "").lower()
+    inv = {}
+    u = (auth or {}).get("username"); p = (auth or {}).get("password")
+    hdr = {"User-Agent": "Mozilla/5.0"}
+    if session_cookie:
+        hdr["Cookie"] = session_cookie
+    try:
+        # ── Zabbix: API inventory (hosts, scripts, users, templates) ──
+        if "zabbix" in prod_l and u and p:
+            with _hx.Client(verify=False, timeout=timeout) as c:
+                tok = None
+                for pk in ("username", "user"):
+                    r = c.post(base + "/api_jsonrpc.php",
+                               json={"jsonrpc": "2.0", "method": "user.login",
+                                     "params": {pk: u, "password": p}, "id": 1},
+                               headers={"Content-Type": "application/json-rpc"})
+                    tok = (r.json() or {}).get("result") if r.status_code == 200 else None
+                    if tok: break
+                if tok:
+                    for method, otype, out_fields in (
+                        ("host.get", "hostid", ["hostid", "name"]),
+                        ("script.get", "scriptid", ["scriptid", "name", "command"]),
+                        ("usergroup.get", "usrgrpid", ["usrgrpid", "name"]),
+                        ("templategroup.get", "groupid", ["groupid", "name"]),
+                    ):
+                        try:
+                            rr = c.post(base + "/api_jsonrpc.php",
+                                        json={"jsonrpc": "2.0", "method": method,
+                                              "params": {"output": out_fields, "limit": 25},
+                                              "auth": tok, "id": 2},
+                                        headers={"Content-Type": "application/json-rpc"})
+                            items = (rr.json() or {}).get("result") or []
+                            vals = [{"id": it.get(otype), "name": it.get("name", "")}
+                                    for it in items if it.get(otype)]
+                            if vals:
+                                inv[otype] = vals
+                        except Exception:  # noqa: BLE001
+                            continue
+        # ── Grafana: dashboards + datasources ──
+        elif "grafana" in prod_l:
+            with _hx.Client(verify=False, timeout=timeout, headers=hdr) as c:
+                for path, otype, idk, namek in (
+                    ("/api/search?type=dash-db", "dashboard_uid", "uid", "title"),
+                    ("/api/datasources", "datasource_id", "id", "name")):
+                    try:
+                        r = c.get(base + path)
+                        if r.status_code == 200:
+                            vals = [{"id": str(it.get(idk)), "name": it.get(namek, "")}
+                                    for it in (r.json() or []) if it.get(idk) is not None]
+                            if vals: inv[otype] = vals
+                    except Exception:  # noqa: BLE001
+                        continue
+        # ── WordPress: users + post types (REST) ──
+        elif "wordpress" in prod_l:
+            with _hx.Client(verify=False, timeout=timeout, headers=hdr) as c:
+                try:
+                    r = c.get(base + "/wp-json/wp/v2/users?per_page=25")
+                    if r.status_code == 200:
+                        vals = [{"id": str(it.get("id")), "name": it.get("slug", "")}
+                                for it in (r.json() or []) if it.get("id") is not None]
+                        if vals: inv["user_id"] = vals
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception as e:  # noqa: BLE001
+        logging.debug("access inventory failed: %s", e)
+    # Persist every enumerated object as a reusable confirmed fact.
+    tgt = f"{ip}:{port or 80}"
+    for otype, items in inv.items():
+        for it in items[:25]:
+            if it.get("id"):
+                _record_confirmation(tgt, "object_id", otype, "confirmed",
+                                     evidence=f"enumerated post-access: {otype}="
+                                              f"{it['id']} ({it.get('name','')})",
+                                     method="enumeration", claim_value=str(it["id"]),
+                                     product=product, cve=None)
+    return inv
+
+
 def _enumerate_exploit_preconditions(ip, port, analysis, session_cookie=None,
-                                      product=None, timeout=10, auth=None):
+                                      product=None, timeout=10, auth=None,
+                                      access_inventory=None):
     """Confirm + RESOLVE the concrete prerequisites an exploit needs, instead
     of letting synth guess them. The advisory/research names preconditions in
     prose ("the user must have access to a host to run a script against");
@@ -20770,6 +20868,27 @@ def _enumerate_exploit_preconditions(ip, port, analysis, session_cookie=None,
         headers["Cookie"] = session_cookie
     resolved, confirmed, unmet = {}, [], []
 
+    # ── Consume the post-access inventory FIRST (operator: "gather all
+    # information from any logins before moving on"). Every object the login
+    # already exposed is an authoritative, enumerated id — a precondition that
+    # names such an object is RESOLVED from the inventory, no re-probe needed.
+    _inv = access_inventory or {}
+    if isinstance(_inv, dict):
+        for _otype, _items in _inv.items():
+            _ids = [str(it.get("id")) for it in (_items or []) if it.get("id")]
+            if not _ids:
+                continue
+            resolved.setdefault(_otype, [])
+            for _i in _ids:
+                if _i not in resolved[_otype]:
+                    resolved[_otype].append(_i)
+            resolved[_otype] = resolved[_otype][:10]
+            _named = ", ".join(
+                f"{it['id']}({it.get('name','')})" if it.get("name") else str(it["id"])
+                for it in (_items or [])[:5] if it.get("id"))
+            confirmed.append(f"{_otype}: {_named} (enumerated from the login's "
+                             f"post-access inventory)")
+
     def _grab_ids(text, keys):
         ids = []
         for k in keys:
@@ -20784,7 +20903,8 @@ def _enumerate_exploit_preconditions(ip, port, analysis, session_cookie=None,
         with _hx.Client(verify=False, follow_redirects=True, timeout=timeout,
                          headers=headers) as cli:
             # ── Zabbix: "host to run a script against" → enumerate hostids ──
-            if "host" in pre_blob or "script" in pre_blob or "zabbix" in prod_l:
+            if ("host" in pre_blob or "script" in pre_blob or "zabbix" in prod_l) \
+                    and not resolved.get("hostid"):
                 hostids = []
                 host_names = {}
                 # Zabbix JSON-RPC API (user.login → host.get) — the authoritative
@@ -21206,7 +21326,8 @@ def _validate_against_vendor_docs(product, version, questions, cve=None,
 def _assess_exploit_readiness(ip, port, analysis, session_info=None,
                                precond_result=None, product=None, model=None,
                                version=None, cve=None, validate_vendor_docs=True,
-                               advisory_text=None, llm_challenge=None):
+                               advisory_text=None, llm_challenge=None,
+                               access_inventory=None):
     """CHALLENGE SKILL — before the build loop hammers iterations, review every
     precondition and judge whether all the pieces are actually in hand.
 
@@ -21265,6 +21386,25 @@ def _assess_exploit_readiness(ip, port, analysis, session_info=None,
         if idkind in pre_blob and idkind not in resolved and not any(idkind in u for u in (pr.get("unmet") or [])):
             blockers.append(f"exploit references {idkind} but none was enumerated "
                             "from the target — value would be guessed")
+
+    # 2b. LOGIN INVENTORY — operator: "gather all information from any logins
+    #     before moving on." If we HAVE a live session, the full post-access
+    #     inventory MUST have been gathered; a blank inventory on a live login
+    #     means we moved on without enumerating what the access exposed — the
+    #     exact gap that let a build hammer a target without its hostid.
+    _inv = access_inventory or {}
+    _inv_objs = sum(len(v or []) for v in _inv.values()) if isinstance(_inv, dict) else 0
+    if cookie:  # a session is in hand
+        if _inv_objs:
+            _kinds = ", ".join(f"{k}={len(v or [])}" for k, v in _inv.items() if v)
+            satisfied.append(f"post-access inventory gathered from the login "
+                             f"({_inv_objs} object(s): {_kinds})")
+        elif needs_auth:
+            blockers.append("a login/session is in hand but NO post-access "
+                            "inventory was gathered — enumerate everything the "
+                            "access exposes (hosts, scripts, users, objects) "
+                            "BEFORE attempting the exploit; moving on without it "
+                            "means prerequisite ids would be guessed")
 
     # 3. TARGET reachability (cheap sanity).
     import httpx as _hx
