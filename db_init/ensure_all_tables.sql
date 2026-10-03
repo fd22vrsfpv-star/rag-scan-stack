@@ -6672,9 +6672,13 @@ WHERE script LIKE ANY(ARRAY['sslscan:%','testssl:%','sslyze:%']) AND port_id IS 
 -- (session validity, endpoint existence, resolved object-ids, version
 -- applicability, vendor-doc answers) reused across attacks. TARGET-level
 -- facts carry cve=NULL so any attack against the same target reuses them.
+-- Identity includes PRODUCT: the same ip:port runs multiple apps (Zabbix the
+-- application vs Apache the web server) and a fact for one is not a fact for
+-- the other. host (hostname/vhost) is tracked distinctly from the ip.
 CREATE TABLE IF NOT EXISTS public.confirmed_facts (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    engagement_id uuid, target text NOT NULL, product text, version text, cve text,
+    engagement_id uuid, target text NOT NULL, host text, product text,
+    version text, cve text,
     claim_type text NOT NULL, claim_key text NOT NULL, claim_value text,
     status text NOT NULL, evidence text, method text,
     confidence real NOT NULL DEFAULT 0.9, ttl_seconds int NOT NULL DEFAULT 0,
@@ -6683,8 +6687,10 @@ CREATE TABLE IF NOT EXISTS public.confirmed_facts (
     last_checked_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_confirmed_fact ON public.confirmed_facts
-    (target, claim_type, claim_key, COALESCE(claim_value,''), COALESCE(cve,''));
-CREATE INDEX IF NOT EXISTS idx_confirmed_target ON public.confirmed_facts (target);
+    (target, COALESCE(product,''), claim_type, claim_key,
+     COALESCE(claim_value,''), COALESCE(cve,''));
+CREATE INDEX IF NOT EXISTS idx_confirmed_target
+    ON public.confirmed_facts (target, COALESCE(product,''));
 
 -- Discovered app knowledge: per-product/version facts the build loop learns
 -- (endpoints, params, csrf source, cookie shape, secondary products).
