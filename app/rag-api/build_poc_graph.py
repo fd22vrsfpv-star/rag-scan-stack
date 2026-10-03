@@ -262,11 +262,47 @@ def node_product_identification(state: BuildPocState) -> Dict[str, Any]:
         conf = info.get("version_confidence", 0)
         bits.append(f"Identified product: {info['product']}{v} "
                     f"(version confidence {conf}).")
+    if info.get("secondary_products"):
+        sp = "; ".join(
+            f"{s['product']}{(' ' + s['version']) if s.get('version') else ''}"
+            f" ({s.get('source','')})"
+            for s in info["secondary_products"])
+        bits.append("Secondary products (own attack surface — web server / "
+                    "language runtime / extra frameworks): " + sp
+                    + ". Consider their CVEs too if the primary app proves hard.")
     if info.get("dates"):
         bits.append("Release-era dates found: " + ", ".join(info["dates"])
                     + " — use these to rule out implausible version lines.")
     if info.get("evidence"):
         bits.append("Fingerprint evidence: " + info["evidence"])
+    # Persist secondary products as discovered facts so they're reusable
+    # (keyed under the primary product or the cve fallback).
+    try:
+        from api import _ensure_discovered_app_knowledge_table, get_db
+        import json as _json
+        sp_list = info.get("secondary_products") or []
+        if sp_list:
+            _ensure_discovered_app_knowledge_table()
+            pkey = (state.get("product") or info.get("product")
+                    or (f"cve:{state.get('cve')}" if state.get("cve") else None))
+            if pkey:
+                with get_db() as _c, _c.cursor() as _cur:
+                    for s in sp_list:
+                        _cur.execute("""
+                            INSERT INTO public.discovered_app_knowledge
+                                (product, version, fact_type, fact_value,
+                                 confidence, discovered_from, source_run_id,
+                                 engagement_id)
+                            VALUES (%s,%s,'secondary_product',%s,0.7,%s,%s,%s)
+                        """, (pkey, state.get("version"),
+                              f"{s['product']}"
+                              + (f" {s['version']}" if s.get('version') else "")
+                              + f" (via {s.get('source','')})",
+                              state.get("cve"), state["run_id"],
+                              state.get("eid")))
+                    _c.commit()
+    except Exception as _spe:  # noqa: BLE001
+        logging.debug("secondary product persist failed: %s", _spe)
     # Fold the early deep-dive analysis into guidance + research_out so synth
     # and the research node reuse it instead of re-fetching.
     deep = info.get("deep_dive")
@@ -293,6 +329,85 @@ def node_product_identification(state: BuildPocState) -> Dict[str, Any]:
     upd["segments"] = seg
     upd["recon_metrics"] = {**state.get("recon_metrics", {}), **metrics}
     return upd
+
+
+def node_product_cve_enumeration(state: BuildPocState) -> Dict[str, Any]:
+    """Per-product CVE-enumeration loop. Operator ask: 'for each product/
+    plugin discovered, have a separate loop added to the LangGraph — but
+    start with product specifics first.'
+
+    Processing ORDER (product specifics first):
+      1. PRIMARY product (the identified app + version) — the thing the
+         build is actually about; its version-specific CVEs lead.
+      2. SECONDARY products (web server, language runtime) — own CVE surface.
+      3. PLUGINS / extensions — each its own product.
+
+    For each, runs _enumerate_cves_for_product which writes matched CVEs to
+    follow_up_items (rule_id='software_known_cve'). Those flow into
+    /software/cves-without-poc and become one-click Build-PoC candidates —
+    so every discovered product gets its OWN exploit path without blocking
+    this build. This node ENUMERATES; it does not fan out 30-iter builds
+    inline (that would be unbounded). The per-product builds are queued as
+    candidates the operator / auto-approve path turns into real builds.
+    """
+    from api import (_identify_product_from_target, _enumerate_cves_for_product,
+                     _poc_trace)
+    _t0 = time.time()
+    # Reuse identification already done by node_product_identification when
+    # possible; otherwise identify now.
+    primary = state.get("product")
+    primary_ver = state.get("version")
+    # Pull the full identification (secondary + plugins) — cheap, cached HTML
+    info = {}
+    try:
+        info = _identify_product_from_target(state["ip"], state["port"],
+                                              run_deep_dive=False)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("product enumeration identify failed: %s", e)
+    # Build the ordered work list: primary first, then secondary, then plugins.
+    targets = []
+    if primary:
+        targets.append({"product": primary, "version": primary_ver, "tier": "primary"})
+    elif info.get("product"):
+        targets.append({"product": info["product"], "version": info.get("version"),
+                        "tier": "primary"})
+    for s in info.get("secondary_products") or []:
+        targets.append({"product": s["product"], "version": s.get("version"),
+                        "tier": "secondary"})
+    for p in info.get("plugins") or []:
+        targets.append({"product": p["product"], "version": p.get("version"),
+                        "tier": f"plugin:{p.get('kind','')}"})
+    results = []
+    seg = []
+    for t in targets[:12]:  # bound the fan-out
+        try:
+            r = _enumerate_cves_for_product(
+                t["product"], t.get("version"),
+                store_as_followup=True, ip=state["ip"], eid=state.get("eid"))
+            r["tier"] = t["tier"]
+            results.append(r)
+            if r["cve_ids"]:
+                seg.append(f"{t['tier']} {t['product']}"
+                           + (f" {t['version']}" if t.get('version') else "")
+                           + f": known CVEs {', '.join(r['cve_ids'][:8])}")
+        except Exception as e:  # noqa: BLE001
+            logging.debug("enumerate %s failed: %s", t.get("product"), e)
+    if seg:
+        g = ("Per-product CVE enumeration (each is a separate Build-PoC "
+             "candidate in cves-without-poc; product specifics first):\n  "
+             + "\n  ".join(seg))
+        _poc_trace(state["run_id"], "recon:product_cve_enumeration",
+                   response=g[:1600],
+                   extra={"products_enumerated": len(results),
+                          "total_cves": sum(len(r["cve_ids"]) for r in results)})
+        seg = [g]
+    metrics = {"product_cve_enum": {
+        "seconds": round(time.time() - _t0, 2),
+        "chars_added": len(seg[0]) if seg else 0,
+        "signal": f"{len(results)} products, "
+                   f"{sum(len(r['cve_ids']) for r in results)} CVEs queued"}}
+    return {"segments": seg,
+            "recon_metrics": {**state.get("recon_metrics", {}), **metrics}}
 
 
 def node_response_mine(state: BuildPocState) -> Dict[str, Any]:
@@ -891,6 +1006,7 @@ def build_graph():
     g.add_node("waf_characterize", node_waf_characterize)
     g.add_node("basic_recon", node_basic_recon)
     g.add_node("product_identification", node_product_identification)
+    g.add_node("product_cve_enumeration", node_product_cve_enumeration)
     g.add_node("response_mine", node_response_mine)
     g.add_node("auto_login", node_auto_login)
     g.add_node("framework_deep_enum", node_framework_deep_enum)
@@ -937,7 +1053,8 @@ def build_graph():
 
     # basic_recon -> response_mine -> (auto_login if creds, deep_enum if fw, else post_mine hub)
     g.add_edge("basic_recon", "product_identification")
-    g.add_edge("product_identification", "response_mine")
+    g.add_edge("product_identification", "product_cve_enumeration")
+    g.add_edge("product_cve_enumeration", "response_mine")
     g.add_conditional_edges("response_mine", _route_after_response_mine,
                              {"auto_login": "auto_login",
                               "framework_deep_enum": "framework_deep_enum",

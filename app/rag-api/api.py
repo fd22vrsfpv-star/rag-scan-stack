@@ -18114,6 +18114,19 @@ def _identify_product_from_target(ip, port, timeout=8, run_deep_dive=False,
     dates = []
     fingerprints = []
     evidence_bits = []
+    # Secondary products — the web server, language runtime, and any extra
+    # framework fingerprints found BESIDES the primary app. Each is its own
+    # attack surface (Apache/nginx CVEs, PHP CVEs, etc.), so we keep them
+    # as a separate enumeration rather than discarding them.
+    secondary = []  # list of {product, version, source}
+    html = ""       # function-scope so plugin detection sees it after the with-block
+    def _add_secondary(prod, ver, src):
+        if not prod:
+            return
+        for s in secondary:
+            if s["product"].lower() == prod.lower():
+                return  # dedup
+        secondary.append({"product": prod, "version": ver, "source": src})
 
     # Known product fingerprints: (regex on html|header, product name,
     # optional version-capture group index). Ordered most-specific first.
@@ -18158,8 +18171,13 @@ def _identify_product_from_target(ip, port, timeout=8, run_deep_dive=False,
                 if hv:
                     evidence_bits.append(f"{hk}={hv}")
                     mv = _re.search(r"([A-Za-z][A-Za-z0-9._-]*?)[/ ]([0-9]+\.[0-9][0-9.]*)", hv)
-                    if mv and not _hdr_product:
-                        _hdr_product, _hdr_version = mv.group(1), mv.group(2)
+                    if mv:
+                        if not _hdr_product:
+                            _hdr_product, _hdr_version = mv.group(1), mv.group(2)
+                        # Every versioned header component is a secondary
+                        # product (Apache from Server, PHP from X-Powered-By).
+                        _add_secondary(mv.group(1), mv.group(2),
+                                       f"header:{hk}")
 
             # App fingerprint scan — HIGHER priority than the server header.
             for pat, prod, vgrp in _FP:
@@ -18186,6 +18204,10 @@ def _identify_product_from_target(ip, port, timeout=8, run_deep_dive=False,
                 product = _hdr_product
                 version = version or _hdr_version
                 version_conf = max(version_conf, 0.55)
+            # Don't double-list the PRIMARY product in the secondary set.
+            if product:
+                secondary[:] = [s for s in secondary
+                                if s["product"].lower() != product.lower()]
             # If we identified the APP but have no app version, the server
             # header version is NOT the app version — leave version None so
             # the deep-dive / date-range narrows it instead of mislabeling.
@@ -18213,6 +18235,14 @@ def _identify_product_from_target(ip, port, timeout=8, run_deep_dive=False,
     except Exception as e:  # noqa: BLE001
         logging.debug("product identification failed: %s", e)
 
+    # Plugin / extension detection — each is its own product + CVE surface.
+    plugins = []
+    try:
+        if html:
+            plugins = _detect_plugins_from_html(ip, port, html)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("plugin detection failed: %s", e)
+
     evidence = "; ".join(evidence_bits[:8])
     deep = None
     if run_deep_dive and product:
@@ -18227,8 +18257,118 @@ def _identify_product_from_target(ip, port, timeout=8, run_deep_dive=False,
         "product": product, "version": version,
         "version_confidence": round(version_conf, 2),
         "dates": dates, "fingerprints": fingerprints,
+        "secondary_products": secondary,
+        "plugins": plugins,
         "evidence": evidence, "deep_dive": deep,
     }
+
+
+def _detect_plugins_from_html(ip, port, html, timeout=8):
+    """Detect installed plugins/extensions/widgets from HTML asset paths.
+
+    Many apps load plugin assets from predictable paths that leak the plugin
+    SLUG and often a VERSION (?ver=X.Y). Each detected plugin is its own
+    product with its own CVE surface — a WordPress core may be clean while a
+    plugin is the actual hole. Patterns cover the big ecosystems:
+      WordPress:  /wp-content/plugins/<slug>/...?ver=X.Y
+                  /wp-content/themes/<slug>/...
+      Joomla:     /components/com_<name>/, /modules/mod_<name>/
+      Drupal:     /modules/<name>/, /sites/all/modules/<name>/
+      Moodle:     /mod/<name>/, /blocks/<name>/
+      Generic:    /plugins/<name>/, /extensions/<name>/
+    Returns [{product, version, kind, slug}] deduped.
+    """
+    import re as _re
+    found = {}
+    def _add(slug, ver, kind):
+        if not slug or slug.lower() in ("js", "css", "img", "assets", "dist", "src"):
+            return
+        key = f"{kind}:{slug}".lower()
+        if key not in found or (ver and not found[key].get("version")):
+            found[key] = {"product": slug, "version": ver, "kind": kind, "slug": slug}
+    html = html or ""
+    PATS = [
+        (r"/wp-content/plugins/([a-z0-9][a-z0-9_-]+)/[^\"'?]*(?:\?ver=([0-9][0-9.]*))?", "wp-plugin"),
+        (r"/wp-content/themes/([a-z0-9][a-z0-9_-]+)/[^\"'?]*(?:\?ver=([0-9][0-9.]*))?", "wp-theme"),
+        (r"/components/com_([a-z0-9_]+)", "joomla-component"),
+        (r"/modules/mod_([a-z0-9_]+)", "joomla-module"),
+        (r"/sites/all/modules/([a-z0-9_]+)", "drupal-module"),
+        (r"/mod/([a-z0-9_]+)/", "moodle-module"),
+        (r"/plugins/([a-z0-9][a-z0-9_-]+)/", "plugin"),
+        (r"/extensions/([a-z0-9][a-z0-9_-]+)/", "extension"),
+    ]
+    for pat, kind in PATS:
+        for m in _re.finditer(pat, html, _re.I):
+            slug = m.group(1)
+            ver = m.group(2) if m.lastindex and m.lastindex >= 2 else None
+            _add(slug, ver, kind)
+    return list(found.values())[:20]
+
+
+def _enumerate_cves_for_product(product, version, store_as_followup=True,
+                                  ip=None, eid=None, limit=10):
+    """CVE-discovery loop for ONE product+version. Reuses the same machinery
+    the bulk-check uses: local searchsploit (instant) + web CVE search
+    (NVD + DDG) + the CVE cache. When store_as_followup=True, matched CVEs
+    are written to follow_up_items (rule_id='software_known_cve') so they
+    flow into /software/cves-without-poc and become one-click Build-PoC
+    candidates — i.e. each discovered product gets its own exploit path.
+
+    Returns {product, version, cve_ids: [...], edb_count}.
+    """
+    if not product:
+        return {"product": product, "version": version, "cve_ids": [], "edb_count": 0}
+    cve_ids = []
+    edb_count = 0
+    try:
+        from rule_engine import _searchsploit, _web_cve_search, _cache_cve_to_db
+        # 1. Local searchsploit — instant, offline
+        try:
+            edb = _searchsploit(product, version or "", limit=limit)
+            edb_count = len(edb)
+            for e in edb:
+                for code in (e.get("codes") or "").split(";"):
+                    code = code.strip()
+                    if code.startswith("CVE-") and code not in cve_ids:
+                        cve_ids.append(code)
+                        try:
+                            _cache_cve_to_db({"id": code,
+                                              "descriptions": [{"lang": "en",
+                                                "value": f"EDB: {e.get('description','')[:100]}"}],
+                                              "metrics": {}, "references": []})
+                        except Exception:  # noqa: BLE001
+                            pass
+        except Exception as e:  # noqa: BLE001
+            logging.debug("searchsploit for %s failed: %s", product, e)
+        # 2. Web CVE search (NVD + DDG) when we have a version
+        if version:
+            try:
+                web = _web_cve_search(product, version)
+                for c in web:
+                    if c not in cve_ids:
+                        cve_ids.append(c)
+            except Exception as e:  # noqa: BLE001
+                logging.debug("web cve search for %s failed: %s", product, e)
+        # 3. Local CVE cache
+        try:
+            for c in _check_cve_cache(product, version or ""):
+                cid = c.get("cve_id")
+                if cid and cid not in cve_ids:
+                    cve_ids.append(cid)
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception as e:  # noqa: BLE001
+        logging.debug("cve enumeration for %s failed: %s", product, e)
+    # Store as follow-ups so they surface in cves-without-poc + become
+    # one-click build candidates (each product's own exploit loop).
+    if store_as_followup and cve_ids:
+        try:
+            _apply_cves_to_inventory(product, version or "", cve_ids,
+                                     source="product_enumeration")
+        except Exception as e:  # noqa: BLE001
+            logging.debug("apply cves to inventory failed: %s", e)
+    return {"product": product, "version": version,
+            "cve_ids": cve_ids[:limit], "edb_count": edb_count}
 
 
 def _scout_url_recon(ip, port, timeout=8):
