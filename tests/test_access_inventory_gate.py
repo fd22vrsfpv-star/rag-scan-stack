@@ -227,3 +227,47 @@ print('OK')
 """
     out, err, rc = _in_container(py)
     assert rc == 0 and 'OK' in out, f"out={out} err={err}"
+
+
+def test_app_request_contract_zabbix_known_fields():
+    # KNOWN request-shape facts are supplied to the model, not guessed.
+    py = r"""
+import sys; sys.path.insert(0,'/app')
+from api import _app_request_contract
+c = _app_request_contract('Zabbix 6.0')
+assert c and c['csrf']['param'] == 'sid', c
+assert 'csrf-token' in (c['csrf'].get('aliases') or []), c
+assert c.get('action_endpoint') == '/zabbix.php', c
+assert _app_request_contract('UnknownApp') is None
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and 'OK' in out, f"out={out} err={err}"
+
+
+def test_enforce_request_contract_renames_and_injects_sid():
+    # The model keeps naming Zabbix's CSRF param wrong / omitting it; the
+    # contract enforcement renames it to `sid` + sets the live token, or injects.
+    py = r"""
+import sys; sys.path.insert(0,'/app')
+from api import _enforce_request_contract
+# wrong name + shell-var value -> renamed to sid + live literal
+cmd = ("curl -s -X POST 'http://t:8080/zabbix.php' "
+       "-d 'action=script.execute&hostid=10084&clientip=1&csrf-token=$TOKEN'")
+out, ch = _enforce_request_contract(cmd, 'Zabbix', {'sid':['c34588cf8d9f5004']})
+assert 'sid=c34588cf8d9f5004' in out and 'csrf-token=' not in out, out
+# missing entirely -> injected into the -d body
+cmd2 = "curl -X POST 'http://t:8080/zabbix.php' -d 'action=script.execute&clientip=1'"
+out2, ch2 = _enforce_request_contract(cmd2, 'Zabbix', {'sid':['abc123def4567890']})
+assert 'sid=abc123def4567890' in out2, out2
+# non-matching command (not zabbix.php) untouched
+out3, ch3 = _enforce_request_contract('curl http://t/x', 'Zabbix', {'sid':['x']})
+assert ch3 == [] and out3 == 'curl http://t/x', (out3, ch3)
+# grep extraction pattern 'csrf-token.*' (no '=') must NOT be renamed
+cmd4 = "curl 'http://t:8080/zabbix.php?action=x' | grep -o 'csrf-token.*'"
+out4, _ = _enforce_request_contract(cmd4, 'Zabbix', {})
+assert "grep -o 'csrf-token.*'" in out4, out4
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and 'OK' in out, f"out={out} err={err}"

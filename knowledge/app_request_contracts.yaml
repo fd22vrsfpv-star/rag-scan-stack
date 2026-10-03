@@ -1,0 +1,95 @@
+# App request contracts — KNOWN request-shape facts per product.
+#
+# Operator ask: "even fields like this should be part of the known info that the
+# model can use instead of trying to determine it."
+#
+# When the build-poc synth/refine knows the target's product, it should be TOLD
+# the request contract (the action endpoint, HTTP method, the anti-CSRF param
+# NAME and where its live token comes from, the usual injection parameter) as
+# established facts — not left to guess (the model kept naming Zabbix's CSRF
+# param `csrf-token` and grepping `value="..."` when it is `sid` from
+# `<meta name="csrf-token" content="...">`).
+#
+# Two consumers:
+#   1. RAG + synth guidance — api._app_request_contract(product) returns the
+#      matching contract; its `notes` + fields are injected into synth/refine
+#      guidance as "KNOWN REQUEST CONTRACT (use these, do not guess)".
+#   2. Deterministic enforcement — api._enforce_request_contract(command, product,
+#      resolved_ids) renames wrong-named CSRF params to the contract's param and
+#      injects the live token (from resolved_ids) when missing, every iteration.
+#
+# Loader: etl/load_knowledge_documents.py (_render_app_request_contracts →
+# RENDERERS["app_request_contracts"]) embeds each contract into rag_documents.
+#
+# Fields:
+#   product         match key (lowercased substring of the identified product)
+#   match           when this contract applies to a command:
+#                     url_contains / body_contains (any listed substring)
+#   action_endpoint the real action-router path (not the homepage)
+#   method          the HTTP method actions use
+#   csrf:
+#     param         the REQUIRED anti-CSRF parameter NAME
+#     aliases       wrong names the model tends to emit (renamed → param)
+#     token_source  human description of where the LIVE token is served
+#     resolved_key  the resolved_ids / precondition key holding the live value
+#   injection_param the parameter the vulnerability lives in (hint, not enforced)
+#   notes           operator-facing contract summary injected into guidance
+
+contracts:
+  - product: zabbix
+    match:
+      url_contains: ["zabbix.php", "/api_jsonrpc.php"]
+      body_contains: ["action="]
+    action_endpoint: "/zabbix.php"
+    method: POST
+    csrf:
+      param: sid
+      aliases: ["csrf-token", "csrf_token", "_csrf_token", "csrftoken"]
+      token_source: '<meta name="csrf-token" content="..."> on any authenticated page (equals sessionid[16:])'
+      resolved_key: sid
+    injection_param: clientip
+    notes: |
+      Zabbix action requests POST to /zabbix.php and route by an `action=` body
+      param (NOT /index.php). The anti-CSRF parameter is named `sid` (NOT
+      `csrf-token`) and its value is the live session CSRF token served as
+      `<meta name="csrf-token" content="...">` (content=, NOT value=; it equals
+      the last 16 hex chars of the zbx_session sessionid). A request with a
+      missing/stale/mis-named `sid` is rejected before the action runs.
+      CVE-2024-22120: time-based blind SQLi in the `clientip` parameter of
+      `action=script.execute` (needs a low-priv session + a hostid the user can
+      operate on + scriptid). Keep the session cookie (zbx_session) on the POST.
+
+  - product: grafana
+    match:
+      url_contains: ["/api/"]
+      body_contains: []
+    action_endpoint: "/api"
+    method: POST
+    csrf:
+      param: ""
+      aliases: []
+      token_source: 'Bearer API token or session cookie (grafana_session); Grafana APIs are JSON, not form-CSRF'
+      resolved_key: ""
+    injection_param: ""
+    notes: |
+      Grafana HTTP APIs under /api/* are JSON and authenticate with a session
+      cookie (grafana_session) or `Authorization: Bearer <token>` — there is no
+      form `sid`/CSRF param. Send JSON bodies with the correct Content-Type.
+
+  - product: wordpress
+    match:
+      url_contains: ["admin-ajax.php", "/wp-json/"]
+      body_contains: ["action="]
+    action_endpoint: "/wp-admin/admin-ajax.php"
+    method: POST
+    csrf:
+      param: _wpnonce
+      aliases: ["nonce", "security", "_ajax_nonce"]
+      token_source: 'the nonce printed inline in the admin page HTML/JS (wpApiSettings.nonce or a data-nonce attribute); REST uses the X-WP-Nonce header'
+      resolved_key: wpnonce
+    injection_param: ""
+    notes: |
+      WordPress AJAX actions POST to /wp-admin/admin-ajax.php with `action=` and a
+      nonce (commonly `_wpnonce`, `security`, or `_ajax_nonce`). REST routes under
+      /wp-json/ use the `X-WP-Nonce` header. The nonce is per-session and printed
+      inline in the authenticated page — extract it live, do not reuse a captured one.

@@ -682,7 +682,31 @@ def _render_http_status_fingerprints(data: Dict[str, Any]) -> List[Doc]:
     return docs
 
 
+def _render_app_request_contracts(data: Dict[str, Any]) -> List[Doc]:
+    """Embed each app request contract so retrievers + synth can recall the
+    KNOWN request shape (action endpoint, method, anti-CSRF param name + token
+    source, injection param) instead of the model guessing it. api runtime reads
+    the YAML directly via _app_request_contract(); this embed is for RAG recall."""
+    docs: List[Doc] = []
+    for c in (data.get("contracts") or []):
+        prod = _s(c.get("product"))
+        if not prod:
+            continue
+        csrf = c.get("csrf") or {}
+        body = (f"Product: {prod}\n"
+                f"Action endpoint: {_s(c.get('action_endpoint'))}  "
+                f"Method: {_s(c.get('method'))}\n"
+                f"Anti-CSRF param: {_s(csrf.get('param')) or '(none)'}  "
+                f"(wrong names to avoid: {', '.join(csrf.get('aliases') or []) or 'n/a'})\n"
+                f"CSRF token source: {_s(csrf.get('token_source'))}\n"
+                f"Injection param: {_s(c.get('injection_param')) or '(varies)'}\n\n"
+                f"{_s(c.get('notes'))}")
+        docs.append((f"App request contract — {prod}", body))
+    return docs
+
+
 RENDERERS = {
+    "app_request_contracts": _render_app_request_contracts,
     "common_web_paths": _render_common_web_paths,
     "http_status_fingerprints": _render_http_status_fingerprints,
     "vuln_class_methodology": _render_vuln_class_methodology,
