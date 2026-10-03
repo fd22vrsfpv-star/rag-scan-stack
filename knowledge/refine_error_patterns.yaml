@@ -203,6 +203,51 @@ patterns:
       — if your body is JSON (`-d '{"...":...}'`), set the JSON header. If
       the server wants multipart, use `-F "field=value"`.
 
+  - id: wrong_action_endpoint
+    title: "POST action= body landed on homepage/index (should be action router)"
+    triggers:
+      # Fires when the command POSTs an action= body param to a homepage-shape
+      # URL (index.php, index.html, or webroot). Generic across PHP/MVC apps
+      # — Zabbix, Prestashop, WordPress AJAX, Joomla admin, Moodle, etc. —
+      # not Zabbix-specific. The common thread: a form that routes by an
+      # `action=X` parameter has a dedicated action-router script separate
+      # from the homepage that just renders HTML.
+      command_contains:
+        - "action="
+      command_contains_any:
+        - "/index.php"
+        - "/index.html"
+        - "' '"
+        - "localhost/'"
+    guidance: |
+      WRONG ENDPOINT — the request POSTed `action=X` to a homepage/index URL,
+      but a form that routes actions by body param almost always has a
+      SEPARATE action-router script. The homepage just renders the HTML
+      form; the submit target is somewhere else.
+
+      Framework-specific routers (common cases):
+        - Zabbix:    /zabbix.php?action=X      (NOT /index.php)
+        - Prestashop: /admin/ajax.php, /admin/index.php?controller=X
+        - WordPress AJAX: /wp-admin/admin-ajax.php?action=X
+        - Joomla admin: /administrator/index.php?option=com_X&task=Y
+        - Moodle:    /mod/{feature}/{action}.php
+        - Django/Flask: endpoint path IS the view URL (no action= body)
+        - Spring MVC: endpoint path IS the controller URL (no action= body)
+        - FastAPI:   endpoint path IS the operation; see /openapi.json
+
+      How to find the real endpoint (any of these):
+        1. GET the HTML form and extract the `<form action="...">` attribute
+           (the browser would submit there, not to the current URL).
+        2. Scan the OpenAPI spec surfaced by recon:openapi for a POST with a
+           body schema matching your action.
+        3. Query the discovered_params / web_findings tables for URLs with
+           method=POST on this host (recon:arjun + Playwright-through-ZAP
+           both populate these).
+        4. Grep the ZAP spider output (recon:zap) for paths ending in `.php`
+           that are not asset files.
+        5. For SPA XHR POSTs, look at the Playwright crawl's dynamic routes
+           (recon:playwright).
+
   - id: cors_in_curl_context
     title: "CORS error (irrelevant in curl)"
     triggers:
