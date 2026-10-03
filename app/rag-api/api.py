@@ -20370,12 +20370,23 @@ def _fetch_cve_advisories_from_apis(cve, timeout=8):
                 if adv.get("description"):
                     bits.append(f"Description: {adv['description'][:2500]}")
                 refs = adv.get("references") or []
-                if refs:
-                    bits.append("References: " + ", ".join(x.get("url", "") for x in refs[:6]))
+                # GitHub Advisories API returns references as a list of plain
+                # URL STRINGS (not {url: ...} objects). Tolerate both shapes —
+                # the previous x.get("url") raised AttributeError on strings
+                # and the bare except swallowed the ENTIRE GitHub branch, so
+                # the richest advisory source produced nothing.
+                def _ref_url(x):
+                    return x if isinstance(x, str) else (x.get("url") or "" if isinstance(x, dict) else "")
+                ref_urls = [u for u in (_ref_url(x) for x in refs) if u]
+                if ref_urls:
+                    bits.append("References: " + ", ".join(ref_urls[:6]))
                 chunks.append("--- GITHUB ADVISORY ---\n" + "\n".join(bits))
-                # Fetch each referenced repo/issue/PR (often the exact PoC)
-                for ref in refs[:3]:
-                    url = ref.get("url") or ""
+                # Fetch each referenced repo/issue/PR/commit (often the exact
+                # PoC or the patch diff). Prioritize commit/pull URLs — the
+                # diff names the vulnerable sink.
+                _patchy = [u for u in ref_urls if any(s in u for s in ("/commit/", "/pull/", "/compare/"))]
+                _other = [u for u in ref_urls if u not in _patchy]
+                for url in (_patchy + _other)[:4]:
                     if any(h in url for h in ("github.com/", "gitee.com/")):
                         body = _fetch_advisory_text(url, timeout=5, max_bytes=4000)
                         if body:
@@ -20417,26 +20428,34 @@ def _fetch_cve_advisories_from_apis(cve, timeout=8):
             + "\n".join(chunks))
 
 
-def _research_cve_advisories(cve, max_results=3, per_url_bytes=6000):
-    """Advisory retrieval for a CVE. Fills the vector-level gap for novel CVEs where
-    MSF/ExploitDB have nothing. Order:
-      1. GitHub Advisories API + CIRCL + Nuclei template (structured JSON/YAML, no
-         rate-limit surprises).
-      2. DDG scrape (fallback when APIs miss).
+def _research_cve_advisories(cve, max_results=3, per_url_bytes=6000,
+                              product=None, version=None):
+    """Advisory + patch/changelog retrieval for a CVE. The GHSA advisory and
+    the PATCH COMMIT that fixed the issue usually name the exact vulnerable
+    endpoint/param — the highest-value vector detail. Order:
+      1. GitHub Advisories API + CIRCL + Nuclei template (structured, no
+         rate-limit surprises) — these link the patch commit.
+      2. DDG scrape for advisory + PATCH + CHANGELOG records (fallback /
+         supplement), including product-specific changelog queries.
     Returns a compact text block; empty on total failure."""
     if not cve:
         return ""
-    # Try structured APIs first — always land, contain vector-level detail directly.
+    # Structured APIs first — they carry the GHSA body + patch-commit links.
     api_text = _fetch_cve_advisories_from_apis(cve)
-    if api_text:
-        return api_text
-    # Fire two queries and merge — DDG advanced operators (site:, quoted-strings, OR)
-    # often collapse the result set to zero on some result-page shapes. Plain queries
-    # get many more hits; we do the filtering client-side.
+    # Fire several queries and merge — advisory, PoC, PATCH COMMIT, and (when
+    # we know the product) the vendor CHANGELOG / release notes for the fixed
+    # version. The changelog entry for a CVE often states the exact component
+    # fixed ("fixed SQL injection in the clientip field of scripts").
+    queries = [f"{cve} poc github", f"{cve} advisory patch commit",
+               f"{cve} fix changelog"]
+    if product:
+        pv = f"{product} {version}" if version else product
+        queries.append(f"{pv} changelog {cve}")
+        queries.append(f"{pv} security release notes {cve}")
     all_results = []
-    for query in (f"{cve} poc github", f"{cve} exploit advisory"):
+    for query in queries:
         try:
-            all_results.extend(ddg_search(query, max_results=10, timeout=8) or [])
+            all_results.extend(ddg_search(query, max_results=8, timeout=8) or [])
         except Exception:  # noqa: BLE001
             pass
     # Filter to real advisory-shaped URLs; skip DDG click-tracking, PDFs, ads.
@@ -20481,12 +20500,20 @@ def _research_cve_advisories(cve, max_results=3, per_url_bytes=6000):
         title = (r.get("title") or "")[:120]
         body = _fetch_advisory_text(url, max_bytes=per_url_bytes)
         if body:
-            chunks.append(f"--- ADVISORY: {title}\nURL: {url}\n{body[:per_url_bytes]}\n")
-    if not chunks:
-        return ""
-    return ("PUBLIC ADVISORIES for " + cve + " (fetched from DDG top hits — these often "
-            "name the exact vulnerable endpoint/param when MSF/ExploitDB have nothing):\n"
-            + "\n".join(chunks))
+            chunks.append(f"--- ADVISORY/PATCH: {title}\nURL: {url}\n{body[:per_url_bytes]}\n")
+    # Merge the structured-API text (GHSA body + patch-commit links) with the
+    # DDG-scraped advisory/patch/changelog chunks — both are valuable; neither
+    # should shadow the other.
+    merged = []
+    if api_text:
+        merged.append(api_text)
+    if chunks:
+        merged.append("PUBLIC ADVISORIES / PATCH NOTES / CHANGELOG for " + cve
+                      + " (the advisory + patch commit + vendor changelog often "
+                        "name the exact vulnerable endpoint/param + the fix — read "
+                        "the DIFF to find what input reaches the sink):\n"
+                      + "\n".join(chunks))
+    return "\n\n".join(merged)
 
 
 def _research_exploit(cve, ip=None, port=None, product=None, version=None, eid=None, model=None):
@@ -20521,12 +20548,19 @@ def _research_exploit(cve, ip=None, port=None, product=None, version=None, eid=N
     # Advisory retrieval: for novel CVEs where MSF/ExploitDB have nothing, pull the
     # top DDG-searched GitHub/Gitee/NVD advisory bodies. Often names the exact endpoint
     # + param — the vector-level detail that unblocks description-only synth.
+    # ALWAYS pull advisories + patch/changelog records — not only when MSF/EDB
+    # are empty. The GitHub Security Advisory (GHSA) and the PATCH COMMIT that
+    # fixed the CVE routinely name the exact vulnerable endpoint + parameter —
+    # the single most valuable vector-level source. Gating this behind "EDB
+    # found nothing" skipped it for products like Zabbix where ExploitDB
+    # matches the NAME broadly but has no PoC for THIS CVE. (operator ask:
+    # "did we look at the patch notes and change records")
     advisory_text = ""
-    if not msf and not poc_text:
-        try:
-            advisory_text = _research_cve_advisories(cve, max_results=3, per_url_bytes=6000)
-        except Exception:  # noqa: BLE001
-            advisory_text = ""
+    try:
+        advisory_text = _research_cve_advisories(
+            cve, max_results=4, per_url_bytes=6000, product=product, version=version)
+    except Exception:  # noqa: BLE001
+        advisory_text = ""
     tgt = f"http://{ip}:{port}" if ip else "the target"
     # Documentation posture: a defender/tester on an AUTHORIZED engagement writing up how the
     # vuln works and how to VALIDATE it. This framing gets a substantive answer where a
