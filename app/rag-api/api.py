@@ -14916,25 +14916,57 @@ _REFINE_PATTERNS_CACHE = {"t": 0.0, "rows": []}
 
 
 def _load_refine_patterns(force=False):
-    """Pull the structured refine-error patterns from refine_error_patterns
-    (YAML-loaded + operator-approved learned patterns). Cached 60s so the
-    hot path doesn't hit the DB each iter. Patterns are the operator-
-    extensible knowledge the refine prompt uses to steer the LLM out of
-    common mistakes (unterminated quote, blind-timing proof model, etc.).
+    """Pull the structured refine-error patterns from refine_error_patterns.
+    Includes:
+      - source='yaml' (hardcoded authoritative seeds)
+      - source='learned' + approved_at NOT NULL (operator-approved learned)
+      - source='learned' + approved_at NULL (PENDING — shadow-applied in
+        builds so we can measure which ones actually help; see
+        `pending` flag in the returned row)
+    Pending patterns are injected in the refine prompt the same way as
+    approved ones so the LLM gets the fix guidance IMMEDIATELY, but each
+    injection is logged as a TRIAL. If the next iter converges, the
+    pattern earns a success credit; once success_count hits the
+    REFINE_AUTO_APPROVE_SUCCESSES threshold (default 2) with success rate
+    >= 0.5, the mining loop auto-approves the pattern — making it
+    permanent.
+
+    Cached 60s so the hot path doesn't hit the DB each iter.
     See knowledge/refine_error_patterns.yaml + etl/load_refine_patterns.py."""
     import time as _t
     if not force and _t.time() - _REFINE_PATTERNS_CACHE["t"] < 60:
         return _REFINE_PATTERNS_CACHE["rows"]
     try:
         with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Ensure the trial-counter columns exist (idempotent — safer than
+            # relying on a separate migration being present).
+            try:
+                cur.execute("""
+                    ALTER TABLE public.refine_error_patterns
+                        ADD COLUMN IF NOT EXISTS trial_count   int NOT NULL DEFAULT 0,
+                        ADD COLUMN IF NOT EXISTS success_count int NOT NULL DEFAULT 0,
+                        ADD COLUMN IF NOT EXISTS last_trial_at timestamptz
+                """)
+                conn.commit()
+            except Exception as _ae:  # noqa: BLE001
+                logging.debug("refine_error_patterns ALTER failed: %s", _ae)
             cur.execute("""
-                SELECT id, title, guidance, triggers, source
+                SELECT id, title, guidance, triggers, source,
+                       approved_at, trial_count, success_count
                 FROM public.refine_error_patterns
                 WHERE source = 'yaml'
-                   OR (source = 'learned' AND approved_at IS NOT NULL)
-                ORDER BY source, id
+                   OR source = 'learned'
+                ORDER BY source,
+                         (approved_at IS NULL) ASC,  -- approved first
+                         id
             """)
-            rows = [dict(r) for r in cur.fetchall()]
+            rows = []
+            for r in cur.fetchall():
+                row = dict(r)
+                # pending = learned pattern not yet operator-approved
+                row["pending"] = (row.get("source") == "learned"
+                                  and row.get("approved_at") is None)
+                rows.append(row)
     except Exception as e:  # noqa: BLE001
         logging.debug("refine patterns load failed: %s", e)
         rows = []
@@ -14987,8 +15019,103 @@ def _match_refine_patterns(output, assertion, canary, command):
             if (canary in out) != want:
                 continue
         matched.append({"id": row.get("id"), "title": row.get("title"),
-                         "guidance": row.get("guidance") or ""})
+                         "guidance": row.get("guidance") or "",
+                         "pending": bool(row.get("pending")),
+                         "trial_count": row.get("trial_count") or 0,
+                         "success_count": row.get("success_count") or 0})
     return matched
+
+
+def _record_refine_pattern_trial(pattern_ids):
+    """Mark one trial on each pending pattern we just injected. Called from
+    the refine loop AFTER a pattern was shown to the LLM, BEFORE we know if
+    it helped. Pending patterns use this + the success recorder below to
+    accumulate evidence toward auto-approval."""
+    if not pattern_ids:
+        return
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""
+                UPDATE public.refine_error_patterns
+                   SET trial_count = trial_count + 1,
+                       last_trial_at = now()
+                 WHERE id = ANY(%s::text[])
+                   AND source = 'learned'
+                   AND approved_at IS NULL
+            """, (list(pattern_ids),))
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("refine trial record failed: %s", e)
+
+
+def _record_refine_pattern_success(pattern_ids):
+    """Credit each pending pattern with a success — the iter AFTER the
+    guidance was injected converged. Called from the refine loop when
+    assertion_passed=True on the subsequent iter. Pending patterns that
+    hit REFINE_AUTO_APPROVE_SUCCESSES successes with rate >= 0.5 get
+    auto-approved on the next mining pass — permanent + visible in the
+    operator's approved list."""
+    if not pattern_ids:
+        return
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""
+                UPDATE public.refine_error_patterns
+                   SET success_count = success_count + 1
+                 WHERE id = ANY(%s::text[])
+                   AND source = 'learned'
+                   AND approved_at IS NULL
+            """, (list(pattern_ids),))
+            conn.commit()
+        _REFINE_PATTERNS_CACHE["t"] = 0.0  # bust cache so next read sees new counts
+    except Exception as e:  # noqa: BLE001
+        logging.debug("refine success record failed: %s", e)
+
+
+def _auto_approve_proven_patterns():
+    """Promote pending patterns whose trial record is strong enough into the
+    approved set. Called from the mining daemon on every pass. Thresholds:
+      REFINE_AUTO_APPROVE_SUCCESSES (default 2) — minimum successful trials
+      REFINE_AUTO_APPROVE_RATE      (default 0.5) — success / trial ratio
+    Returns the list of auto-approved pattern IDs."""
+    s_min = int(os.environ.get("REFINE_AUTO_APPROVE_SUCCESSES", "2") or "2")
+    r_min = float(os.environ.get("REFINE_AUTO_APPROVE_RATE", "0.5") or "0.5")
+    approved = []
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, trial_count, success_count, title
+                  FROM public.refine_error_patterns
+                 WHERE source = 'learned' AND approved_at IS NULL
+                   AND success_count >= %s
+                   AND trial_count > 0
+                   AND (success_count::float / trial_count::float) >= %s
+            """, (s_min, r_min))
+            candidates = [dict(r) for r in cur.fetchall()]
+            for c in candidates:
+                cur.execute("""
+                    UPDATE public.refine_error_patterns
+                       SET approved_at = now(),
+                           approved_by = 'auto-approve',
+                           updated_at = now()
+                     WHERE id = %s
+                       AND approved_at IS NULL
+                """, (c["id"],))
+                approved.append({"id": c["id"], "title": c["title"],
+                                  "trials": c["trial_count"],
+                                  "successes": c["success_count"]})
+            conn.commit()
+        if approved:
+            _REFINE_PATTERNS_CACHE["t"] = 0.0
+            for a in approved:
+                try:
+                    emit_webhook("refine_pattern_auto_approved",
+                                 "rag-knowledge", a)
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception as e:  # noqa: BLE001
+        logging.debug("auto-approve pass failed: %s", e)
+    return approved
 
 
 def _mine_refine_pattern_candidates(limit=200, min_hits=3):
@@ -15658,6 +15785,19 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                           "method": verification_method,
                           "confidence": verification_confidence,
                           "reason": _verdict.get("reason", "")})
+        # Credit any pending patterns injected on the PREVIOUS iter if THIS
+        # iter converged. The guidance helped the LLM write a working
+        # command; after enough successes the auto-approve pass promotes
+        # them from pending to approved — permanent + visible in the
+        # operator's approved list, applied in every future build.
+        if success and _prev_pending:
+            try:
+                _record_refine_pattern_success(_prev_pending)
+                _poc_trace(run_id, "refine_pattern_success_credit",
+                           iteration=it, extra={"ids": _prev_pending,
+                                                "verdict_method": verification_method})
+            except Exception as _rpe:  # noqa: BLE001
+                logging.debug("refine pattern credit failed: %s", _rpe)
         # Track consecutive same-tier status iters so the escalation hook
         # below can fire. Any OTHER verdict resets every tier counter.
         if verification_method in _status_tier_streak:
@@ -15826,17 +15966,34 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         #     general consultation (both the structured match AND the
         #     semantic embedding land in rag_documents)
         rag_pattern_notes = ""
+        # Track which pending patterns we inject this iter — if the NEXT
+        # iter converges, each gets a success credit. Reused by the auto-
+        # approve path to promote proven-helpful learned patterns.
+        _pending_tried_this_iter = []
         try:
             matched = _match_refine_patterns(output, assertion, canary, command)
             if matched:
                 blocks = []
                 for p in matched[:4]:  # cap at 4 so prompt doesn't balloon
-                    blocks.append(f"\n[{p.get('title', p.get('id'))}]\n{p['guidance'].strip()}")
+                    tag = p.get("title", p.get("id"))
+                    if p.get("pending"):
+                        tag = f"PENDING-TRIAL · {tag}"  # transparency
+                        _pending_tried_this_iter.append(p.get("id"))
+                    blocks.append(f"\n[{tag}]\n{p['guidance'].strip()}")
                 rag_pattern_notes = "".join(blocks)
                 _poc_trace(run_id, "refine_patterns_matched", iteration=it,
-                           extra={"ids": [p.get("id") for p in matched]})
+                           extra={"ids": [p.get("id") for p in matched],
+                                  "pending": [p.get("id") for p in matched if p.get("pending")]})
+                # Record ONE trial per injected pending pattern. The success
+                # credit comes next iter (if assertion_passed).
+                if _pending_tried_this_iter:
+                    _record_refine_pattern_trial(_pending_tried_this_iter)
         except Exception as _re:  # noqa: BLE001
             logging.debug("refine pattern match failed: %s", _re)
+        # Pending patterns awaiting their success credit from the PREVIOUS
+        # iter's injection are tracked in metrics for cross-iter lookup.
+        _prev_pending = metrics.get("_pending_tried_last_iter") or []
+        metrics["_pending_tried_last_iter"] = _pending_tried_this_iter
         # Keep the legacy inline notes as empty strings for the f-string below
         # (so the composition stays explicit; everything that was hardcoded is
         # now carried by rag_pattern_notes).
@@ -18342,18 +18499,33 @@ def list_refine_patterns(include_pending: bool = True,
 
 @app.get("/refine-patterns/pending", tags=["RAG/Knowledge"])
 def list_pending_refine_patterns(authorized: bool = Depends(auth)):
-    """Learned patterns awaiting operator review. Trace-mined from
-    converging builds; the body is a stub the operator refines before
-    approving. Approved patterns go live immediately on the next refine
-    iter (cache is 60s TTL)."""
+    """Learned patterns awaiting operator review. Trace-mined from converging
+    builds; shadow-applied in subsequent builds so the operator can see
+    per-pattern trial outcomes BEFORE approving:
+      trial_count    — iterations where the guidance was injected
+      success_count  — iterations the next build iter converged
+      success_rate   — successes / trials
+    Patterns reaching REFINE_AUTO_APPROVE_SUCCESSES (default 2) at rate
+    >= REFINE_AUTO_APPROVE_RATE (default 0.5) get auto-approved on the
+    next mining pass — permanent + visible in the approved list.
+    Approved patterns go live immediately on the next refine iter (cache
+    is 60s TTL)."""
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
-            SELECT id, title, guidance, triggers, created_at
+            SELECT id, title, guidance, triggers, created_at,
+                   trial_count, success_count, last_trial_at
             FROM public.refine_error_patterns
             WHERE source = 'learned' AND approved_at IS NULL
-            ORDER BY created_at DESC
+            ORDER BY success_count DESC, last_trial_at DESC NULLS LAST
         """)
-        return {"pending": [dict(r) for r in cur.fetchall()]}
+        rows = []
+        for r in cur.fetchall():
+            d = dict(r)
+            t = d.get("trial_count") or 0
+            s = d.get("success_count") or 0
+            d["success_rate"] = round(s / t, 3) if t > 0 else None
+            rows.append(d)
+        return {"pending": rows}
 
 
 @app.post("/refine-patterns/approve/{pattern_id}", tags=["RAG/Knowledge"])
@@ -33068,6 +33240,18 @@ def _refine_mine_sweep_loop():
                                           "signals": [p["signal"] for p in promoted]})
                         except Exception:  # noqa: BLE001
                             pass
+                    # Auto-approve pass — pending patterns that have been
+                    # shadow-applied in enough builds AND helped the LLM
+                    # recover get promoted to approved automatically.
+                    # Operator still sees them in the approved list and
+                    # can revoke if they later cause regressions.
+                    try:
+                        auto = _auto_approve_proven_patterns()
+                        if auto:
+                            logging.info("refine auto-approved %d patterns: %s",
+                                         len(auto), [a["id"] for a in auto])
+                    except Exception as _aae:  # noqa: BLE001
+                        logging.warning("refine auto-approve failed: %s", _aae)
                 except Exception as e:  # noqa: BLE001
                     logging.warning("refine-mine iteration failed: %s", e)
         except Exception as e:  # noqa: BLE001
