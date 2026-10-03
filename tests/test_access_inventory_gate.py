@@ -156,3 +156,21 @@ print('OK')
 """
     out, err, rc = _in_container(py)
     assert rc == 0 and 'OK' in out, f"out={out} err={err}"
+
+
+def test_enforce_resolved_ids_rewrites_hex_token_sid():
+    # Zabbix `sid` is a hex CSRF token, not digits — enforcement must rewrite a
+    # stale hardcoded sid to the live-enumerated one (kinds ending in 'id' incl.
+    # 'sid'; values may be hex). This is the CVE-2024-22120 CSRF-token fix.
+    py = """
+import sys; sys.path.insert(0,'/app')
+from api import _enforce_resolved_object_ids
+cmd = "curl -d 'action=script.execute&hostid=10084&sid=a6094b4f052fd133adc335382f0297f6&ip=1'"
+out, ch = _enforce_resolved_object_ids(cmd, {'sid': ['8f7a151b9cb72637'], 'hostid': ['10084']})
+assert 'sid=8f7a151b9cb72637' in out, out
+assert 'a6094b4f' not in out, out
+assert any(k=='sid' and n=='8f7a151b9cb72637' for (k,o,n) in ch), ch
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and 'OK' in out, f"out={out} err={err}"
