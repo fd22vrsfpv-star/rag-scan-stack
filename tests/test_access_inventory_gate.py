@@ -174,3 +174,29 @@ print('OK')
 """
     out, err, rc = _in_container(py)
     assert rc == 0 and 'OK' in out, f"out={out} err={err}"
+
+
+def test_sanitize_poc_auth_redacts_literals_keeps_shell_vars():
+    # Auth info must never be stored as a literal (operator: "auth info should
+    # never be hard coded"); live shell-var references are kept (they resolve at
+    # run time). Covers the CVE-2024-22120 poisoning: a stored PoC embedded a
+    # stale sid + a plaintext zbx_session cookie that seeded later builds.
+    py = r"""
+import sys; sys.path.insert(0,'/app')
+from api import _sanitize_poc_auth
+t = ('curl -d "sid=a6094b4f052fd133adc335382f0297f6&x=1" '
+     '-H "Cookie: zbx_session=eyJzZXNzaW9uaWQiOiJhYmMi" '
+     '-H "X-CSRF-Token: $CSRF_TOKEN" -H "Authorization: Bearer $TOKEN"')
+out = _sanitize_poc_auth(t)
+assert 'sid=<SID>' in out, out
+assert 'a6094b4f' not in out, out
+assert 'zbx_session=<SESSION>' in out, out
+assert 'eyJzZXNzaW9u' not in out, out
+assert 'X-CSRF-Token: $CSRF_TOKEN' in out, out      # shell var preserved
+assert 'Bearer $TOKEN' in out, out                   # shell var preserved
+# idempotent
+assert _sanitize_poc_auth(out) == out, 'not idempotent'
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and 'OK' in out, f"out={out} err={err}"

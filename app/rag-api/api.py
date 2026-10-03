@@ -19668,6 +19668,49 @@ def _exploit_store_artifacts(kind, command, name, cve, rationale, assertion):
         return {"python_code": None, "http_request": None}
 
 
+def _sanitize_poc_auth(text):
+    """Redact SESSION-SPECIFIC auth material from a PoC before it is persisted or
+    reused. Two operator rules converge here: "auth info should never be hard
+    coded" and "do not assume anything" — a stored PoC that embeds a live session
+    cookie or CSRF token (a) leaks a secret in plaintext (CLAUDE.md: use
+    <placeholder> markers, plaintext stays in origin tables) and (b) poisons the
+    NEXT build, which copies the dead token and assumes it still works (exactly
+    how a stale sid=a6094b4f… propagated identically across separate builds).
+
+    Replaces the value with a typed placeholder the re-run path re-establishes
+    live (session from auth_establish, sid via precondition enumeration +
+    _enforce_resolved_object_ids). Shell variable references ($VAR) are LEFT
+    ALONE — they resolve live at run time and are not literals. Returns the text."""
+    import re as _re
+    if not text or not isinstance(text, str):
+        return text
+
+    def _ph(placeholder):
+        def _sub(m):
+            val = m.group(2)
+            if val.startswith("$"):   # live shell var — not a literal secret
+                return m.group(0)
+            return m.group(1) + placeholder
+        return _sub
+
+    t = text
+    # session cookies anywhere (Cookie header or body/param)
+    t = _re.sub(r'((?:zbx_session|PHPSESSID|JSESSIONID|sessionid|_session|'
+                r'laravel_session|csrftoken|session)=)([A-Za-z0-9%+/._=-]+)',
+                _ph("<SESSION>"), t, flags=_re.I)
+    # Zabbix sid / anti-CSRF token param (16+ hex)
+    t = _re.sub(r'(sid=)([A-Fa-f0-9]{16,})', _ph("<SID>"), t)
+    # named CSRF token params + header
+    t = _re.sub(r'((?:csrf[_-]?token|_csrf_token|authenticity_token)=)'
+                r'([A-Za-z0-9._%-]+)', _ph("<CSRF>"), t, flags=_re.I)
+    t = _re.sub(r'(X-CSRF-Token:\s*)([A-Za-z0-9._-]+)', _ph("<CSRF>"), t, flags=_re.I)
+    # bearer / api-key headers
+    t = _re.sub(r'(Authorization:\s*Bearer\s+)([A-Za-z0-9._-]+)', _ph("<TOKEN>"),
+                t, flags=_re.I)
+    t = _re.sub(r'(x-api-key:\s*)([A-Za-z0-9._-]+)', _ph("<APIKEY>"), t, flags=_re.I)
+    return t
+
+
 def _save_exploit_store(name, cve=None, kind="cve_poc", target_host=None, target_port=None,
                         product=None, version=None, command=None, assertion=None,
                         rationale=None, verified=False, source="exploit_store",
@@ -19675,12 +19718,19 @@ def _save_exploit_store(name, cve=None, kind="cve_poc", target_host=None, target
                         built_at=None, eid=None, metadata=None, created_by="operator",
                         python_code=None, http_request=None):
     """Insert one exploit-store entry. Auto-generates the Python + raw-HTTP artifacts from
-    the command when they are not supplied (web/curl PoCs). Returns the new id (or None)."""
+    the command when they are not supplied (web/curl PoCs). Session-specific auth
+    (cookies, sid/CSRF tokens, bearer keys) is redacted to placeholders so a
+    stored PoC never embeds a live secret or poisons the next build with a stale
+    token. Returns the new id (or None)."""
     _ensure_exploit_store()
     if (python_code is None or http_request is None) and command:
         art = _exploit_store_artifacts(kind, command, name, cve, rationale, assertion)
         python_code = python_code or art["python_code"]
         http_request = http_request or art["http_request"]
+    # Redact auth material from every stored form of the PoC.
+    command = _sanitize_poc_auth(command)
+    http_request = _sanitize_poc_auth(http_request)
+    python_code = _sanitize_poc_auth(python_code)
     try:
         with get_db() as conn, conn.cursor() as cur:
             cur.execute("""INSERT INTO exploit_store
@@ -21009,12 +21059,38 @@ def _enumerate_exploit_preconditions(ip, port, analysis, session_cookie=None,
                         _mt = _re.search(
                             r'name=["\']csrf-token["\']\s+content=["\']([A-Za-z0-9]+)',
                             _pr.text or "", _re.I)
-                        if _mt:
-                            resolved["sid"] = [_mt.group(1)]
+                        if not _mt:
+                            continue
+                        _tok = _mt.group(1)
+                        # VALIDATE the token before relying on it (operator: "get
+                        # token and validate it before sending it" / "do not
+                        # assume anything"). A token that extracts but isn't
+                        # accepted is worse than none — it reads as a failed
+                        # exploit. Only a validated token enters resolved.
+                        _hid = (resolved.get("hostid") or [None])[0]
+                        _sid_ok, _sid_why = _probe_zabbix_sid_valid(
+                            ip, port, session_cookie, _tok, hostid=_hid,
+                            scriptid=(resolved.get("scriptid") or [1])[0])
+                        if _sid_ok:
+                            resolved["sid"] = [_tok]
                             confirmed.append(
-                                f"sid (live Zabbix CSRF token, required on POST "
-                                f"actions): {_mt.group(1)}")
+                                f"sid (live Zabbix CSRF token, VALIDATED accepted "
+                                f"by the target before use): {_tok} — {_sid_why}")
+                            _record_confirmation(
+                                f"{ip}:{port or 80}", "token_valid", "sid",
+                                "confirmed", evidence=_sid_why, method="probe",
+                                claim_value=_tok, product=product)
                             break
+                        else:
+                            unmet.append(
+                                f"extracted a Zabbix sid ({_tok}) but it was NOT "
+                                f"accepted on validation ({_sid_why}) — the "
+                                f"session/CSRF token is stale; re-establish the "
+                                f"session before the exploit relies on it")
+                            _record_confirmation(
+                                f"{ip}:{port or 80}", "token_valid", "sid",
+                                "refuted", evidence=_sid_why, method="probe",
+                                claim_value=_tok, product=product)
                     except Exception:  # noqa: BLE001
                         continue
             # ── Generic: any "<thing>id" precondition → sitemap/discovered ──
@@ -21254,6 +21330,45 @@ def _get_confirmation(target, claim_type, claim_key, cve=None, claim_value=None,
     except Exception as e:  # noqa: BLE001
         logging.debug("get confirmation failed: %s", e)
         return None
+
+
+def _probe_zabbix_sid_valid(ip, port, session_cookie, sid, hostid=None,
+                            scriptid=None, timeout=10):
+    """VALIDATE a Zabbix anti-CSRF `sid` is actually ACCEPTED before the exploit
+    relies on it. Operator: "that should be a step, get token and validate it
+    before sending it." Extracting the token isn't proof it works — a stale or
+    mismatched sid makes the action router reject the request with a CSRF error
+    BEFORE the payload runs, which the build can't tell from a failed exploit.
+
+    Sends a BENIGN probe (no injection — clientip=127.0.0.1) with the token and
+    reads the router's verdict: a bad sid yields a CSRF/auth rejection
+    ('incorrect request', re-login redirect, 'not logged in'); a good one is
+    accepted by the CSRF layer (even if the action then errors for an unrelated
+    reason — we validate the TOKEN, not the action). Returns (valid, reason)."""
+    import httpx as _hx
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    hdr = {"Cookie": session_cookie,
+           "Content-Type": "application/x-www-form-urlencoded",
+           "User-Agent": "Mozilla/5.0"}
+    data = (f"action=script.execute&scriptid={scriptid or 1}"
+            f"&hostid={hostid or 0}&sid={sid}&clientip=127.0.0.1")
+    try:
+        with _hx.Client(verify=False, timeout=timeout, follow_redirects=False) as c:
+            r = c.post(base + "/zabbix.php", content=data, headers=hdr)
+            body = (r.text or "").lower()
+            loc = r.headers.get("location", "").lower()
+            csrf_reject = any(m in body for m in (
+                "incorrect request", "csrf", "invalid session", "not logged in",
+                "you are not logged in"))
+            auth_redirect = r.status_code in (301, 302) and (
+                "index.php" in loc or "login" in loc)
+            if csrf_reject or auth_redirect:
+                return False, (f"sid rejected by CSRF layer (status {r.status_code}"
+                               + (f", -> {loc}" if loc else "") + ")")
+            return True, f"sid accepted by CSRF layer (status {r.status_code})"
+    except Exception as e:  # noqa: BLE001
+        return False, f"sid probe error: {e}"
 
 
 def _probe_session_valid(ip, port, cookie, product=None, timeout=8):
