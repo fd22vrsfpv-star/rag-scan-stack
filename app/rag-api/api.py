@@ -19716,17 +19716,22 @@ def _snapshot_exploit_version(cur, row, label, created_by="operator"):
 
 
 def _exploit_store_artifacts(kind, command, name, cve, rationale, assertion):
-    """Generate {python_code, http_request} for a web/curl PoC (best-effort, never raises)."""
+    """Generate {python_code, http_request, sqlmap} for a web/curl PoC. `sqlmap`
+    is a ready-to-run sqlmap command for SQLi PoCs (empty for non-SQLi) so the
+    operator can hand the finding to sqlmap for exploitation. Best-effort; never
+    raises."""
     if not command:
-        return {"python_code": None, "http_request": None}
+        return {"python_code": None, "http_request": None, "sqlmap": ""}
     try:
         from common import exploit_artifacts as _ea
         art = _ea.web_exploit_artifacts(command, name=name or "poc", cve=cve or "",
                                         rationale=rationale or "", assertion=assertion or {})
-        return {"python_code": art.get("python_code"), "http_request": art.get("http_request")}
+        return {"python_code": art.get("python_code"),
+                "http_request": art.get("http_request"),
+                "sqlmap": art.get("sqlmap") or ""}
     except Exception as e:  # noqa: BLE001
         logging.debug("exploit artifact gen failed: %s", e)
-        return {"python_code": None, "http_request": None}
+        return {"python_code": None, "http_request": None, "sqlmap": ""}
 
 
 def _sanitize_poc_auth(text):
@@ -19784,14 +19789,23 @@ def _save_exploit_store(name, cve=None, kind="cve_poc", target_host=None, target
     stored PoC never embeds a live secret or poisons the next build with a stale
     token. Returns the new id (or None)."""
     _ensure_exploit_store()
-    if (python_code is None or http_request is None) and command:
+    _sqlmap = ""
+    if command:
         art = _exploit_store_artifacts(kind, command, name, cve, rationale, assertion)
-        python_code = python_code or art["python_code"]
-        http_request = http_request or art["http_request"]
+        if python_code is None:
+            python_code = art["python_code"]
+        if http_request is None:
+            http_request = art["http_request"]
+        _sqlmap = art.get("sqlmap") or ""
     # Redact auth material from every stored form of the PoC.
     command = _sanitize_poc_auth(command)
     http_request = _sanitize_poc_auth(http_request)
     python_code = _sanitize_poc_auth(python_code)
+    # sqlmap hand-off command (SQLi PoCs) — stored in metadata so the operator can
+    # pivot the finding into sqlmap for data extraction. Redact auth here too.
+    if _sqlmap:
+        metadata = dict(metadata or {})
+        metadata["sqlmap_command"] = _sanitize_poc_auth(_sqlmap)
     try:
         with get_db() as conn, conn.cursor() as cur:
             cur.execute("""INSERT INTO exploit_store
