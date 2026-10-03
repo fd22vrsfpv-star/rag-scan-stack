@@ -19485,7 +19485,8 @@ def mine_refine_patterns(min_hits: int = 3,
 
 @app.get("/confirmed-facts", tags=["Exploit Store"])
 def list_confirmed_facts(target: Optional[str] = None, cve: Optional[str] = None,
-                          product: Optional[str] = None, status: Optional[str] = None,
+                          product: Optional[str] = None, host: Optional[str] = None,
+                          status: Optional[str] = None,
                           fresh_only: bool = False, authorized: bool = Depends(auth)):
     """The confirmed-facts ledger — durable record of what's been verified
     (session validity, endpoint existence, version applicability, resolved
@@ -19498,6 +19499,7 @@ def list_confirmed_facts(target: Optional[str] = None, cve: Optional[str] = None
     if target: where.append("target = %s"); args.append(target)
     if cve: where.append("cve = %s"); args.append(cve)
     if product: where.append("lower(product) = lower(%s)"); args.append(product)
+    if host: where.append("lower(host) = lower(%s)"); args.append(host)
     if status: where.append("status = %s"); args.append(status)
     sql = ("SELECT *, EXTRACT(EPOCH FROM (now()-last_checked_at)) AS age_s "
            "FROM public.confirmed_facts")
@@ -20836,30 +20838,37 @@ def _ensure_confirmed_facts_table():
                     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
                     engagement_id uuid,
                     target        text NOT NULL,     -- ip:port
-                    product       text,
+                    host          text,              -- hostname/vhost (distinct from ip)
+                    product       text,              -- APPLICATION — Zabbix != Apache on same ip:port
                     version       text,
                     cve           text,
-                    claim_type    text NOT NULL,     -- session_valid | endpoint_exists
-                                                     -- | version_applies | object_id
-                                                     -- | precondition | vendor_doc | target_reachable
-                    claim_key     text NOT NULL,     -- e.g. 'auth', '/zabbix.php', 'hostid'
-                    claim_value   text,              -- concrete value when applicable
-                    status        text NOT NULL,     -- confirmed | refuted | unverified
+                    claim_type    text NOT NULL,
+                    claim_key     text NOT NULL,
+                    claim_value   text,
+                    status        text NOT NULL,
                     evidence      text,
-                    method        text,              -- probe | enumeration | vendor_doc | run | advisory
+                    method        text,
                     confidence    real NOT NULL DEFAULT 0.9,
-                    ttl_seconds   int  NOT NULL DEFAULT 0,  -- 0 = durable, >0 = re-verify after
+                    ttl_seconds   int  NOT NULL DEFAULT 0,
                     source_run_id text,
                     confirmed_at  timestamptz NOT NULL DEFAULT now(),
                     last_checked_at timestamptz NOT NULL DEFAULT now()
                 )
             """)
+            # Add columns to pre-existing tables (idempotent).
+            cur.execute("ALTER TABLE public.confirmed_facts "
+                        "ADD COLUMN IF NOT EXISTS host text")
+            # Identity MUST include product: the same ip:port runs multiple
+            # apps (Zabbix the application vs Apache the web server), and a
+            # fact confirmed for one is NOT a fact for the other. Migrate the
+            # old product-less unique index to one scoped by product.
+            cur.execute("DROP INDEX IF EXISTS public.uq_confirmed_fact")
             cur.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_confirmed_fact
                 ON public.confirmed_facts
-                (target, claim_type, claim_key, COALESCE(claim_value,''),
-                 COALESCE(cve,''))""")
+                (target, COALESCE(product,''), claim_type, claim_key,
+                 COALESCE(claim_value,''), COALESCE(cve,''))""")
             cur.execute("""CREATE INDEX IF NOT EXISTS idx_confirmed_target
-                ON public.confirmed_facts (target)""")
+                ON public.confirmed_facts (target, COALESCE(product,''))""")
             c.commit()
     except Exception as e:  # noqa: BLE001
         logging.debug("ensure confirmed_facts failed: %s", e)
@@ -20925,11 +20934,14 @@ def _register_web_session_access(ip, port, username, cookie, product=None,
 def _record_confirmation(target, claim_type, claim_key, status, evidence="",
                           method="probe", claim_value=None, confidence=0.9,
                           product=None, version=None, cve=None,
-                          engagement_id=None, run_id=None, ttl_seconds=None):
-    """Upsert one confirmation into the ledger. status: confirmed|refuted|
-    unverified. A later check UPDATES the same (target, claim, cve) row —
-    so a refutation overwrites a stale confirmation and vice versa, and the
-    timestamps track when we last knew."""
+                          engagement_id=None, run_id=None, ttl_seconds=None,
+                          host=None):
+    """Upsert one confirmation into the ledger. Identity is (target, PRODUCT,
+    claim, claim_value, cve) — product is part of the key because the same
+    ip:port runs multiple apps (Zabbix != Apache) and a fact for one is not a
+    fact for the other. A later check UPDATES the matching row, so a
+    refutation overwrites a stale confirmation and the timestamps track when
+    we last knew."""
     _ensure_confirmed_facts_table()
     if ttl_seconds is None:
         ttl_seconds = _CONFIRM_TTL.get(claim_type, 0)
@@ -20937,14 +20949,15 @@ def _record_confirmation(target, claim_type, claim_key, status, evidence="",
         with get_db() as c, c.cursor() as cur:
             cur.execute("""
                 INSERT INTO public.confirmed_facts
-                    (engagement_id, target, product, version, cve, claim_type,
-                     claim_key, claim_value, status, evidence, method,
-                     confidence, ttl_seconds, source_run_id, confirmed_at,
-                     last_checked_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),now())
-                ON CONFLICT (target, claim_type, claim_key,
+                    (engagement_id, target, host, product, version, cve,
+                     claim_type, claim_key, claim_value, status, evidence,
+                     method, confidence, ttl_seconds, source_run_id,
+                     confirmed_at, last_checked_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),now())
+                ON CONFLICT (target, COALESCE(product,''), claim_type, claim_key,
                              COALESCE(claim_value,''), COALESCE(cve,''))
                 DO UPDATE SET status = EXCLUDED.status,
+                              host = COALESCE(EXCLUDED.host, public.confirmed_facts.host),
                               evidence = EXCLUDED.evidence,
                               method = EXCLUDED.method,
                               confidence = EXCLUDED.confidence,
@@ -20956,7 +20969,7 @@ def _record_confirmation(target, claim_type, claim_key, status, evidence="",
                                   THEN public.confirmed_facts.confirmed_at
                                   ELSE now() END
             """, (_validate_engagement_uuid(engagement_id) if engagement_id else None,
-                  target, product, version, cve, claim_type, claim_key,
+                  target, host, product, version, cve, claim_type, claim_key,
                   claim_value, status, evidence[:2000], method, confidence,
                   ttl_seconds, run_id))
             c.commit()
@@ -20965,9 +20978,10 @@ def _record_confirmation(target, claim_type, claim_key, status, evidence="",
 
 
 def _get_confirmation(target, claim_type, claim_key, cve=None, claim_value=None,
-                       fresh_only=True):
-    """Return the prior confirmation row for this exact claim, or None. When
-    fresh_only, a row whose TTL has elapsed is treated as stale (returns None)
+                       fresh_only=True, product=None):
+    """Return the prior confirmation for this exact claim, or None. Scoped by
+    PRODUCT — a Zabbix fact won't answer for an Apache attack on the same
+    ip:port. When fresh_only, a row past its TTL is treated as stale (None)
     so the caller re-verifies instead of trusting an expired confirmation."""
     _ensure_confirmed_facts_table()
     try:
@@ -20978,8 +20992,9 @@ def _get_confirmation(target, claim_type, claim_key, cve=None, claim_value=None,
                 WHERE target = %s AND claim_type = %s AND claim_key = %s
                   AND COALESCE(cve,'') = COALESCE(%s,'')
                   AND COALESCE(claim_value,'') = COALESCE(%s,'')
+                  AND COALESCE(product,'') = COALESCE(%s,'')
                 ORDER BY last_checked_at DESC LIMIT 1
-            """, (target, claim_type, claim_key, cve, claim_value))
+            """, (target, claim_type, claim_key, cve, claim_value, product))
             row = cur.fetchone()
             if not row:
                 return None
