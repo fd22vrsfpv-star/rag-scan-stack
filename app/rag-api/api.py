@@ -21272,6 +21272,62 @@ def _load_building_blocks():
     return _BUILDING_BLOCKS_CACHE
 
 
+def _rag_recall(query, top_k=3, sources=None):
+    """Internal semantic recall over rag_documents (same path as the
+    /rag/knowledge/search endpoint). Best-effort; returns [{title,text,similarity}]."""
+    try:
+        vec = _embed_text(query)
+    except Exception:  # noqa: BLE001
+        return []
+    vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+    where = "embedding IS NOT NULL"
+    params = [vec_str]
+    if sources:
+        where += " AND metadata->>'source' = ANY(%s)"
+        params.append(list(sources))
+    params += [vec_str, max(1, min(int(top_k), 10))]
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SET LOCAL ivfflat.probes = 100")
+            cur.execute(f"SELECT title, text_chunk, 1-(embedding<=>%s::vector) AS sim "
+                        f"FROM rag_documents WHERE {where} "
+                        f"ORDER BY embedding<=>%s::vector LIMIT %s", params)
+            return [{"title": r["title"], "text": r["text_chunk"],
+                     "similarity": round(float(r["sim"]), 3)} for r in cur.fetchall()]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _research_building_block(block_id, product, cve, advisory_text="", analysis=None):
+    """Before ASSUMING an unconfirmed building block, DO RESEARCH to resolve it:
+    recall the RAG knowledge corpus AND scan the already-gathered advisory/ticket
+    text for the specific answer. Operator: "when making an assumption, shouldn't
+    it do some research." Returns a short "RESEARCH: ..." hint (or '')."""
+    q_map = {
+        "injection_vector": f"{cve} {product} SQL injection which parameter or "
+                            "header carries the payload X-Forwarded-For clientip audit log",
+        "csrf_token": f"{product} anti-CSRF token parameter name sid",
+        "action_permitted": f"{product} {cve} privilege required to run the vulnerable action",
+        "endpoint_exists": f"{cve} {product} vulnerable endpoint path",
+        "version_in_range": f"{cve} {product} affected version range",
+        "object_ids": f"{product} {cve} object ids required (host script user)",
+    }
+    q = q_map.get(block_id, f"{cve or ''} {product or ''} {block_id}".strip())
+    hints = []
+    adv = advisory_text or ""
+    # Concrete extraction from the advisory/ticket for the highest-value block.
+    if block_id == "injection_vector" and adv:
+        found = [h for h in _IP_INJECTION_HEADERS if h.lower() in adv.lower()]
+        if found or "x-forwarded-for" in adv.lower():
+            hints.append(f"advisory/ticket names header(s) {', '.join(found) or 'X-Forwarded-For'} "
+                         "as the injection carrier — probe/use THAT, not a body param")
+    # RAG recall for the block topic.
+    for r in _rag_recall(q, top_k=3):
+        if r.get("similarity", 0) >= 0.3:
+            hints.append(f"{r['title']}: {r['text'][:140]}")
+    return ("RESEARCH: " + " | ".join(hints[:3])) if hints else ""
+
+
 # block id → confirmed_facts claim_type(s) that satisfy it (filled by existing probes)
 _BLOCK_FACT_TYPES = {
     "target_reachable": ["target_reachable"],
@@ -21286,7 +21342,8 @@ _BLOCK_FACT_TYPES = {
 
 
 def _run_challenge_checks(ip, port, product, analysis, auth=None,
-                          session_cookie=None, run_lightweight=True, timeout=12):
+                          session_cookie=None, run_lightweight=True, timeout=12,
+                          advisory_text=""):
     """Walk the building-block catalog: for each piece the exploit needs, report
     whether it's already CONFIRMED (from the confirmed_facts ledger), run the
     LIGHTWEIGHT check if it's cheap + missing, and SUGGEST the heavier ones.
@@ -21348,10 +21405,16 @@ def _run_challenge_checks(ip, port, product, analysis, auth=None,
             confirmed.append({"id": bid, "validates": b.get("validates"),
                               "confirms": b.get("confirms")})
         else:
+            # Don't just assume it's missing — RESEARCH the specific item first.
+            research = ""
+            try:
+                research = _research_building_block(bid, product, cve, advisory_text, analysis)
+            except Exception:  # noqa: BLE001
+                research = ""
             missing.append({"id": bid, "validates": b.get("validates"),
                             "cost": b.get("cost")})
             suggestions.append({"id": bid, "cost": b.get("cost"),
-                                "suggest": b.get("suggest")})
+                                "suggest": b.get("suggest"), "research": research})
     bits = []
     if confirmed:
         bits.append("CONFIRMED BUILDING BLOCKS (assemble the exploit from these "
@@ -21359,9 +21422,12 @@ def _run_challenge_checks(ip, port, product, analysis, auth=None,
         for c in confirmed:
             bits.append(f"  ✓ {c['id']}: {c['validates']}")
     if suggestions:
-        bits.append("QUICK CHECKS TO VALIDATE NEXT (build the rest in pieces):")
+        bits.append("QUICK CHECKS TO VALIDATE NEXT (build the rest in pieces — "
+                    "research first, then probe, don't assume):")
         for sgst in suggestions:
             bits.append(f"  • [{sgst['cost']}] {sgst['id']}: {sgst['suggest']}")
+            if sgst.get("research"):
+                bits.append(f"      {sgst['research']}")
     return {"confirmed": confirmed, "missing": missing,
             "suggestions": suggestions, "guidance": "\n".join(bits)}
 

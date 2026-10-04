@@ -329,3 +329,24 @@ print('OK')
 """
     out, err, rc = _in_container(py)
     assert rc == 0 and 'OK' in out, f"out={out} err={err}"
+
+
+def test_research_building_block_resolves_assumption_from_advisory():
+    # "When making an assumption, do some research": an unconfirmed block pulls
+    # the concrete answer from the advisory/ticket text (and RAG) before guessing.
+    py = r"""
+import sys; sys.path.insert(0,'/app')
+from api import _research_building_block
+adv = ("CVE-2024-22120 Zabbix time-based blind SQLi: the clientip is taken from "
+       "the X-Forwarded-For header and logged to auditlog (ZBX-24505).")
+r = _research_building_block("injection_vector", "Zabbix", "CVE-2024-22120", adv)
+assert r.startswith("RESEARCH:"), r
+assert "X-Forwarded-For" in r, r
+assert "not a body param" in r.lower(), r
+# no advisory + no RAG hit -> empty (no fabricated assumption)
+r2 = _research_building_block("injection_vector", "Zabbix", "CVE-9999-0000", "")
+assert isinstance(r2, str), r2
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and 'OK' in out, f"out={out} err={err}"
