@@ -374,3 +374,28 @@ print('OK')
 """
     out, err, rc = _in_container(py)
     assert rc == 0 and 'OK' in out, f"out={out} err={err}"
+
+
+def test_http_transport_ctx_sub_and_extract():
+    # Generic HTTP transport primitives (REST/JSON/XML/all-methods backbone):
+    # placeholder substitution + response extraction (header/json/regex/status).
+    py = r"""
+import sys; sys.path.insert(0,'/app')
+from api import _ctx_sub, _http_extract
+# recursive placeholder fill in str/dict/list
+assert _ctx_sub({"log":"{user}","pwd":"{pass}","x":["{user}"]}, {"user":"a","pass":"b"}) \
+       == {"log":"a","pwd":"b","x":["a"]}
+assert _ctx_sub("id={INJ}", {"INJ":"1' AND SLEEP(5)"}) == "id=1' AND SLEEP(5)"
+# unknown placeholder left intact
+assert _ctx_sub("{missing}", {}) == "{missing}"
+# extraction
+resp = {"status":200, "headers":{"Server":"Apache/2.4"}, "text":'name="_wpnonce" value="abc123"',
+        "json":{"data":{"id":"10084"}}}
+assert _http_extract(resp, {"source":"header","name":"server"}) == "Apache/2.4"
+assert _http_extract(resp, {"source":"body_regex","regex":'value="([^"]+)"'}) == "abc123"
+assert _http_extract(resp, {"source":"json_pointer","pointer":"/data/id"}) == "10084"
+assert _http_extract(resp, {"source":"status"}) == 200
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and 'OK' in out, f"out={out} err={err}"
