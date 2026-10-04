@@ -963,7 +963,14 @@ def node_assemble_guidance(state: BuildPocState) -> Dict[str, Any]:
         if ref:
             parts.append("Public ExploitDB PoC (adapt the request/payload to the target):\n"
                          + str(ref)[:3500])
-        guidance = (auth_guidance + " " + " ".join(parts)).strip()
+        # CRITICAL: keep the challenge/recon segments. recon_guidance carries the
+        # challenge output — resolved preconditions, confirmed building blocks,
+        # the probed injection vector, the known request contract, research-on-
+        # assumption — which are VERIFIED facts for THIS target. The research
+        # override used to drop them (it predates the challenge nodes), so none of
+        # that reached synth on a research run. Lead with the verified facts, then
+        # the generic reference material.
+        guidance = (auth_guidance + " " + recon_guidance + " " + " ".join(parts)).strip()
     return {"recon_guidance": recon_guidance, "guidance": guidance}
 
 
