@@ -877,7 +877,7 @@ def node_readiness_gate(state: BuildPocState) -> Dict[str, Any]:
             state["ip"], state["port"], state.get("product"), analysis or {},
             auth=state.get("auth"),
             session_cookie=(_si.get("cookie_header") if isinstance(_si, dict) else None),
-            run_lightweight=True)
+            run_lightweight=True, advisory_text=_adv)
         if _blocks.get("guidance"):
             seg.append(_blocks["guidance"])
             _poc_trace(state["run_id"], "challenge_building_blocks",
