@@ -906,23 +906,52 @@ def node_readiness_gate(state: BuildPocState) -> Dict[str, Any]:
 
 def node_research(state: BuildPocState) -> Dict[str, Any]:
     """Fetch reference-PoC material from MSF/ExploitDB/NVD. Returns the analysis
-    dict but does NOT compose the guidance string — that's assemble_guidance's job."""
+    dict but does NOT compose the guidance string — that's assemble_guidance's job.
+
+    After the research is in hand, run the AGENT-DRIVEN SPEC DERIVATION pipeline
+    (operator ask: "the agent should do the work, not have you create hints"):
+    fetch patch commit diffs → LLM extracts a structured recipe → LIVE-VERIFY on
+    the target → fuzz-fallback → persist the VERIFIED spec in derived_cve_specs.
+    The spec then flows into node_synth via _cve_exploit_spec() so the loop
+    STARTS from an assembled, confirmed exploit."""
     if not state.get("research"):
         return {"research_out": None}
     # If the early product-identification node already ran the deep-dive
     # research (research_out populated), reuse it — don't pay for a second
     # identical _research_exploit call.
-    if state.get("research_out"):
-        return {}
-    from api import _research_exploit
-    try:
-        research_out = _research_exploit(
-            state["cve"], state["ip"], state["port"],
-            state.get("product"), state.get("version"), state.get("eid"),
-            model=state.get("model"))
-    except Exception as e:  # noqa: BLE001
-        logging.debug("build research step failed: %s", e)
-        research_out = None
+    research_out = state.get("research_out")
+    if not research_out:
+        from api import _research_exploit
+        try:
+            research_out = _research_exploit(
+                state["cve"], state["ip"], state["port"],
+                state.get("product"), state.get("version"), state.get("eid"),
+                model=state.get("model"))
+        except Exception as e:  # noqa: BLE001
+            logging.debug("build research step failed: %s", e)
+            research_out = None
+    # Agent-driven spec derivation. Skip if a hand-curated YAML spec already exists
+    # or env BUILD_POC_AUTO_DERIVE=off.
+    if (os.environ.get("BUILD_POC_AUTO_DERIVE", "on") or "on").lower() != "off":
+        try:
+            from api import _cve_exploit_spec, _derive_cve_spec, _poc_trace, _load_cve_exploit_specs
+            # Only auto-derive when the YAML has NO entry for this CVE.
+            cu = str(state["cve"]).upper()
+            yaml_hit = any(str(s.get("cve", "")).upper() == cu
+                           for s in _load_cve_exploit_specs())
+            if not yaml_hit:
+                derived = _derive_cve_spec(
+                    state["cve"], state.get("product"), state.get("version"),
+                    state["ip"], state["port"], model=state.get("model"),
+                    auth=state.get("auth"))
+                _poc_trace(state["run_id"], "cve_spec_derivation",
+                           response=f"verified={derived.get('verified')} "
+                                    f"source={derived.get('source')} "
+                                    f"evidence={(derived.get('evidence') or '')[:200]}",
+                           extra={"verified": derived.get("verified"),
+                                  "source": derived.get("source")})
+        except Exception as e:  # noqa: BLE001
+            logging.debug("spec derivation failed: %s", e)
     return {"research_out": research_out}
 
 

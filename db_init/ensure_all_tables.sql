@@ -6692,6 +6692,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_confirmed_fact ON public.confirmed_facts
 CREATE INDEX IF NOT EXISTS idx_confirmed_target
     ON public.confirmed_facts (target, COALESCE(product,''));
 
+-- AGENT-DERIVED CVE EXPLOIT SPECS (auto-derivation pipeline persists verified recipes here)
+CREATE TABLE IF NOT EXISTS public.derived_cve_specs (
+    cve           text PRIMARY KEY,
+    product       text,
+    version       text,
+    vuln_class    text,
+    spec          jsonb NOT NULL,
+    verified      boolean NOT NULL DEFAULT false,
+    verify_method text,
+    verify_evidence text,
+    source        text,
+    derived_at    timestamptz NOT NULL DEFAULT now(),
+    last_verified timestamptz
+);
+
 -- Discovered app knowledge: per-product/version facts the build loop learns
 -- (endpoints, params, csrf source, cookie shape, secondary products).
 CREATE TABLE IF NOT EXISTS public.discovered_app_knowledge (
