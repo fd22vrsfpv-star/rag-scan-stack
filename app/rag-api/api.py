@@ -16371,6 +16371,46 @@ def _http_login(base, auth_spec, creds, timeout=15):
     return {"cookie_header": cookie_header if ok else "", "headers": {}}
 
 
+def _ws_request(url, message, timeout=15, subprotocols=None, headers=None):
+    """Generic WebSocket probe (the 'potentially websockets' transport): connect,
+    send one text frame, return the first reply + round-trip time. Enough to drive
+    timing-based and echo/parse checks over ws:// or wss:// endpoints. Returns
+    {ok, recv, elapsed, error}. Uses the async `websockets` lib via asyncio.run."""
+    import asyncio, time as _t
+    try:
+        import websockets  # available in the image
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "recv": None, "elapsed": 0.0, "error": f"websockets lib missing: {e}"}
+
+    async def _go():
+        import ssl as _ssl
+        kw = {}
+        if url.startswith("wss://"):
+            ctx = _ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
+            kw["ssl"] = ctx
+        if subprotocols:
+            kw["subprotocols"] = subprotocols
+        if headers:
+            kw["additional_headers"] = headers
+        t0 = _t.time()
+        async with websockets.connect(url, open_timeout=timeout, close_timeout=5, **kw) as ws:
+            if message is not None:
+                await ws.send(message)
+            try:
+                recv = await asyncio.wait_for(ws.recv(), timeout=timeout)
+            except asyncio.TimeoutError:
+                recv = None
+            return {"ok": True, "recv": (recv if isinstance(recv, str) else "[binary]"),
+                    "elapsed": round(_t.time() - t0, 3), "error": None}
+
+    try:
+        return asyncio.run(asyncio.wait_for(_go(), timeout=timeout + 5))
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "recv": None, "elapsed": 0.0, "error": str(e)}
+
+
 def _http_extract(resp, spec):
     """Extract a value from an _http_do response per spec:
       {source: header, name: Server} | {source: body_regex, regex: '...'}
@@ -21832,19 +21872,46 @@ def _run_one_building_block(probe, ip, port, product, analysis, auth,
         except Exception:  # noqa: BLE001
             return False
     if probe == "endpoint":
+        # ENHANCEMENT 4: endpoint existence + DISCOVERY. Try the advisory endpoint;
+        # if it's missing/404, probe a bounded candidate set (the product's probe/
+        # action endpoints from the contract + a few common app paths) and record
+        # the first that responds — so an all_404 target gets a real endpoint to
+        # aim at instead of looping on a guessed path.
+        cands = []
         tep = ((analysis or {}).get("target_endpoint") or "").strip()
         if tep.startswith("/"):
-            try:
-                with _hx.Client(verify=False, timeout=timeout, follow_redirects=True,
-                                 headers={"Cookie": session_cookie} if session_cookie else {}) as c:
-                    er = c.get(base + tep)
-                if er.status_code != 404:
-                    _record_confirmation(tgt, "endpoint_exists", tep, "confirmed",
-                                         evidence=f"HTTP {er.status_code}", method="probe",
-                                         product=product)
-                    return True
-            except Exception:  # noqa: BLE001
-                return False
+            cands.append(tep)
+        _spec = _probe_spec(product)
+        if _spec and _spec.get("endpoint"):
+            cands.append(_spec["endpoint"])
+        _contract = _app_request_contract(product)
+        if _contract and _contract.get("action_endpoint"):
+            cands.append(_contract["action_endpoint"])
+        try:
+            cands += [p for p in (load_common_web_paths() or [])][:15]
+        except Exception:  # noqa: BLE001
+            pass
+        seen = set()
+        hdrs = {"Cookie": session_cookie} if session_cookie else {}
+        try:
+            with _hx.Client(verify=False, timeout=timeout, follow_redirects=True,
+                            headers=hdrs) as c:
+                for path in cands:
+                    if not path or path in seen:
+                        continue
+                    seen.add(path)
+                    try:
+                        er = c.get(base + ("/" + path.lstrip("/")))
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if er.status_code != 404:
+                        _record_confirmation(tgt, "endpoint_exists", path, "confirmed",
+                                             evidence=f"HTTP {er.status_code} (discovered)"
+                                             if path != tep else f"HTTP {er.status_code}",
+                                             method="probe", claim_value=path, product=product)
+                        return True
+        except Exception:  # noqa: BLE001
+            return False
         return False
     if probe == "action_permitted" and auth and auth.get("username"):
         # DATA-DRIVEN: spec.action_probe (login + benign action + success check).

@@ -426,3 +426,18 @@ print('OK')
 """
     out, err, rc = _in_container(py)
     assert rc == 0 and 'OK' in out, f"out={out} err={err}"
+
+
+def test_ws_request_graceful_and_endpoint_discovery_shape():
+    # WebSocket primitive returns a well-formed result even against a non-ws port
+    # (graceful, never raises). Endpoint-discovery probe returns a bool.
+    py = r"""
+import sys; sys.path.insert(0,'/app')
+from api import _ws_request
+r = _ws_request("ws://127.0.0.1:1/nope", "{}", timeout=3)
+assert isinstance(r, dict) and r.get("ok") is False and "error" in r, r
+assert set(["ok","recv","elapsed","error"]).issubset(r.keys()), r
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and 'OK' in out, f"out={out} err={err}"
