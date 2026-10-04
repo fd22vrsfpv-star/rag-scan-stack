@@ -742,10 +742,30 @@ def _render_exploit_building_blocks(data: Dict[str, Any]) -> List[Doc]:
     return docs
 
 
+def _render_cve_exploit_specs(data: Dict[str, Any]) -> List[Doc]:
+    """Embed each per-CVE exploit recipe so the planner/build can recall the
+    concrete endpoint + vector + payload for a known CVE."""
+    docs: List[Doc] = []
+    for s in (data.get("specs") or []):
+        cve = _s(s.get("cve"))
+        if not cve:
+            continue
+        req = s.get("request") or {}
+        inj = s.get("injection") or {}
+        body = (f"CVE: {cve}  product: {_s(s.get('product'))}  class: {_s(s.get('vuln_class'))}\n"
+                f"Request: {_s(req.get('method'))} {_s(req.get('path'))} "
+                f"({_s(req.get('content_type')) or 'n/a'})\n"
+                f"Injection payload: {_s(inj.get('payload_template'))}\n\n"
+                f"{_s(s.get('notes'))}")
+        docs.append((f"CVE exploit spec — {cve}", body))
+    return docs
+
+
 RENDERERS = {
     "app_request_contracts": _render_app_request_contracts,
     "exploitation_tools": _render_exploitation_tools,
     "exploit_building_blocks": _render_exploit_building_blocks,
+    "cve_exploit_specs": _render_cve_exploit_specs,
     "common_web_paths": _render_common_web_paths,
     "http_status_fingerprints": _render_http_status_fingerprints,
     "vuln_class_methodology": _render_vuln_class_methodology,
