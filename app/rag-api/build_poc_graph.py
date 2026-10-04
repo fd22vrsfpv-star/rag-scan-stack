@@ -866,6 +866,26 @@ def node_readiness_gate(state: BuildPocState) -> Dict[str, Any]:
         if rd.get("satisfied"):
             guidance += ("\nAlready satisfied:\n  - " + "\n  - ".join(rd["satisfied"]))
         seg.append(guidance)
+    # BUILD-IN-PIECES: walk the lightweight building-block checklist — run the
+    # cheap checks that aren't confirmed yet, and SUGGEST the heavier ones — so
+    # synth assembles the exploit from verified parts. Operator: "suggest quick
+    # and easy checks to validate specific items ... if they are lightweight."
+    try:
+        from api import _run_challenge_checks
+        _si = state.get("session_info") or {}
+        _blocks = _run_challenge_checks(
+            state["ip"], state["port"], state.get("product"), analysis or {},
+            auth=state.get("auth"),
+            session_cookie=(_si.get("cookie_header") if isinstance(_si, dict) else None),
+            run_lightweight=True)
+        if _blocks.get("guidance"):
+            seg.append(_blocks["guidance"])
+            _poc_trace(state["run_id"], "challenge_building_blocks",
+                       response=_blocks["guidance"][:1200],
+                       extra={"confirmed": [b["id"] for b in _blocks.get("confirmed", [])],
+                              "missing": [b["id"] for b in _blocks.get("missing", [])]})
+    except Exception as e:  # noqa: BLE001
+        logging.debug("building-block checks failed: %s", e)
     _poc_trace(state["run_id"], "readiness_gate",
                response=(guidance or "all preconditions satisfied")[:1200],
                extra={"ready": rd.get("ready"), "hard_blocked": rd.get("hard_blocked"),
