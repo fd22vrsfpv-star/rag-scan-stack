@@ -17125,20 +17125,40 @@ def _curl_run(ip, port, cmd, timeout=30):
 
 
 def _derive_cve_spec(cve, product, version, ip, port, model=None, auth=None,
-                     allow_fuzz=True):
-    """AUTO-DERIVATION PIPELINE — operator ask: have the AGENT do the work, not
-    have Claude pre-encode specs. Flow:
-      1) Gather CVE intel (advisory + GHSA + Jira + ExploitDB) — already a shared
-         helper (_gather_cve_intel) used by research + deep-dive.
-      2) For each fix-commit URL in the intel, fetch the raw diff — the removed
-         lines are the vulnerable code.
-      3) LLM extracts a structured recipe from intel + patch diffs.
-      4) LIVE-VERIFY the recipe against the target (timing / canary scaling).
-      5) FALLBACK: if the recipe fails verification but named concrete params,
-         selectively fuzz those params with a timing payload.
-      6) Store the VERIFIED spec in derived_cve_specs so future builds (and other
-         targets of the same CVE) consume it immediately.
-    Returns {verified, source, spec, evidence}."""
+                     allow_fuzz=True, max_passes=None):
+    """AUTO-DERIVATION PIPELINE with built-in MULTI-PASS CONVERGENCE. Operator ask:
+    "kick more passes to converge the tentatives — increase the defaults." Each
+    pass extracts a recipe (informed by the hints of what already failed),
+    verifies it live, and either stores verified (short-circuits) or stores
+    tentative + loops. Default max_passes = env BUILD_POC_DERIVE_PASSES=5.
+    Returns the LAST pass's result (verified=True on any pass short-circuits)."""
+    if max_passes is None:
+        try:
+            max_passes = int(os.environ.get("BUILD_POC_DERIVE_PASSES", "5") or "5")
+        except ValueError:
+            max_passes = 5
+    max_passes = max(1, int(max_passes))
+    last_result = None
+    for pass_n in range(1, max_passes + 1):
+        res = _derive_cve_spec_single_pass(cve, product, version, ip, port,
+                                           model=model, auth=auth, allow_fuzz=allow_fuzz)
+        res["pass"] = pass_n
+        res["max_passes"] = max_passes
+        last_result = res
+        if res.get("verified"):
+            return res
+        # Only loop if the pipeline actually stored a tentative (i.e. it had a
+        # plausible recipe to improve). If extraction returned no recipe at all,
+        # another pass with the same intel will yield the same result; stop.
+        if not res.get("stored_tentative"):
+            return res
+    return last_result or {"verified": False, "source": "exhausted",
+                           "spec": None, "evidence": "all derivation passes failed"}
+
+
+def _derive_cve_spec_single_pass(cve, product, version, ip, port, model=None,
+                                 auth=None, allow_fuzz=True):
+    """One pass of the derivation pipeline. See _derive_cve_spec for the loop."""
     _ensure_derived_cve_specs_table()
     # Short-circuit: already derived AND verified
     try:
