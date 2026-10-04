@@ -1019,12 +1019,29 @@ def node_plan_verify(state: BuildPocState) -> Dict[str, Any]:
 
 # ── synth + run-refine loop ────────────────────────────────────────────────────
 def node_synth(state: BuildPocState) -> Dict[str, Any]:
-    from api import _synthesize_cve_poc
+    from api import _synthesize_cve_poc, _assemble_confirmed_poc_command, _poc_trace
     built = _synthesize_cve_poc(
         state["cve"], state["ip"], state["port"],
         state.get("product"), state.get("version"), state.get("eid"),
         run_id=state["run_id"], guidance_extra=state.get("guidance") or "",
         model=state.get("model"))
+    # ENHANCEMENT 1: if the challenge CONFIRMED an injection vector, seed the loop
+    # with a command auto-assembled from those verified pieces (endpoint + carrier
+    # + resolved ids + inline login) instead of the model's first guess — the loop
+    # then refines from a request that is known to fire, and the drift-block keeps
+    # it there.
+    try:
+        asm = _assemble_confirmed_poc_command(
+            state["ip"], state["port"], state.get("product"),
+            built.get("canary"), auth=state.get("auth"))
+        if asm and asm.get("command"):
+            _poc_trace(state["run_id"], "synth_seeded_from_confirmed",
+                       response=asm["command"][:600],
+                       extra={"origin": asm.get("origin"), "assertion": asm.get("assertion")})
+            built = {**built, "command": asm["command"], "assertion": asm["assertion"],
+                     "origin_family": None}
+    except Exception as e:  # noqa: BLE001
+        logging.debug("confirmed-command assembly failed: %s", e)
     return {"built": built,
             "command": built["command"], "assertion": built["assertion"],
             "canary": built.get("canary"), "origin_family": built.get("origin_family"),
