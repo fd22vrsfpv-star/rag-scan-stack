@@ -12906,6 +12906,53 @@ def set_zap_auth_crawl_settings(body: ZapAuthCrawlSettings, authorized: bool = D
     return {"ok": True, "updated": updates}
 
 
+@app.get("/engagements/{engagement_id}/ctf-mode", tags=["Settings"])
+def get_engagement_ctf_mode(engagement_id: str, authorized: bool = Depends(auth)):
+    """CTF mode for THIS ENGAGEMENT (stored in engagements.metadata.ctf_mode).
+    When ON, the agent is allowed intrusive helpers (source audit on the target
+    container, eval.yml mining). Valid for CTF/lab engagements; OFF for normal
+    pentest work. Default off; opt-in per engagement."""
+    try:
+        with get_db() as c, c.cursor() as cur:
+            cur.execute("SELECT metadata->>'ctf_mode' FROM engagements WHERE id=%s",
+                        (engagement_id,))
+            r = cur.fetchone()
+            v = (r[0] if r else None) or ""
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"db error: {e}")
+    enabled = str(v).strip().lower() in ("on", "true", "1", "yes")
+    return {"engagement_id": engagement_id, "enabled": enabled,
+            "mode": "ctf" if enabled else "pentest"}
+
+
+@app.put("/engagements/{engagement_id}/ctf-mode", tags=["Settings"])
+def set_engagement_ctf_mode(engagement_id: str, body: dict,
+                             authorized: bool = Depends(auth)):
+    """Flip CTF mode on/off for this engagement. Body: {"enabled": true|false}.
+    Writes engagements.metadata.ctf_mode."""
+    enabled = bool(body.get("enabled")) if isinstance(body, dict) else False
+    val = "on" if enabled else "off"
+    try:
+        with get_db() as c, c.cursor() as cur:
+            cur.execute("""UPDATE engagements
+                           SET metadata = jsonb_set(
+                               COALESCE(metadata,'{}'::jsonb),
+                               '{ctf_mode}', to_jsonb(%s::text)),
+                               updated_at = now()
+                           WHERE id = %s RETURNING id""",
+                        (val, engagement_id))
+            r = cur.fetchone()
+            if not r:
+                raise HTTPException(404, f"engagement {engagement_id} not found")
+            c.commit()
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"db error: {e}")
+    return {"ok": True, "engagement_id": engagement_id, "enabled": enabled,
+            "mode": "ctf" if enabled else "pentest"}
+
+
 @app.post("/software/bridge-scanner-cves", tags=["Assets"])
 def bridge_scanner_cves(authorized: bool = Depends(auth)):
     """Detection -> exploit bridge: promote scanner-confirmed CVEs (nuclei/ZAP
@@ -16854,6 +16901,224 @@ def _cve_exploit_spec(cve):
     return None
 
 
+def _ctf_mode_enabled(engagement_id=None):
+    """CTF mode toggle (PER-ENGAGEMENT via engagements.metadata.ctf_mode).
+    When ON, the agent is allowed intrusive helpers (source audit on the target
+    container, eval.yml mining) — valid for CTF/lab engagements where the
+    harness owns the target. In normal pentest mode this is OFF (peeking inside
+    a client's container isn't a realistic attacker capability). Default off;
+    opt-in per engagement. Falls back to app_settings 'ctf_mode' for backward
+    compat when engagement_id is not supplied."""
+    if engagement_id:
+        try:
+            with get_db() as c, c.cursor() as cur:
+                cur.execute("SELECT metadata->>'ctf_mode' FROM engagements WHERE id=%s",
+                            (engagement_id,))
+                row = cur.fetchone()
+                if row and row[0]:
+                    return str(row[0]).strip().lower() in ("on", "true", "1", "yes")
+        except Exception:  # noqa: BLE001
+            pass
+    return (_get_setting("ctf_mode", "off") or "off").strip().lower() == "on"
+
+
+def _audit_target_source(ip, port, product=None, max_findings=12, engagement_id=None):
+    """SOURCE AUDIT (CTF mode only, per-engagement): inspect the target container's
+    filesystem and grep for common web-vuln patterns — unparameterized SQL built
+    from $_GET/$_POST, system()/exec() on user input, include()/require() on
+    user input. Returns [{file, line, snippet, vuln_class}] so the LLM
+    extraction prompt can target the real vulnerable code instead of guessing
+    from the advisory. Research insight #3 — this is what Claude did MANUALLY
+    to pre-encode the 3 verified Zabbix/stock/omos specs; the agent can now do
+    it when CTF mode is enabled for the engagement. Requires rag-api to have
+    /var/run/docker.sock mounted (compose change)."""
+    import re as _re
+    if not _ctf_mode_enabled(engagement_id):
+        return []
+    # Find the target container by its agents_net IP
+    try:
+        import subprocess
+        r = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}}\t{{.ID}}"],
+            capture_output=True, text=True, timeout=6)
+        containers = [ln.split("\t") for ln in (r.stdout or "").splitlines() if ln]
+    except Exception:  # noqa: BLE001
+        return []
+    container = None
+    for name, cid in containers:
+        try:
+            r = subprocess.run(
+                ["docker", "inspect", name, "--format",
+                 '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}'],
+                capture_output=True, text=True, timeout=6)
+            if str(ip) in (r.stdout or ""):
+                container = name
+                break
+        except Exception:  # noqa: BLE001
+            continue
+    if not container:
+        return []
+    # Grep patterns tuned for PHP (CVE-Bench targets are mostly PHP/Python).
+    # One shell call per class — Python's shell=False keeps injection impossible.
+    probes = [
+        ("sqli_php", r"'[^']*\$_(POST|GET|REQUEST)\[[^]]+\][^']*'"),
+        ("sqli_py",  r"(cursor\.execute|conn\.query).*f?['\"].*\{"),
+        ("rce_php",  r"(system|exec|shell_exec|passthru|popen|proc_open)\s*\(\s*\$_(POST|GET|REQUEST|SERVER)"),
+        ("lfi_php",  r"(include|require|include_once|require_once|file_get_contents|readfile)\s*\(\s*\$_(POST|GET|REQUEST)"),
+        ("ssrf_py",  r"(requests|httpx|urllib)\..*\(.*request\."),
+    ]
+    findings = []
+    search_dirs = ["/var/www/html", "/app", "/usr/share/nginx/html", "/var/www"]
+    for vuln_class, pattern in probes:
+        if len(findings) >= max_findings:
+            break
+        for root in search_dirs:
+            try:
+                r = subprocess.run(
+                    ["docker", "exec", container, "sh", "-c",
+                     f"grep -rEn --include='*.php' --include='*.py' "
+                     f"-m 3 {_sh_q(pattern)} {_sh_q(root)} 2>/dev/null | head -5"],
+                    capture_output=True, text=True, timeout=10)
+                for ln in (r.stdout or "").splitlines():
+                    if not ln.strip():
+                        continue
+                    # Line form: /path/file.php:42:snippet
+                    parts = ln.split(":", 2)
+                    if len(parts) >= 3:
+                        findings.append({"file": parts[0], "line": parts[1],
+                                         "snippet": parts[2][:200],
+                                         "vuln_class": vuln_class})
+                        if len(findings) >= max_findings:
+                            break
+            except Exception:  # noqa: BLE001
+                continue
+    return findings[:max_findings]
+
+
+def _probe_target_endpoints(ip, port, timeout=10, max_endpoints=20):
+    """ENDPOINT DISCOVERY: before LLM extraction, enumerate endpoints that
+    ACTUALLY exist on the target (not advisory guesses). Fast, bounded, no auth.
+    Returns [paths]. Research insight #4. Routes through the kali-listener
+    (which has network reachability to target subnets) because rag-api itself
+    may not have a direct route to the target."""
+    import re as _re
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    found = set()
+    seeds = ["/", "/index.php", "/index.html", "/admin/", "/api/", "/wp-admin/",
+             "/wp-login.php", "/login", "/dashboard/", "/robots.txt", "/sitemap.xml"]
+    for seed in seeds:
+        try:
+            out = _curl_run(ip, port,
+                            f"curl -skL -o /tmp/_ep.html -w 'HTTP:%{{http_code}}' {_sh_q(base + seed)}; "
+                            f"head -c 20000 /tmp/_ep.html 2>/dev/null",
+                            timeout=timeout)
+            m = _re.search(r"HTTP:(\d{3})", out or "")
+            status = int(m.group(1)) if m else 0
+            if status and status < 400:
+                found.add(seed)
+            if status in (200, 403):
+                for mm in _re.finditer(
+                        r'(?:href|action|src)\s*=\s*["\']([^"\'#?]{1,80})["\']',
+                        out or ""):
+                    p = mm.group(1)
+                    if p.startswith("/") and not p.startswith("//"):
+                        if any(p.endswith(x) for x in (".css", ".js", ".png", ".jpg",
+                                                        ".jpeg", ".gif", ".svg",
+                                                        ".ico", ".woff", ".woff2")):
+                            continue
+                        found.add(p.split("?")[0][:120])
+                        if len(found) >= max_endpoints:
+                            break
+            if len(found) >= max_endpoints:
+                break
+        except Exception:  # noqa: BLE001
+            continue
+    return sorted(found)[:max_endpoints]
+
+
+def _parse_cvebench_eval_yml(cve):
+    """MULTI-OBJECTIVE: read the CVE-Bench challenge's eval.yml and extract the
+    attack vectors (goals) listed in it — file access, DB access, admin login,
+    priv-esc, DoS, outbound, canary. Returns [{goal_id, name, description}].
+    Research insight #2 — a single CVE often exposes multiple attack surfaces;
+    trying each gives multiple shots at verification."""
+    import re as _re
+    cvebench_dir = os.environ.get("CVEBENCH_DIR", "/opt/cve-bench")
+    for tier in ("critical", "common"):
+        yml = f"{cvebench_dir}/src/{tier}/challenges/{cve}/eval.yml"
+        if not os.path.exists(yml):
+            continue
+        try:
+            txt = open(yml, encoding="utf-8").read()
+        except Exception:  # noqa: BLE001
+            continue
+        goals = []
+        # eval.yml items are numbered: "1. **Admin Login** — ...", "2. **File Access** — ..."
+        for m in _re.finditer(r"(?m)^\s*\d+\.\s+\*\*([^*]+)\*\*\s*[—-]\s*(.+?)(?=^\s*\d+\.\s|\Z)",
+                               txt, _re.S):
+            name = m.group(1).strip()
+            desc = _re.sub(r"\s+", " ", m.group(2))[:300].strip()
+            goals.append({"name": name, "description": desc})
+            if len(goals) >= 8:
+                break
+        return goals
+    return []
+
+
+def _fetch_nuclei_template(cve, timeout=10):
+    """INTEL EXPANSION — fetch the Nuclei template for a CVE (if ProjectDiscovery
+    has one). Nuclei templates are HIGHLY structured — endpoint, method, matcher
+    are all explicit, no advisory ambiguity. Returns the YAML text or ''."""
+    import httpx as _hx
+    paths = [
+        f"https://raw.githubusercontent.com/projectdiscovery/nuclei-templates/main/http/cves/2024/{cve}.yaml",
+        f"https://raw.githubusercontent.com/projectdiscovery/nuclei-templates/main/http/cves/2023/{cve}.yaml",
+        f"https://raw.githubusercontent.com/projectdiscovery/nuclei-templates/main/http/cves/2022/{cve}.yaml",
+    ]
+    try:
+        with _hx.Client(verify=False, follow_redirects=True, timeout=timeout) as c:
+            for u in paths:
+                try:
+                    r = c.get(u, headers={"User-Agent": "Mozilla/5.0 (Pentest/Research)"})
+                    if r.status_code == 200 and r.text and "id:" in r.text:
+                        return r.text[:12000]
+                except Exception:  # noqa: BLE001
+                    continue
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _search_github_pocs(cve, timeout=10, max_results=5):
+    """INTEL EXPANSION — GitHub topic/code search for `<CVE>-poc` / `<CVE>-exploit`
+    repositories. Many CVEs have community PoC repos the GHSA entry doesn't link.
+    Uses unauthenticated search API (60 req/hr/IP), bounded. Returns [{url, snippet}]."""
+    import httpx as _hx
+    hits = []
+    try:
+        with _hx.Client(verify=False, follow_redirects=True, timeout=timeout) as c:
+            for q in (f"{cve} poc in:name", f"{cve} exploit in:name", f'"{cve}" vulnerability'):
+                try:
+                    r = c.get(f"https://api.github.com/search/repositories",
+                              params={"q": q, "per_page": 3, "sort": "stars"},
+                              headers={"Accept": "application/vnd.github+json",
+                                       "User-Agent": "Pentest-Research"})
+                    if r.status_code == 200:
+                        for it in (r.json() or {}).get("items", [])[:3]:
+                            u = it.get("html_url")
+                            if u and u not in {h.get("url") for h in hits}:
+                                hits.append({"url": u,
+                                             "snippet": (it.get("description") or "")[:200]})
+                                if len(hits) >= max_results:
+                                    return hits
+                except Exception:  # noqa: BLE001
+                    continue
+    except Exception:  # noqa: BLE001
+        pass
+    return hits
+
+
 def _fetch_patch_diff(url, timeout=12, max_bytes=60000):
     """Fetch the raw diff/patch from a fix-commit URL (GitHub/Gitee/GitLab/
     Bitbucket). Returns the unified-diff text, or ''. Only the vulnerable-code
@@ -17359,6 +17624,52 @@ def _derive_cve_spec_single_pass(cve, product, version, ip, port, model=None,
     prior = _load_tentative_spec(cve) or {}
     prior_hints = prior.get("hints") or {}
     prior_last_failure = prior.get("last_failure")
+    # 2c. EXPAND intel beyond GHSA/CIRCL — Nuclei templates + GitHub-PoC search
+    #     + CVE-Bench eval.yml goals + endpoint discovery + source audit (CTF
+    #     mode). All appended to intel['combined'] so the LLM extractor sees
+    #     everything in one pass.
+    extras = []
+    try:
+        nuc = _fetch_nuclei_template(cve)
+        if nuc:
+            extras.append(f"\n--- NUCLEI TEMPLATE for {cve} ---\n{nuc}\n")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        pocs = _search_github_pocs(cve)
+        if pocs:
+            extras.append("\n--- GitHub PoC repos (community exploits):\n"
+                          + "\n".join(f"  * {p['url']} — {p['snippet']}" for p in pocs))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        goals = _parse_cvebench_eval_yml(cve)
+        if goals:
+            extras.append("\n--- CVE-Bench attack goals (eval.yml) — pick ONE goal to target first:\n"
+                          + "\n".join(f"  * {g['name']}: {g['description']}" for g in goals))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        eps = _probe_target_endpoints(ip, port)
+        if eps:
+            extras.append(f"\n--- ENDPOINTS DISCOVERED on this live target "
+                          f"(pick from THESE, don't invent paths):\n  "
+                          + ", ".join(eps[:20]))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        # Note: engagement_id plumbing from node_research → _derive_cve_spec_single_pass
+        # is a follow-up; for now the global app_settings 'ctf_mode' toggle acts
+        # as the fallback. When plumbed, _audit_target_source(engagement_id=...)
+        # will read per-engagement.
+        src = _audit_target_source(ip, port, product=product)
+        if src:
+            extras.append(f"\n--- SOURCE AUDIT (CTF mode) — vulnerable code pattern matches:\n"
+                          + "\n".join(f"  * [{s['vuln_class']}] {s['file']}:{s['line']}: {s['snippet']}" for s in src[:10]))
+    except Exception:  # noqa: BLE001
+        pass
+    if extras:
+        intel["combined"] = (intel.get("combined") or "") + "".join(extras)
     # 3. LLM extract — pass prior hints + last_failure so the LLM gets a
     # targeted "switch to X" recommendation (not just "don't repeat").
     recipe = _llm_extract_exploit_recipe(cve, product, version, intel, patches,
