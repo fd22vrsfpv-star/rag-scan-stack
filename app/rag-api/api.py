@@ -17226,11 +17226,11 @@ def _derive_cve_spec(cve, product, version, ip, port, model=None, auth=None,
     "kick more passes to converge the tentatives — increase the defaults." Each
     pass extracts a recipe (informed by the hints of what already failed),
     verifies it live, and either stores verified (short-circuits) or stores
-    tentative + loops. Default max_passes = env BUILD_POC_DERIVE_PASSES=5.
+    tentative + loops. Default max_passes = env BUILD_POC_DERIVE_PASSES=15.
     Returns the LAST pass's result (verified=True on any pass short-circuits)."""
     if max_passes is None:
         try:
-            max_passes = int(os.environ.get("BUILD_POC_DERIVE_PASSES", "5") or "5")
+            max_passes = int(os.environ.get("BUILD_POC_DERIVE_PASSES", "15") or "15")
         except ValueError:
             max_passes = 5
     max_passes = max(1, int(max_passes))
