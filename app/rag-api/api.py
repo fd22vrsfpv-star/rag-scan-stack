@@ -21248,6 +21248,217 @@ def _enumerate_access_inventory(ip, port, product=None, auth=None,
     return inv
 
 
+_BUILDING_BLOCKS_CACHE = None
+
+
+def _load_building_blocks():
+    """Load knowledge/exploit_building_blocks.yaml (cached) — the lightweight-
+    check catalog the challenge walks to validate exploit pieces."""
+    global _BUILDING_BLOCKS_CACHE
+    if _BUILDING_BLOCKS_CACHE is not None:
+        return _BUILDING_BLOCKS_CACHE
+    import yaml as _yaml
+    _kd = os.environ.get("KNOWLEDGE_DIR", "/knowledge")
+    for p in (os.path.join(_kd, "exploit_building_blocks.yaml"),
+              os.path.join(os.path.dirname(__file__), "..", "knowledge", "exploit_building_blocks.yaml"),
+              "knowledge/exploit_building_blocks.yaml"):
+        try:
+            with open(p, encoding="utf-8") as f:
+                _BUILDING_BLOCKS_CACHE = (_yaml.safe_load(f) or {}).get("blocks") or []
+                return _BUILDING_BLOCKS_CACHE
+        except Exception:  # noqa: BLE001
+            continue
+    _BUILDING_BLOCKS_CACHE = []
+    return _BUILDING_BLOCKS_CACHE
+
+
+# block id → confirmed_facts claim_type(s) that satisfy it (filled by existing probes)
+_BLOCK_FACT_TYPES = {
+    "target_reachable": ["target_reachable"],
+    "version_in_range": ["version_applies"],
+    "session_valid": ["session_valid"],
+    "endpoint_exists": ["endpoint_exists"],
+    "action_permitted": ["action_permitted"],
+    "object_ids": ["object_id"],
+    "csrf_token": ["object_id", "token_valid"],
+    "injection_vector": ["injection_vector"],
+}
+
+
+def _run_challenge_checks(ip, port, product, analysis, auth=None,
+                          session_cookie=None, run_lightweight=True, timeout=12):
+    """Walk the building-block catalog: for each piece the exploit needs, report
+    whether it's already CONFIRMED (from the confirmed_facts ledger), run the
+    LIGHTWEIGHT check if it's cheap + missing, and SUGGEST the heavier ones.
+
+    Operator ask: "suggest quick and easy checks to validate specific items to
+    help build the exploit in pieces as part of the challenge if they are
+    lightweight." Builds the exploit from verified parts. Returns
+    {confirmed:[], missing:[], suggestions:[], guidance}."""
+    import httpx as _hx
+    a = analysis or {}
+    blob = (" ".join(str(p) for p in (a.get("preconditions") or []))
+            + " " + str(a.get("summary", "")) + " " + str(a.get("vuln_class", ""))).lower()
+    # infer vuln class(es)
+    classes = set()
+    if "sql" in blob or "sleep" in blob or "union select" in blob:
+        classes.add("sqli")
+    if any(k in blob for k in ("command inj", "os command", "rce", ";id", "|id")):
+        classes.add("cmdi")
+    if "template inj" in blob or "ssti" in blob:
+        classes.add("ssti")
+    prod_l = (product or "").lower()
+    cve = a.get("cve")
+    tgt = f"{ip}:{port or 80}"
+    # read confirmed facts for this target/product once
+    confirmed_types = set()
+    try:
+        with get_db() as c, c.cursor() as cur:
+            cur.execute("SELECT claim_type FROM public.confirmed_facts "
+                        "WHERE target=%s AND status='confirmed' "
+                        "AND (product IS NULL OR lower(product)=lower(%s))",
+                        (tgt, product or ""))
+            confirmed_types = {r[0] for r in cur.fetchall()}
+    except Exception:  # noqa: BLE001
+        pass
+
+    confirmed, missing, suggestions = [], [], []
+    for b in _load_building_blocks():
+        bid = b.get("id")
+        aw = b.get("applies_when") or {}
+        vca = aw.get("vuln_class_any") or []
+        pa = [str(x).lower() for x in (aw.get("product_any") or [])]
+        if vca and not (classes & set(vca)):
+            continue
+        if pa and prod_l not in pa and not any(p in prod_l for p in pa):
+            continue
+        if aw.get("needs_auth") and not (session_cookie or (auth or {}).get("username")):
+            continue
+        is_conf = any(t in confirmed_types for t in _BLOCK_FACT_TYPES.get(bid, []))
+        # lightweight + missing → run the cheap inline check now
+        if not is_conf and run_lightweight and (b.get("cost") == "lightweight"):
+            try:
+                ran = _run_one_building_block(b.get("probe"), ip, port, product,
+                                              analysis, auth, session_cookie, timeout)
+            except Exception:  # noqa: BLE001
+                ran = None
+            if ran:
+                is_conf = True
+        if is_conf:
+            confirmed.append({"id": bid, "validates": b.get("validates"),
+                              "confirms": b.get("confirms")})
+        else:
+            missing.append({"id": bid, "validates": b.get("validates"),
+                            "cost": b.get("cost")})
+            suggestions.append({"id": bid, "cost": b.get("cost"),
+                                "suggest": b.get("suggest")})
+    bits = []
+    if confirmed:
+        bits.append("CONFIRMED BUILDING BLOCKS (assemble the exploit from these "
+                    "verified pieces):")
+        for c in confirmed:
+            bits.append(f"  ✓ {c['id']}: {c['validates']}")
+    if suggestions:
+        bits.append("QUICK CHECKS TO VALIDATE NEXT (build the rest in pieces):")
+        for sgst in suggestions:
+            bits.append(f"  • [{sgst['cost']}] {sgst['id']}: {sgst['suggest']}")
+    return {"confirmed": confirmed, "missing": missing,
+            "suggestions": suggestions, "guidance": "\n".join(bits)}
+
+
+def _run_one_building_block(probe, ip, port, product, analysis, auth,
+                            session_cookie, timeout=12):
+    """Run ONE lightweight building-block check inline; record a confirmed_fact
+    on success. Returns True when the piece is confirmed."""
+    import httpx as _hx
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    tgt = f"{ip}:{port or 80}"
+    if probe == "reachable":
+        try:
+            with _hx.Client(verify=False, timeout=timeout) as c:
+                r = c.get(base + "/")
+            _record_confirmation(tgt, "target_reachable", "/", "confirmed",
+                                 evidence=f"HTTP {r.status_code}", method="probe",
+                                 product=product)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+    if probe == "version":
+        # Zabbix: apiinfo.version (no auth). Generic: Server header.
+        try:
+            with _hx.Client(verify=False, timeout=timeout) as c:
+                if "zabbix" in (product or "").lower():
+                    rr = c.post(base + "/api_jsonrpc.php",
+                                json={"jsonrpc": "2.0", "method": "apiinfo.version",
+                                      "params": {}, "id": 1},
+                                headers={"Content-Type": "application/json-rpc"})
+                    ver = (rr.json() or {}).get("result")
+                else:
+                    ver = c.get(base + "/").headers.get("Server")
+            if ver:
+                _record_confirmation(tgt, "version_applies", str(ver), "confirmed",
+                                     evidence=f"detected version {ver}", method="probe",
+                                     claim_value=str(ver), product=product)
+                return True
+        except Exception:  # noqa: BLE001
+            return False
+        return False
+    if probe == "session" and session_cookie:
+        try:
+            valid, why = _probe_session_valid(ip, port, session_cookie, product=product)
+            if valid:
+                _record_confirmation(tgt, "session_valid", "auth", "confirmed",
+                                     evidence=why, method="probe", product=product)
+            return valid
+        except Exception:  # noqa: BLE001
+            return False
+    if probe == "endpoint":
+        tep = ((analysis or {}).get("target_endpoint") or "").strip()
+        if tep.startswith("/"):
+            try:
+                with _hx.Client(verify=False, timeout=timeout, follow_redirects=True,
+                                 headers={"Cookie": session_cookie} if session_cookie else {}) as c:
+                    er = c.get(base + tep)
+                if er.status_code != 404:
+                    _record_confirmation(tgt, "endpoint_exists", tep, "confirmed",
+                                         evidence=f"HTTP {er.status_code}", method="probe",
+                                         product=product)
+                    return True
+            except Exception:  # noqa: BLE001
+                return False
+        return False
+    if probe == "action_permitted" and "zabbix" in (product or "").lower() \
+            and auth and auth.get("username"):
+        try:
+            with _hx.Client(verify=False, timeout=timeout) as c:
+                tok = None
+                for pk in ("username", "user"):
+                    r = c.post(base + "/api_jsonrpc.php",
+                               json={"jsonrpc": "2.0", "method": "user.login",
+                                     "params": {pk: auth["username"], "password": auth.get("password")},
+                                     "id": 1}, headers={"Content-Type": "application/json-rpc"})
+                    tok = (r.json() or {}).get("result")
+                    if tok:
+                        break
+                if not tok:
+                    return False
+                ex = c.post(base + "/api_jsonrpc.php",
+                            json={"jsonrpc": "2.0", "method": "script.execute",
+                                  "params": {"scriptid": "1", "hostid": "10084"},
+                                  "auth": tok, "id": 1},
+                            headers={"Content-Type": "application/json-rpc"})
+                ok = ((ex.json() or {}).get("result") or {}).get("response") == "success"
+            if ok:
+                _record_confirmation(tgt, "action_permitted", "script.execute",
+                                     "confirmed", evidence="benign script.execute succeeded",
+                                     method="api_execute", product=product)
+            return ok
+        except Exception:  # noqa: BLE001
+            return False
+    return False
+
+
 _IP_INJECTION_HEADERS = ("X-Forwarded-For", "X-Real-IP", "X-Client-IP",
                          "True-Client-IP", "Forwarded", "X-Forwarded")
 

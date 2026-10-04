@@ -727,9 +727,25 @@ def _render_exploitation_tools(data: Dict[str, Any]) -> List[Doc]:
     return docs
 
 
+def _render_exploit_building_blocks(data: Dict[str, Any]) -> List[Doc]:
+    """Embed the building-block checklist so the challenge (and the planner) can
+    recall which lightweight checks validate each piece of an exploit."""
+    docs: List[Doc] = []
+    for b in (data.get("blocks") or []):
+        bid = _s(b.get("id"))
+        if not bid:
+            continue
+        body = (f"Building block: {bid}\nValidates: {_s(b.get('validates'))}\n"
+                f"Cost: {_s(b.get('cost'))}\nConfirms: {_s(b.get('confirms'))}\n"
+                f"Quick check: {_s(b.get('suggest'))}")
+        docs.append((f"Exploit building block — {bid}", body))
+    return docs
+
+
 RENDERERS = {
     "app_request_contracts": _render_app_request_contracts,
     "exploitation_tools": _render_exploitation_tools,
+    "exploit_building_blocks": _render_exploit_building_blocks,
     "common_web_paths": _render_common_web_paths,
     "http_status_fingerprints": _render_http_status_fingerprints,
     "vuln_class_methodology": _render_vuln_class_methodology,
