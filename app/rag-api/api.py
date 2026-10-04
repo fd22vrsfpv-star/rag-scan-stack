@@ -16240,6 +16240,163 @@ def _spec_fill(params, resolved):
     return out
 
 
+def _ctx_sub(obj, ctx):
+    """Recursively substitute {placeholder} tokens in a str/dict/list from ctx.
+    Unknown placeholders are left as-is so callers can detect them."""
+    import re as _re
+    if isinstance(obj, str):
+        return _re.sub(r"\{(\w+)\}", lambda m: str(ctx.get(m.group(1), m.group(0))), obj)
+    if isinstance(obj, dict):
+        return {k: _ctx_sub(v, ctx) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_ctx_sub(v, ctx) for v in obj]
+    return obj
+
+
+def _http_do(base, req, ctx=None, session_headers=None, timeout=15, follow_redirects=True):
+    """Generic HTTP request from a declarative spec — the backbone for probing a
+    WIDE variety of web endpoints (REST / JSON / XML / all methods). `req`:
+      {method, path, query{}, content_type: form|json|xml|raw, body: dict|str,
+       headers{}, accept}
+    Placeholders {user}/{pass}/{INJ}/{hostid}/... are filled from ctx. Returns
+    {status, text, json, headers, elapsed} (elapsed in seconds)."""
+    import httpx as _hx, time as _t, json as _json
+    ctx = ctx or {}
+    method = (req.get("method") or "GET").upper()
+    path = _ctx_sub(req.get("path", "/"), ctx)
+    url = path if "://" in path else base.rstrip("/") + "/" + path.lstrip("/")
+    query = _ctx_sub(req.get("query") or {}, ctx)
+    ct = (req.get("content_type") or "").lower()
+    body = _ctx_sub(req.get("body"), ctx) if req.get("body") is not None else None
+    headers = dict(session_headers or {})
+    headers.update(_ctx_sub(req.get("headers") or {}, ctx))
+    if req.get("accept"):
+        headers["Accept"] = req["accept"]
+    kwargs = {"params": query or None, "headers": headers, "timeout": timeout}
+    if body is not None:
+        if ct == "json":
+            kwargs["json"] = body
+        elif ct == "form":
+            kwargs["data"] = body
+            headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+        elif ct == "xml":
+            kwargs["content"] = body if isinstance(body, str) else str(body)
+            headers.setdefault("Content-Type", "application/xml")
+        else:  # raw
+            kwargs["content"] = body if isinstance(body, (str, bytes)) else str(body)
+            if req.get("content_type"):
+                headers.setdefault("Content-Type", req["content_type"])
+    t0 = _t.time()
+    try:
+        with _hx.Client(verify=False, follow_redirects=follow_redirects, timeout=timeout) as c:
+            r = c.request(method, url, **kwargs)
+        el = _t.time() - t0
+        j = None
+        try:
+            j = r.json()
+        except Exception:  # noqa: BLE001
+            j = None
+        return {"status": r.status_code, "text": r.text or "", "json": j,
+                "headers": dict(r.headers), "elapsed": el,
+                "set_cookies": [v for k, v in r.headers.multi_items() if k.lower() == "set-cookie"]}
+    except Exception as e:  # noqa: BLE001
+        return {"status": None, "text": f"error: {e}", "json": None,
+                "headers": {}, "elapsed": _t.time() - t0, "set_cookies": []}
+
+
+def _http_login(base, auth_spec, creds, timeout=15):
+    """Generic web auth → returns {cookie_header, headers}. Modes:
+      form_login — GET login page (optionally extract a CSRF token), POST creds,
+                   capture Set-Cookie.
+      bearer     — Authorization: Bearer <token/password>.
+      basic      — HTTP Basic.
+      cookie     — use a supplied cookie value directly.
+      none       — no auth."""
+    import re as _re, base64 as _b64
+    a = auth_spec or {}
+    mode = (a.get("mode") or "none").lower()
+    user = (creds or {}).get("username", "")
+    pw = (creds or {}).get("password", "")
+    ctx = {"user": user, "pass": pw}
+    if mode == "bearer":
+        tok = pw or user
+        return {"cookie_header": "", "headers": {"Authorization": f"Bearer {tok}"}}
+    if mode == "basic":
+        enc = _b64.b64encode(f"{user}:{pw}".encode()).decode()
+        return {"cookie_header": "", "headers": {"Authorization": f"Basic {enc}"}}
+    if mode == "cookie":
+        return {"cookie_header": _ctx_sub(a.get("cookie", ""), ctx), "headers": {}}
+    if mode != "form_login":
+        return {"cookie_header": "", "headers": {}}
+    # form_login — ALWAYS pre-GET the login page first to collect initial cookies
+    # (e.g. WordPress wordpress_test_cookie, Django csrftoken, session seeds) and,
+    # when configured, extract a CSRF token from it.
+    jar = {}
+    csrf = a.get("csrf") or {}
+    pre_path = csrf.get("from_path") or a.get("login_path", "/login")
+    g = _http_do(base, {"method": "GET", "path": pre_path}, ctx, timeout=timeout)
+    for sc in g.get("set_cookies", []):
+        nv = sc.split(";", 1)[0]
+        if "=" in nv:
+            k, v = nv.split("=", 1); jar[k.strip()] = v.strip()
+    if csrf.get("regex"):
+        m = _re.search(csrf["regex"], g.get("text", ""))
+        if m:
+            ctx[csrf.get("field", "csrf")] = m.group(1)
+    fields = _ctx_sub(a.get("fields") or {}, ctx)
+    if csrf.get("field") and ctx.get(csrf["field"]):
+        fields[csrf["field"]] = ctx[csrf["field"]]
+    ck_hdr = "; ".join(f"{k}={v}" for k, v in jar.items())
+    r = _http_do(base, {"method": a.get("method", "POST"),
+                        "path": a.get("login_path", "/login"),
+                        "content_type": a.get("content_type", "form"),
+                        "body": fields,
+                        "headers": {"Cookie": ck_hdr} if ck_hdr else {}},
+                 ctx, timeout=timeout, follow_redirects=False)
+    for sc in r.get("set_cookies", []):
+        nv = sc.split(";", 1)[0]
+        if "=" in nv:
+            k, v = nv.split("=", 1); jar[k.strip()] = v.strip()
+    cookie_header = "; ".join(f"{k}={v}" for k, v in jar.items())
+    # success check
+    succ = a.get("success") or {}
+    ok = True
+    if succ.get("cookie_contains"):
+        ok = succ["cookie_contains"] in cookie_header
+    return {"cookie_header": cookie_header if ok else "", "headers": {}}
+
+
+def _http_extract(resp, spec):
+    """Extract a value from an _http_do response per spec:
+      {source: header, name: Server} | {source: body_regex, regex: '...'}
+      | {source: json_pointer, pointer: '/a/b'} | {source: status}."""
+    import re as _re
+    src = (spec or {}).get("source")
+    if src == "header":
+        for k, v in (resp.get("headers") or {}).items():
+            if k.lower() == str(spec.get("name", "")).lower():
+                return v
+        return None
+    if src == "body_regex":
+        m = _re.search(spec.get("regex", ""), resp.get("text", "") or "")
+        return m.group(1) if m else None
+    if src == "json_pointer":
+        node = resp.get("json")
+        for part in str(spec.get("pointer", "")).strip("/").split("/"):
+            if part == "":
+                continue
+            if isinstance(node, list) and part.isdigit():
+                node = node[int(part)] if int(part) < len(node) else None
+            elif isinstance(node, dict):
+                node = node.get(part)
+            else:
+                return None
+        return node
+    if src == "status":
+        return resp.get("status")
+    return None
+
+
 def _spec_jsonrpc(base, ct, method, params, token=None, timeout=15):
     """One generic JSON-RPC call. Returns (result, error)."""
     import httpx as _hx
