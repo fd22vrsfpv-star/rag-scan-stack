@@ -6704,8 +6704,17 @@ CREATE TABLE IF NOT EXISTS public.derived_cve_specs (
     verify_evidence text,
     source        text,
     derived_at    timestamptz NOT NULL DEFAULT now(),
-    last_verified timestamptz
+    last_verified timestamptz,
+    status        text NOT NULL DEFAULT 'tentative',  -- 'tentative' | 'verified' | 'refuted'
+    attempts      integer NOT NULL DEFAULT 0,
+    last_failure  text,
+    refine_hints  jsonb NOT NULL DEFAULT '{}'::jsonb  -- {tried_payloads:[], tried_endpoints:[], tried_proof_models:[], notes:""}
 );
+-- Idempotent columns for in-place upgrades (ensure_all_tables runs on existing DBs too)
+ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'tentative';
+ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS attempts integer NOT NULL DEFAULT 0;
+ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS last_failure text;
+ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS refine_hints jsonb NOT NULL DEFAULT '{}'::jsonb;
 
 -- Discovered app knowledge: per-product/version facts the build loop learns
 -- (endpoints, params, csrf source, cookie shape, secondary products).
