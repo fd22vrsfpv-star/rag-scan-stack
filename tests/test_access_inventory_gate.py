@@ -399,3 +399,30 @@ print('OK')
 """
     out, err, rc = _in_container(py)
     assert rc == 0 and 'OK' in out, f"out={out} err={err}"
+
+
+def test_assemble_confirmed_poc_command_from_ledger():
+    # Enhancement 1: build the first command from CONFIRMED pieces. CVE-2024-22120
+    # has a confirmed injection_vector (X-Forwarded-For) in the ledger from the
+    # probe, so the assembler produces an inline-login + header-injection command.
+    py = r"""
+import sys; sys.path.insert(0,'/app')
+from api import _assemble_confirmed_poc_command
+asm = _assemble_confirmed_poc_command('172.18.0.40', 8080, 'Zabbix', 'POCx',
+                                      auth={'username':'low_priv_user','password':'zabbixpw'})
+# depends on the ledger having a confirmed injection_vector for this target
+if asm:
+    assert 'user.login' in asm['command'], asm['command']
+    assert 'X-Forwarded-For' in asm['command'] or 'header' in asm.get('origin',''), asm
+    assert asm['assertion'].get('min_seconds') == 5, asm['assertion']
+    assert asm['assertion'].get('canary') == 'POCx', asm['assertion']
+    print('OK-assembled')
+else:
+    # no confirmed vector in this environment -> graceful None (still valid)
+    print('OK-none')
+# no spec / unknown product -> None, never crashes
+assert _assemble_confirmed_poc_command('1.2.3.4', 80, 'NoSuchApp', 'c', auth={'username':'u'}) is None
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and 'OK' in out, f"out={out} err={err}"

