@@ -16893,21 +16893,56 @@ def _llm_extract_exploit_recipe(cve, product, version, intel, patch_diffs, model
         patch_section = "\n\nFIX COMMIT DIFF(S) — the lines BEFORE the fix show the vulnerable code:\n"
         for i, (url, diff) in enumerate(patch_diffs[:3], 1):
             patch_section += f"\n--- patch {i}: {url} ---\n{diff[:6000]}\n"
-    # Prior-attempt hints: tell the LLM what already FAILED so it doesn't repeat.
+    # Prior-attempt hints with ESCALATION: the more attempts have failed, the
+    # harder we push the LLM to diversify. Soft "don't repeat" → "abandon this
+    # vuln class / endpoint and try an orthogonal approach." Operator ask: the
+    # loop was burning iterations on near-duplicate variants of the same shape.
     hints_section = ""
     if prior_hints and any(prior_hints.values()):
         tp = prior_hints.get("tried_payloads") or []
         te = prior_hints.get("tried_endpoints") or []
         tm = prior_hints.get("tried_proof_models") or []
+        total_tried = len(tp) + len(te) + len(tm)
+        # Escalation tiers based on how exhausted the current approach is.
+        if total_tried <= 2:
+            escalation = (
+                f"If a proof model already failed and the advisory describes a "
+                f"state change, switch to read_back_after_action. If single-request "
+                f"read_back failed, switch to oob_callback (SSRF/XXE) or "
+                f"read_back_after_action (file write / priv-esc).\n"
+            )
+        elif total_tried <= 5:
+            escalation = (
+                f"⚠ Multiple prior attempts failed. BROADEN exploration:\n"
+                f"  * If one endpoint has been tried repeatedly, try a DIFFERENT "
+                f"endpoint from the vulnerable component (not just path variants).\n"
+                f"  * If one proof_model has been tried, try a DIFFERENT one — "
+                f"timing / read_back / read_back_after_action / oob_callback.\n"
+                f"  * Reconsider the vuln_class — advisory may describe "
+                f"'file deletion' but a different endpoint on the same component "
+                f"has an SQLi; probe both.\n"
+            )
+        else:
+            escalation = (
+                f"🛑 EXTENSIVE prior attempts have all failed. ABANDON the "
+                f"current approach entirely:\n"
+                f"  * ABANDON the tried endpoints — look for a DIFFERENT entry "
+                f"point in the same component.\n"
+                f"  * ABANDON the tried proof_models — the advisory may be "
+                f"misleading about the proof shape; try the LEAST-attempted model.\n"
+                f"  * RECONSIDER the vuln_class from the advisory — if a 'file "
+                f"delete' recipe keeps failing to read-back, try absence_proof "
+                f"shape (resource exists before, 404s after exploit) OR check "
+                f"if the real vuln is adjacent (auth bypass, SQLi in same handler).\n"
+                f"  * If no plausible shape remains, return empty — don't waste "
+                f"another iteration on a near-duplicate.\n"
+            )
         hints_section = (
-            f"\n\nPRIOR ATTEMPTS (do NOT repeat these — try a DIFFERENT shape):\n"
-            f"  tried payloads: {tp[:8]}\n"
-            f"  tried endpoints: {te[:5]}\n"
-            f"  tried proof_models: {tm}\n"
-            f"If timing already failed and the advisory describes a state change, "
-            f"switch to read_back_after_action. If a single-request read_back "
-            f"failed, switch to oob_callback (SSRF/XXE) or read_back_after_action "
-            f"(file write / priv-esc).\n"
+            f"\n\nPRIOR ATTEMPTS (do NOT repeat these — try a GENUINELY DIFFERENT shape):\n"
+            f"  tried payloads ({len(tp)}): {tp[:8]}\n"
+            f"  tried endpoints ({len(te)}): {te[:5]}\n"
+            f"  tried proof_models ({len(tm)}): {tm}\n"
+            f"{escalation}"
         )
     prompt = (
         f"You are a security engineer on an AUTHORIZED penetration test documenting "
@@ -16969,6 +17004,53 @@ def _llm_extract_exploit_recipe(cve, product, version, intel, patch_diffs, model
     except Exception as e:  # noqa: BLE001
         logging.debug("recipe extraction failed: %s", e)
     return {}
+
+
+def _is_duplicate_recipe(spec, prior_hints):
+    """A recipe is a near-duplicate when its ENDPOINT and PAYLOAD-TEMPLATE both
+    materially overlap with something already stored in refine_hints. Short
+    identical substrings don't count; we compare the normalized payload shape
+    (stripped of {CANARY}/{INJ}/{OOB_URL} placeholders + whitespace) against
+    the hint set. Returns True = skip verify + emit "duplicate" result."""
+    if not prior_hints:
+        return False
+    import re as _re
+    req = spec.get("request") or {}
+    this_endpoint = (req.get("path") or "").strip().lower()
+    # Keep original case for payload until AFTER _norm strips placeholders —
+    # the placeholder regex is case-insensitive now, so {CANARY}/{canary} both
+    # strip. Earlier bug: pre-lowercasing turned {CANARY} into {canary} which
+    # the uppercase-only regex no longer matched, so dup-detection missed every
+    # case.
+    this_payload = ((spec.get("injection") or {}).get("payload_template") or "").strip()
+
+    def _norm(s):
+        s = _re.sub(r"\{[A-Za-z_]+\}", "", str(s or ""))
+        s = _re.sub(r"\s+", "", s)
+        return s.lower()
+
+    this_payload_n = _norm(this_payload)
+    tried_payloads = prior_hints.get("tried_payloads") or []
+    tried_endpoints = prior_hints.get("tried_endpoints") or []
+    # Endpoint exact-match on this call-site is a weak signal alone; combined
+    # with a payload-shape overlap it's a duplicate.
+    endpoint_match = any(this_endpoint == (e or "").strip().lower() for e in tried_endpoints)
+    for tp in tried_payloads:
+        tp_n = _norm(tp)
+        if not tp_n or not this_payload_n:
+            continue
+        # Dup requires BOTH endpoint overlap AND payload match — different
+        # endpoints with the same payload shape are legitimate new attacks.
+        if not endpoint_match:
+            continue
+        # Exact normalized payload match on an already-tried endpoint → dup.
+        if tp_n == this_payload_n:
+            return True
+        # Substring overlap on same endpoint → minor variant, dup.
+        if len(this_payload_n) >= 10 and (
+                tp_n in this_payload_n or this_payload_n in tp_n):
+            return True
+    return False
 
 
 def _recipe_to_spec(cve, product, recipe):
@@ -17161,6 +17243,20 @@ def _derive_cve_spec(cve, product, version, ip, port, model=None, auth=None,
         last_result = res
         if res.get("verified"):
             return res
+        # Consecutive-duplicate early-exit: when the LLM returns a near-duplicate
+        # recipe TWICE in a row, further passes with the same intel will yield
+        # the same shape — the hints didn't move the model. Save the time, let
+        # the operator / another signal (new intel) drive the next attempt.
+        if res.get("source") == "extract+duplicate":
+            dup_streak = (last_result.get("dup_streak") or 0) + 1 if pass_n > 1 else 1
+            res["dup_streak"] = dup_streak
+            if dup_streak >= 2:
+                res["source"] = "exhausted_duplicates"
+                res["evidence"] = (
+                    f"the LLM returned a near-duplicate recipe {dup_streak} times "
+                    f"in a row; the hints did not move it off the current shape, "
+                    f"so further passes with the same intel will not help")
+                return res
         # Only loop if the pipeline actually stored a tentative (i.e. it had a
         # plausible recipe to improve). If extraction returned no recipe at all,
         # another pass with the same intel will yield the same result; stop.
@@ -17209,6 +17305,16 @@ def _derive_cve_spec_single_pass(cve, product, version, ip, port, model=None,
         return {"verified": False, "source": "extract",
                 "spec": None, "evidence": "recipe extraction returned no concrete recipe"}
     spec = _recipe_to_spec(cve, product, recipe)
+    # 3b. DUPLICATE-RECIPE DETECTION: if this spec's payload+endpoint+proof is a
+    #     near-duplicate of something already tried, SKIP the ~1-2 min verify
+    #     and short-circuit — the loop should move on, not re-verify what the
+    #     hints already recorded as failed. Operator ask: "stop wasting iterations
+    #     on near-duplicate variants."
+    if _is_duplicate_recipe(spec, prior_hints):
+        return {"verified": False, "source": "extract+duplicate",
+                "spec": spec, "stored_tentative": False,
+                "evidence": "recipe is a near-duplicate of a prior failed attempt — "
+                            "LLM did not diversify; skipping verify to save iteration"}
     # 4. Live verify
     verdict = _live_verify_recipe(ip, port, spec)
     if verdict["verified"]:
