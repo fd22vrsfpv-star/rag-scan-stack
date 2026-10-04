@@ -16805,6 +16805,11 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
     # cleared — the model dropping min_seconds is the exact regression we block.
     _timing_mode = bool((assertion or {}).get("min_seconds")) or \
         (_timing_payload_scale(command or "", delta=0)[1] is not None)
+    # Refine-pattern tracking across iterations. MUST be initialised before the
+    # loop: it is read near the top of each iteration (on success) but only
+    # assigned at the end, so a FIRST-iteration success (e.g. a synth command
+    # seeded from confirmed pieces) would hit it unassigned. Init to [].
+    _prev_pending = []
     _REGRESS_FALLBACK_AT = int(os.environ.get("REFINE_REGRESS_FALLBACK_AT", "2") or "2")
     # Model fallback: when a model gets stuck in a shell-quoting death
     # spiral, switch to a backup (BUILD_POC_MODEL_FALLBACK env, else
