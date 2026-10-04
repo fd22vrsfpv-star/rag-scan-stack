@@ -16757,19 +16757,47 @@ def _oob_check_hit(canary, log_path="/tmp/oob.18099.log", timeout=5):
 def _two_request_verify(ip, port, exploit_req, verify_req, canary, timeout=25):
     """read_back_after_action proof: run exploit (which writes/changes something,
     with a canary embedded), then run a follow-up read request, and confirm the
-    canary appears in the read response. Returns {verified, method, evidence}."""
+    canary appears in the read response. Returns {verified, method, evidence}.
+
+    FIX 2: inspect the exploit response for 4xx/5xx + known rejection markers.
+    If the exploit itself was rejected (403/401/404/400 or body says 'forbidden'/
+    'unauthorized'/'invalid'), the write never happened — report that as the real
+    failure instead of blaming the verify step. Saves the hint from recording a
+    misleading 'two_req_canary_missing' when the true problem was auth/csrf/404."""
+    import re as _re
     exploit_cmd = _curl_from_cve_spec(ip, port, exploit_req, canary)
-    out1 = _curl_run(ip, port, exploit_cmd, timeout=timeout)
+    # Add -w HTTP: so we capture the exploit's status code
+    exploit_cmd_with_status = exploit_cmd + " -w ' __HTTP_STATUS__:%{http_code}'"
+    out1 = _curl_run(ip, port, exploit_cmd_with_status, timeout=timeout)
+    # Extract status we just appended; strip for subsequent canary scanning
+    m = _re.search(r"__HTTP_STATUS__:(\d{3})", out1 or "")
+    exploit_status = int(m.group(1)) if m else None
+    out1_body = (_re.sub(r"__HTTP_STATUS__:\d{3}", "", out1 or "") or "").rstrip()
+    # 4xx/5xx means the exploit itself was rejected; abort before the read.
+    rejection_markers = ("forbidden", "unauthorized", "access denied",
+                         "invalid token", "csrf", "not found", "method not allowed")
+    body_lower = out1_body.lower()
+    rejected_body = any(m in body_lower for m in rejection_markers)
+    if exploit_status and exploit_status >= 400:
+        return {"verified": False, "method": "exploit_step_http_error",
+                "evidence": f"exploit request returned HTTP {exploit_status} — "
+                            f"the write/state-change never happened "
+                            f"(body prefix: {out1_body[:160]!r})"}
+    if rejected_body and (exploit_status is None or exploit_status < 300):
+        return {"verified": False, "method": "exploit_step_rejected",
+                "evidence": f"exploit response body contains rejection marker "
+                            f"({', '.join(m for m in rejection_markers if m in body_lower)[:120]})"}
     verify_cmd = _curl_from_cve_spec(ip, port, verify_req, canary)
     out2 = _curl_run(ip, port, verify_cmd, timeout=timeout)
     if canary in (out2 or ""):
         return {"verified": True, "method": "read_back_after_action",
                 "evidence": f"canary {canary} appeared in follow-up read "
-                            f"(exploit→verify)"}
+                            f"(exploit→verify, exploit HTTP {exploit_status or '?'})"}
     return {"verified": False, "method": "two_req_canary_missing",
             "evidence": f"follow-up read did not contain canary; "
-                        f"exploit response was {len(out1 or '')} bytes, "
-                        f"verify response was {len(out2 or '')} bytes"}
+                        f"exploit HTTP {exploit_status or '?'}, "
+                        f"exploit body {len(out1_body)} bytes, "
+                        f"verify body {len(out2 or '')} bytes"}
 
 
 def _oob_verify(ip, port, exploit_req, canary, timeout=25):
@@ -16879,7 +16907,7 @@ def _extract_patch_urls(advisory_text, poc_text=""):
 
 
 def _llm_extract_exploit_recipe(cve, product, version, intel, patch_diffs, model=None,
-                                prior_hints=None):
+                                prior_hints=None, last_failure=None):
     """Ask the LLM to produce a STRUCTURED recipe (endpoint/method/content_type/
     body/headers/injection payload template + proof model) from the gathered
     intel + patch diffs. Returns {endpoint, method, content_type, body, headers,
@@ -16904,8 +16932,23 @@ def _llm_extract_exploit_recipe(cve, product, version, intel, patch_diffs, model
         tm = prior_hints.get("tried_proof_models") or []
         total_tried = len(tp) + len(te) + len(tm)
         # Escalation tiers based on how exhausted the current approach is.
+        # FIX 4: translate last_failure into a specific "switch to X" recommendation
+        # so the LLM doesn't just vary payloads within the same failing proof model.
+        FAILURE_TO_SWITCH = {
+            "canary_missing": "the response did NOT echo the canary — switch proof_model to timing (SLEEP-based) OR oob_callback (if network primitive)",
+            "two_req_canary_missing": "the verify read did NOT find the canary — switch to single-request read_back OR timing",
+            "timing_did_not_block": "the SLEEP payload did NOT delay the response — the SQLi path isn't live; switch to read_back (error-based SQLi) OR explore a different endpoint",
+            "oob_no_callback": "listener did NOT receive the SSRF probe — switch to read_back_after_action (write+read) OR timing OR a different endpoint",
+            "exploit_step_http_error": "the exploit request itself was REJECTED (4xx) — the write never happened; switch endpoint OR add auth OR change the vuln_class",
+            "exploit_step_rejected": "the exploit response contained a rejection marker — try a different endpoint on the same component OR add auth",
+            "spec_missing_verify_request": "you declared read_back_after_action but did NOT supply verify_request — either SUPPLY one OR switch to a single-request proof_model",
+        }
+        failure_hint = ""
+        if last_failure and last_failure in FAILURE_TO_SWITCH:
+            failure_hint = f"LAST FAILURE WAS `{last_failure}` → {FAILURE_TO_SWITCH[last_failure]}.\n"
         if total_tried <= 2:
             escalation = (
+                f"{failure_hint}"
                 f"If a proof model already failed and the advisory describes a "
                 f"state change, switch to read_back_after_action. If single-request "
                 f"read_back failed, switch to oob_callback (SSRF/XXE) or "
@@ -16913,6 +16956,7 @@ def _llm_extract_exploit_recipe(cve, product, version, intel, patch_diffs, model
             )
         elif total_tried <= 5:
             escalation = (
+                f"{failure_hint}"
                 f"⚠ Multiple prior attempts failed. BROADEN exploration:\n"
                 f"  * If one endpoint has been tried repeatedly, try a DIFFERENT "
                 f"endpoint from the vulnerable component (not just path variants).\n"
@@ -16924,6 +16968,7 @@ def _llm_extract_exploit_recipe(cve, product, version, intel, patch_diffs, model
             )
         else:
             escalation = (
+                f"{failure_hint}"
                 f"🛑 EXTENSIVE prior attempts have all failed. ABANDON the "
                 f"current approach entirely:\n"
                 f"  * ABANDON the tried endpoints — look for a DIFFERENT entry "
@@ -17109,6 +17154,21 @@ def _recipe_to_spec(cve, product, recipe):
             **({"body": vr["body"]} if vr.get("body") else {}),
             **({"headers": vr["headers"]} if vr.get("headers") else {}),
         }
+    # FIX 1: when the proof model is read_back_after_action but the LLM forgot
+    # to produce a verify_request, SYNTH a reasonable default from the exploit
+    # endpoint so the verifier doesn't abort with spec_missing_verify_request.
+    # Default: GET the SAME endpoint (common pattern — the write handler often
+    # has a sibling read, OR the write directly reflects on GET). It is a weak
+    # proof, so the next pass's hints will record "read_back_after_action tried"
+    # and the escalation will kick in.
+    if (spec.get("proof_model") == "read_back_after_action"
+            and "verify_request" not in spec):
+        spec["verify_request"] = {
+            "method": "GET",
+            "path": spec["request"]["path"],
+            "content_type": "form",
+        }
+        spec["notes"] = (spec.get("notes") or "") + " [verify_request SYNTHESIZED default (GET same endpoint) — LLM did not supply one]"
     return spec
 
 
@@ -17298,9 +17358,12 @@ def _derive_cve_spec_single_pass(cve, product, version, ip, port, model=None,
     # doesn't repeat payloads/endpoints/proof-models that already failed.
     prior = _load_tentative_spec(cve) or {}
     prior_hints = prior.get("hints") or {}
-    # 3. LLM extract — pass prior hints so the LLM avoids tried-and-failed shapes
+    prior_last_failure = prior.get("last_failure")
+    # 3. LLM extract — pass prior hints + last_failure so the LLM gets a
+    # targeted "switch to X" recommendation (not just "don't repeat").
     recipe = _llm_extract_exploit_recipe(cve, product, version, intel, patches,
-                                         model=model, prior_hints=prior_hints)
+                                         model=model, prior_hints=prior_hints,
+                                         last_failure=prior_last_failure)
     if not recipe.get("endpoint") or not recipe.get("injection_param"):
         return {"verified": False, "source": "extract",
                 "spec": None, "evidence": "recipe extraction returned no concrete recipe"}
