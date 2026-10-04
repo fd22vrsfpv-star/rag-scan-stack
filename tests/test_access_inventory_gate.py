@@ -441,3 +441,23 @@ print('OK')
 """
     out, err, rc = _in_container(py)
     assert rc == 0 and 'OK' in out, f"out={out} err={err}"
+
+
+def test_cve_exploit_spec_assembler():
+    # Per-CVE exploit spec engine: build the first command from a recipe.
+    py = r"""
+import sys; sys.path.insert(0,'/app')
+from api import _cve_exploit_spec, _assemble_from_cve_spec
+s = _cve_exploit_spec('CVE-2024-36779')
+assert s and s['product']=='stock' and s['vuln_class']=='sqli', s
+asm = _assemble_from_cve_spec('CVE-2024-36779','172.18.0.32',9090,'POCx')
+assert asm and asm['origin']=='cve_spec:CVE-2024-36779', asm
+assert 'SLEEP' in asm['command'].upper() and 'index.php' in asm['command'], asm['command']
+assert 'username=' in asm['command'], asm['command']
+assert asm['assertion'].get('min_seconds')==5 and asm['assertion'].get('canary')=='POCx', asm
+assert _cve_exploit_spec('CVE-0000-0000') is None
+assert _assemble_from_cve_spec('CVE-0000-0000','1.1.1.1',80,'c') is None
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and 'OK' in out, f"out={out} err={err}"
