@@ -16623,8 +16623,22 @@ def _store_tentative_spec(cve, product, version, spec, verdict, source):
         _ensure_derived_cve_specs_table()
         tried_payload = (spec.get("injection") or {}).get("payload_template", "")
         tried_endpoint = (spec.get("request") or {}).get("path", "")
-        tried_proof = ("timing" if (spec.get("assertion") or {}).get("min_seconds")
-                       else "read_back")
+        # Bug fix: record the ACTUAL proof model the spec used, not just inferred
+        # from assertion.min_seconds (which missed every read_back_after_action
+        # and oob_callback attempt, so the LLM's "don't repeat these" hint was
+        # wrong and it kept picking the same proof shape pass after pass).
+        tried_proof = (spec.get("proof_model")
+                       or (spec.get("injection") or {}).get("proof_model"))
+        if not tried_proof:
+            assertion = spec.get("assertion") or {}
+            if assertion.get("min_seconds"):
+                tried_proof = "timing"
+            elif spec.get("verify_request"):
+                tried_proof = "read_back_after_action"
+            elif assertion.get("expect_regex"):
+                tried_proof = "read_back"
+            else:
+                tried_proof = "unknown"
         with get_db() as c, c.cursor() as cur:
             cur.execute("SELECT attempts, refine_hints FROM public.derived_cve_specs "
                         "WHERE cve = %s", (str(cve).upper(),))
@@ -17340,18 +17354,21 @@ def _selective_fuzz_recipe(ip, port, spec, timeout=30):
 
 def _store_derived_spec(cve, product, version, spec, verdict, source):
     """Persist a VERIFIED derived spec so future builds (and other targets of
-    the same CVE) use it immediately — no re-derivation cost."""
+    the same CVE) use it immediately — no re-derivation cost. Sets status
+    explicitly to 'verified' (bug fix: previously left at the column default
+    'tentative' even when verified=true was set, so dashboards showed the row
+    as still-learning when it was actually confirmed)."""
     import json as _json
     try:
         _ensure_derived_cve_specs_table()
         with get_db() as c, c.cursor() as cur:
             cur.execute("""
                 INSERT INTO public.derived_cve_specs
-                  (cve, product, version, vuln_class, spec, verified,
+                  (cve, product, version, vuln_class, spec, verified, status,
                    verify_method, verify_evidence, source, last_verified)
-                VALUES (%s,%s,%s,%s,%s::jsonb,true,%s,%s,%s,now())
+                VALUES (%s,%s,%s,%s,%s::jsonb,true,'verified',%s,%s,%s,now())
                 ON CONFLICT (cve) DO UPDATE SET
-                  spec = EXCLUDED.spec, verified = true,
+                  spec = EXCLUDED.spec, verified = true, status = 'verified',
                   verify_method = EXCLUDED.verify_method,
                   verify_evidence = EXCLUDED.verify_evidence,
                   source = EXCLUDED.source, last_verified = now()
