@@ -1137,8 +1137,14 @@ def node_run_refine(state: BuildPocState) -> Dict[str, Any]:
 
 def node_save_store(state: BuildPocState) -> Dict[str, Any]:
     """Save the built PoC + emit webhook. Store verified/unverified — the
-    unverified rows stay for operator inspection (same as monolith)."""
-    from api import _save_exploit_store
+    unverified rows stay for operator inspection (same as monolith).
+
+    Also CAPTURE any credentials/tokens/IDs the exploit's output leaked and file
+    them into credential_findings so they appear in the asset's Credentials
+    section + exports (operator: "when we get creds and IDs from a PoC exploit
+    they should go into the credentials captured part of the assets")."""
+    from api import (_save_exploit_store, _extract_credentials_from_poc_output,
+                     _store_captured_credentials, _poc_trace)
     from webhooks import emit_webhook
     built = state.get("built") or {}
     result = state.get("result") or {}
@@ -1179,6 +1185,35 @@ def node_save_store(state: BuildPocState) -> Dict[str, Any]:
                           "research_sources": (research_out or {}).get("sources")})
     except Exception:  # noqa: BLE001
         pass
+    # CAPTURED CREDENTIALS — scan the exploit's output for leaked creds/tokens/
+    # IDs and file them into credential_findings so the asset's Credentials
+    # section shows them. Only on verified exploits (unverified output is
+    # noise). Also runs for unverified when env BUILD_POC_CAPTURE_UNVERIFIED=on.
+    try:
+        _run_output = (result.get("final_output") or result.get("output") or "")
+        _should_capture = bool(result.get("verified")) or (
+            os.environ.get("BUILD_POC_CAPTURE_UNVERIFIED", "off").lower() == "on")
+        if _run_output and _should_capture:
+            captured = _extract_credentials_from_poc_output(_run_output)
+            if captured:
+                n = _store_captured_credentials(
+                    state["ip"], state["port"], state.get("eid"),
+                    captured, cve=state["cve"], source="cve_poc_builder")
+                _poc_trace(state["run_id"], "poc_captured_credentials",
+                           response=f"captured {len(captured)} credential(s) from "
+                                    f"PoC output; stored {n} into credential_findings",
+                           extra={"count": n, "cve": state["cve"],
+                                  "ip": state["ip"], "exploit_store_id": store_id})
+                try:
+                    emit_webhook("poc_credentials_captured", "cve_poc_builder", {
+                        "cve": state["cve"], "target": state["ip"],
+                        "port": state["port"], "count": n,
+                        "exploit_store_id": store_id,
+                        "engagement_id": state.get("eid")})
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception as e:  # noqa: BLE001
+        logging.debug("poc credential capture failed: %s", e)
     try:
         emit_webhook("cve_poc_built", "software",
                      {"cve": state["cve"], "target": state["ip"],

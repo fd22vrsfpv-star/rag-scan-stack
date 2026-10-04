@@ -12819,7 +12819,7 @@ def _store_researched_cred_candidates(product: str, version: str, pairs: list) -
                                     'default_cred_research','unvalidated',%s,%s)
                             ON CONFLICT DO NOTHING""",
                             (asset_id, ip, port, p["username"], p["password"], eng,
-                             _Json({"product": product, "version": version,
+                             Json({"product": product, "version": version,
                                     "note": p.get("note", ""), "via": "default_cred_research"})))
                         n += 1
                         # Live-embed into RAG so a follow-on build recalls it
@@ -21310,6 +21310,120 @@ def _sanitize_poc_auth(text):
                 t, flags=_re.I)
     t = _re.sub(r'(x-api-key:\s*)([A-Za-z0-9._-]+)', _ph("<APIKEY>"), t, flags=_re.I)
     return t
+
+
+def _extract_credentials_from_poc_output(output, context=None):
+    """Scan a verified PoC's output for extracted creds/tokens/IDs. Operator ask:
+    "when we get creds and ids from a PoC exploit they should go into the
+    credentials captured part of the assets." Catches common exfil shapes:
+      - SQL dump rows: username|password or username,password_hash
+      - WordPress user_pass hashes ($P$B...), MySQL hashes (*ABC...)
+      - API tokens / bearer tokens / JWT (eyJ...)
+      - sessionid / cookie values the exploit leaked
+      - plaintext password: X / pass: X
+      - canonical id leaks (admin_id, user_id = N)
+    Returns list of {username, secret, secret_type, auth_type, source_hint}
+    (any field may be None; caller sets ip/port/engagement)."""
+    import re as _re
+    out = output or ""
+    found = []
+    if not out:
+        return found
+    seen = set()
+
+    def _add(username=None, secret=None, secret_type="password", auth_type="form", hint=""):
+        key = (username or "", secret or "", secret_type)
+        if key in seen or not (username or secret):
+            return
+        seen.add(key)
+        found.append({"username": username, "secret_value": secret,
+                      "secret_type": secret_type, "auth_type": auth_type,
+                      "source_hint": hint[:200]})
+
+    # SQL dump rows: look for lines with |-separated or ,-separated identity+hash/pw
+    # Common WP output: admin|$P$B...   or   1|admin|$P$B...|admin@...
+    for m in _re.finditer(r"(?m)^[^\n|,]*[\s|,](?P<u>[A-Za-z][\w.@-]{2,32})[\s|,]+(?P<s>\$[APS12][\$B][A-Za-z0-9./]{20,}|\*[A-F0-9]{40}|[a-f0-9]{32,128})", out):
+        _add(username=m.group("u"), secret=m.group("s"),
+             secret_type=("mysql_hash" if m.group("s").startswith("*") else "wp_hash"),
+             hint="sql dump row")
+    # JWT bearer tokens
+    for m in _re.finditer(r"\b(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,})\b", out):
+        _add(secret=m.group(1), secret_type="jwt", auth_type="bearer",
+             hint="JWT leaked in response")
+    # Bearer tokens / api keys / X-API-Key
+    for m in _re.finditer(r"(?:bearer\s+|authorization:\s*bearer\s+|api[_-]?key[:=]\s*|x-api-key:\s*)([A-Za-z0-9._-]{16,})", out, _re.I):
+        _add(secret=m.group(1), secret_type="api_token", auth_type="bearer",
+             hint="bearer/api key in response")
+    # Session cookies the exploit leaked (very common SQLi output)
+    for m in _re.finditer(r"\b(PHPSESSID|JSESSIONID|sessionid|session_id|_session|wordpress_logged_in[\w]*|zbx_session|csrftoken)\s*[:=]\s*([A-Za-z0-9%+/._=-]{10,})", out, _re.I):
+        _add(secret=f"{m.group(1)}={m.group(2)}", secret_type="session_cookie",
+             auth_type="cookie", hint="session cookie leaked")
+    # Plain "password: X" / "pass: X" (quoted or not)
+    for m in _re.finditer(r"(?i)(?:^|\s)(?:password|pwd|passwd)\s*[:=]\s*[\"']?([^\s\"'<>,;]{3,64})[\"']?", out):
+        _add(secret=m.group(1), secret_type="password", auth_type="form",
+             hint="plaintext password mention")
+    # username: X paired with a nearby password/hash (same line, within 80 chars)
+    for m in _re.finditer(r"(?i)(?:username|user|login|email)\s*[:=]\s*[\"']?([A-Za-z][\w.@+-]{2,64})[\"']?", out):
+        u = m.group(1)
+        # look for a secret in the next 120 chars
+        tail = out[m.end():m.end()+120]
+        s = _re.search(r"(?i)(?:password|pwd|passwd|hash|token)\s*[:=]\s*[\"']?([^\s\"'<>,;]{3,120})", tail)
+        if s:
+            _add(username=u, secret=s.group(1),
+                 secret_type=("hash" if _re.match(r"[a-f0-9]{32,}", s.group(1)) else "password"),
+                 hint="username+secret pair")
+        else:
+            _add(username=u, hint="username only (id leak)")
+    return found
+
+
+def _store_captured_credentials(ip, port, engagement_id, creds, cve=None,
+                                 asset_id=None, source="cve_poc_builder"):
+    """Insert each captured cred into credential_findings so it shows up in the
+    asset's Credentials section + export + spray surfaces. Idempotent via the
+    existing uq_credential_findings_identity index. Returns count inserted."""
+    if not creds:
+        return 0
+    try:
+        n = 0
+        with get_db() as c, c.cursor() as cur:
+            if not asset_id:
+                try:
+                    cur.execute("SELECT id FROM public.assets WHERE host(ip) = %s "
+                                "AND (engagement_id = %s OR engagement_id IS NULL) "
+                                "ORDER BY engagement_id NULLS LAST LIMIT 1",
+                                (str(ip), engagement_id))
+                    r = cur.fetchone()
+                    if r:
+                        asset_id = r[0]
+                except Exception:  # noqa: BLE001
+                    pass
+            for cr in creds:
+                try:
+                    cur.execute("""
+                        INSERT INTO public.credential_findings
+                          (asset_id, ip, port, protocol, username, secret_value,
+                           secret_type, valid_cred, auth_type, severity, source,
+                           status, engagement_id, metadata)
+                        VALUES (%s,%s,%s,'http',%s,%s,%s,true,%s,'high',%s,
+                                'captured',%s,%s)
+                        ON CONFLICT DO NOTHING
+                    """, (asset_id, str(ip), int(port or 80),
+                          cr.get("username") or "(unknown)",
+                          cr.get("secret_value"), cr.get("secret_type") or "password",
+                          cr.get("auth_type") or "form", source, engagement_id,
+                          Json({"cve": cve, "source_hint": cr.get("source_hint"),
+                                 "captured_at": "poc_build", "via": source})))
+                    n += 1
+                except Exception as e:  # noqa: BLE001
+                    logging.debug("captured-cred insert failed: %s", e)
+                    try: c.rollback()
+                    except Exception: pass
+            c.commit()
+        return n
+    except Exception as e:  # noqa: BLE001
+        logging.debug("_store_captured_credentials failed: %s", e)
+        return 0
 
 
 def _save_exploit_store(name, cve=None, kind="cve_poc", target_host=None, target_port=None,
