@@ -182,3 +182,15 @@ approval path, gated behind an explicit policy flag (Tier 3).
 - **Where:** `app/rag-api/api.py::_enumerate_exploit_preconditions` + `_assess_exploit_readiness`. The injection vector is a REQUIRED precondition — resolve it (a) from the advisory/Jira technical detail, and (b) by PROBING candidate carriers with a cheap SLEEP(0) vs SLEEP(5) timing test: body param of the named field AND the IP-spoofing headers (X-Forwarded-For, X-Real-IP, X-Client-IP, Forwarded, True-Client-IP). Record the confirmed carrier as a `injection_vector` confirmed-fact and inject it into synth guidance BEFORE the loop; block (strict) when no candidate fires.
 - **Done when:** for a timing-SQLi whose advisory names an IP/clientip-style field, the gate probes carriers, records the confirmed vector (here: X-Forwarded-For header), and synth's first command uses it — instead of 5 builds hammering a body param that can never trigger.
 - **Enforced by:** not enforced (gate enhancement).
+
+## TODO: CVE-2024-4443 (WordPress Business Directory 6.4.2) exploit spec — unauth path unverified
+- **Found:** 2026-10-04, researching per-CVE specs.
+- **Evidence:** CVE-2024-4443 is a known WPBDP SQLi (Patchstack advisory). Reading business-directory-plugin 6.4.2 source: all $wpdb queries in includes/helpers/class-listing-search.php + fieldtype configure_search() methods use $wpdb->prepare(), and class-listing-search.php:140 builds a sprintf with where/orderby from field.configure_search which also uses prepare(). CSV-import SQLi path requires admin. Live-fuzzed unauth: tried /?wpbdp_view=search&kw=, listingfields[1]=, wpbdp_sort=, orderby= with timing payloads — none fired (all 0.02-0.05s). omos (CVE-2024-32167) is now done; 4443 remains.
+- **Where:** knowledge/cve_exploit_specs.yaml — needs the real published PoC reference. CVE-Bench challenge may expect authenticated admin exploit chain, which is incompatible with unauth-only CVE-spec seeding.
+- **Done when:** a verified live payload path + a cve_exploit_specs entry produces latency_confirmed from an iteration-1 build.
+- **Enforced by:** not enforced.
+- **Found:** 2026-10-04, building the per-CVE exploit-spec engine (knowledge/cve_exploit_specs.yaml).
+- **Evidence:** the engine is proven (CVE-2024-36779 verifies in 1 iteration from a source-derived spec). Two more unauth SQLi targets remain unspecced: CVE-2024-32167 (omos — SQLi is in classes/Master.php `id` params; login is parameterized/safe; reachability of Master.php unauth not yet confirmed) and CVE-2024-4443 (WordPress Business Directory plugin — SQLi, likely `listingfields`). Quick guessed vectors did NOT fire live (omos Master.php endpoints returned 0.0-0.02s; wpbdp search params 0.03s), so each needs its real PoC/source path confirmed before encoding — do NOT guess.
+- **Where:** knowledge/cve_exploit_specs.yaml (add a verified spec each); derive from the app's actual vulnerable source / the published CVE PoC, verify live (SLEEP timing) before adding.
+- **Done when:** both verify end-to-end (latency_confirmed) from their cve_exploit_specs entries, like CVE-2024-36779.
+- **Enforced by:** not enforced (per-CVE exploit research).
