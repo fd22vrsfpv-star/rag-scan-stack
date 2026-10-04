@@ -308,3 +308,24 @@ print('OK')
 """
     out, err, rc = _in_container(py)
     assert rc == 0 and 'OK' in out, f"out={out} err={err}"
+
+
+def test_injection_vector_probe_shape_and_candidates():
+    # The injection-vector probe is a required precondition: it returns a
+    # {confirmed, guidance} shape, handles no-auth gracefully (no crash, nothing
+    # confirmed), and its candidate carriers include the IP-spoofing headers that
+    # CVE-2024-22120 actually uses (X-Forwarded-For).
+    py = r"""
+import sys; sys.path.insert(0,'/app')
+from api import _probe_injection_vectors, _IP_INJECTION_HEADERS
+assert 'X-Forwarded-For' in _IP_INJECTION_HEADERS, _IP_INJECTION_HEADERS
+# no auth -> no probe, graceful empty result
+r = _probe_injection_vectors('127.0.0.1', 1, 'Zabbix', resolved={}, auth=None)
+assert isinstance(r, dict) and r.get('confirmed') == [] and 'guidance' in r, r
+# non-matching product -> empty, no crash
+r2 = _probe_injection_vectors('127.0.0.1', 1, 'Grafana', resolved={}, auth={'username':'x'})
+assert r2.get('confirmed') == [], r2
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and 'OK' in out, f"out={out} err={err}"
