@@ -23711,9 +23711,18 @@ def _run_one_building_block(probe, ip, port, product, analysis, auth,
         try:
             with _hx.Client(verify=False, timeout=timeout) as c:
                 r = c.get(base + "/")
+            # Richer evidence so the operator sees the actual probe output,
+            # not just a verdict. Headers + a body snippet make "reachable"
+            # audit-worthy instead of a bare "HTTP 200".
+            srv = r.headers.get("Server") or ""
+            ct = r.headers.get("Content-Type") or ""
+            snippet = (r.text or "").strip().replace("\r", "")[:400]
+            ev = f"GET {base}/\nHTTP {r.status_code}  ({len(r.text or '')} bytes)"
+            if srv: ev += f"\nServer: {srv}"
+            if ct:  ev += f"\nContent-Type: {ct}"
+            if snippet: ev += f"\n---\n{snippet}"
             _record_confirmation(tgt, "target_reachable", "/", "confirmed",
-                                 evidence=f"HTTP {r.status_code}", method="probe",
-                                 product=product)
+                                 evidence=ev, method="probe", product=product)
             return True
         except Exception:  # noqa: BLE001
             return False
@@ -23778,9 +23787,14 @@ def _run_one_building_block(probe, ip, port, product, analysis, auth,
                     except Exception:  # noqa: BLE001
                         continue
                     if er.status_code != 404:
+                        snippet = (er.text or "").strip().replace("\r", "")[:400]
+                        ev = (f"GET {base}/{path.lstrip('/')}\n"
+                              f"HTTP {er.status_code}  ({len(er.text or '')} bytes)"
+                              + (f"\n(discovered — advisory named {tep})" if path != tep else "")
+                              + (f"\nContent-Type: {er.headers.get('Content-Type')}" if er.headers.get('Content-Type') else "")
+                              + (f"\n---\n{snippet}" if snippet else ""))
                         _record_confirmation(tgt, "endpoint_exists", path, "confirmed",
-                                             evidence=f"HTTP {er.status_code} (discovered)"
-                                             if path != tep else f"HTTP {er.status_code}",
+                                             evidence=ev,
                                              method="probe", claim_value=path, product=product)
                         return True
         except Exception:  # noqa: BLE001
@@ -24421,14 +24435,24 @@ def _probe_session_valid(ip, port, cookie, product=None, timeout=8):
                 except Exception:  # noqa: BLE001
                     continue
                 body_l = (r.text or "").lower()
+                snippet = (r.text or "").strip().replace("\r", "")[:600]
+                # Build an evidence block the operator can read: the request,
+                # the status, a few key response headers, and a body excerpt.
+                # Keeps "the actual output" in the ledger, not just a verdict.
+                hdrs = {k.lower(): r.headers.get(k) for k in
+                        ("server", "content-type", "location", "set-cookie")
+                        if r.headers.get(k)}
+                hdr_lines = "\n".join(f"{k}: {v}" for k, v in hdrs.items())
+                head = f"GET {p}\nHTTP {r.status_code}  ({len(r.text or '')} bytes)\n{hdr_lines}".strip()
+                full = f"{head}\n---\n{snippet}" if snippet else head
                 # A tiny body (<2KB) on an app page is almost always a
                 # login/warning shell, not the real authenticated view.
                 if len(r.text or "") < 2000 and any(m in body_l for m in DEAD):
-                    return False, f"{p} returned a not-logged-in page ({len(r.text)}b)"
+                    return False, f"{p} returned a not-logged-in page ({len(r.text)}b)\n{full}"
                 if any(m in body_l for m in DEAD):
-                    return False, f"{p} contains a not-logged-in marker"
+                    return False, f"{p} contains a not-logged-in marker\n{full}"
                 # Looks like real authenticated content.
-                return True, f"{p} returned authenticated content ({len(r.text)}b)"
+                return True, f"{p} returned authenticated content ({len(r.text)}b)\n{full}"
     except Exception as e:  # noqa: BLE001
         return False, f"probe error: {e}"
     return False, "no authenticated endpoint confirmed"

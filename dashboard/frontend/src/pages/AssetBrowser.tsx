@@ -908,6 +908,10 @@ function ConfirmedFactsSection({ ip, hostname }: { ip: string; hostname?: string
     refetchInterval: 30000,
   })
   const { data: access } = useAssetAccess(ip, false)
+  // Per-row expand toggle so an operator can click the Evidence cell to see
+  // the full stored text (the ledger holds up to 2000 chars; the table cell
+  // clips at ~280px). Operator ask: "nice to see the actual output."
+  const [expandedEvidence, setExpandedEvidence] = useState<Record<string, boolean>>({})
 
   // Client-filter to this host: target is "ip:port", so match the ip prefix, OR
   // the stored hostname matches the asset's hostname (vhost-distinct facts).
@@ -1012,19 +1016,44 @@ function ConfirmedFactsSection({ ip, hostname }: { ip: string; hostname?: string
                   </tr>
                 </thead>
                 <tbody>
-                  {pfacts.map(f => (
-                    <tr key={f.id} className="border-b border-border/40 align-top">
-                      <td className="py-1 px-2">
-                        <div className="font-mono">{f.claim_type}</div>
-                        <div className="text-[10px] text-muted-foreground font-mono">{f.claim_key}</div>
-                      </td>
-                      <td className="px-2 font-mono">{f.claim_value || '—'}</td>
-                      <td className="px-2">{statusBadge(f.status, isStale(f))}</td>
-                      <td className="px-2 text-[10px] text-muted-foreground max-w-[280px]">{f.evidence || '—'}</td>
-                      <td className="px-2 text-[10px] text-muted-foreground font-mono">{f.method || '—'}</td>
-                      <td className="px-2 text-right text-[10px] text-muted-foreground whitespace-nowrap">{fmtAge(f.age_s)}</td>
-                    </tr>
-                  ))}
+                  {pfacts.map(f => {
+                    const long = (f.evidence || '').length > 90 || (f.evidence || '').includes('\n')
+                    const isOpen = expandedEvidence[f.id] === true
+                    return (
+                      <Fragment key={f.id}>
+                        <tr className="border-b border-border/40 align-top">
+                          <td className="py-1 px-2">
+                            <div className="font-mono">{f.claim_type}</div>
+                            <div className="text-[10px] text-muted-foreground font-mono">{f.claim_key}</div>
+                          </td>
+                          <td className="px-2 font-mono">{f.claim_value || '—'}</td>
+                          <td className="px-2">{statusBadge(f.status, isStale(f))}</td>
+                          <td className="px-2 text-[10px] text-muted-foreground max-w-[280px]">
+                            {long ? (
+                              <button type="button"
+                                className="inline-flex items-start gap-1 text-left hover:text-foreground"
+                                title={isOpen ? "collapse evidence" : "expand to see full evidence output"}
+                                onClick={() => setExpandedEvidence(s => ({ ...s, [f.id]: !isOpen }))}>
+                                <ChevronRight className={cn("h-3 w-3 mt-0.5 shrink-0 transition-transform", isOpen && "rotate-90")} />
+                                <span className="truncate">{(f.evidence || '').slice(0, 90)}{(f.evidence || '').length > 90 ? '…' : ''}</span>
+                              </button>
+                            ) : (
+                              <span>{f.evidence || '—'}</span>
+                            )}
+                          </td>
+                          <td className="px-2 text-[10px] text-muted-foreground font-mono">{f.method || '—'}</td>
+                          <td className="px-2 text-right text-[10px] text-muted-foreground whitespace-nowrap">{fmtAge(f.age_s)}</td>
+                        </tr>
+                        {long && isOpen && (
+                          <tr>
+                            <td colSpan={6} className="px-2 pb-2">
+                              <pre className="text-[10px] font-mono bg-background border border-border rounded p-2 whitespace-pre-wrap break-words max-h-80 overflow-auto">{f.evidence}</pre>
+                            </td>
+                          </tr>
+                        )}
+                      </Fragment>
+                    )
+                  })}
                 </tbody>
               </table>
             </div>
