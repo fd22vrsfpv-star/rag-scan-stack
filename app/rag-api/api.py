@@ -17100,10 +17100,17 @@ def _fetch_nuclei_template(cve, timeout=10):
     return ""
 
 
-def _search_github_pocs(cve, timeout=10, max_results=5):
+def _search_github_pocs(cve, timeout=10, max_results=5, fetch_readme=True):
     """INTEL EXPANSION — GitHub topic/code search for `<CVE>-poc` / `<CVE>-exploit`
     repositories. Many CVEs have community PoC repos the GHSA entry doesn't link.
-    Uses unauthenticated search API (60 req/hr/IP), bounded. Returns [{url, snippet}]."""
+    Uses unauthenticated search API (60 req/hr/IP), bounded. Returns
+    [{url, snippet, readme?}]. When fetch_readme=True, the top-ranked repo's
+    README is fetched (first ~4KB) so the recipe extractor sees the actual
+    wire shape (curl commands, request bodies, multipart boundaries) instead
+    of inventing a plausible-looking schema. Operator research finding: the
+    Cacti CVE-2024-25641 agent spec invented `<package>` XML wrapper when the
+    real schema is `<xml><files><file>...` — the GitHub PoC README has the
+    real one, we just weren't reading it."""
     import httpx as _hx
     hits = []
     try:
@@ -17119,11 +17126,37 @@ def _search_github_pocs(cve, timeout=10, max_results=5):
                             u = it.get("html_url")
                             if u and u not in {h.get("url") for h in hits}:
                                 hits.append({"url": u,
+                                             "full_name": it.get("full_name"),
+                                             "default_branch": it.get("default_branch") or "main",
                                              "snippet": (it.get("description") or "")[:200]})
                                 if len(hits) >= max_results:
-                                    return hits
+                                    break
+                        if len(hits) >= max_results:
+                            break
                 except Exception:  # noqa: BLE001
                     continue
+            # Fetch the top-ranked repo's README so the LLM sees the real wire
+            # shape (curl commands, HTTP requests, XML/JSON bodies). One extra
+            # HTTP call per CVE, bounded to 4KB. Fail-soft per repo.
+            if fetch_readme and hits:
+                for h in hits[:2]:  # top 2 only to keep intel size bounded
+                    full_name = h.get("full_name")
+                    branch = h.get("default_branch", "main")
+                    if not full_name:
+                        continue
+                    for br in (branch, "main", "master"):
+                        for fname in ("README.md", "readme.md", "README.rst", "README"):
+                            try:
+                                rr = c.get(f"https://raw.githubusercontent.com/"
+                                           f"{full_name}/{br}/{fname}",
+                                           headers={"User-Agent": "Pentest-Research"})
+                                if rr.status_code == 200 and rr.text:
+                                    h["readme"] = rr.text[:4000]
+                                    break
+                            except Exception:  # noqa: BLE001
+                                continue
+                        if h.get("readme"):
+                            break
     except Exception:  # noqa: BLE001
         pass
     return hits
@@ -17179,6 +17212,43 @@ def _extract_patch_urls(advisory_text, poc_text=""):
             if u not in urls:
                 urls.append(u)
     return urls[:4]
+
+
+def _extract_product_from_advisory(advisory_text):
+    """Pull the product name from a GHSA/CIRCL advisory block. Looks for
+    patterns like "Summary: Zabbix server can perform..." or "<Product> <= X.Y.Z
+    is affected" or "Improper Privilege Management vulnerability in <Product>
+    allows...". Returns "" when no clear name is found; the caller falls back
+    to the (possibly empty) product arg instead of overriding."""
+    import re as _re
+    if not advisory_text:
+        return ""
+    text = advisory_text[:4000]
+    patterns = [
+        # "Improper <X> vulnerability in <Product> allows..." (patchstack/
+        # WordPress-plugin GHSA shape — matches CVE-2024-32511, CVE-2023-51483)
+        r"vulnerability\s+in\s+([A-Z][A-Za-z0-9._\- /]{2,60}?)\s+allows\b",
+        # "man-group/dtale version 3.10.0 is vulnerable" — repo path first
+        r"\b([a-z][a-z0-9\-]+/[A-Za-z][A-Za-z0-9\-_]+)\s+version",
+        # "<Product> version X.Y.Z is affected" / "<Product> <= X.Y.Z"
+        r"\b([A-Z][A-Za-z0-9._\-]+(?:\s+[A-Z][A-Za-z0-9._\-]+)*)\s+(?:version|v\d|<=|from n/a through|is vulnerable)",
+        # "Summary: <Product>" first-noun — strip trailing descriptors
+        r"Summary:\s*([A-Z][A-Za-z0-9._\-]+(?:\s+[A-Z][A-Za-z0-9._\-]+)?)\b",
+    ]
+    STOPWORDS = {"server", "applications", "application", "can", "is", "was",
+                  "has", "version", "allows", "vulnerable"}
+    for pat in patterns:
+        m = _re.search(pat, text)
+        if m:
+            name = m.group(1).strip().strip("'\"`")
+            # strip trailing stopwords (" server", " applications", etc.)
+            parts = name.split()
+            while parts and parts[-1].lower() in STOPWORDS:
+                parts.pop()
+            name = " ".join(parts)
+            if 2 < len(name) < 60:
+                return name
+    return ""
 
 
 def _summarize_intel_for_exploit(cve, product, version, intel, patch_diffs, model=None):
@@ -17577,6 +17647,26 @@ def _recipe_to_spec(cve, product, recipe):
             and "verify_request" not in spec):
         spec["proof_model"] = "read_back"
         spec["notes"] = (spec.get("notes") or "") + " [proof_model DOWNGRADED read_back_after_action→read_back: LLM did not supply verify_request]"
+    # {OOB_URL} VALIDATOR: when the LLM declares proof_model=oob_callback but
+    # the payload template doesn't contain the {OOB_URL} placeholder, auto-fix
+    # by injecting it. The verifier substitutes {OOB_URL} with the live
+    # listener URL; without it, the callback goes to whatever literal domain
+    # the LLM baked in (research finding: CVE-2024-32980 payload was literal
+    # "Host: google.com:80" — the callback went to google.com, never to the
+    # listener, so oob_no_callback was reported for a potentially-working
+    # exploit). If injection carrier is `header`, replace the value; otherwise
+    # append `{OOB_URL}` to the template so at least ONE substitution happens.
+    if spec.get("proof_model") == "oob_callback":
+        pt = spec.get("injection", {}).get("payload_template", "")
+        if "{OOB_URL}" not in pt:
+            spec["notes"] = (spec.get("notes") or "") + \
+                " [auto-fix: inserted {OOB_URL} placeholder — payload had a literal host, OOB callback would never fire]"
+            if carrier == "header":
+                # replace the header value entirely with {OOB_URL}
+                spec["injection"]["payload_template"] = "{OOB_URL}"
+            else:
+                # append or wrap depending on shape
+                spec["injection"]["payload_template"] = pt + " {OOB_URL}" if pt else "{OOB_URL}"
     return spec
 
 
@@ -17855,10 +17945,23 @@ def _derive_cve_spec_single_pass(cve, product, version, ip, port, model=None,
     except Exception:  # noqa: BLE001
         pass
     try:
-        pocs = _search_github_pocs(cve)
+        pocs = _search_github_pocs(cve, fetch_readme=True)
         if pocs:
-            extras.append("\n--- GitHub PoC repos (community exploits):\n"
-                          + "\n".join(f"  * {p['url']} — {p['snippet']}" for p in pocs))
+            # List all URLs + snippets
+            lines = ["\n--- GitHub PoC repos (community exploits):"]
+            for p in pocs:
+                lines.append(f"  * {p['url']} — {p.get('snippet','')}")
+            # Embed the top repo's README so the LLM sees the actual wire shape
+            # (curl commands, HTTP requests, body schemas) instead of inventing
+            # one. Research finding: for CVE-2024-25641 (Cacti), the agent
+            # invented a `<package>` XML wrapper when the real schema in the
+            # linked PoC's README is `<xml><files><file>...`.
+            for p in pocs[:2]:
+                if p.get("readme"):
+                    lines.append(f"\n--- README for {p['url']} (verbatim — "
+                                 "use this for the exact request shape):")
+                    lines.append(p["readme"])
+            extras.append("\n".join(lines))
     except Exception:  # noqa: BLE001
         pass
     try:
@@ -17891,9 +17994,16 @@ def _derive_cve_spec_single_pass(cve, product, version, ip, port, model=None,
     # for the intel data to consolidate and help the LLM build an exploit" +
     # "maybe standardize the format". The brief is also surfaced in the
     # derivation-intel panel for manual review.
+    # Resolve product from GHSA summary when caller passed None/empty. 6 of 7
+    # research-sampled failing CVEs had product=unknown on the stored spec,
+    # which bypasses all product-tailored intel. The GHSA summary line almost
+    # always names the real product (e.g. "Zabbix server...", "Spin
+    # applications...") — pull it before the summary pass.
+    resolved_product = product or _extract_product_from_advisory(
+        intel.get("advisory_text") or "")
     intel_summary = {}
     try:
-        intel_summary = _summarize_intel_for_exploit(cve, product, version, intel,
+        intel_summary = _summarize_intel_for_exploit(cve, resolved_product, version, intel,
                                                     patches, model=model)
         if intel_summary:
             intel["summary"] = intel_summary
