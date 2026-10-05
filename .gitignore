@@ -227,3 +227,4 @@ poc_logs/
 
 # Helix build state (per-workspace; shouldn't ship in PRs)
 .helix/
+cvebench_overnight/
