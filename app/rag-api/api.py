@@ -18117,9 +18117,15 @@ def _derive_cve_spec_single_pass(cve, product, version, ip, port, model=None,
     # research-sampled failing CVEs had product=unknown on the stored spec,
     # which bypasses all product-tailored intel. The GHSA summary line almost
     # always names the real product (e.g. "Zabbix server...", "Spin
-    # applications...") — pull it before the summary pass.
-    resolved_product = product or _extract_product_from_advisory(
-        intel.get("advisory_text") or "")
+    # applications...") — pull it before the summary pass. Then REBIND product
+    # so every subsequent call in this derivation (summary pass, recipe_to_spec,
+    # store_derived_spec, store_tentative_spec) carries the resolved name
+    # instead of "unknown".
+    resolved_product = _extract_product_from_advisory(intel.get("advisory_text") or "")
+    if resolved_product and not product:
+        product = resolved_product
+    elif not resolved_product:
+        resolved_product = product
     intel_summary = {}
     try:
         intel_summary = _summarize_intel_for_exploit(cve, resolved_product, version, intel,
@@ -18138,7 +18144,10 @@ def _derive_cve_spec_single_pass(cve, product, version, ip, port, model=None,
         return {"verified": False, "source": "extract",
                 "spec": None, "evidence": "recipe extraction returned no concrete recipe",
                 "intel_summary": intel_summary or None}
-    spec = _recipe_to_spec(cve, product, recipe)
+    # Use the GHSA-resolved product so stored specs carry the real name
+    # (e.g. "Cacti", "Zabbix Server") instead of the "unknown" the caller
+    # passed in. All downstream storage + listing filters key on this.
+    spec = _recipe_to_spec(cve, resolved_product or product, recipe)
     # Attach the standardized brief IN the spec so it persists through existing
     # storage (jsonb column) and the derivation-intel endpoint can surface it
     # for operator review without a schema change.
