@@ -30513,6 +30513,157 @@ def list_scope_decisions(
     return {"decisions": [{k: str(v) if k == "id" else v for k, v in r.items()} for r in rows], "total": len(rows)}
 
 
+@app.post("/scope-pivot/typosquat/{engagement_id}", tags=["Scope"])
+def run_typosquat_pivot(
+    engagement_id: str,
+    check_resolution: bool = True,
+    auto_block_at: float = 0.85,
+    authorized: bool = Depends(auth),
+):
+    """Run the typosquat detector against this engagement's apex scope.
+
+    For each in-scope domain / url target, generates ~200 lookalike
+    candidates (edit-1/2, QWERTY, homoglyph, bitsquat, IDN, TLD swap),
+    scores each, writes `scope_suggestions` rows with `method='typosquat'`,
+    and auto-adds high-confidence hits to the GLOBAL `not_in_scope`
+    deny-list (where the scope-gate short-circuit refuses dispatch for
+    every engagement).
+
+    Query params:
+      * check_resolution — DNS A/AAAA resolution check per candidate
+        (slower, but much better signal). Default True.
+      * auto_block_at — score threshold for auto-adding to the deny-list.
+        Default 0.85 — operator-confirmed in the OSINT scope-expansion plan.
+
+    Returns the summary dict from `flag_typosquats_for_engagement`:
+      {seeds, total_candidates, suggestions_written, denylist_added, errors}
+    """
+    try:
+        eid = _validate_engagement_uuid(engagement_id)
+    except Exception:
+        raise HTTPException(status_code=400,
+                            detail="invalid engagement_id uuid")
+    if not eid:
+        raise HTTPException(status_code=400,
+                            detail="engagement_id required")
+    try:
+        from typosquat_agent import flag_typosquats_for_engagement
+    except ImportError as e:
+        logging.exception("typosquat_agent import failed")
+        raise HTTPException(status_code=500,
+                            detail=f"typosquat_agent unavailable: {e}")
+    summary = flag_typosquats_for_engagement(
+        get_db, eid,
+        check_resolution=check_resolution,
+        auto_block_at=auto_block_at,
+    )
+    return {"ok": True, "engagement_id": eid, "summary": summary}
+
+
+@app.get("/scope-pivot/suggestions", tags=["Scope"])
+def list_scope_suggestions(
+    status: Optional[str] = None,
+    method: Optional[str] = None,
+    limit: int = 500,
+    authorized: bool = Depends(auth),
+):
+    """List rows from `scope_suggestions` — the review workflow for the
+    typosquat detector + cert-pivot + ASN-pivot pass.
+
+    Filters:
+      * status=pending|accepted|rejected  (default: all)
+      * method=typosquat|cert_pivot|asn_pivot|rule|similarity|llm
+    """
+    where, args = [], []
+    if status:
+        where.append("status = %s"); args.append(status)
+    if method:
+        where.append("method = %s"); args.append(method)
+    sql = ("SELECT id::text, target, suggested_scope, confidence, "
+           "reasoning, method, status, created_at, reviewed_at "
+           "FROM public.scope_suggestions ")
+    if where:
+        sql += "WHERE " + " AND ".join(where) + " "
+    sql += "ORDER BY confidence DESC NULLS LAST, created_at DESC LIMIT %s"
+    args.append(int(limit))
+    with get_db() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, tuple(args))
+        rows = [dict(r) for r in cur.fetchall()]
+    for r in rows:
+        if r.get("created_at"):
+            r["created_at"] = r["created_at"].isoformat()
+        if r.get("reviewed_at"):
+            r["reviewed_at"] = r["reviewed_at"].isoformat()
+    return {"ok": True, "suggestions": rows, "total": len(rows)}
+
+
+@app.post("/scope-pivot/suggestions/{suggestion_id}/review", tags=["Scope"])
+def review_scope_suggestion(
+    suggestion_id: str,
+    body: dict,
+    authorized: bool = Depends(auth),
+):
+    """Operator review action on a scope_suggestions row.
+    Body: {action: "accept"|"reject"}.
+
+    For method='typosquat' AND action='accept': the target is ALSO added
+    to the global not_in_scope deny-list (if not already) via the same
+    pathway as exclude_from_scope — the deny-list is the belt-and-braces
+    for the scope-gate short-circuit, so operator confirmation of a
+    typosquat is what pins it there even when the score was below the
+    auto-block threshold.
+
+    For method IN ('cert_pivot','asn_pivot') AND action='accept': the
+    target is ADDED to the engagement's in-scope list (via /scope/add
+    semantics) so the pivot promotes it to an attack surface.
+    """
+    action = (body or {}).get("action", "").lower().strip()
+    if action not in ("accept", "reject"):
+        raise HTTPException(status_code=400,
+                            detail="action must be 'accept' or 'reject'")
+    new_status = "accepted" if action == "accept" else "rejected"
+    with get_db() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT target, method, suggested_scope FROM public.scope_suggestions "
+                    "WHERE id = %s::uuid", (suggestion_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404,
+                                detail="scope_suggestion not found")
+        cur.execute("UPDATE public.scope_suggestions "
+                    "SET status = %s, reviewed_at = now() "
+                    "WHERE id = %s::uuid", (new_status, suggestion_id))
+        # Post-review action depending on method
+        if action == "accept":
+            method = row["method"]
+            target = row["target"]
+            if method == "typosquat":
+                # Add to the GLOBAL not_in_scope deny-list.
+                cur.execute(
+                    "INSERT INTO public.scope_targets "
+                    "(name, target, target_type, source, engagement_id) "
+                    "VALUES ('not_in_scope', %s, 'domain', 'typosquat_review', NULL) "
+                    "ON CONFLICT DO NOTHING",
+                    (target,),
+                )
+            elif method in ("cert_pivot", "asn_pivot"):
+                # Add to the current engagement's in-scope list. The
+                # suggested_scope column names which engagement scope
+                # it belongs to. Default to the active engagement from
+                # the operator session.
+                eid = _resolve_engagement_id(None)
+                if eid:
+                    cur.execute(
+                        "INSERT INTO public.scope_targets "
+                        "(name, target, target_type, source, engagement_id) "
+                        "VALUES ('default', %s, 'domain', %s, %s::uuid) "
+                        "ON CONFLICT DO NOTHING",
+                        (target, f"{method}_review", eid),
+                    )
+        c.commit()
+    return {"ok": True, "suggestion_id": suggestion_id,
+            "new_status": new_status, "action": action}
+
+
 @app.post("/scope/exclude", tags=["Scope"])
 def exclude_from_scope(
     body: dict,

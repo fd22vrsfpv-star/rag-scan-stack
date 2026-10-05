@@ -1870,6 +1870,224 @@ def _cert_serial_chain(job_id: str, tlsx_output_file: str, original_domains: lis
     }
 
 
+# ─── Scope-pivot helpers (step 4 of OSINT scope-expansion plan) ───────────
+# `_cert_serial_chain` above already does serial pivot; these helpers extend
+# the pattern with key-fingerprint (SPKI SHA-256) and SAN-overlap pivots, add
+# a direct TLS probe path for the live baseline, and add the high-precision
+# ASN filter required by the operator-confirmed design (ASN-only matching is
+# too noisy; require a cert-subject or domain-string signal in addition).
+
+def _query_crtsh_by_spki(spki_sha256_hex: str, timeout: int = 30,
+                          max_retries: int = 2) -> list:
+    """Query crt.sh by SPKI SHA-256 fingerprint. Same shape as
+    `_query_crtsh_serial`. SPKI pivot catches re-issued certs that share
+    the private key (same org, different serial)."""
+    import time as _time
+    hex_hash = (spki_sha256_hex or "").strip().lower().replace(":", "")
+    if not hex_hash:
+        return []
+    url = f"https://crt.sh/?spkisha256={hex_hash}&output=json"
+    headers = {"User-Agent": "Mozilla/5.0 (recon-scanner)"}
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, timeout=timeout, headers=headers)
+            if resp.status_code == 200:
+                try:
+                    return resp.json()
+                except (json.JSONDecodeError, ValueError):
+                    return []
+            elif resp.status_code in (502, 503, 504, 429):
+                _time.sleep((2 ** attempt) * 3)
+                continue
+            else:
+                return []
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            _time.sleep((2 ** attempt) * 3)
+            continue
+        except Exception:  # noqa: BLE001
+            return []
+    return []
+
+
+def _fetch_tls_cert_direct(host: str, port: int = 443,
+                            timeout: float = 5.0) -> dict:
+    """Fetch the live TLS cert from a host directly — no CT-log dependency.
+    Returns {serial, spki_sha256, subject_cn, san_list, issuer} or {} on
+    failure. Used as the current-baseline probe before CT lookups so the
+    agent has data even when CT indexing lags.
+
+    Uses stdlib `ssl` for the TLS handshake and `cryptography` for X.509
+    parsing. `cryptography` is already in the rag-api requirements; this
+    module ships with it too via the shared common/ bind mount."""
+    import ssl
+    import socket
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+    except ImportError:
+        logging.warning("cryptography unavailable; _fetch_tls_cert_direct skipped")
+        return {}
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                der = ssock.getpeercert(binary_form=True)
+        if not der:
+            return {}
+        cert = x509.load_der_x509_certificate(der)
+        # Serial as uppercase hex (matches crt.sh query format)
+        serial_hex = format(cert.serial_number, "x").upper()
+        # SPKI SHA-256 fingerprint
+        spki_der = cert.public_key().public_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        d = hashes.Hash(hashes.SHA256())
+        d.update(spki_der)
+        spki_hex = d.finalize().hex().upper()
+        # Subject CN + SAN list
+        subject_cn = ""
+        try:
+            for attr in cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME):
+                subject_cn = attr.value
+                break
+        except Exception:  # noqa: BLE001
+            pass
+        san_list: list[str] = []
+        try:
+            ext = cert.extensions.get_extension_for_oid(
+                x509.ExtensionOID.SUBJECT_ALTERNATIVE_NAME).value
+            san_list = ext.get_values_for_type(x509.DNSName)
+        except x509.ExtensionNotFound:
+            pass
+        except Exception:  # noqa: BLE001
+            pass
+        issuer_cn = ""
+        try:
+            for attr in cert.issuer.get_attributes_for_oid(x509.NameOID.COMMON_NAME):
+                issuer_cn = attr.value
+                break
+        except Exception:  # noqa: BLE001
+            pass
+        return {
+            "serial": serial_hex,
+            "spki_sha256": spki_hex,
+            "subject_cn": subject_cn,
+            "san_list": san_list,
+            "issuer_cn": issuer_cn,
+        }
+    except Exception as e:  # noqa: BLE001
+        logging.debug("_fetch_tls_cert_direct(%s:%s) failed: %s",
+                       host, port, e)
+        return {}
+
+
+def _cert_pivot_candidates(seed_host: str, parent_domains: set,
+                            serial: str = "", spki_sha256: str = "",
+                            san_list: list = None,
+                            rate_limit_sec: float = 1.0) -> dict:
+    """Collect pivot candidates for ONE in-scope host across three signals:
+    serial, SPKI SHA-256, and SAN overlap. Returns:
+      {"from_serial": set(), "from_spki": set(), "from_san": set()}
+
+    Each set contains candidate domains that pivot to the seed via that
+    signal AND whose registrable domain is in `parent_domains` (filter
+    out noise). The caller aggregates across all seeds.
+    """
+    import time as _time
+    out = {"from_serial": set(), "from_spki": set(), "from_san": set()}
+
+    def _collect_from_crtsh_rows(rows: list) -> set:
+        found: set = set()
+        for cert in rows or []:
+            for field in ("common_name", "name_value"):
+                val = cert.get(field, "")
+                if not val:
+                    continue
+                for name in val.replace("\n", " ").split():
+                    name = name.strip().lstrip("*.")
+                    if not name or "." not in name:
+                        continue
+                    name_parts = name.split(".")
+                    if len(name_parts) < 2:
+                        continue
+                    name_parent = ".".join(name_parts[-2:])
+                    if name_parent in parent_domains:
+                        found.add(name)
+        return found
+
+    if serial:
+        rows = _query_crtsh_serial(serial, timeout=30)
+        out["from_serial"] = _collect_from_crtsh_rows(rows)
+        _time.sleep(rate_limit_sec)
+    if spki_sha256:
+        rows = _query_crtsh_by_spki(spki_sha256, timeout=30)
+        out["from_spki"] = _collect_from_crtsh_rows(rows)
+        _time.sleep(rate_limit_sec)
+    for san in (san_list or []):
+        san = (san or "").strip().lstrip("*.").lower()
+        if not san or "." not in san or san == seed_host:
+            continue
+        name_parts = san.split(".")
+        if len(name_parts) < 2:
+            continue
+        # SAN pivot: any SAN entry whose parent is NOT in parent_domains
+        # (i.e. a different registrable domain) is a candidate. SAN
+        # entries within the SAME parent are expected and get filtered.
+        san_parent = ".".join(name_parts[-2:])
+        if san_parent not in parent_domains:
+            out["from_san"].add(san)
+    return out
+
+
+def _asn_high_precision_filter(asn_hosts: list, in_scope_orgs: set,
+                                in_scope_domains: set) -> list:
+    """Filter asnmap/Cymru results to high-precision matches only.
+
+    Operator-confirmed: naive ASN membership is too noisy. A host in the
+    in-scope ASN must ALSO have a cert-subject org string matching
+    `in_scope_orgs` OR a hostname / rDNS substring matching
+    `in_scope_domains` to count as a candidate.
+
+    `asn_hosts` is a list of dicts: {host, cert_subject, rdns, asn}.
+    Returns the filtered subset with each entry annotated with
+    `match_signal` ('cert_subject' or 'rdns' or 'both')."""
+    out: list = []
+    lower_orgs = {o.lower() for o in in_scope_orgs if o}
+    lower_domains = {d.lower() for d in in_scope_domains if d}
+
+    def _org_match(cert_subject: str) -> bool:
+        cs = (cert_subject or "").lower()
+        if not cs:
+            return False
+        return any(org in cs for org in lower_orgs)
+
+    def _domain_match(host: str, rdns: str) -> bool:
+        h = (host or "").lower()
+        r = (rdns or "").lower()
+        for d in lower_domains:
+            if d and (d in h or d in r):
+                return True
+        return False
+
+    for row in asn_hosts or []:
+        host = row.get("host") or ""
+        cert_subject = row.get("cert_subject") or ""
+        rdns = row.get("rdns") or ""
+        cert_hit = _org_match(cert_subject)
+        dom_hit = _domain_match(host, rdns)
+        if not (cert_hit or dom_hit):
+            continue
+        signal = "both" if (cert_hit and dom_hit) else (
+            "cert_subject" if cert_hit else "rdns")
+        annotated = dict(row)
+        annotated["match_signal"] = signal
+        out.append(annotated)
+    return out
+
+
 def _run_passive_recon(job_id: str, domains: list, include_spider: bool = False,
                         spider_depth: int = 2, include_cert_chain: bool = True,
                         cert_chain_max_iterations: int = 2, scope_name: str = None,
