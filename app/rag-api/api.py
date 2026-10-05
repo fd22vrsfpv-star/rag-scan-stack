@@ -371,6 +371,12 @@ _build_poc_candidate_fanout: contextvars.ContextVar = contextvars.ContextVar(
 _build_poc_deep_flags: contextvars.ContextVar = contextvars.ContextVar(
     "build_poc_deep_flags", default={},  # {default_cred_sweep, wordlist_fuzz, known_poc_seed}
 )
+# Monotonic deadline (time.monotonic() + wall_timeout_sec) or None. The
+# derive-pass loop checks this between passes and exits early. Per-site:
+# this applies to one build-poc call only.
+_build_poc_wall_deadline: contextvars.ContextVar = contextvars.ContextVar(
+    "build_poc_wall_deadline", default=None,
+)
 
 
 @app.middleware("http")
@@ -19348,7 +19354,22 @@ def _derive_cve_spec(cve, product, version, ip, port, model=None, auth=None,
             max_passes = 5
     max_passes = max(1, int(max_passes))
     last_result = None
+    deadline = _build_poc_wall_deadline.get()
     for pass_n in range(1, max_passes + 1):
+        # Per-site wall-clock budget. "quick" preset = 1800s, "deep" =
+        # 7200s, custom = whatever the operator supplied. Checked BEFORE
+        # each pass starts so we never spend an iteration we don't have.
+        if deadline is not None and time.monotonic() >= deadline:
+            if last_result:
+                last_result["source"] = "wall_timeout"
+                last_result["evidence"] = (
+                    f"per-site wall-clock budget exhausted after "
+                    f"{pass_n - 1} pass(es); returning last tentative")
+                return last_result
+            return {"verified": False, "source": "wall_timeout",
+                    "spec": None,
+                    "evidence": "per-site wall-clock budget exhausted "
+                                "before any pass completed"}
         res = _derive_cve_spec_single_pass(cve, product, version, ip, port,
                                            model=model, auth=auth, allow_fuzz=allow_fuzz,
                                            engagement_id=engagement_id)
@@ -21070,6 +21091,25 @@ class BuildPocBody(BaseModel):
     # per iteration, prior behavior) or higher for broader exploration.
     # Each extra candidate is one extra LLM call per iteration.
     candidate_fanout: int = 3
+
+    # Preset that pins the knobs + budget to a named profile — avoids
+    # per-knob tuning and makes a run reproducible by name.
+    # These apply PER SITE (per build-poc call) — a batch runner that
+    # loops N CVEs gets the preset budget N times, once per target.
+    #   "quick" — 30-min wall budget, 5 iterations, fanout 1, no deep
+    #             flags. Baseline for comparison / spot-checks.
+    #   "deep"  — 2h wall budget, 15 iterations, fanout 5, ALL three
+    #             deep flags on. The thorough pass.
+    #   None    — operator-tuned (respects individual flags above, no
+    #             wall cap).
+    # When set, the preset OVERRIDES the matching individual fields.
+    test_mode: Optional[str] = None
+
+    # Hard wall-clock cap for THIS build-poc call (seconds, per site).
+    # None = no limit; "quick" preset sets 1800, "deep" sets 7200. The
+    # derive loop checks this between passes and exits early with
+    # source='wall_timeout' when the budget is spent.
+    wall_timeout_sec: Optional[int] = None
 
 
 class FetchPreconditionsBody(BaseModel):
@@ -23436,19 +23476,60 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     if body.username or body.password or body.bruteforce:
         auth = {"username": body.username, "password": body.password,
                 "login_url": body.login_url, "bruteforce": body.bruteforce}
+    # Resolve test_mode preset — pins knobs + wall budget to a named
+    # profile. Preset wins over individual flags for the fields it
+    # names; unspecified fields fall back to the body values. Per-site:
+    # the wall budget applies to THIS one build-poc call.
+    preset = (body.test_mode or "").strip().lower()
+    eff_fanout = body.candidate_fanout or 3
+    eff_max_iters = body.max_iters
+    eff_dcs = bool(body.enable_default_cred_sweep)
+    eff_wlf = bool(body.enable_wordlist_fuzz)
+    eff_kps = bool(body.enable_known_poc_seed)
+    eff_wall = body.wall_timeout_sec
+    if preset == "quick":
+        eff_fanout = 1
+        eff_max_iters = min(eff_max_iters, 5)
+        eff_dcs = eff_wlf = eff_kps = False
+        eff_wall = eff_wall or 1800
+    elif preset == "deep":
+        eff_fanout = max(eff_fanout, 5)
+        eff_max_iters = max(eff_max_iters, 15)
+        eff_dcs = eff_wlf = eff_kps = True
+        eff_wall = eff_wall or 7200
+    elif preset and preset not in ("custom", "none"):
+        raise HTTPException(400,
+            f"test_mode must be one of: quick, deep, custom "
+            f"(got: {preset!r})")
+
     # Deep-test knobs — propagate into contextvars so derivation helpers
     # pick them up without passing extra params through 10+ layers.
-    _build_poc_candidate_fanout.set(max(1, int(body.candidate_fanout or 3)))
+    _build_poc_candidate_fanout.set(max(1, int(eff_fanout)))
     _build_poc_deep_flags.set({
-        "default_cred_sweep": bool(body.enable_default_cred_sweep),
-        "wordlist_fuzz": bool(body.enable_wordlist_fuzz),
-        "known_poc_seed": bool(body.enable_known_poc_seed),
+        "default_cred_sweep": eff_dcs,
+        "wordlist_fuzz": eff_wlf,
+        "known_poc_seed": eff_kps,
     })
+    # Wall-clock deadline for the derive loop (per site). None = no cap.
+    if eff_wall and eff_wall > 0:
+        _build_poc_wall_deadline.set(time.monotonic() + float(eff_wall))
+    else:
+        _build_poc_wall_deadline.set(None)
     core = _build_poc_core(cve, ip, port, body.product, body.version, eid,
-                           body.max_iters, model=body.model, auth=auth, recon_first=body.recon_first,
+                           eff_max_iters, model=body.model, auth=auth, recon_first=body.recon_first,
                            recon_source=body.recon_source or "basic", hint=hint,
                            focused_urls=body.focused_urls or [])
-    return {"ok": True, "cve": cve, **core}
+    return {"ok": True, "cve": cve,
+            "test_mode": preset or "custom",
+            "effective_knobs": {
+                "candidate_fanout": eff_fanout,
+                "max_iters": eff_max_iters,
+                "default_cred_sweep": eff_dcs,
+                "wordlist_fuzz": eff_wlf,
+                "known_poc_seed": eff_kps,
+                "wall_timeout_sec": eff_wall,
+            },
+            **core}
 
 
 class PocGrantBody(BaseModel):
