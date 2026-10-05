@@ -1002,18 +1002,104 @@ def run_dnsx(req: DnsxReq, background_tasks: BackgroundTasks):
     return {"ok": True, "job_id": job_id, "status": "queued", "status_url": f"/jobs/{job_id}", "no_ingest": req.no_ingest}
 
 
+def _run_asnmap_job(job_id: str, targets: list, proxy: str = None, no_ingest: bool = False):
+    """ASN / CIDR mapping with a Team Cymru DNS fallback.
+
+    asnmap (ProjectDiscovery) v1.1+ requires a PDCP API key for EVERY lookup
+    and prompts for it interactively — which fails in a non-tty container
+    ("Could not read input from terminal"), so the binary alone never produced
+    data here (and it was being invoked with the wrong `-l` flag too). We try
+    the binary only when PDCP_API_KEY is set, then fall back to the FREE Team
+    Cymru DNS lookup (no key) — the same path the recon pipeline already uses.
+    Writes source='asnmap' recon_findings so the ASN scope-pivot has data.
+    """
+    import socket as _socket
+    _job_tracker.update_job(job_id, status="running",
+                            started_at=datetime.now().isoformat())
+    targets = [t.strip() for t in (targets or []) if t and t.strip()]
+    targets_file = _write_targets_file(targets)
+    output_file = str(REPORT_DIR / f"asnmap_{job_id[:8]}.jsonl")
+    emit_webhook_event("scan_started", "asnmap", {"job_id": job_id,
+                                                  "targets": len(targets)})
+    try:
+        # Scope gate (defense in depth; the BFF also gates before dispatch).
+        refusal = _scope_refusal_for_targets(targets_file)
+        if refusal:
+            _job_tracker.update_job(job_id, status="failed",
+                                    error=f"scope refusal: {refusal}",
+                                    completed_at=datetime.now().isoformat())
+            emit_webhook_event("scan_failed", "asnmap",
+                               {"job_id": job_id, "reason": "out_of_scope"})
+            return
+        _job_tracker.update_progress(job_id, stage="asnmap",
+                                     targets_count=len(targets))
+        results = []
+        # 1) asnmap binary — only worth trying when a PDCP key is configured.
+        if os.environ.get("PDCP_API_KEY"):
+            env = _build_proxy_env(proxy)
+            cmd = ["asnmap", "-f", targets_file, "-json", "-o", output_file, "-silent"]
+            _job_tracker.push_command(job_id, "asnmap", " ".join(cmd))
+            try:
+                subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=600, env=env)
+                results = _read_jsonl(output_file)
+            except Exception as e:  # noqa: BLE001
+                logging.info("[%s] asnmap binary failed (%s); using Cymru",
+                             job_id, e)
+        # 2) Team Cymru fallback (free, no key). Resolve domains → IPs first.
+        if not results:
+            ips = set()
+            for t in targets:
+                tt = t.lstrip("*.")
+                try:
+                    ipaddress.ip_address(tt)
+                    ips.add(tt)
+                    continue
+                except ValueError:
+                    pass
+                try:
+                    _n, _a, addrs = _socket.gethostbyname_ex(tt)
+                    for a in addrs:
+                        ips.add(a)
+                except Exception:  # noqa: BLE001
+                    continue
+            ips = list(ips)[:500]
+            results = _cymru_enrich_as_names(_cymru_asn_lookup(ips))
+            if results:
+                with open(output_file, "w") as f:
+                    for rec in results:
+                        f.write(json.dumps(rec) + "\n")
+        # 3) Ingest as source='asnmap' so the ASN pivot + gap model see it.
+        if results and not no_ingest:
+            _ingest_results("recon", output_file, job_id=job_id, source="asnmap")
+        _job_tracker.update_progress(job_id, findings_count=len(results))
+        _job_tracker.update_job(job_id, status="completed",
+                                completed_at=datetime.now().isoformat(),
+                                result={"mappings": len(results),
+                                        "file": output_file})
+        emit_webhook_event("scan_completed", "asnmap",
+                           {"job_id": job_id, "mappings": len(results)})
+    except Exception as e:  # noqa: BLE001
+        logging.exception("[%s] asnmap job failed", job_id)
+        _job_tracker.update_job(job_id, status="failed", error=str(e),
+                                completed_at=datetime.now().isoformat())
+        emit_webhook_event("scan_failed", "asnmap",
+                           {"job_id": job_id, "error": str(e)})
+    finally:
+        try:
+            os.remove(targets_file)
+        except OSError:
+            pass
+
+
 @app.post("/jobs/asnmap")
 def run_asnmap(req: AsnmapReq, background_tasks: BackgroundTasks):
-    """ASN to CIDR mapping."""
+    """ASN to CIDR mapping (asnmap binary when a PDCP key is set, else the
+    free Team Cymru DNS fallback). Ingests source='asnmap' recon_findings."""
     job_id = _job_tracker.create_job(job_type="asnmap")
-    targets_file = _write_targets_file(req.targets)
-    output_file = str(REPORT_DIR / f"asnmap_{job_id[:8]}.jsonl")
-
-    cmd = ["asnmap", "-l", targets_file, "-json", "-o", output_file, "-silent"]
-
-    env = _build_proxy_env(req.proxy)
     _job_tracker.update_progress(job_id, targets_count=len(req.targets))
-    background_tasks.add_task(_run_tool_job, job_id, "asnmap", cmd, targets_file, output_file, ingest_as="recon", env=env)
+    background_tasks.add_task(_run_asnmap_job, job_id, req.targets,
+                              req.proxy, bool(req.no_ingest))
     return {"ok": True, "job_id": job_id, "status": "queued", "status_url": f"/jobs/{job_id}"}
 
 
@@ -3500,7 +3586,7 @@ def _pipeline_domains(job_id: str, domains: list, skip: set, env: dict, proxy: s
             logging.info(f"[{job_id}] Pipeline phase: asnmap ({len(resolved_ips)} IPs)")
             ips_file = _write_targets_file(resolved_ips)
             asnmap_out = str(REPORT_DIR / f"pipeline_asnmap_{short}.jsonl")
-            cmd = ["asnmap", "-l", ips_file, "-json", "-o", asnmap_out, "-silent"]
+            cmd = ["asnmap", "-f", ips_file, "-json", "-o", asnmap_out, "-silent"]
             cp = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
             asnmap_results = _read_jsonl(asnmap_out)
 
@@ -3549,7 +3635,7 @@ def _pipeline_ips_asns(job_id: str, ips: list, asns: list, skip: set,
                 logging.info(f"[{job_id}] Pipeline phase: asnmap ({len(asns)} ASNs)")
                 targets_file = _write_targets_file(asns)
                 asnmap_out = str(REPORT_DIR / f"pipeline_asnmap_{short}.jsonl")
-                cmd = ["asnmap", "-l", targets_file, "-json", "-o", asnmap_out, "-silent"]
+                cmd = ["asnmap", "-f", targets_file, "-json", "-o", asnmap_out, "-silent"]
                 subprocess.run(cmd, capture_output=True, text=True, timeout=600)
                 results = _read_jsonl(asnmap_out)
                 _ingest_results("recon", asnmap_out, job_id=job_id, source="asnmap")

@@ -23,6 +23,7 @@ import pytest
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCANS = os.path.join(REPO, "dashboard", "bff", "routers", "scans.py")
 RECON = os.path.join(REPO, "dashboard", "bff", "services", "recon_agent.py")
+OSINT = os.path.join(REPO, "osint_runner", "osint_runner.py")
 
 
 def _module(path):
@@ -138,6 +139,45 @@ def test_asnmap_stage_is_ungated():
                 found = True
                 break
     assert found, 'no `scan_type != "asnmap"` gate exemption — asnmap can be starved by an earlier waiting stage'
+
+
+# ─── osint runner job ───────────────────────────────────────────────────────
+
+def _func(tree, name):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    return None
+
+
+def test_asnmap_job_has_cymru_fallback():
+    """The /jobs/asnmap worker falls back to the free Team Cymru lookup.
+
+    asnmap (ProjectDiscovery) needs a PDCP API key and prompts interactively,
+    so in a non-tty container the binary alone yields nothing. _run_asnmap_job
+    must call _cymru_asn_lookup so ASN data is actually produced without a key."""
+    tree = _module(OSINT)
+    fn = _func(tree, "_run_asnmap_job")
+    assert fn is not None, "_run_asnmap_job worker is gone — /jobs/asnmap lost its Cymru path"
+    called = {n.func.id for n in ast.walk(fn)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    assert "_cymru_asn_lookup" in called, "_run_asnmap_job never calls the Team Cymru fallback"
+    assert "_ingest_results" in called, "_run_asnmap_job never ingests its results"
+
+
+def test_asnmap_binary_uses_correct_flag():
+    """asnmap takes `-f` for a file of targets; the old `-l` is not a real flag
+    (v1.1 exits 2: 'flag provided but not defined: -l'), so every asnmap
+    invocation must use -f, never -l."""
+    tree = _module(OSINT)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.List) and node.elts:
+            first = node.elts[0]
+            if isinstance(first, ast.Constant) and first.value == "asnmap":
+                flags = [e.value for e in node.elts[1:]
+                         if isinstance(e, ast.Constant)]
+                assert "-l" not in flags, f"asnmap invoked with the invalid -l flag: {flags}"
+                assert "-f" in flags, f"asnmap invocation missing -f file flag: {flags}"
 
 
 if __name__ == "__main__":
