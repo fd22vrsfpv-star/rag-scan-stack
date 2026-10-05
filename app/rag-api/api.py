@@ -18456,6 +18456,26 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
     _MODEL_FALLBACK_TO = os.environ.get("BUILD_POC_MODEL_FALLBACK", "") or None
     _active_model = model  # may be swapped after fallback
     _model_fallback_fired = False
+    # Near-duplicate detector for the refine loop. The LLM was returning
+    # essentially the same command for 9+ iterations in a row (e.g. the same
+    # csrf_token=$(curl ...) prefix with trivial variations) — operator saw
+    # this as "the exploit workbench gets into a loop." Track a normalized
+    # signature per iteration; after 2+ consecutive duplicates (configurable
+    # via REFINE_DUP_EXIT_AT), stop refining and surface a clear reason.
+    _REFINE_DUP_EXIT_AT = int(os.environ.get("REFINE_DUP_EXIT_AT", "2") or "2")
+    _cmd_signatures = []
+    _refine_dup_streak = 0
+    import re as _re_dup
+    def _refine_signature(cmd):
+        """Normalize a shell command into a comparable signature. Collapses
+        whitespace, canonicalizes canary tokens and other per-run values so
+        a cosmetically-different retry of the same shape compares equal."""
+        s = (cmd or "").strip().lower()
+        s = _re_dup.sub(r"poc[0-9a-f]{6,}", "{CANARY}", s)      # canary tokens
+        s = _re_dup.sub(r"\b\d{10,}\b", "{EPOCH}", s)           # unix epochs
+        s = _re_dup.sub(r"\s+", " ", s)                         # whitespace
+        s = _re_dup.sub(r"'[a-f0-9]{32,}'", "'{HEX}'", s)       # hex blobs
+        return s[:300]
     for it in range(1, max(1, max_iters) + 1):
         iters = it
         # Enforce enumerated object-ids BEFORE running: the login proved these
@@ -18922,7 +18942,27 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                 pass
         if not obj or not obj.get("command"):
             break
-        command = str(obj["command"]).strip()
+        _new_cmd = str(obj["command"]).strip()
+        # Near-duplicate break: did the LLM just return essentially the same
+        # command as the previous iteration(s)? If so, further iterations will
+        # repeat the same shape and burn the budget. Stop and tell the operator.
+        _sig = _refine_signature(_new_cmd)
+        if _cmd_signatures and _sig == _cmd_signatures[-1]:
+            _refine_dup_streak += 1
+        else:
+            _refine_dup_streak = 0
+        _cmd_signatures.append(_sig)
+        if _refine_dup_streak >= _REFINE_DUP_EXIT_AT:
+            _poc_trace(run_id, "refine_dup_exit", iteration=it,
+                       extra={"streak": _refine_dup_streak,
+                              "signature": _sig[:150],
+                              "iterations_remaining": max_iters - it,
+                              "reason": "LLM returned near-duplicate commands "
+                                        f"for {_refine_dup_streak + 1} iterations "
+                                        "in a row — stopping to avoid an infinite "
+                                        "loop over the same shape."})
+            break
+        command = _new_cmd
         la = obj.get("assertion")
         # Keep timing mode sticky: if the (new) command still carries a timing
         # payload, this stays a timing proof even if the LLM omitted min_seconds.
