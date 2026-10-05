@@ -72,6 +72,13 @@ RESERVED_NONSCANNABLE = {"customer_scope", "customer", "excluded", "not_in_scope
 # `config.kb_driven_recon=false` on the agent state to restore the old chain
 # (useful when scan-recommender or its KB store is offline).
 STAGE_TO_SCAN = {
+    -1: "asnmap",   # passive — IP/domain → ASN + CIDR mapping (no target contact);
+                    #           feeds the ASN scope-pivot. Runs FIRST and UNGATED
+                    #           (see the `scan_type != "asnmap"` gate exemption below)
+                    #           so the loop's break-on-waiting-stage can never starve
+                    #           it, and it does not wait on dnsx (asnmap resolves
+                    #           domains itself). Stage -1 sorts ahead of whois(0);
+                    #           scope_coverage.stage is a plain int, negatives are fine.
     0: "whois",     # passive — WHOIS registration/ownership (no target contact)
     1: "dnsx",      # passive — DNS resolution (no target contact)
     2: "nmap",      # discovery (masscan-then-nmap, touches target)
@@ -80,14 +87,16 @@ STAGE_TO_SCAN = {
 }
 
 # Stages that always run regardless of kb_driven_recon — they produce the
-# port data the KB needs.  Stages NOT in this set are legacy-only.
-SEED_STAGES = {0, 1, 2}
+# port data the KB needs.  Stages NOT in this set are legacy-only. asnmap(-1)
+# is a passive seed (ASN/CIDR intel), so it belongs here too.
+SEED_STAGES = {-1, 0, 1, 2}
 
-STAGE_NAMES = {0: "passive-whois", 1: "passive-dns", 2: "discovery", 3: "fingerprint", 4: "exploit"}
+STAGE_NAMES = {-1: "passive-asn", 0: "passive-whois", 1: "passive-dns", 2: "discovery", 3: "fingerprint", 4: "exploit"}
 
 # Which target types each scan applies to. If a scan isn't listed here, it runs on all types.
 # Configurable per-engagement via config.scan_target_types override.
 SCAN_TARGET_TYPES: dict[str, set[str]] = {
+    "asnmap": {"domain", "ip"},       # maps domains/IPs to ASN + CIDR
     "whois": {"domain", "ip"},
     "dnsx": {"domain"},               # DNS resolution only makes sense for domains
     "subfinder": {"domain"},           # subdomain enum only for domains
@@ -732,8 +741,11 @@ class ReconAgent:
             if not stage_remaining:
                 continue  # stage done, move to next
 
-            # Don't start later stages until earlier ones are complete for applicable targets
-            if stage > 0:
+            # Don't start later stages until earlier ones are complete for applicable targets.
+            # asnmap(-1) is exempt: it is passive, independent of every other stage
+            # (it resolves domains → ASN itself), and must not be starved by the
+            # break-on-waiting-stage below, so it never waits on a prior stage.
+            if stage > 0 and scan_type != "asnmap":
                 prev_stage = stage - 1
                 prev_type = STAGE_TO_SCAN.get(prev_stage)
                 if prev_type and prev_stage not in skip_stages:

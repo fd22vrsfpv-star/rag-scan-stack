@@ -152,7 +152,7 @@ NO_EGRESS_TYPES = {"hashcat"}
 THIRD_PARTY_PASSIVE_TYPES = {
     "subfinder", "dnsx", "crtsh", "uncover", "chaos", "vulnx", "vulnx-scope",
     "recon-pipeline", "passive-recon", "greyhatwarfare", "whois", "cloud-tenant",
-    "amass", "censys", "gau", "waybackurls", "trufflehog",
+    "amass", "censys", "gau", "waybackurls", "trufflehog", "asnmap",
 }
 
 
@@ -529,6 +529,7 @@ SCAN_ROUTES = {
     }.items() if v is not None}),
     "subfinder": ("osint_runner_url", "/jobs/subfinder", lambda p: {"domains": _ensure_target_list(p)}),
     "dnsx": ("osint_runner_url", "/jobs/dnsx", lambda p: {"domains": _ensure_target_list(p)}),
+    "asnmap": ("osint_runner_url", "/jobs/asnmap", lambda p: {"targets": _ensure_target_list(p)}),
     "uncover": ("osint_runner_url", "/jobs/uncover", lambda p: {"query": p.get("query", ""), "engine": p.get("engine", "shodan"), "limit": p.get("limit", 100)}),
     "chaos": ("osint_runner_url", "/jobs/chaos", lambda p: {"domain": p.get("target", "")}),
     "shuffledns": ("osint_runner_url", "/jobs/shuffledns", lambda p: {"domains": _ensure_target_list(p)}),
