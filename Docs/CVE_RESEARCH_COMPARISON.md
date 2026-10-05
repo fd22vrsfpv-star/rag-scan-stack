@@ -628,3 +628,68 @@ Same bug class as CVE-2023-51483 (another WP plugin priv-esc) — missing role p
 - Fix A downgrade works as designed (CVE 7)
 
 **Signal:** The agent isn't fundamentally broken. It's missing a handful of specific pieces — mostly around EXPRESSION LANGUAGE dialect, DYNAMIC PREREQUISITES, and PRE-FETCH of PoC content. Each is a targeted change, not a redesign.
+
+---
+
+## Implementation status (overnight batch)
+
+Of the 7 priorities named above, **6 shipped overnight** against the running
+40-run so morning results can show the actual effect. The 7th (oracle-chain
+translation) is the biggest and defers to next session.
+
+| # | Priority | Commit | Status | Expected effect |
+|---|---|---|---|---|
+| 1 | Fetch GitHub PoC README into intel | `7a288b4` | shipped | CVE-2024-25641 (Cacti) — real XML schema reaches the LLM instead of invented `<package>` wrapper |
+| 2 | `payload.sink_grammar` field in brief | `4b39661` | shipped | CVE-2024-22120 (Zabbix) — LLM pins `sqli-postgres` and uses `pg_sleep()` not MySQL `SLEEP()`. Also CVE-2024-3408 (dtale) → `pandas-query` |
+| 3 | `{OOB_URL}` auto-insert validator | `7a288b4` | shipped | CVE-2024-32980 (Spin) — payload with literal `google.com:80` is auto-rewritten so the callback reaches the listener |
+| 4 | `auth_setup` form_login block | `e71b853` | shipped | Zabbix / WP plugins / Cacti / dtale — the LLM declares auth_setup; verifier does the login FIRST, injects the captured Cookie into every subsequent request. Replaces `{SESSIONID}` placeholder failure mode |
+| 5 | Resolve product from GHSA summary | `7a288b4` | shipped | 6 of 7 research CVEs showed product=unknown; now Zabbix / Spin / Astoundify / man-group/dtale / Glowlogix WP Frontend Profile resolve from GHSA text alone (one FP: "Blind XSS" from a Froxlor summary) |
+| 6 | Longer `cvebench_oracle` async wait | `4b39661` | shipped | CVE-2024-34070 (Froxlor blind-XSS) — oracle polled every 3s for up to 30s (CVEBENCH_ORACLE_WAIT) so a victim-triggered XSS gets caught by the admin-bot cycle |
+| 7 | Oracle-chain translation (primitive → goal) | — | NEXT | CVE-2024-22120 — turn verified time-SQLi into Database Access oracle hit via substring extraction + POST to :9091/upload |
+
+Also shipped: `fix(cvebench): re-check runpoc.sh in rag-api before every CVE`
+(local to `cvebench_overnight/run_40.sh`) — the prior 40-run had 29 of 40
+CVEs fail with "no such file" after an in-flight rag-api recreate wiped
+`/tmp/runpoc.sh`. Now idempotent-copy before every CVE.
+
+### Observable signals for the morning
+
+In `derived_cve_specs.spec._intel_summary` look for:
+- `payload.sink_grammar` populated (new field; previously absent) → fix 2 landing.
+- `product` resolved to a real name (previously `unknown`) → fix 5 landing.
+
+In the stored spec root look for:
+- `auth_setup` block with `form_login` type → fix 4 landing.
+- `notes` field containing `[auto-fix: inserted {OOB_URL} placeholder]` → fix 3 landing.
+- `notes` containing `[proof_model DOWNGRADED read_back_after_action→read_back]` → earlier Fix A still firing.
+
+In `derived_cve_specs.source`:
+- Any `intel+oracle_fallback` row → fix 6 landed a goal hit the primitive missed.
+
+In `intel['combined']` block (not persisted, visible in debug mode):
+- GitHub README sections prefixed `--- README for https://github.com/...` → fix 1 landing.
+
+### Running state
+- 40-run PID: see `ps -ef | grep run_40`, started 23:22 EDT 2026-10-04
+- All six fixes active for CVEs 2 onward (CVE #1 CVE-2023-37999 completed from DB cache before the restart)
+- Progress log: `cvebench_overnight/progress_40.log`
+- Monitor is tailing for "done in" + failure signatures; events arrive asynchronously
+
+### Session commit summary (chronological)
+
+```
+28fe474 ui(workbench): default-collapse PoC Store, Asset-Software CVEs, PoC panels
+6b58943 fix(refine): break the loop when the LLM returns near-duplicate commands
+cb50308 feat(confirmed-facts): capture + embed response screenshots in evidence
+427c5b4 fix(foothold+facts): mirror web_session into credentials; stop labeling Server header as product version
+f2fdd64 feat(confirmed-facts): expandable evidence rows + richer probe output
+d76be01 fix(workbench): "Open in browser" buttons search by CVE, not literal "unknown"
+6f8b790 feat(derive): standardized intel summary pass + CVE-Bench oracle proof + fallback
+122c037 ui(workbench): fix duplicate "Exploit Workbench" + add Create&Test entry + run-results fingerprint filter
+0491010 ui(workbench): carry ip:port forward from Asset-Software CVE row to new exploit
+c9686f7 docs: human-driven research comparison for 7 failing CVE-Bench targets
+7a288b4 feat(derive): three top-leverage fixes from the research gap analysis (PoC README fetch, product-from-GHSA, OOB_URL validator)
+4b39661 feat(derive): add payload.sink_grammar field + longer async oracle wait
+e71b853 feat(derive): auth_setup block — login first, inject cookie into subsequent requests
+```
+
