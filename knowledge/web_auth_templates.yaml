@@ -1,0 +1,147 @@
+# Web auth / CSRF chain templates for PoC pre_requests.
+#
+# PURPOSE
+#   When build-poc derives an exploit for a product that gates its sensitive
+#   endpoints behind a login + anti-CSRF token (nonce / sid / crumb /
+#   __csrf_magic / bearer), the LLM needs to see the SHAPE of the chain for
+#   that product: which endpoint logs in, where the token is captured from,
+#   which field or header carries it into the exploit request.
+#
+#   Rather than hard-code these in the extractor prompt (brittle, doesn't
+#   scale, defeats the RAG-first invariant), each template lives here as a
+#   retrievable fact. The loader embeds them into rag_documents with
+#   metadata.source='web_auth_template'; the extractor pulls matching rows
+#   by product and injects them into the brief's intel block.
+#
+# ADDING A NEW TEMPLATE
+#   1. Append a block below with product / login_shape / csrf_shape / notes.
+#   2. docker exec rag-api python3 /app/../etl/load_knowledge_documents.py
+#      (or wait for the auto-sync on container start).
+#   3. The next build-poc run against that product will retrieve it.
+#
+# No code change required.
+
+templates:
+
+  - product: wordpress
+    aliases: [wp, wordpress-core]
+    login_shape:
+      method: POST
+      path: /wp-login.php
+      content_type: form
+      body_fields: {log: "<user>", pwd: "<pass>", "wp-submit": "Log In"}
+      captures: [{source: set-cookie, name: wp_cookie}]
+    csrf_shape:
+      - method: GET
+        path: /wp-admin/profile.php
+        headers: {Cookie: "{wp_cookie}"}
+        captures:
+          - source: body-regex
+            pattern: "name=['\"]_wpnonce['\"] value=['\"]([a-f0-9]+)['\"]"
+            name: wpnonce
+    exploit_use:
+      body_fields: {_wpnonce: "{wpnonce}"}
+      headers: {Cookie: "{wp_cookie}"}
+    notes: >
+      Nonces rotate per session. Capture the nonce AFTER login on the admin
+      page that owns the AJAX action being exploited — a nonce from
+      profile.php is NOT valid for every admin-ajax action.
+
+  - product: zabbix
+    aliases: [zabbix-frontend]
+    login_shape:
+      method: POST
+      path: /index.php?autologin=1
+      content_type: form
+      body_fields: {name: "<user>", password: "<pass>", enter: "Sign in"}
+      captures:
+        - source: set-cookie
+          name: zbx_cookie
+        - source: body-regex
+          pattern: '"sessionid":"([a-f0-9]{32})"'
+          name: sessionid
+    csrf_shape:
+      - note: >
+          Zabbix's anti-CSRF 'sid' body parameter is the FIRST 16 characters
+          of sessionid. Capture 16 chars directly via a tighter regex:
+          pattern='"sessionid":"([a-f0-9]{16})'
+          name=sid_short
+    exploit_use:
+      body_fields: {sid: "{sid_short}"}
+      headers: {Cookie: "{zbx_cookie}"}
+    notes: >
+      Every /zabbix.php?action=... POST needs the sid body param OR a
+      X-Csrf-Token header on newer builds. If the exploit targets an
+      action= endpoint and omits sid, the server returns a login redirect
+      and the proof canary never fires.
+
+  - product: jenkins
+    aliases: [jenkins-ci]
+    login_shape:
+      method: POST
+      path: /j_spring_security_check
+      content_type: form
+      body_fields: {j_username: "<user>", j_password: "<pass>"}
+      captures: [{source: set-cookie, name: jenkins_cookie}]
+    csrf_shape:
+      - method: GET
+        path: /crumbIssuer/api/json
+        headers: {Cookie: "{jenkins_cookie}"}
+        captures:
+          - source: body-regex
+            pattern: '"crumb":"([a-f0-9]+)"'
+            name: crumb
+    exploit_use:
+      headers: {Cookie: "{jenkins_cookie}", "Jenkins-Crumb": "{crumb}"}
+    notes: >
+      Jenkins crumb header name varies on older builds — check
+      crumbRequestField in the crumbIssuer response if the default header
+      is rejected.
+
+  - product: cacti
+    aliases: []
+    login_shape:
+      method: POST
+      path: /index.php
+      content_type: form
+      body_fields: {login_username: "admin", login_password: "admin", action: "login"}
+      captures: [{source: set-cookie, name: cacti_cookie}]
+    csrf_shape:
+      - method: GET
+        path: /index.php
+        headers: {Cookie: "{cacti_cookie}"}
+        captures:
+          - source: body-regex
+            pattern: "name=['\"]__csrf_magic['\"][^>]+value=['\"]([^'\"]+)"
+            name: csrf_magic
+    exploit_use:
+      body_fields: {__csrf_magic: "{csrf_magic}"}
+      headers: {Cookie: "{cacti_cookie}"}
+    notes: >
+      __csrf_magic is a per-page token. Fetch it from the SAME endpoint
+      the exploit targets if the generic index.php token is rejected.
+
+  - product: grafana
+    aliases: []
+    login_shape:
+      method: POST
+      path: /login
+      content_type: json
+      body_fields: {user: "<user>", password: "<pass>"}
+      captures: [{source: set-cookie, name: grafana_cookie}]
+    csrf_shape:
+      - method: POST
+        path: /api/auth/keys
+        content_type: json
+        headers: {Cookie: "{grafana_cookie}"}
+        body_fields: {name: "poc", role: "Admin"}
+        captures:
+          - source: body-regex
+            pattern: '"key":"([a-zA-Z0-9]+)"'
+            name: api_key
+    exploit_use:
+      headers: {Authorization: "Bearer {api_key}"}
+    notes: >
+      Grafana API-key endpoints are deprecated on 10.x in favour of
+      service-account tokens — if /api/auth/keys returns 410, create a
+      service account instead (POST /api/serviceaccounts).
