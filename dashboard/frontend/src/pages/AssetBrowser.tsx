@@ -895,6 +895,28 @@ interface ConfirmedFact {
   age_s: number | null
 }
 
+// Renders the full evidence text with any `Screenshot: /confirmed-facts/screenshot/<x>.png`
+// line stripped and shown as an inline <img>. Multiple screenshots are each inlined.
+// The /confirmed-facts/screenshot/* path is proxied by the BFF to rag-api.
+function ExpandedEvidence({ evidence }: { evidence: string }) {
+  const re = /^Screenshot:\s+(\S+)\s*$/gm
+  const shots: string[] = []
+  const text = evidence.replace(re, (_m, p1) => { shots.push(p1); return '' }).replace(/\n{3,}/g, '\n\n').trim()
+  return (
+    <div className="space-y-2">
+      <pre className="text-[10px] font-mono bg-background border border-border rounded p-2 whitespace-pre-wrap break-words max-h-80 overflow-auto">{text}</pre>
+      {shots.map((src, i) => (
+        <a key={i} href={`/api${src}`} target="_blank" rel="noopener noreferrer"
+           className="block border border-border rounded overflow-hidden hover:border-blue-500/60"
+           title="Click to open full-size screenshot">
+          <img src={`/api${src}`} alt="Response screenshot"
+               className="w-full max-h-96 object-contain bg-background" />
+        </a>
+      ))}
+    </div>
+  )
+}
+
 // Confirmed Facts / Foothold panel for a host. Reads the durable confirmed_facts
 // ledger (session validity, resolved object-ids, endpoint existence, version
 // applicability, vendor-doc answers) + the live foothold, and groups them BY
@@ -1047,7 +1069,7 @@ function ConfirmedFactsSection({ ip, hostname }: { ip: string; hostname?: string
                         {long && isOpen && (
                           <tr>
                             <td colSpan={6} className="px-2 pb-2">
-                              <pre className="text-[10px] font-mono bg-background border border-border rounded p-2 whitespace-pre-wrap break-words max-h-80 overflow-auto">{f.evidence}</pre>
+                              <ExpandedEvidence evidence={f.evidence || ''} />
                             </td>
                           </tr>
                         )}
