@@ -309,8 +309,13 @@ const PROTOCOLS = ['ssh', 'ftp', 'rdp', 'smb', 'http', 'https', 'telnet', 'vnc',
  *  operator doesn't have to switch pages: stored exploits that match any
  *  collected CVE, a Build-PoC shortcut (pre-filled with the first CVE), and
  *  a jump link to the full /exploits page for deeper operational work. */
-function ExploitWorkbenchOperationsTab({ product, version, collectedCves }: {
+function ExploitWorkbenchOperationsTab({ product, version, collectedCves, embedded }: {
   product: string; version: string; collectedCves: string[]
+  // When embedded inside the Exploit Workbench's inline research surface,
+  // the outer workbench already has its own build-PoC entry — suppress the
+  // redundant "Build a new PoC for this product" subsection to avoid a
+  // second exploit-workbench stack showing up (operator-flagged).
+  embedded?: boolean
 }) {
   // Fetch stored exploits per CVE — bounded to the first 10 so the modal
   // doesn't fan out into dozens of parallel queries.
@@ -402,35 +407,44 @@ function ExploitWorkbenchOperationsTab({ product, version, collectedCves }: {
         )}
       </div>
 
-      <div className="border border-border rounded-md p-3 space-y-2">
-        <h4 className="text-sm font-semibold inline-flex items-center gap-1">
-          <Sparkles className="h-3.5 w-3.5" /> Build a new PoC for this product
-        </h4>
-        <p className="text-[11px] text-muted-foreground">
-          Kicks /software/build-poc for the first collected CVE
-          {firstCve && <> (<span className="font-mono text-amber-400">{firstCve}</span>)</>}
-          with product + version pre-filled. 5–10 min; result lands in Exploit
-          Store regardless of verdict, so you can tweak + rerun.
-        </p>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={runBuild}
-            disabled={!firstCve || buildPoc.isPending}
-            className="h-7 px-3 rounded bg-purple-600 hover:bg-purple-700 text-white text-xs inline-flex items-center gap-1 disabled:opacity-40">
-            {buildPoc.isPending ? <Loader2 className="w-3 h-3 animate-spin" /> : <Sparkles className="w-3 h-3" />}
-            Build PoC
-          </button>
-          <a href="/exploits" target="_blank" rel="noopener"
-            className="h-7 px-3 rounded border border-border hover:bg-muted text-xs inline-flex items-center gap-1">
-            <ExternalLink className="w-3 h-3" /> Open full Exploit Manager
-          </a>
-        </div>
-        {buildMsg && (
-          <div className="text-[11px] font-mono bg-muted/40 border border-border rounded p-2 whitespace-pre-wrap">
-            {buildMsg}
+      {/* Build-PoC section — only shown when standalone (modal form). When
+          this component is embedded inside the Exploit Workbench, the outer
+          surface already has its own build-PoC entry (the "PoC for product"
+          details panel + the top-bar "Create & Test Exploit" button), so
+          this redundant subsection is suppressed to avoid two "exploit
+          workbench" surfaces stacking on top of each other — operator
+          flagged "the second exploit workbench shows up". */}
+      {!embedded && (
+        <div className="border border-border rounded-md p-3 space-y-2">
+          <h4 className="text-sm font-semibold inline-flex items-center gap-1">
+            <Sparkles className="h-3.5 w-3.5" /> Build a new PoC for this product
+          </h4>
+          <p className="text-[11px] text-muted-foreground">
+            Kicks /software/build-poc for the first collected CVE
+            {firstCve && <> (<span className="font-mono text-amber-400">{firstCve}</span>)</>}
+            with product + version pre-filled. 5–10 min; result lands in Exploit
+            Store regardless of verdict, so you can tweak + rerun.
+          </p>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={runBuild}
+              disabled={!firstCve || buildPoc.isPending}
+              className="h-7 px-3 rounded bg-purple-600 hover:bg-purple-700 text-white text-xs inline-flex items-center gap-1 disabled:opacity-40">
+              {buildPoc.isPending ? <Loader2 className="w-3 h-3 animate-spin" /> : <Sparkles className="w-3 h-3" />}
+              Build PoC
+            </button>
+            <a href="/exploits" target="_blank" rel="noopener"
+              className="h-7 px-3 rounded border border-border hover:bg-muted text-xs inline-flex items-center gap-1">
+              <ExternalLink className="w-3 h-3" /> Open full Exploit Manager
+            </a>
           </div>
-        )}
-      </div>
+          {buildMsg && (
+            <div className="text-[11px] font-mono bg-muted/40 border border-border rounded p-2 whitespace-pre-wrap">
+              {buildMsg}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
@@ -3562,7 +3576,9 @@ export function ExploitLookupModal({ product, version, cve, cveFlags, onClose, e
       <div className="bg-card border border-border rounded-lg p-5 w-full max-w-3xl max-h-[85vh] overflow-auto space-y-4" onClick={e => e.stopPropagation()}>
         <div className="flex items-center justify-between">
           <h3 className="text-sm font-semibold">
-            Exploit Workbench: {product} {version || ''}
+            {embedded
+              ? <>Research &amp; Public Exploits: {product} {version || ''}</>
+              : <>Exploit Workbench: {product} {version || ''}</>}
           </h3>
           <div className="flex items-center gap-1">
             {!embedded && (
@@ -4160,6 +4176,7 @@ export function ExploitLookupModal({ product, version, cve, cveFlags, onClose, e
           <ExploitWorkbenchOperationsTab
             product={product}
             version={version || ''}
+            embedded={embedded}
             collectedCves={(() => {
               const seen = new Set<string>()
               // Pull every CVE the modal has gathered — from VulnX, DDG
