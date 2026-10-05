@@ -10,16 +10,23 @@
 // the panel's natural home is at the ENGAGEMENT level (one picker already
 // in context), not inside a single-scope drill-down. The dropdown-form
 // stays as a graceful fallback for the standalone page.
-import { useState } from 'react'
+import { useState, useMemo, useEffect } from 'react'
 import { Zap, Target } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { usePivotSuggestions, useRunTyposquatPivot, useReviewPivotSuggestion } from '@/api/scope'
+import {
+  usePivotSuggestions,
+  useRunTyposquatPivot,
+  useReviewPivotSuggestion,
+  useBulkReviewPivotSuggestions,
+} from '@/api/scope'
 import { useEngagements } from '@/api/engagements'
 
 export function ScopePivotPanel({ engagementId: fixedEid }: { engagementId?: string }) {
   const [methodFilter, setMethodFilter] = useState<string>('')
   const [pickedEid, setPickedEid] = useState<string>('')
   const [lastRunSummary, setLastRunSummary] = useState<string>('')
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [bulkSummary, setBulkSummary] = useState<string>('')
   const effectiveEid = fixedEid || pickedEid
 
   const { data: suggestionsData, isLoading } = usePivotSuggestions({
@@ -29,8 +36,65 @@ export function ScopePivotPanel({ engagementId: fixedEid }: { engagementId?: str
   const { data: engagementsData } = useEngagements()
   const runPivot = useRunTyposquatPivot()
   const review = useReviewPivotSuggestion()
+  const bulkReview = useBulkReviewPivotSuggestions()
   const suggestions = suggestionsData?.suggestions ?? []
   const engagements = engagementsData?.engagements ?? []
+
+  // Drop stale selections when the pending set changes (a filter switch
+  // or a successful bulk commit should empty the box).
+  const visibleIds = useMemo(() => new Set(suggestions.map(s => s.id)), [suggestions])
+  useEffect(() => {
+    setSelectedIds(prev => {
+      const next = new Set<string>()
+      for (const id of prev) if (visibleIds.has(id)) next.add(id)
+      return next.size === prev.size ? prev : next
+    })
+  }, [visibleIds])
+
+  const allVisibleChecked = suggestions.length > 0 && suggestions.every(s => selectedIds.has(s.id))
+  const toggleOne = (id: string) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id); else next.add(id)
+      return next
+    })
+  }
+  const toggleAllVisible = () => {
+    setSelectedIds(prev => {
+      if (allVisibleChecked) {
+        const next = new Set(prev)
+        for (const s of suggestions) next.delete(s.id)
+        return next
+      }
+      const next = new Set(prev)
+      for (const s of suggestions) next.add(s.id)
+      return next
+    })
+  }
+
+  const runBulk = async (action: 'accept' | 'reject') => {
+    const ids = Array.from(selectedIds)
+    if (!ids.length) { setBulkSummary('nothing selected'); return }
+    // Bias toward the honest action — a bulk Confirm on typosquats is
+    // destructive-adjacent (adds to the global not_in_scope deny-list),
+    // so warn when the selection spans methods or the count is large.
+    const typoCount = suggestions.filter(s => selectedIds.has(s.id) && s.method === 'typosquat').length
+    const promoteCount = ids.length - typoCount
+    if (action === 'accept') {
+      const parts: string[] = []
+      if (typoCount) parts.push(`${typoCount} typosquat → not_in_scope deny-list`)
+      if (promoteCount) parts.push(`${promoteCount} pivot → engagement in-scope`)
+      const msg = `Confirm ${ids.length} suggestions?\n\n${parts.join('\n')}\n\nThis is reversible per-row from the suggestion lists.`
+      if (!window.confirm(msg)) return
+    }
+    try {
+      const r = await bulkReview.mutateAsync({ ids, action })
+      setBulkSummary(`${action}: ${r.processed}/${r.requested} processed`)
+      setSelectedIds(new Set())
+    } catch (e: unknown) {
+      setBulkSummary(`error: ${(e as Error).message}`)
+    }
+  }
 
   const handleRun = async () => {
     if (!effectiveEid) { setLastRunSummary('select an engagement first'); return }
@@ -114,6 +178,38 @@ export function ScopePivotPanel({ engagementId: fixedEid }: { engagementId?: str
         </span>
       </div>
 
+      {/* Bulk action bar — appears whenever anything is selected */}
+      {selectedIds.size > 0 && (
+        <div className="flex items-center gap-2 flex-wrap p-2 bg-primary/5 border border-primary/30 rounded">
+          <span className="text-[11px] font-medium">{selectedIds.size} selected</span>
+          <button
+            onClick={() => runBulk('accept')}
+            disabled={bulkReview.isPending}
+            className="h-6 px-2 text-[11px] rounded bg-red-500/15 hover:bg-red-500/25 text-red-300 border border-red-500/30 disabled:opacity-40"
+            title="Confirm every selected suggestion. Typosquats go to the global not_in_scope deny-list; cert/ASN pivots are promoted to this engagement's in-scope list."
+          >
+            Confirm selected
+          </button>
+          <button
+            onClick={() => runBulk('reject')}
+            disabled={bulkReview.isPending}
+            className="h-6 px-2 text-[11px] rounded border border-border hover:bg-accent disabled:opacity-40"
+            title="Mark every selected suggestion as a false positive. No deny-list or scope changes; the rows drop out of the pending view."
+          >
+            Reject selected
+          </button>
+          <button
+            onClick={() => setSelectedIds(new Set())}
+            className="h-6 px-2 text-[11px] rounded border border-border hover:bg-accent"
+          >
+            Clear
+          </button>
+          {bulkSummary && (
+            <span className="text-[10px] font-mono text-muted-foreground ml-2">{bulkSummary}</span>
+          )}
+        </div>
+      )}
+
       {/* Suggestions table */}
       {isLoading ? (
         <p className="text-[11px] text-muted-foreground">Loading…</p>
@@ -127,6 +223,18 @@ export function ScopePivotPanel({ engagementId: fixedEid }: { engagementId?: str
           <table className="w-full text-[11px]">
             <thead>
               <tr className="border-b border-border text-left text-muted-foreground">
+                <th className="py-1 px-2 font-medium w-6">
+                  <input
+                    type="checkbox"
+                    checked={allVisibleChecked}
+                    ref={el => {
+                      if (el) el.indeterminate = !allVisibleChecked && suggestions.some(s => selectedIds.has(s.id))
+                    }}
+                    onChange={toggleAllVisible}
+                    aria-label="Select all visible suggestions"
+                    className="cursor-pointer"
+                  />
+                </th>
                 <th className="py-1 px-2 font-medium">Target</th>
                 <th className="py-1 px-2 font-medium w-20">Method</th>
                 <th className="py-1 px-2 font-medium w-16">Score</th>
@@ -136,7 +244,19 @@ export function ScopePivotPanel({ engagementId: fixedEid }: { engagementId?: str
             </thead>
             <tbody>
               {suggestions.map(s => (
-                <tr key={s.id} className="border-b border-border/50 hover:bg-muted/50 align-top">
+                <tr key={s.id} className={cn(
+                  'border-b border-border/50 hover:bg-muted/50 align-top',
+                  selectedIds.has(s.id) && 'bg-primary/5',
+                )}>
+                  <td className="py-1.5 px-2">
+                    <input
+                      type="checkbox"
+                      checked={selectedIds.has(s.id)}
+                      onChange={() => toggleOne(s.id)}
+                      aria-label={`Select ${s.target}`}
+                      className="cursor-pointer"
+                    />
+                  </td>
                   <td className="py-1.5 px-2 font-mono">{s.target}</td>
                   <td className="py-1.5 px-2">{methodBadge(s.method)}</td>
                   <td className="py-1.5 px-2 font-mono">{s.confidence?.toFixed(2) ?? '—'}</td>

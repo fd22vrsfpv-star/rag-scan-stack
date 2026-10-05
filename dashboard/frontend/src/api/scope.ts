@@ -362,3 +362,30 @@ export function useReviewPivotSuggestion() {
     },
   })
 }
+
+/**
+ * Bulk confirm/reject up to 500 pending suggestions in one call.
+ * The server runs them inside a single transaction, so the whole batch
+ * commits together or rolls back together.
+ */
+export function useBulkReviewPivotSuggestions() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ ids, action }: { ids: string[]; action: 'accept' | 'reject' }) =>
+      apiFetch<{
+        ok: boolean
+        action: string
+        requested: number
+        processed: number
+        new_status: string
+        results: Record<string, string>
+      }>(`/scope-pivot/suggestions/review-bulk`, {
+        method: 'POST', body: JSON.stringify({ ids, action }),
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['pivot-suggestions'] })
+      qc.invalidateQueries({ queryKey: ['excluded-targets'] })
+      qc.invalidateQueries({ queryKey: ['scope-names'] })
+    },
+  })
+}

@@ -30806,6 +30806,100 @@ def review_scope_suggestion(
             "new_status": new_status, "action": action}
 
 
+@app.post("/scope-pivot/suggestions/review-bulk", tags=["Scope"])
+def review_scope_suggestions_bulk(
+    body: dict,
+    authorized: bool = Depends(auth),
+):
+    """Operator bulk-review action on scope_suggestions rows.
+
+    Body: {ids: [uuid, ...], action: "accept"|"reject"}.
+
+    Runs ONE transaction over the whole batch — all-or-nothing per the
+    scope-gate's fail-closed principle, so a mid-batch rejection on one
+    row (e.g. a typosquat insert that races a duplicate) can't leave
+    half the batch half-committed. Returns per-id outcomes
+    (processed / not_found / error-reason) so the UI can show which
+    rows landed and which did not.
+
+    Each accepted row runs the same post-review side-effect as the
+    single-row endpoint (typosquat → global not_in_scope deny-list;
+    cert_pivot / asn_pivot → engagement in-scope list).
+    """
+    ids = body.get("ids") or []
+    action = (body.get("action") or "").lower().strip()
+    if action not in ("accept", "reject"):
+        raise HTTPException(status_code=400,
+                            detail="action must be 'accept' or 'reject'")
+    if not isinstance(ids, list) or not ids:
+        raise HTTPException(status_code=400,
+                            detail="ids must be a non-empty list of UUIDs")
+    # Hard upper bound — the UI never has more than a page of pending rows
+    # visible at once, and a 1 000-id batch is almost certainly a mis-call.
+    if len(ids) > 500:
+        raise HTTPException(status_code=400,
+                            detail="batch size limited to 500 ids")
+    new_status = "accepted" if action == "accept" else "rejected"
+    results: dict = {}
+    processed = 0
+    with get_db() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
+        # Resolve the active engagement once; cert_pivot/asn_pivot accepts
+        # all land on the same engagement for the batch (operator chose
+        # which engagement is active before clicking).
+        eid = _resolve_engagement_id(None) if action == "accept" else None
+        for sid in ids:
+            sid_s = str(sid).strip()
+            if not sid_s:
+                results[sid_s or "(empty)"] = "invalid_id"
+                continue
+            try:
+                cur.execute(
+                    "SELECT target, method FROM public.scope_suggestions "
+                    "WHERE id = %s::uuid", (sid_s,))
+            except Exception:  # noqa: BLE001 — malformed uuid
+                results[sid_s] = "invalid_uuid"
+                continue
+            row = cur.fetchone()
+            if not row:
+                results[sid_s] = "not_found"
+                continue
+            cur.execute(
+                "UPDATE public.scope_suggestions "
+                "SET status = %s, reviewed_at = now() "
+                "WHERE id = %s::uuid", (new_status, sid_s))
+            if action == "accept":
+                target = row["target"]
+                method = row["method"]
+                if method == "typosquat":
+                    cur.execute(
+                        "INSERT INTO public.scope_targets "
+                        "(name, target, target_type, source, engagement_id) "
+                        "VALUES ('not_in_scope', %s, 'domain', "
+                        "'typosquat_review_bulk', NULL) "
+                        "ON CONFLICT DO NOTHING",
+                        (target,),
+                    )
+                elif method in ("cert_pivot", "asn_pivot") and eid:
+                    cur.execute(
+                        "INSERT INTO public.scope_targets "
+                        "(name, target, target_type, source, engagement_id) "
+                        "VALUES ('default', %s, 'domain', %s, %s::uuid) "
+                        "ON CONFLICT DO NOTHING",
+                        (target, f"{method}_review_bulk", eid),
+                    )
+            results[sid_s] = "processed"
+            processed += 1
+        c.commit()
+    return {
+        "ok": True,
+        "action": action,
+        "requested": len(ids),
+        "processed": processed,
+        "new_status": new_status,
+        "results": results,
+    }
+
+
 @app.post("/scope/exclude", tags=["Scope"])
 def exclude_from_scope(
     body: dict,

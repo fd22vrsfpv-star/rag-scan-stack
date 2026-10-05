@@ -209,11 +209,31 @@ class ReviewPivotBody(BaseModel):
 
 
 @router.post("/api/scope-pivot/suggestions/{suggestion_id}/review")
-async def review_pivot_suggestion(suggestion_id: int, body: ReviewPivotBody):
+async def review_pivot_suggestion(suggestion_id: str, body: ReviewPivotBody):
     s = get_settings()
     async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.post(
             f"{s.rag_api_url}/scope-pivot/suggestions/{suggestion_id}/review",
+            json=body.model_dump(),
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        return safe_json(resp)
+
+
+class BulkReviewPivotBody(BaseModel):
+    ids: list[str]
+    action: str  # "accept" | "reject"
+
+
+@router.post("/api/scope-pivot/suggestions/review-bulk")
+async def review_pivot_suggestions_bulk(body: BulkReviewPivotBody):
+    """Bulk operator review — up to 500 ids per call, one rag-api round-trip
+    + one DB transaction, so the UI can confirm/reject a page of
+    suggestions without 500 serial requests."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=120) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/scope-pivot/suggestions/review-bulk",
             json=body.model_dump(),
             headers={"x-api-key": s.api_key, **engagement_headers()},
         )
