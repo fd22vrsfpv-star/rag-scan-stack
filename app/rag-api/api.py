@@ -18884,12 +18884,36 @@ def _curl_from_cve_spec(ip, port, req, payload):
 
     def sub(v):
         return v.replace("{INJ}", payload) if isinstance(v, str) else v
+    # For path-traversal payloads we need slashes to go through literally so
+    # the traversal actually traverses — only encode the non-slash special
+    # chars. For non-traversal payloads encode everything (so `'`, spaces,
+    # `=`, etc. don't break the URL).
+    _path_safe = "/" if ("../" in payload or "..%2F" in payload or "..\\" in payload) else ""
+    def sub_encoded(v):
+        """{INJ} substitution with URL-encoding — for path + query-string
+        contexts. Prevents raw `'`, spaces, `=` from breaking the URL;
+        preserves `/` when the payload is path-traversal-shaped."""
+        return v.replace("{INJ}", _u.quote(payload, safe=_path_safe))\
+            if isinstance(v, str) else v
     query = {k: sub(v) for k, v in (req.get("query") or {}).items()}
     raw_body = req.get("body")
     body = ({k: sub(v) for k, v in raw_body.items()} if isinstance(raw_body, dict)
             else sub(raw_body))
     headers = {k: sub(v) for k, v in (req.get("headers") or {}).items()}
-    url = base + (req.get("path") or "/")
+    # Path substitution + encoding. Previously the path was used verbatim
+    # which meant {INJ} inside a path (e.g. "/update-settings/{INJ}?...") was
+    # NEVER substituted. Research cleanup #4 — URL-encoding on query/path
+    # carriers. Split path at `?` so the path segment and the inline-query
+    # string get the right encoding treatment.
+    raw_path = req.get("path") or "/"
+    if "?" in raw_path:
+        _p_seg, _q_seg = raw_path.split("?", 1)
+        _p_seg = sub_encoded(_p_seg)
+        _q_seg = sub_encoded(_q_seg)
+        raw_path = f"{_p_seg}?{_q_seg}"
+    else:
+        raw_path = sub_encoded(raw_path)
+    url = base + raw_path
     if query:
         url += ("&" if "?" in url else "?") + _u.urlencode(query)
     parts = ["curl", "-s", "-k"]
