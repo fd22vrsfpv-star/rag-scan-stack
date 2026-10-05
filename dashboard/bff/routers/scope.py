@@ -185,6 +185,36 @@ async def run_typosquat_pivot(
         return safe_json(resp)
 
 
+@router.post("/api/scope-pivot/cert/{engagement_id}")
+async def run_cert_pivot(
+    engagement_id: str,
+    limit: int = Query(500, le=1000),
+):
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=120) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/scope-pivot/cert/{engagement_id}",
+            params={"limit": limit},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        return safe_json(resp)
+
+
+@router.post("/api/scope-pivot/asn/{engagement_id}")
+async def run_asn_pivot(
+    engagement_id: str,
+    limit: int = Query(500, le=1000),
+):
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=120) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/scope-pivot/asn/{engagement_id}",
+            params={"limit": limit},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        return safe_json(resp)
+
+
 @router.get("/api/scope-pivot/suggestions")
 async def list_pivot_suggestions(
     status: Optional[str] = Query(None),

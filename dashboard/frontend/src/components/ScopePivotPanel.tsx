@@ -16,6 +16,8 @@ import { cn } from '@/lib/utils'
 import {
   usePivotSuggestions,
   useRunTyposquatPivot,
+  useRunCertPivot,
+  useRunAsnPivot,
   useReviewPivotSuggestion,
   useBulkReviewPivotSuggestions,
 } from '@/api/scope'
@@ -35,6 +37,8 @@ export function ScopePivotPanel({ engagementId: fixedEid }: { engagementId?: str
   })
   const { data: engagementsData } = useEngagements()
   const runPivot = useRunTyposquatPivot()
+  const runCert = useRunCertPivot()
+  const runAsn = useRunAsnPivot()
   const review = useReviewPivotSuggestion()
   const bulkReview = useBulkReviewPivotSuggestions()
   const suggestions = suggestionsData?.suggestions ?? []
@@ -83,7 +87,7 @@ export function ScopePivotPanel({ engagementId: fixedEid }: { engagementId?: str
     if (action === 'accept') {
       const parts: string[] = []
       if (typoCount) parts.push(`${typoCount} typosquat → this engagement's typosquats scope`)
-      if (promoteCount) parts.push(`${promoteCount} pivot → engagement in-scope`)
+      if (promoteCount) parts.push(`${promoteCount} cert/ASN pivot → this engagement's new_for_review scope (gate still refuses dispatch)`)
       const msg = `Confirm ${ids.length} suggestions?\n\n${parts.join('\n')}\n\nThis is reversible per-row from the suggestion lists.`
       if (!window.confirm(msg)) return
     }
@@ -104,6 +108,34 @@ export function ScopePivotPanel({ engagementId: fixedEid }: { engagementId?: str
       setLastRunSummary(
         `seeds=${s.seeds} candidates=${s.total_candidates} suggestions=${s.suggestions_written} auto-blocked=${s.denylist_added}`
         + (s.errors.length ? ` (${s.errors.length} errors)` : '')
+      )
+    } catch (e: unknown) {
+      setLastRunSummary(`error: ${(e as Error).message}`)
+    }
+  }
+
+  const handleRunCert = async () => {
+    if (!effectiveEid) { setLastRunSummary('select an engagement first'); return }
+    try {
+      const r = await runCert.mutateAsync({ engagementId: effectiveEid })
+      const s = r.summary
+      setLastRunSummary(
+        `cert-pivot: seeds=${s.seeds} certs=${s.certs_examined} candidates=${s.candidates} suggestions=${s.suggestions_written}`
+        + (s.errors.length ? ` (${s.errors.join('; ')})` : '')
+      )
+    } catch (e: unknown) {
+      setLastRunSummary(`error: ${(e as Error).message}`)
+    }
+  }
+
+  const handleRunAsn = async () => {
+    if (!effectiveEid) { setLastRunSummary('select an engagement first'); return }
+    try {
+      const r = await runAsn.mutateAsync({ engagementId: effectiveEid })
+      const s = r.summary
+      setLastRunSummary(
+        `asn-pivot: seeds=${s.seeds} asns=${s.asns_matched} candidates=${s.candidates} suggestions=${s.suggestions_written}`
+        + (s.errors.length ? ` (${s.errors.join('; ')})` : '')
       )
     } catch (e: unknown) {
       setLastRunSummary(`error: ${(e as Error).message}`)
@@ -131,6 +163,15 @@ export function ScopePivotPanel({ engagementId: fixedEid }: { engagementId?: str
         <code className="mx-1 text-amber-300">typosquats</code> scope. The scope gate's deny-list
         loader reads every engagement's typosquats scope, so refusal is cross-engagement.
       </p>
+      <p className="text-[11px] text-muted-foreground">
+        <strong className="text-blue-300">Cert pivot</strong> flags domains sharing a TLS
+        certificate SAN with an in-scope host (a same-owner signal);{' '}
+        <strong className="text-emerald-300">ASN pivot</strong> suggests the CIDR ranges of the
+        ASNs your in-scope hosts live in. Both are passive (they read recon already collected)
+        and land accepted targets in this engagement's
+        <code className="mx-1 text-foreground">new_for_review</code> scope — visible under the
+        engagement but gate-refused until you promote them to a live scope.
+      </p>
 
       {/* Run bar — hide engagement picker when panel is bound to a known engagement */}
       <div className="flex items-center gap-2 flex-wrap p-2 bg-muted/20 border border-border rounded">
@@ -157,6 +198,24 @@ export function ScopePivotPanel({ engagementId: fixedEid }: { engagementId?: str
         >
           <Zap className="w-3 h-3" />
           {runPivot.isPending ? 'running…' : 'Run typosquat pivot'}
+        </button>
+        <button
+          onClick={handleRunCert}
+          disabled={!effectiveEid || runCert.isPending}
+          className="h-6 px-2 text-[11px] rounded bg-blue-500/15 hover:bg-blue-500/25 text-blue-300 border border-blue-500/30 disabled:opacity-40 inline-flex items-center gap-1"
+          title="Cert pivot: scans TLS certs already collected on this engagement's in-scope hosts (tlsx/crtsh) and flags SANs in a different registrable domain — a same-owner signal. Passive (no new traffic). Accepted hits land in this engagement's new_for_review scope (gate still refuses dispatch)."
+        >
+          <Zap className="w-3 h-3" />
+          {runCert.isPending ? 'running…' : 'Run cert pivot'}
+        </button>
+        <button
+          onClick={handleRunAsn}
+          disabled={!effectiveEid || runAsn.isPending}
+          className="h-6 px-2 text-[11px] rounded bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 disabled:opacity-40 inline-flex items-center gap-1"
+          title="ASN pivot: reads asnmap results already collected for this engagement and suggests the CIDR ranges of the ASNs the in-scope hosts live in (cloud/CDN dropped unless the AS name matches the org). Passive (no new traffic). Accepted ranges land in this engagement's new_for_review scope (gate still refuses dispatch)."
+        >
+          <Zap className="w-3 h-3" />
+          {runAsn.isPending ? 'running…' : 'Run ASN pivot'}
         </button>
         {lastRunSummary && (
           <span className="text-[10px] font-mono text-muted-foreground ml-2">{lastRunSummary}</span>
@@ -186,7 +245,7 @@ export function ScopePivotPanel({ engagementId: fixedEid }: { engagementId?: str
             onClick={() => runBulk('accept')}
             disabled={bulkReview.isPending}
             className="h-6 px-2 text-[11px] rounded bg-red-500/15 hover:bg-red-500/25 text-red-300 border border-red-500/30 disabled:opacity-40"
-            title="Confirm every selected suggestion. Typosquats go into this engagement's typosquats scope (gate still refuses dispatch); cert/ASN pivots are promoted to this engagement's in-scope list."
+            title="Confirm every selected suggestion. Typosquats go into this engagement's typosquats scope; cert/ASN pivots go into this engagement's new_for_review scope. The gate refuses dispatch to both until you promote a target to a live scope."
           >
             Confirm selected
           </button>
@@ -215,8 +274,9 @@ export function ScopePivotPanel({ engagementId: fixedEid }: { engagementId?: str
         <p className="text-[11px] text-muted-foreground">Loading…</p>
       ) : suggestions.length === 0 ? (
         <p className="text-[11px] text-muted-foreground italic">
-          No pending suggestions. Run the typosquat pivot above or wait for the
-          cert/ASN pipeline to land its proposals.
+          No pending suggestions. Run the typosquat, cert, or ASN pivot above.
+          Cert/ASN pivots read recon already collected (tlsx/crtsh for certs,
+          asnmap for ASNs) — run that recon first if a pivot finds nothing.
         </p>
       ) : (
         <div className="max-h-80 overflow-y-auto">

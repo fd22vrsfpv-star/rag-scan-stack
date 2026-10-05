@@ -194,3 +194,18 @@ approval path, gated behind an explicit policy flag (Tier 3).
 - **Where:** knowledge/cve_exploit_specs.yaml (add a verified spec each); derive from the app's actual vulnerable source / the published CVE PoC, verify live (SLEEP timing) before adding.
 - **Done when:** both verify end-to-end (latency_confirmed) from their cve_exploit_specs entries, like CVE-2024-36779.
 - **Enforced by:** not enforced (per-CVE exploit research).
+
+## `/api/exploit-store/meta/models` is shadowed by the dynamic `{exploit_id}` routes
+**Found:** 2026-10-05 (while adding cert/ASN scope-pivot runs; file untouched by that change)
+**Evidence:** `pytest tests/test_route_contracts.py -k exploits` fails:
+`GET /api/exploit-store/meta/models (line 785) is unreachable — /api/exploit-store/{exploit_id}/derivation-intel (line 550) matches first` (also shadowed by `/download`, `/versions`, `/trace`). The literal `meta/models` is declared AFTER four `/{exploit_id}/...` routes, so FastAPI matches `meta` as an `exploit_id`.
+**Where:** `dashboard/bff/routers/exploits.py` — move the literal `meta/models` route declaration ABOVE the `/{exploit_id}/...` routes (declaration order decides matching).
+**Done when:** `tests/test_route_contracts.py::test_no_literal_route_is_shadowed_by_a_dynamic_one[exploits.py]` passes.
+**Enforced by:** `tests/test_route_contracts.py::test_no_literal_route_is_shadowed_by_a_dynamic_one`
+
+## guard-style source-substring ratchet is 5 over its baseline
+**Found:** 2026-10-05 (running the suite after an unrelated change; files below untouched by it)
+**Evidence:** `pytest tests/test_guard_style.py::test_source_substring_assertions_do_not_grow` fails `assert 196 <= 191`. Over-baseline counts live in files not touched this session: `test_post_enumeration.py (18)`, `test_access_selection.py (9)`, `test_langgraph_phases.py (7)`, `test_severity_normalization.py (6)`, `test_zap_access_control.py (6)`.
+**Where:** `tests/test_guard_style.py` BASELINE=191 vs actual 196 — five source-substring guards were added without converting five to `tests/_ast_assert.py` structural form (or lowering the baseline with reason).
+**Done when:** the count is back to <= BASELINE (convert five brittle `assert "<fragment>" in src` to `defines()/calls()/call_order()` etc.), and the test passes.
+**Enforced by:** `tests/test_guard_style.py::test_source_substring_assertions_do_not_grow`

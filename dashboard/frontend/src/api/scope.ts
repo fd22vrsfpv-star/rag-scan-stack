@@ -347,6 +347,56 @@ export function useRunTyposquatPivot() {
   })
 }
 
+export function useRunCertPivot() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ engagementId, limit }: { engagementId: string; limit?: number }) => {
+      const q = new URLSearchParams()
+      if (limit !== undefined) q.set('limit', String(limit))
+      return apiFetch<{
+        ok: boolean
+        engagement_id: string
+        summary: {
+          seeds: number
+          certs_examined: number
+          candidates: number
+          suggestions_written: number
+          errors: string[]
+        }
+      }>(`/scope-pivot/cert/${engagementId}?${q.toString()}`, { method: 'POST' })
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['pivot-suggestions'] })
+      qc.invalidateQueries({ queryKey: ['scope-names'] })
+    },
+  })
+}
+
+export function useRunAsnPivot() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ engagementId, limit }: { engagementId: string; limit?: number }) => {
+      const q = new URLSearchParams()
+      if (limit !== undefined) q.set('limit', String(limit))
+      return apiFetch<{
+        ok: boolean
+        engagement_id: string
+        summary: {
+          seeds: number
+          asns_matched: number
+          candidates: number
+          suggestions_written: number
+          errors: string[]
+        }
+      }>(`/scope-pivot/asn/${engagementId}?${q.toString()}`, { method: 'POST' })
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['pivot-suggestions'] })
+      qc.invalidateQueries({ queryKey: ['scope-names'] })
+    },
+  })
+}
+
 export function useReviewPivotSuggestion() {
   const qc = useQueryClient()
   return useMutation({

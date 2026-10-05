@@ -182,6 +182,30 @@ class TestLoadNotInScopeDenylist:
         assert "not_in_scope" in sql
         assert "engagement_id is null" in sql
 
+    def test_loader_reads_new_for_review_scope(self):
+        """cert-pivot / asn-pivot accepts land in a per-engagement
+        `new_for_review` STAGING scope; the deny-list loader MUST read it
+        so the gate refuses dispatch until the operator promotes the
+        target. Sabotage: drop 'new_for_review' from the loader's WHERE
+        and this fails."""
+        cur = MagicMock()
+        cur.fetchall.return_value = []
+        load_not_in_scope_denylist(cur)
+        sql = cur.execute.call_args[0][0].lower()
+        assert "new_for_review" in sql
+        assert "typosquats" in sql
+
+    def test_new_for_review_cidr_refused_even_when_in_scope(self):
+        """A host inside a new_for_review CIDR is refused even if it also
+        matches an in-scope row — the staging scope is gate-blocked."""
+        denylist = [("203.0.113.0/24", "cidr"), ("altoromutual.example.org", "domain")]
+        # The host is in-scope AND in the new_for_review deny-list.
+        scope = [("203.0.113.0/24", "cidr")]
+        assert is_in_scope("203.0.113.10", scope, denylist=denylist) is False
+        assert is_in_scope("altoromutual.example.org",
+                           [("altoromutual.example.org", "domain")],
+                           denylist=denylist) is False
+
     def test_query_error_returns_empty(self):
         cur = MagicMock()
         cur.execute.side_effect = RuntimeError("db down")

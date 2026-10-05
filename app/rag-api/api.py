@@ -30702,6 +30702,94 @@ def run_typosquat_pivot(
     return {"ok": True, "engagement_id": eid, "summary": summary}
 
 
+@app.post("/scope-pivot/cert/{engagement_id}", tags=["Scope"])
+def run_cert_pivot_endpoint(
+    engagement_id: str,
+    limit: int = 500,
+    authorized: bool = Depends(auth),
+):
+    """Cert-pivot pass for this engagement.
+
+    Reads TLS certificates already collected on the engagement's in-scope
+    hosts (tlsx / crtsh / certspotter in `recon_findings`) and flags any
+    SAN that names a DIFFERENT registrable domain — a "same owner, new
+    surface" signal. Writes `scope_suggestions` rows with
+    `method='cert_pivot'`, `suggested_scope='new_for_review'`.
+
+    Passive: sends NO traffic to any host. If no certs have been collected
+    yet, the summary says so (run recon first).
+    """
+    try:
+        eid = _validate_engagement_uuid(engagement_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid engagement_id uuid")
+    if not eid:
+        raise HTTPException(status_code=400, detail="engagement_id required")
+    try:
+        from scope_pivot_agent import run_cert_pivot
+    except ImportError as e:
+        logging.exception("scope_pivot_agent import failed")
+        raise HTTPException(status_code=500,
+                            detail=f"scope_pivot_agent unavailable: {e}")
+    summary = run_cert_pivot(get_db, eid, limit=limit)
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("scope_cert_pivot_completed", "scope_pivot", {
+            "engagement_id": eid,
+            "seeds": summary.get("seeds"),
+            "certs_examined": summary.get("certs_examined"),
+            "candidates": summary.get("candidates"),
+            "suggestions_written": summary.get("suggestions_written"),
+        })
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "engagement_id": eid, "summary": summary}
+
+
+@app.post("/scope-pivot/asn/{engagement_id}", tags=["Scope"])
+def run_asn_pivot_endpoint(
+    engagement_id: str,
+    limit: int = 500,
+    authorized: bool = Depends(auth),
+):
+    """ASN-pivot pass for this engagement.
+
+    Reads the ASN mappings already collected (asnmap in `recon_findings`)
+    for the engagement's in-scope hosts and suggests the CIDR ranges of
+    those ASNs, dropping cloud/CDN AS names unless the AS name matches an
+    in-scope org token. Writes `scope_suggestions` rows with
+    `method='asn_pivot'`, `suggested_scope='new_for_review'`.
+
+    Passive: sends NO traffic to any host. If no asnmap results have been
+    collected yet, the summary says so (run asnmap first).
+    """
+    try:
+        eid = _validate_engagement_uuid(engagement_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid engagement_id uuid")
+    if not eid:
+        raise HTTPException(status_code=400, detail="engagement_id required")
+    try:
+        from scope_pivot_agent import run_asn_pivot
+    except ImportError as e:
+        logging.exception("scope_pivot_agent import failed")
+        raise HTTPException(status_code=500,
+                            detail=f"scope_pivot_agent unavailable: {e}")
+    summary = run_asn_pivot(get_db, eid, limit=limit)
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("scope_asn_pivot_completed", "scope_pivot", {
+            "engagement_id": eid,
+            "seeds": summary.get("seeds"),
+            "asns_matched": summary.get("asns_matched"),
+            "candidates": summary.get("candidates"),
+            "suggestions_written": summary.get("suggestions_written"),
+        })
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "engagement_id": eid, "summary": summary}
+
+
 @app.get("/scope-pivot/suggestions", tags=["Scope"])
 def list_scope_suggestions(
     status: Optional[str] = None,
@@ -30739,6 +30827,22 @@ def list_scope_suggestions(
     return {"ok": True, "suggestions": rows, "total": len(rows)}
 
 
+def _pivot_target_type(target: str) -> str:
+    """Classify an accepted pivot target so the scope_targets row carries
+    the right target_type. cert_pivot yields domains; asn_pivot yields
+    CIDRs; a bare IP is possible too."""
+    t = (target or "").strip()
+    try:
+        import ipaddress as _ip
+        if "/" in t:
+            _ip.ip_network(t, strict=False)
+            return "cidr"
+        _ip.ip_address(t)
+        return "ip"
+    except Exception:  # noqa: BLE001
+        return "domain"
+
+
 @app.post("/scope-pivot/suggestions/{suggestion_id}/review", tags=["Scope"])
 def review_scope_suggestion(
     suggestion_id: str,
@@ -30756,8 +30860,10 @@ def review_scope_suggestion(
     auto-block threshold.
 
     For method IN ('cert_pivot','asn_pivot') AND action='accept': the
-    target is ADDED to the engagement's in-scope list (via /scope/add
-    semantics) so the pivot promotes it to an attack surface.
+    target is promoted into the engagement's `new_for_review` STAGING
+    scope. The scope gate refuses dispatch to that scope (like
+    `typosquats`), so the pivot is visible under the engagement but is
+    NOT scannable until the operator moves it to a live scope.
     """
     action = (body or {}).get("action", "").lower().strip()
     if action not in ("accept", "reject"):
@@ -30803,19 +30909,29 @@ def review_scope_suggestion(
                     (target, eid),
                 )
             elif method in ("cert_pivot", "asn_pivot"):
-                # Add to the current engagement's in-scope list. The
-                # suggested_scope column names which engagement scope
-                # it belongs to. Default to the active engagement from
-                # the operator session.
+                # Promote into the engagement's `new_for_review` STAGING
+                # scope — NOT the live in-scope list. The scope gate's
+                # deny-list loader reads `new_for_review`, so the pivot is
+                # visible under the engagement but dispatch is refused
+                # until the operator moves it to a live scope. REFUSE the
+                # write with no active engagement (same rule as typosquat)
+                # so a pivot is never recorded under the wrong engagement.
                 eid = _resolve_engagement_id(None)
-                if eid:
-                    cur.execute(
-                        "INSERT INTO public.scope_targets "
-                        "(name, target, target_type, source, engagement_id) "
-                        "VALUES ('default', %s, 'domain', %s, %s::uuid) "
-                        "ON CONFLICT DO NOTHING",
-                        (target, f"{method}_review", eid),
+                if not eid:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=("Cannot confirm pivot without an active "
+                                "engagement. Select an engagement in the "
+                                "header before confirming."),
                     )
+                cur.execute(
+                    "INSERT INTO public.scope_targets "
+                    "(name, target, target_type, source, engagement_id) "
+                    "VALUES ('new_for_review', %s, %s, %s, %s::uuid) "
+                    "ON CONFLICT DO NOTHING",
+                    (target, _pivot_target_type(target),
+                     f"{method}_review", eid),
+                )
         c.commit()
     return {"ok": True, "suggestion_id": suggestion_id,
             "new_status": new_status, "action": action}
@@ -30838,8 +30954,9 @@ def review_scope_suggestions_bulk(
     rows landed and which did not.
 
     Each accepted row runs the same post-review side-effect as the
-    single-row endpoint (typosquat → global not_in_scope deny-list;
-    cert_pivot / asn_pivot → engagement in-scope list).
+    single-row endpoint (typosquat → per-engagement `typosquats` scope;
+    cert_pivot / asn_pivot → per-engagement `new_for_review` staging
+    scope, which the gate refuses dispatch to until promoted).
     """
     ids = body.get("ids") or []
     action = (body.get("action") or "").lower().strip()
@@ -30917,12 +31034,15 @@ def review_scope_suggestions_bulk(
                         (target, eid),
                     )
                 elif method in ("cert_pivot", "asn_pivot") and eid:
+                    # Staging `new_for_review` scope — gate-blocked until
+                    # the operator promotes it (see single-review note).
                     cur.execute(
                         "INSERT INTO public.scope_targets "
                         "(name, target, target_type, source, engagement_id) "
-                        "VALUES ('default', %s, 'domain', %s, %s::uuid) "
+                        "VALUES ('new_for_review', %s, %s, %s, %s::uuid) "
                         "ON CONFLICT DO NOTHING",
-                        (target, f"{method}_review_bulk", eid),
+                        (target, _pivot_target_type(target),
+                         f"{method}_review_bulk", eid),
                     )
             results[sid_s] = "processed"
             processed += 1
