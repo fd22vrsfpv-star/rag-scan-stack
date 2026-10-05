@@ -106,12 +106,17 @@ def _host_from_url(value):
 
 
 def load_not_in_scope_denylist(cur):
-    """Return a list of (target, target_type) for the GLOBAL not_in_scope
-    deny-list. These rows live under `name='not_in_scope'` with
-    `engagement_id IS NULL` by design — a cross-engagement safety list,
-    documented in CLAUDE.md. Populated via POST /scope/exclude and by the
-    typosquat detector when a candidate scores above the auto-block
-    threshold.
+    """Return a list of (target, target_type) for the deny-list, drawn
+    from two sources:
+
+      1. The GLOBAL `not_in_scope` deny-list (engagement_id IS NULL) — a
+         cross-engagement safety list, documented in CLAUDE.md. Populated
+         via POST /scope/exclude and by legacy typosquat detections.
+      2. Every engagement's `typosquats` scope (any engagement_id) — the
+         new home for typosquat-sourced blocks. Each engagement has its
+         own `typosquats` scope so operators can see them grouped per
+         engagement; the gate reads all of them so a lookalike flagged
+         in engagement A also refuses dispatch from engagement B.
 
     Returns [] on any query error (fail-open on the deny-list side: a
     deny-list that can't load must not accidentally refuse legitimate
@@ -120,7 +125,8 @@ def load_not_in_scope_denylist(cur):
     try:
         cur.execute(
             "SELECT target, target_type FROM public.scope_targets "
-            "WHERE name = 'not_in_scope' AND engagement_id IS NULL "
+            "WHERE (name = 'not_in_scope' AND engagement_id IS NULL "
+            "       OR name = 'typosquats') "
             "AND target IS NOT NULL AND target <> ''"
         )
         rows = cur.fetchall()

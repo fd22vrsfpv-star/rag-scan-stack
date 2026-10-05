@@ -473,7 +473,7 @@ def _write_suggestion(cur, candidate: str, reasoning: str,
         cur.execute(
             "INSERT INTO public.scope_suggestions "
             "(target, suggested_scope, confidence, reasoning, method) "
-            "VALUES (%s, 'not_in_scope', %s, %s, 'typosquat') "
+            "VALUES (%s, 'typosquats', %s, %s, 'typosquat') "
             "ON CONFLICT (target) DO NOTHING",
             (candidate, confidence, reasoning),
         )
@@ -483,26 +483,53 @@ def _write_suggestion(cur, candidate: str, reasoning: str,
         return False
 
 
-def _add_to_denylist(cur, candidate: str) -> bool:
-    """Insert the candidate into the GLOBAL not_in_scope deny-list
-    (name='not_in_scope', engagement_id IS NULL). Idempotent via the
-    partial unique index on scope_targets.
+def _add_to_typosquats_scope(cur, candidate: str, engagement_id: str) -> bool:
+    """Insert the candidate into the engagement's `typosquats` scope.
 
-    This is what the scope gate's deny-list short-circuit reads. Once
-    added, the gate refuses dispatch for every engagement."""
+    This replaces the earlier flat insert into the global `not_in_scope`
+    deny-list: operator asked for typosquats to be grouped under their
+    own named scope so they are visible as a cohort instead of mixed
+    into the general exclude list. The scope gate's deny-list loader
+    (etl/scope_gate.load_not_in_scope_denylist) now ALSO reads every
+    engagement's `typosquats` scope, so block semantics are preserved —
+    the gate still refuses dispatch to anything landed here, including
+    cross-engagement.
+
+    engagement_id is REQUIRED and set on the row — matches the project
+    invariant that per-engagement scope entries carry an engagement_id
+    (CLAUDE.md: "Scope entries are per-engagement collected config").
+    Falls back to a global not_in_scope insert when no engagement is
+    available, so a pivot run that lands typosquats before an operator
+    picks an engagement still blocks them.
+    """
     try:
-        cur.execute(
-            "INSERT INTO public.scope_targets "
-            "(name, target, target_type, source, engagement_id) "
-            "VALUES ('not_in_scope', %s, 'domain', 'typosquat_auto', NULL) "
-            "ON CONFLICT DO NOTHING",
-            (candidate,),
-        )
+        if engagement_id:
+            cur.execute(
+                "INSERT INTO public.scope_targets "
+                "(name, target, target_type, source, engagement_id) "
+                "VALUES ('typosquats', %s, 'domain', 'typosquat_auto', %s::uuid) "
+                "ON CONFLICT DO NOTHING",
+                (candidate, engagement_id),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO public.scope_targets "
+                "(name, target, target_type, source, engagement_id) "
+                "VALUES ('not_in_scope', %s, 'domain', 'typosquat_auto', NULL) "
+                "ON CONFLICT DO NOTHING",
+                (candidate,),
+            )
         return cur.rowcount > 0
     except Exception as e:  # noqa: BLE001
-        logger.debug("not_in_scope deny-list write failed for %s: %s",
+        logger.debug("typosquats scope write failed for %s: %s",
                      candidate, e)
         return False
+
+
+# Keep the old name as an alias so any late-pattern caller / test that
+# imports `_add_to_denylist` still finds it. Both routes write to the
+# same destination now.
+_add_to_denylist = _add_to_typosquats_scope
 
 
 def flag_typosquats_for_engagement(get_db_fn, engagement_id: str,
@@ -549,7 +576,8 @@ def flag_typosquats_for_engagement(get_db_fn, engagement_id: str,
                     # auto-block tld_swap-only (operator-confirmed guard).
                     if (score_info["score"] >= auto_block_at
                             and cand.get("transform") != "tld_swap"):
-                        if _add_to_denylist(cur, cand["domain"]):
+                        if _add_to_typosquats_scope(cur, cand["domain"],
+                                                     engagement_id):
                             out["denylist_added"] += 1
             c.commit()
     except Exception as e:
