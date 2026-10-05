@@ -17517,6 +17517,71 @@ _SINK_GRAMMAR_TEMPLATES = {
 }
 
 
+def _extract_endpoint_candidates(intel_text, exclude=None, limit=4):
+    """Scan advisory + exploit script text for HTTP paths plausibly named by
+    the vuln. Returns up to `limit` distinct paths, with the exclude path
+    removed. Used by the timing_did_not_block fallback: when the LLM picked
+    the wrong endpoint, retry at the advisory-named ones before giving up.
+
+    Research finding on CVE-2024-22120 Zabbix: advisory names
+    `/zabbix.php?action=script.execute` but the agent picked `/auditlog.php`
+    (which doesn't route to the vulnerable SQL). pg_sleep ran at the wrong
+    endpoint → no delay observed.
+
+    Heuristics:
+      - Extract `/path.ext` (ext in php|aspx|jsp|do|action|html|json) or
+        `/path?action=...` or `/api/.../resource`.
+      - Dedup and skip common noise (/, /index.php without params).
+      - Prefer paths that include specific action/method segments.
+    """
+    import re as _re
+    if not intel_text:
+        return []
+    text = intel_text[:30000]
+    found = []
+    seen = set()
+    exclude_norm = (exclude or "").rstrip("/").lower()
+    # Preceding delimiter class allows `/` so URLs embedded in `http://host/path`
+    # match too. Path+query char class allows `?`, `=`, `&` so action= query
+    # strings survive the extraction.
+    patterns = [
+        # /path.ext (common web endpoints) with optional ?action=...&more
+        r"[\s'\"`(><,=/](/(?:[a-zA-Z0-9_\-]+/)*[a-zA-Z0-9_\-]+\.(?:php|aspx|jsp|do|action|json|html?)(?:\?[a-zA-Z0-9_&=\-\.%]+)?)",
+        # /api/.../resource (REST-ish)
+        r"[\s'\"`(><,=/](/(?:api|wp-admin|wp-json|admin|administrator|rest|graphql)/(?:[a-zA-Z0-9_\-.]+/)*[a-zA-Z0-9_\-.]+)",
+        # curl ... /path?query
+        r"curl\s+(?:-[a-zA-Z]+\s+\S*\s*)*(?:https?://[^/\s]+)?(/[a-zA-Z0-9_\-./%?=&]+)",
+    ]
+    for pat in patterns:
+        for m in _re.finditer(pat, text):
+            p = m.group(1).rstrip("/,.;'\"")
+            if not p or len(p) < 2:
+                continue
+            # Normalize for dedup
+            p_norm = p.rstrip("/").lower()
+            if p_norm == exclude_norm:
+                continue
+            if p_norm in seen:
+                continue
+            if p_norm in ("/", "/index.php", "/index.html", "/index"):
+                continue
+            seen.add(p_norm)
+            found.append(p)
+    # Dedup by SUFFIX — when a URL-embedded match like `/target/zabbix.php?a=b`
+    # overlaps with a canonical `/zabbix.php?a=b`, keep only the shorter one
+    # (the hostname prefix is noise from `http://host/path` extractions).
+    deduped = []
+    for p in found:
+        is_dup = False
+        for q in found:
+            if q is not p and p.lower().endswith("/" + q.lower().lstrip("/")) and len(q) < len(p):
+                is_dup = True
+                break
+        if not is_dup:
+            deduped.append(p)
+    return deduped[:limit]
+
+
 def _extract_http_method_hint(intel_text, endpoint):
     """Scan advisory + exploit_script text for an explicit HTTP method bound
     to the endpoint. Advisories often spell out the real wire shape:
@@ -18703,6 +18768,25 @@ def _derive_cve_spec_single_pass(cve, product, version, ip, port, model=None,
                     "spec": spec, "evidence": fb_verdict["evidence"]}
     except Exception as e:  # noqa: BLE001
         logging.debug("oracle fallback failed: %s", e)
+    # 4a2. timing_did_not_block → retry at endpoint candidates extracted from
+    #      intel. Research cleanup #6. The LLM may have picked a plausible
+    #      endpoint that doesn't actually route to the vulnerable SQL (Zabbix
+    #      case: /auditlog.php looks right, but the real sink is on
+    #      /zabbix.php?action=script.execute). Try up to 3 advisory-named
+    #      alternates before giving up.
+    if verdict.get("method") == "timing_did_not_block":
+        cur_path = (spec.get("request") or {}).get("path", "/")
+        candidates = _extract_endpoint_candidates(intel.get("combined") or "",
+                                                   exclude=cur_path, limit=3)
+        for alt in candidates:
+            vspec = dict(spec); vspec["request"] = dict(spec["request"]); vspec["request"]["path"] = alt
+            vv = _live_verify_recipe(ip, port, vspec)
+            if vv["verified"]:
+                _store_derived_spec(cve, product, version, vspec, vv,
+                                    source="intel+timing_endpoint_retry")
+                return {"verified": True, "source": "intel+timing_endpoint_retry",
+                        "spec": vspec,
+                        "evidence": f"timing fired at alt endpoint {alt}: {vv.get('evidence')}"}
     # 4b. If verify looks like a 404 (endpoint not at expected path on this
     #     install), discover variants and retry verify on each.
     probe = _curl_run(ip, port, _curl_from_cve_spec(ip, port, spec.get("request") or {},
