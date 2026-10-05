@@ -682,6 +682,51 @@ def _render_http_status_fingerprints(data: Dict[str, Any]) -> List[Doc]:
     return docs
 
 
+def _render_web_auth_templates(data: Dict[str, Any]) -> List[Doc]:
+    """Embed each product's auth-chain template so the build-poc extractor can
+    retrieve the SHAPE of a login + anti-CSRF chain for a product by RAG
+    lookup rather than the model guessing. The extractor queries
+    rag_documents WHERE metadata->>'source'='knowledge' AND title LIKE
+    'Web auth template - %s%%' at pre_requests derivation time."""
+    docs: List[Doc] = []
+    for t in (data.get("templates") or []):
+        prod = _s(t.get("product"))
+        if not prod:
+            continue
+        aliases = t.get("aliases") or []
+        login = t.get("login_shape") or {}
+        csrf_steps = t.get("csrf_shape") or []
+        use = t.get("exploit_use") or {}
+        import json as _j
+        body = (
+            f"Product: {prod}  (aliases: {', '.join(aliases) or 'none'})\n\n"
+            f"LOGIN step (pre_request #1):\n"
+            f"  method: {_s(login.get('method'))}  path: {_s(login.get('path'))}\n"
+            f"  content_type: {_s(login.get('content_type'))}\n"
+            f"  body_fields: {_j.dumps(login.get('body_fields') or {}, sort_keys=True)}\n"
+            f"  captures: {_j.dumps(login.get('captures') or [], sort_keys=True)}\n\n"
+            f"CSRF/token step(s) (pre_request #2+):\n"
+        )
+        for i, step in enumerate(csrf_steps, start=1):
+            if step.get("note"):
+                body += f"  [{i}] NOTE: {_s(step.get('note'))}\n"
+                continue
+            body += (
+                f"  [{i}] method: {_s(step.get('method'))}  "
+                f"path: {_s(step.get('path'))}\n"
+                f"      headers: {_j.dumps(step.get('headers') or {}, sort_keys=True)}\n"
+                f"      captures: {_j.dumps(step.get('captures') or [], sort_keys=True)}\n"
+            )
+        body += (
+            f"\nEXPLOIT request uses these captured names:\n"
+            f"  body_fields: {_j.dumps(use.get('body_fields') or {}, sort_keys=True)}\n"
+            f"  headers: {_j.dumps(use.get('headers') or {}, sort_keys=True)}\n\n"
+            f"Notes: {_s(t.get('notes'))}"
+        )
+        docs.append((f"Web auth template - {prod}", body))
+    return docs
+
+
 def _render_app_request_contracts(data: Dict[str, Any]) -> List[Doc]:
     """Embed each app request contract so retrievers + synth can recall the
     KNOWN request shape (action endpoint, method, anti-CSRF param name + token
@@ -793,6 +838,7 @@ RENDERERS = {
     "tool_options": _render_tool_options,
     "web_profiles": _render_web_profiles,
     "credential_spray_policy": _render_credential_spray_policy,
+    "web_auth_templates": _render_web_auth_templates,
 }
 
 

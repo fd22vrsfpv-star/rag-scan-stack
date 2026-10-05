@@ -17836,6 +17836,58 @@ def _format_intel_summary_for_prompt(summary):
     return "\n".join(lines)
 
 
+def _lookup_web_auth_templates(product: str) -> str:
+    """Retrieve auth-chain templates for `product` from rag_documents
+    (populated by etl/load_knowledge_documents.py from
+    knowledge/web_auth_templates.yaml) and format them as a prompt section.
+
+    Deterministic DB lookup — not vector search — because:
+      * the template corpus is small (~5-50 rows) so a title substring match
+        is both faster and more accurate than embedding similarity;
+      * a wrong template is actively harmful (model copies the wrong cookie
+        name / wrong token param), so recall is less valuable than precision.
+
+    Returns "" when no product match. The extractor caller injects this
+    verbatim; an empty string means the generic WordPress example in the
+    PRE_REQUESTS section is the only exemplar the model sees — same behaviour
+    as before this knowledge was factored out.
+    """
+    if not product:
+        return ""
+    needle = str(product).strip().lower()
+    if not needle:
+        return ""
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            # Match either the product's name in the title OR the product
+            # keyword appearing in the aliases line of the body. LIKE %needle%
+            # is fine because titles are "Web auth template - <product>" and
+            # the alias line is "(aliases: ...)" — both operator-controlled.
+            cur.execute(
+                """
+                SELECT title, text_chunk
+                FROM rag_documents
+                WHERE title ILIKE 'Web auth template -%%'
+                  AND (title ILIKE %s OR text_chunk ILIKE %s)
+                ORDER BY char_length(title)
+                LIMIT 3
+                """,
+                (f"%{needle}%", f"%aliases:%{needle}%"),
+            )
+            rows = cur.fetchall() or []
+    except Exception:  # noqa: BLE001 — RAG lookup is best-effort
+        return ""
+    if not rows:
+        return ""
+    body = ("AUTH_TEMPLATES FROM KB (retrieved for product=" + needle + "):\n"
+            "Use the shapes below when building pre_requests. These are RETRIEVED "
+            "from the knowledge base, not invented — the field names, capture "
+            "regexes and cookie names reflect the live product.\n\n")
+    for i, (title, text) in enumerate(rows, 1):
+        body += f"[KB.{i}] {title}\n{text}\n\n"
+    return body
+
+
 def _llm_extract_exploit_recipe(cve, product, version, intel, patch_diffs, model=None,
                                 prior_hints=None, last_failure=None, intel_summary=None):
     """Ask the LLM to produce a STRUCTURED recipe (endpoint/method/content_type/
@@ -17928,6 +17980,11 @@ def _llm_extract_exploit_recipe(cve, product, version, intel, patch_diffs, model
     if intel_summary and isinstance(intel_summary, dict):
         _grammar = ((intel_summary.get("payload") or {}).get("sink_grammar") or "").strip()
     grammar_section = _format_sink_grammar_guidance(_grammar)
+    # Pull auth-chain templates for THIS product from RAG (knowledge/
+    # web_auth_templates.yaml). Operator-extensible: a new product's
+    # login+CSRF shape is added to that YAML and loaded via
+    # etl/load_knowledge_documents.py — NO extractor edit required.
+    auth_templates_section = _lookup_web_auth_templates(product)
     prompt = (
         f"You are a security engineer on an AUTHORIZED penetration test documenting "
         f"{cve} ({product or '?'} {version or ''}) so the tester can validate it. "
@@ -17936,6 +17993,7 @@ def _llm_extract_exploit_recipe(cve, product, version, intel, patch_diffs, model
         f"request RECIPE that will trigger the weakness. Output JSON ONLY, no prose.\n\n"
         f"{brief_section}"
         f"{grammar_section}"
+        f"{auth_templates_section}"
         f"REFERENCE:\n{(intel.get('combined') or '')[:14000]}\n"
         f"{patch_section}{hints_section}\n\n"
         f'Required JSON shape: {{"vuln_class": "sqli|rce|lfi|ssrf|xxe|ssti|idor", '
@@ -18008,43 +18066,16 @@ def _llm_extract_exploit_recipe(cve, product, version, intel, patch_diffs, model
         f'"content_type":"form|json","capture":[{{"source":"set-cookie|body-regex|header-regex","name":"<var>","pattern":"<regex with 1 capture group>"}}]}}. '
         f"Captured values become available as {{<var>}} in subsequent steps "
         f"AND in the main request/body/path/headers AND in verify_request. "
-        f"PRODUCT-SPECIFIC AUTH TEMPLATES — pick the one that matches the "
-        f"product in the brief, adapt field names from intel:\n\n"
-        f"[A] WordPress + nonce flow (admin-ajax actions, plugin priv-esc):\n"
+        f"Generic WordPress nonce example (shape only, do not copy field names):\n"
         f'  pre_requests=[\n'
-        f'    {{"name":"login","method":"POST","path":"/wp-login.php","content_type":"form","body":{{"log":"<user>","pwd":"<pass>","wp-submit":"Log In","redirect_to":"/wp-admin/","testcookie":"1"}},"capture":[{{"source":"set-cookie","name":"wp_sess"}}]}},\n'
-        f'    {{"name":"nonce","method":"GET","path":"/wp-admin/profile.php","headers":{{"Cookie":"{{wp_sess}}"}},"capture":[{{"source":"body-regex","pattern":"name=[\\"\\\\\']_wpnonce[\\"\\\\\'] value=[\\"\\\\\']([a-f0-9]+)[\\"\\\\\']","name":"val"}}]}}\n'
+        f'    {{"name":"login","method":"POST","path":"/wp-login.php","content_type":"form","body":{{"log":"user","pwd":"pw"}},"capture":[{{"source":"set-cookie","name":"wp_cookie"}}]}},\n'
+        f'    {{"name":"nonce","method":"GET","path":"/wp-admin/profile.php","headers":{{"Cookie":"{{wp_cookie}}"}},"capture":[{{"source":"body-regex","pattern":"_wpnonce[\\"\\\\\']?[:= ]+[\\"\\\\\']?([a-f0-9]+)","name":"val"}}]}}\n'
         f'  ]\n'
-        f'Then the exploit body includes {{val}} as _wpnonce and {{wp_sess}} as Cookie.\n\n'
-        f"[B] Zabbix sid derivation (critical for /zabbix.php?action=... POSTs):\n"
-        f"  Zabbix sets zbx_session as base64(JSON) containing a 'sessionid' "
-        f"field. The anti-CSRF 'sid' param is the FIRST 16 chars of sessionid. "
-        f"Capture both via two regexes on the Set-Cookie line:\n"
-        f'  pre_requests=[\n'
-        f'    {{"name":"login","method":"POST","path":"/index.php?autologin=1","content_type":"form","body":{{"name":"<user>","password":"<pass>","enter":"Sign in"}},"capture":[{{"source":"set-cookie","name":"zbx_cookie"}},{{"source":"body-regex","pattern":"\\"sessionid\\"[: ]*\\"([a-f0-9]{{32}})\\"","name":"sessionid"}}]}}\n'
-        f'  ]\n'
-        f'IMPORTANT: Zabbix needs sid as a BODY param on every POST — '
-        f'request.body should include "sid":"{{sessionid}}".substring(0,16) '
-        f'OR capture sid directly: pattern="\\"sessionid\\":\\"([a-f0-9]{{16}})" '
-        f'and use {{sessionid}} directly.\n\n'
-        f"[C] Jenkins crumb flow (CSRF protection):\n"
-        f'  pre_requests=[\n'
-        f'    {{"name":"login","method":"POST","path":"/j_spring_security_check","content_type":"form","body":{{"j_username":"<user>","j_password":"<pass>"}},"capture":[{{"source":"set-cookie","name":"jenkins_cookie"}}]}},\n'
-        f'    {{"name":"crumb","method":"GET","path":"/crumbIssuer/api/json","headers":{{"Cookie":"{{jenkins_cookie}}"}},"capture":[{{"source":"body-regex","pattern":"\\"crumb\\":\\"([a-f0-9]+)\\"","name":"val"}}]}}\n'
-        f'  ]\n'
-        f'Main request MUST send header Jenkins-Crumb: {{val}} AND cookie {{jenkins_cookie}}.\n\n'
-        f"[D] Cacti __csrf_magic flow:\n"
-        f'  pre_requests=[\n'
-        f'    {{"name":"login","method":"POST","path":"/index.php","content_type":"form","body":{{"login_username":"admin","login_password":"admin","action":"login"}},"capture":[{{"source":"set-cookie","name":"cacti_cookie"}}]}},\n'
-        f'    {{"name":"csrf","method":"GET","path":"/index.php","headers":{{"Cookie":"{{cacti_cookie}}"}},"capture":[{{"source":"body-regex","pattern":"name=[\\"\\\\\']__csrf_magic[\\"\\\\\'][^>]+value=[\\"\\\\\']([^\\"\\\\\']+)","name":"val"}}]}}\n'
-        f'  ]\n'
-        f'Then exploit body includes "__csrf_magic":"{{val}}" and Cookie:{{cacti_cookie}}.\n\n'
-        f"[E] Grafana API-key flow (for exploits that need a bearer token):\n"
-        f'  pre_requests=[\n'
-        f'    {{"name":"login","method":"POST","path":"/login","content_type":"json","body":{{"user":"<user>","password":"<pass>"}},"capture":[{{"source":"set-cookie","name":"grafana_cookie"}}]}},\n'
-        f'    {{"name":"key","method":"POST","path":"/api/auth/keys","content_type":"json","headers":{{"Cookie":"{{grafana_cookie}}"}},"body":{{"name":"poc","role":"Admin"}},"capture":[{{"source":"body-regex","pattern":"\\"key\\":\\"([a-zA-Z0-9]+)\\"","name":"token"}}]}}\n'
-        f'  ]\n'
-        f'Then exploit headers include "Authorization":"Bearer {{token}}".\n'
+        f"Then the main request's body can include `_wpnonce: {{val}}` and "
+        f"headers can include `Cookie: {{wp_cookie}}`.\n\n"
+        f"If auth_templates were supplied in the intel block above, prefer "
+        f"their shapes (CSRF token locations, cookie names, body params) "
+        f"over this generic example — intel reflects the live product."
     )
     try:
         res = _llm_for_model(prompt, model=model, caller="cve_recipe_extract", num_predict=1024)
