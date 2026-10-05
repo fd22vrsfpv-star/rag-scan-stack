@@ -17517,6 +17517,51 @@ _SINK_GRAMMAR_TEMPLATES = {
 }
 
 
+def _extract_http_method_hint(intel_text, endpoint):
+    """Scan advisory + exploit_script text for an explicit HTTP method bound
+    to the endpoint. Advisories often spell out the real wire shape:
+      "The vulnerable endpoint is GET /dtale/update-settings/<id>?settings=..."
+      "curl -X POST http://target/wp-admin/admin-ajax.php -d ..."
+    Returns the uppercased method or '' when nothing matches.
+
+    Research finding on CVE-2024-3408 dtale: advisory text literally shows
+    `GET /dtale/update-settings/<data_id>?settings=...` but the LLM emitted
+    `POST /update-settings` with a JSON body. A regex on the intel would
+    have caught this; now it does."""
+    if not intel_text or not endpoint:
+        return ""
+    import re as _re
+    # Normalize endpoint for matching: strip leading /, take the last 2-3
+    # path segments so a partial match still works even when the advisory
+    # includes a longer path.
+    ep = endpoint.lstrip("/")
+    parts = ep.split("/")
+    # match on the LONGEST plausible suffix: full endpoint OR last segment
+    candidates = [ep, parts[-1] if parts else ""]
+    if len(parts) > 1:
+        candidates.append("/".join(parts[-2:]))
+    text = intel_text[:20000]
+    for cand in candidates:
+        if not cand or len(cand) < 2:
+            continue
+        # "GET /path" / "POST /path" / "curl -X POST /path" / "curl ... POST ... /path"
+        # Match within 50 chars of endpoint to avoid distant unrelated verbs.
+        rx = _re.compile(
+            rf"(?i)\b(GET|POST|PUT|DELETE|PATCH)\b[^\n]{{0,80}}/{_re.escape(cand)}"
+        )
+        m = rx.search(text)
+        if m:
+            return m.group(1).upper()
+        # Also handle curl -X METHOD before URL
+        rx2 = _re.compile(
+            rf"(?i)-X\s+(GET|POST|PUT|DELETE|PATCH)[^\n]{{0,120}}/{_re.escape(cand)}"
+        )
+        m = rx2.search(text)
+        if m:
+            return m.group(1).upper()
+    return ""
+
+
 def _format_sink_grammar_guidance(sink_grammar):
     """Return a prompt block with REQUIRED exemplars for the chosen grammar.
     Fed into the recipe extractor so the LLM uses the right syntax instead
@@ -17871,7 +17916,12 @@ def _recipe_to_spec(cve, product, recipe):
         "proof_model": recipe.get("proof_model") or (
             "timing" if assertion.get("min_seconds") else "read_back"),
         "request": {
-            "method": (recipe.get("method") or "POST").upper(),
+            # Advisory-derived method hint overrides the LLM's guess. The
+            # LLM freewheels POST a lot even when advisories explicitly say
+            # GET; the hint is a reliable override extracted via regex from
+            # the advisory text + exploit script content.
+            "method": (recipe.get("_method_hint")
+                       or recipe.get("method") or "POST").upper(),
             "path": recipe.get("endpoint") or "/",
             "content_type": recipe.get("content_type") or "form",
             **({"body": body} if body else {}),
@@ -18392,6 +18442,15 @@ def _derive_cve_spec_single_pass(cve, product, version, ip, port, model=None,
         return {"verified": False, "source": "extract",
                 "spec": None, "evidence": "recipe extraction returned no concrete recipe",
                 "intel_summary": intel_summary or None}
+    # HTTP method hint from advisory text — tag onto the recipe so
+    # _recipe_to_spec can override the LLM's method when it disagrees with
+    # what the advisory literally says. Research finding on CVE-2024-3408:
+    # advisory shows `GET /dtale/update-settings/<data_id>?settings=...`
+    # but the LLM emitted POST.
+    _method_hint = _extract_http_method_hint(intel.get("combined") or "",
+                                              recipe.get("endpoint") or "")
+    if _method_hint and _method_hint != (recipe.get("method") or "").upper():
+        recipe["_method_hint"] = _method_hint
     # Use the GHSA-resolved product so stored specs carry the real name
     # (e.g. "Cacti", "Zabbix Server") instead of the "unknown" the caller
     # passed in. All downstream storage + listing filters key on this.
