@@ -3,6 +3,7 @@ FROM python:3.10-slim
 
 # Install curl for healthcheck, dnsutils for reverse DNS lookups (dig), git for exploitdb updates
 RUN apt-get update && apt-get install -y --no-install-recommends curl dnsutils git \
+    docker.io \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
