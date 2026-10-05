@@ -3371,8 +3371,14 @@ function AssetReconIntel({ hostname, ip, asset }: { hostname?: string | null; ip
 
 // Exported so /exploits Research tab can render the same lookup/research
 // surface inline — one combined window, one component, no iframe.
-export function ExploitLookupModal({ product, version, cveFlags, onClose, embedded }: {
+export function ExploitLookupModal({ product, version, cve, cveFlags, onClose, embedded }: {
   product: string; version: string; cveFlags?: any[]; onClose: () => void;
+  // Explicit CVE context so the "Open in browser" DDG/ExploitDB links can
+  // anchor the search on the CVE id even when product is empty / "unknown".
+  // Operators reported every open-in-browser button searching for literal
+  // "unknown" because the exploit workbench passed product="unknown" when
+  // data.product was null — now the CVE wins over an unusable product.
+  cve?: string
   // When true, suppress the "Open workbench in new tab" header button —
   // the modal is already rendered INSIDE the Workbench pane, so the
   // operator doesn't need a second pop-out trigger. Keeps the close [X].
@@ -3396,7 +3402,7 @@ export function ExploitLookupModal({ product, version, cveFlags, onClose, embedd
   const { data: edbData, isLoading: edbLoading } = useSearchsploit(product, edbVersion || undefined, edbAnalyze, edbWide ? version : undefined)
   const edbNoVersionResults = !edbWide && !edbLoading && (edbData?.count ?? 0) === 0
 
-  const ddgLinks = getDdgSearchUrls(product, version || undefined)
+  const ddgLinks = getDdgSearchUrls(product, version || undefined, cve)
   const [ddgData, setDdgData] = useState<DdgSearchResponse | null>(null)
   const [ddgLoading, setDdgLoading] = useState(false)
   const [ddgStage, setDdgStage] = useState('')

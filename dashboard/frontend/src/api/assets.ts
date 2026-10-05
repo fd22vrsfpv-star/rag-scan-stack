@@ -740,17 +740,29 @@ export function useSearchsploit(product?: string, version?: string, analyze?: bo
   })
 }
 
-export function getDdgSearchUrls(product: string, version?: string) {
-  const q = `${product} ${version || ''}`.trim().replace(/ /g, '+')
+export function getDdgSearchUrls(product: string, version?: string, cve?: string) {
+  // Guard against callers that passed the literal fallback string "unknown"
+  // or an empty product. When product is unusable but a CVE is in hand, anchor
+  // every search on the CVE id — operators clicking "Open in browser" from the
+  // exploit workbench are looking for THAT CVE, not a search for the word
+  // "unknown". Falls back to product-based search when product is real.
+  const effectiveProduct = (product && product.toLowerCase() !== 'unknown') ? product : ''
+  const anchor = effectiveProduct || cve || ''
+  const q = `${anchor} ${version || ''}`.trim().replace(/ /g, '+')
   // Short product name for vendor-specific searches
-  const words = product.split(' ').filter(w => w.length >= 4 && !['server', 'data', 'center', 'cloud'].includes(w.toLowerCase()))
-  const short = words[words.length - 1] || product
+  const words = effectiveProduct.split(' ').filter(w => w.length >= 4 && !['server', 'data', 'center', 'cloud'].includes(w.toLowerCase()))
+  const short = words[words.length - 1] || effectiveProduct || cve || ''
   const shortQ = `${short}+${version || ''}`.replace(/ /g, '+')
+  // When CVE is known, add it to the main queries so results pin to the exact
+  // vuln instead of returning every exploit for the product.
+  const cveTail = cve ? `+${cve}` : ''
   return [
-    { label: 'Exploits', url: `https://duckduckgo.com/?q=${q}+exploit` },
-    { label: 'CVEs', url: `https://duckduckgo.com/?q=${q}+CVE` },
-    { label: 'ExploitDB', url: `https://duckduckgo.com/?q=site%3Aexploit-db.com+${q}` },
-    { label: 'Tenable', url: `https://www.tenable.com/plugins/search?q=${shortQ}` },
+    { label: 'Exploits', url: `https://duckduckgo.com/?q=${q}+exploit${cveTail}` },
+    { label: 'CVEs', url: cve
+        ? `https://nvd.nist.gov/vuln/detail/${cve}`
+        : `https://duckduckgo.com/?q=${q}+CVE` },
+    { label: 'ExploitDB', url: `https://duckduckgo.com/?q=site%3Aexploit-db.com+${q}${cveTail}` },
+    { label: 'Tenable', url: `https://www.tenable.com/plugins/search?q=${cve || shortQ}` },
     { label: 'Releases', url: `https://duckduckgo.com/?q=${shortQ}+release+notes` },
   ]
 }
