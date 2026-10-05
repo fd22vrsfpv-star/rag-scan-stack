@@ -17145,6 +17145,7 @@ def _search_github_pocs(cve, timeout=10, max_results=5, fetch_readme=True):
                     if not full_name:
                         continue
                     for br in (branch, "main", "master"):
+                        # README first — usually has the usage example
                         for fname in ("README.md", "readme.md", "README.rst", "README"):
                             try:
                                 rr = c.get(f"https://raw.githubusercontent.com/"
@@ -17155,7 +17156,25 @@ def _search_github_pocs(cve, timeout=10, max_results=5, fetch_readme=True):
                                     break
                             except Exception:  # noqa: BLE001
                                 continue
-                        if h.get("readme"):
+                        # Exploit script — the ACTUAL request shape (headers,
+                        # body, dialect). Many PoC repos README says "run poc.py"
+                        # without showing the request; the .py file has it.
+                        if not h.get("exploit_script"):
+                            for sname in ("exploit.py", "poc.py", "exp.py",
+                                          "main.py", "cve.py", "exploit.sh"):
+                                try:
+                                    rs = c.get(f"https://raw.githubusercontent.com/"
+                                               f"{full_name}/{br}/{sname}",
+                                               headers={"User-Agent": "Pentest-Research"})
+                                    if rs.status_code == 200 and rs.text:
+                                        h["exploit_script"] = {
+                                            "name": sname,
+                                            "content": rs.text[:5000],
+                                        }
+                                        break
+                                except Exception:  # noqa: BLE001
+                                    continue
+                        if h.get("readme") or h.get("exploit_script"):
                             break
     except Exception:  # noqa: BLE001
         pass
@@ -18056,6 +18075,11 @@ def _derive_cve_spec_single_pass(cve, product, version, ip, port, model=None,
                     lines.append(f"\n--- README for {p['url']} (verbatim — "
                                  "use this for the exact request shape):")
                     lines.append(p["readme"])
+                if p.get("exploit_script"):
+                    es = p["exploit_script"]
+                    lines.append(f"\n--- {es['name']} from {p['url']} "
+                                 "(verbatim — contains the ACTUAL request):")
+                    lines.append(es["content"])
             extras.append("\n".join(lines))
     except Exception:  # noqa: BLE001
         pass
