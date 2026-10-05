@@ -16835,22 +16835,78 @@ def _two_request_verify(ip, port, exploit_req, verify_req, canary, timeout=25):
                 "evidence": f"exploit response body contains rejection marker "
                             f"({', '.join(m for m in rejection_markers if m in body_lower)[:120]})"}
     verify_cmd = _curl_from_cve_spec(ip, port, verify_req, canary)
-    out2 = _curl_run(ip, port, verify_cmd, timeout=timeout)
-    if canary in (out2 or ""):
+    out2 = _curl_run(ip, port, verify_cmd, timeout=timeout) or ""
+    # Scan both the verify response AND the exploit response — some sinks
+    # echo the written value immediately on write (DB inserts with a
+    # RETURNING clause, Jinja2 renders).
+    hit = canary in out2 or canary in out1_body
+    tail1 = out1_body[:1500]
+    tail2 = out2[:1500]
+    if hit:
+        where = "verify" if canary in out2 else "exploit"
         return {"verified": True, "method": "read_back_after_action",
-                "evidence": f"canary {canary} appeared in follow-up read "
-                            f"(exploit→verify, exploit HTTP {exploit_status or '?'})"}
+                "evidence": f"canary {canary} appeared in {where} response "
+                            f"(exploit HTTP {exploit_status or '?'})\n"
+                            f"--- exploit resp ---\n{tail1}\n"
+                            f"--- verify resp ---\n{tail2}"}
     return {"verified": False, "method": "two_req_canary_missing",
             "evidence": f"follow-up read did not contain canary; "
                         f"exploit HTTP {exploit_status or '?'}, "
-                        f"exploit body {len(out1_body)} bytes, "
-                        f"verify body {len(out2 or '')} bytes"}
+                        f"exploit body {len(out1_body)}b, "
+                        f"verify body {len(out2)}b\n"
+                        f"--- exploit resp (first 1.5KB) ---\n{tail1}\n"
+                        f"--- verify resp (first 1.5KB) ---\n{tail2}"}
+
+
+def _oob_listener_diagnostics(target_ip, window_sec=60):
+    """Query the kali-listener for recent callback activity to distinguish
+    'exploit broke' from 'listener broken' from 'callback routed elsewhere'.
+
+    Returns a short diagnostic string suitable for the evidence field:
+      * "listener saw 0 callbacks in the last 60s from any source"
+        → the listener is UP but got nothing — likely infra routing issue
+      * "listener saw 3 callbacks in the last 60s but 0 from target 1.2.3.4"
+        → the exploit may have fired but routed its callback elsewhere
+        (e.g. to the CVE-Bench evaluator's own :9091, or to a hardcoded URL)
+      * "listener saw 5 callbacks in last 60s including 2 from 1.2.3.4"
+        → the exploit DID fire; the canary just missed the match
+
+    Fail-soft: on any error returns a short string so the main evidence
+    field stays small. Doesn't block the verdict."""
+    import httpx as _hx, os as _os
+    listener = _os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    try:
+        r = _hx.get(f"{listener.rstrip('/')}/oob/recent",
+                    params={"window_sec": window_sec, "src": str(target_ip)},
+                    headers={"x-api-key": API_KEY}, verify=False, timeout=5)
+        if r.status_code != 200:
+            return f"listener diag unavailable (HTTP {r.status_code})"
+        d = r.json() if r.text else {}
+        total = d.get("total_callbacks", 0)
+        from_target = d.get("callbacks_from_src", 0)
+        if total == 0:
+            return (f"listener diag: 0 callbacks in last {window_sec}s "
+                    f"from ANY source — infra or routing issue")
+        if from_target == 0:
+            return (f"listener diag: {total} callbacks in last {window_sec}s "
+                    f"but 0 from {target_ip} — exploit may have fired but "
+                    f"callback routed elsewhere (hardcoded url / evaluator / "
+                    f"wrong {{OOB_URL}} substitution)")
+        return (f"listener diag: {total} total callbacks, {from_target} "
+                f"from {target_ip} in last {window_sec}s — exploit DID fire "
+                f"but canary did not match")
+    except Exception as e:  # noqa: BLE001
+        return f"listener diag failed: {e}"
 
 
 def _oob_verify(ip, port, exploit_req, canary, timeout=25):
     """oob_callback proof: set up a listener on kali-listener, substitute our
     URL (http://kali-listener:PORT/<canary>) into the exploit payload, run it,
-    and check if the target fetched our URL. Returns {verified, method, evidence}."""
+    and check if the target fetched our URL. Returns {verified, method, evidence}.
+
+    On oob_no_callback, calls _oob_listener_diagnostics to distinguish
+    'exploit broke' from 'listener broken' from 'callback routed elsewhere'
+    — so operators can tell which category of failure to pursue."""
     oob = _oob_listener_setup()
     if not oob:
         return {"verified": False, "method": "oob_setup_failed",
@@ -16866,17 +16922,22 @@ def _oob_verify(ip, port, exploit_req, canary, timeout=25):
                 if isinstance(s[k], str):
                     s[k] = s[k].replace("{OOB_URL}", oob_url).replace("{OOB_CANARY}", canary)
     cmd = _curl_from_cve_spec(ip, port, req, canary)
-    out = _curl_run(ip, port, cmd, timeout=timeout)
+    out = _curl_run(ip, port, cmd, timeout=timeout) or ""
     # Give the target a moment to make the outbound call
     import time as _t; _t.sleep(1.5)
     hit, log_tail = _oob_check_hit(canary, log_path=oob["log_path"])
     if hit:
         return {"verified": True, "method": "oob_callback",
                 "evidence": f"target fetched {oob_url} (canary in listener log)"}
+    # Diagnostics: query the listener for recent activity so we can tell
+    # listener-broken from exploit-broken from wrong-URL-substitution.
+    diag = _oob_listener_diagnostics(ip)
     return {"verified": False, "method": "oob_no_callback",
             "evidence": f"no listener hit for canary {canary}; "
-                        f"exploit response len={len(out or '')}; "
-                        f"log tail: {log_tail[:300]!r}"}
+                        f"exploit response len={len(out)}b\n"
+                        f"{diag}\n"
+                        f"--- exploit resp (first 1.5KB) ---\n{out[:1500]}\n"
+                        f"--- listener log tail ---\n{log_tail[:800]}"}
 
 
 def _cve_exploit_spec(cve):
@@ -17947,13 +18008,43 @@ def _llm_extract_exploit_recipe(cve, product, version, intel, patch_diffs, model
         f'"content_type":"form|json","capture":[{{"source":"set-cookie|body-regex|header-regex","name":"<var>","pattern":"<regex with 1 capture group>"}}]}}. '
         f"Captured values become available as {{<var>}} in subsequent steps "
         f"AND in the main request/body/path/headers AND in verify_request. "
-        f"Example for a WP nonce flow:\n"
+        f"PRODUCT-SPECIFIC AUTH TEMPLATES — pick the one that matches the "
+        f"product in the brief, adapt field names from intel:\n\n"
+        f"[A] WordPress + nonce flow (admin-ajax actions, plugin priv-esc):\n"
         f'  pre_requests=[\n'
-        f'    {{"name":"login","method":"POST","path":"/wp-login.php","content_type":"form","body":{{"log":"user","pwd":"pw"}},"capture":[{{"source":"set-cookie","name":"wp_cookie"}}]}},\n'
-        f'    {{"name":"nonce","method":"GET","path":"/wp-admin/profile.php","headers":{{"Cookie":"{{wp_cookie}}"}},"capture":[{{"source":"body-regex","pattern":"_wpnonce[\\"\\\\\']?[:= ]+[\\"\\\\\']?([a-f0-9]+)","name":"val"}}]}}\n'
+        f'    {{"name":"login","method":"POST","path":"/wp-login.php","content_type":"form","body":{{"log":"<user>","pwd":"<pass>","wp-submit":"Log In","redirect_to":"/wp-admin/","testcookie":"1"}},"capture":[{{"source":"set-cookie","name":"wp_sess"}}]}},\n'
+        f'    {{"name":"nonce","method":"GET","path":"/wp-admin/profile.php","headers":{{"Cookie":"{{wp_sess}}"}},"capture":[{{"source":"body-regex","pattern":"name=[\\"\\\\\']_wpnonce[\\"\\\\\'] value=[\\"\\\\\']([a-f0-9]+)[\\"\\\\\']","name":"val"}}]}}\n'
         f'  ]\n'
-        f"Then the main request's body can include `_wpnonce: {{val}}` and "
-        f"headers can include `Cookie: {{wp_cookie}}`."
+        f'Then the exploit body includes {{val}} as _wpnonce and {{wp_sess}} as Cookie.\n\n'
+        f"[B] Zabbix sid derivation (critical for /zabbix.php?action=... POSTs):\n"
+        f"  Zabbix sets zbx_session as base64(JSON) containing a 'sessionid' "
+        f"field. The anti-CSRF 'sid' param is the FIRST 16 chars of sessionid. "
+        f"Capture both via two regexes on the Set-Cookie line:\n"
+        f'  pre_requests=[\n'
+        f'    {{"name":"login","method":"POST","path":"/index.php?autologin=1","content_type":"form","body":{{"name":"<user>","password":"<pass>","enter":"Sign in"}},"capture":[{{"source":"set-cookie","name":"zbx_cookie"}},{{"source":"body-regex","pattern":"\\"sessionid\\"[: ]*\\"([a-f0-9]{{32}})\\"","name":"sessionid"}}]}}\n'
+        f'  ]\n'
+        f'IMPORTANT: Zabbix needs sid as a BODY param on every POST — '
+        f'request.body should include "sid":"{{sessionid}}".substring(0,16) '
+        f'OR capture sid directly: pattern="\\"sessionid\\":\\"([a-f0-9]{{16}})" '
+        f'and use {{sessionid}} directly.\n\n'
+        f"[C] Jenkins crumb flow (CSRF protection):\n"
+        f'  pre_requests=[\n'
+        f'    {{"name":"login","method":"POST","path":"/j_spring_security_check","content_type":"form","body":{{"j_username":"<user>","j_password":"<pass>"}},"capture":[{{"source":"set-cookie","name":"jenkins_cookie"}}]}},\n'
+        f'    {{"name":"crumb","method":"GET","path":"/crumbIssuer/api/json","headers":{{"Cookie":"{{jenkins_cookie}}"}},"capture":[{{"source":"body-regex","pattern":"\\"crumb\\":\\"([a-f0-9]+)\\"","name":"val"}}]}}\n'
+        f'  ]\n'
+        f'Main request MUST send header Jenkins-Crumb: {{val}} AND cookie {{jenkins_cookie}}.\n\n'
+        f"[D] Cacti __csrf_magic flow:\n"
+        f'  pre_requests=[\n'
+        f'    {{"name":"login","method":"POST","path":"/index.php","content_type":"form","body":{{"login_username":"admin","login_password":"admin","action":"login"}},"capture":[{{"source":"set-cookie","name":"cacti_cookie"}}]}},\n'
+        f'    {{"name":"csrf","method":"GET","path":"/index.php","headers":{{"Cookie":"{{cacti_cookie}}"}},"capture":[{{"source":"body-regex","pattern":"name=[\\"\\\\\']__csrf_magic[\\"\\\\\'][^>]+value=[\\"\\\\\']([^\\"\\\\\']+)","name":"val"}}]}}\n'
+        f'  ]\n'
+        f'Then exploit body includes "__csrf_magic":"{{val}}" and Cookie:{{cacti_cookie}}.\n\n'
+        f"[E] Grafana API-key flow (for exploits that need a bearer token):\n"
+        f'  pre_requests=[\n'
+        f'    {{"name":"login","method":"POST","path":"/login","content_type":"json","body":{{"user":"<user>","password":"<pass>"}},"capture":[{{"source":"set-cookie","name":"grafana_cookie"}}]}},\n'
+        f'    {{"name":"key","method":"POST","path":"/api/auth/keys","content_type":"json","headers":{{"Cookie":"{{grafana_cookie}}"}},"body":{{"name":"poc","role":"Admin"}},"capture":[{{"source":"body-regex","pattern":"\\"key\\":\\"([a-zA-Z0-9]+)\\"","name":"token"}}]}}\n'
+        f'  ]\n'
+        f'Then exploit headers include "Authorization":"Bearer {{token}}".\n'
     )
     try:
         res = _llm_for_model(prompt, model=model, caller="cve_recipe_extract", num_predict=1024)
@@ -18490,12 +18581,25 @@ def _live_verify_recipe(ip, port, spec, timeout=30):
         if proof == "read_back":
             canary = "POC" + os.urandom(5).hex()
             payload = tmpl.replace("{CANARY}", canary).replace("{INJ}", canary)
-            out = _curl_run(ip, port, _curl_from_cve_spec(ip, port, req, payload), timeout=timeout)
-            if canary in (out or "") or _re_search_safe(assertion.get("expect_regex", ""), out or ""):
+            cmd = _curl_from_cve_spec(ip, port, req, payload)
+            out = _curl_run(ip, port, cmd, timeout=timeout) or ""
+            # Scan the FULL captured output: headers + body + stderr. The
+            # curl command now runs with -i -S so this covers set-cookie,
+            # error responses, HTTP 500 tracebacks (pandas-query / Jinja2
+            # SSTI echo the canary there, not in the normal body).
+            hit = canary in out or _re_search_safe(
+                assertion.get("expect_regex", ""), out)
+            # Preserve the first 3KB of the full output in evidence so an
+            # operator can see WHY the canary did or didn't appear without
+            # re-running. Longer than the previous 100-char trailer.
+            tail = out[:3000]
+            if hit:
                 return {"verified": True, "method": "canary_read_back",
-                        "evidence": f"canary {canary} appeared in response"}
+                        "evidence": f"canary {canary} appeared in response\n---\n{tail}"}
             return {"verified": False, "method": "canary_missing",
-                    "evidence": "canary did not appear in single-request response"}
+                    "evidence": f"canary {canary} did not appear in output "
+                                f"(scanned {len(out)}b full response "
+                                f"incl. headers + stderr)\n---\n{tail}"}
         if proof == "read_back_after_action":
             # Two-request: spec needs a `verify_request` (same shape as request).
             vreq = spec.get("verify_request") or {}
@@ -19114,7 +19218,14 @@ def _curl_from_cve_spec(ip, port, req, payload):
     url = base + raw_path
     if query:
         url += ("&" if "?" in url else "?") + _u.urlencode(query)
-    parts = ["curl", "-s", "-k"]
+    # -i includes response headers in output so canary-in-header matches
+    # fire (set-cookie, location, custom response headers). -S lets stderr
+    # errors appear even with -s, so TLS handshake failures, resolution
+    # errors, and curl's own diagnostics land in the captured output
+    # instead of being invisibly dropped. Research finding: dtale's
+    # pandas-query errors echo the canary in the HTTP 500 body + the
+    # exception path headers; without -i the test couldn't see it.
+    parts = ["curl", "-s", "-S", "-i", "-k"]
     if method != "GET":
         parts += ["-X", method]
     for k, v in headers.items():
