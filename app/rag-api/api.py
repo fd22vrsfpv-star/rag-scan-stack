@@ -17947,6 +17947,29 @@ def _recipe_to_spec(cve, product, recipe):
         spec["notes"] = (spec.get("notes") or "") + f" [grammar-mismatch: {hint}]"
         # Also surface in refine_hints-style metadata so the next pass sees it
         spec["_grammar_mismatch"] = {"grammar": _sg, "hint": hint}
+    # Content-type auto-align from sink_grammar. Each grammar has a canonical
+    # content-type the sink expects. When the LLM declared a mismatching
+    # content_type (e.g. XML grammar but `form` body), rewrite so the exploit
+    # payload lands in the right parse path. Example from the research: Cacti
+    # CVE-2024-25641 verified with content-type=xml; a sibling exploit path
+    # that was labeled xml-xxe but shipped as `form` wouldn't trigger entity
+    # expansion. Fail-soft: leave alone when no mapping fits (e.g. ssrf
+    # grammar can go in header or body).
+    _CT_MAP = {
+        "xml-xxe": "xml",
+        "jinja2": "form",     # SSTI usually form or url param
+        "pandas-query": "json",  # dtale takes JSON
+        "spel": "json",
+        "mvel": "json",
+    }
+    if _sg and _sg.lower() in _CT_MAP:
+        _preferred_ct = _CT_MAP[_sg.lower()]
+        _current_ct = (spec.get("request") or {}).get("content_type")
+        if _current_ct and _current_ct != _preferred_ct:
+            spec["request"] = dict(spec.get("request") or {})
+            spec["notes"] = (spec.get("notes") or "") + \
+                f" [content-type AUTO-ALIGNED {_current_ct}→{_preferred_ct} to match sink_grammar={_sg}]"
+            spec["request"]["content_type"] = _preferred_ct
     return spec
 
 
