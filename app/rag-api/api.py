@@ -30779,14 +30779,30 @@ def review_scope_suggestion(
             method = row["method"]
             target = row["target"]
             if method == "typosquat":
-                # Add to the GLOBAL not_in_scope deny-list.
-                cur.execute(
-                    "INSERT INTO public.scope_targets "
-                    "(name, target, target_type, source, engagement_id) "
-                    "VALUES ('not_in_scope', %s, 'domain', 'typosquat_review', NULL) "
-                    "ON CONFLICT DO NOTHING",
-                    (target,),
-                )
+                # Add to the engagement's `typosquats` scope. The scope
+                # gate's deny-list loader reads every engagement's
+                # typosquats scope, so block semantics are preserved
+                # (cross-engagement) while visibility is grouped per
+                # engagement. Falls back to the global `not_in_scope`
+                # deny-list when no active engagement — never leave a
+                # confirmed lookalike unblocked.
+                eid = _resolve_engagement_id(None)
+                if eid:
+                    cur.execute(
+                        "INSERT INTO public.scope_targets "
+                        "(name, target, target_type, source, engagement_id) "
+                        "VALUES ('typosquats', %s, 'domain', 'typosquat_review', %s::uuid) "
+                        "ON CONFLICT DO NOTHING",
+                        (target, eid),
+                    )
+                else:
+                    cur.execute(
+                        "INSERT INTO public.scope_targets "
+                        "(name, target, target_type, source, engagement_id) "
+                        "VALUES ('not_in_scope', %s, 'domain', 'typosquat_review', NULL) "
+                        "ON CONFLICT DO NOTHING",
+                        (target,),
+                    )
             elif method in ("cert_pivot", "asn_pivot"):
                 # Add to the current engagement's in-scope list. The
                 # suggested_scope column names which engagement scope
@@ -30871,14 +30887,29 @@ def review_scope_suggestions_bulk(
                 target = row["target"]
                 method = row["method"]
                 if method == "typosquat":
-                    cur.execute(
-                        "INSERT INTO public.scope_targets "
-                        "(name, target, target_type, source, engagement_id) "
-                        "VALUES ('not_in_scope', %s, 'domain', "
-                        "'typosquat_review_bulk', NULL) "
-                        "ON CONFLICT DO NOTHING",
-                        (target,),
-                    )
+                    # Per-engagement `typosquats` scope (see single-row
+                    # endpoint for the design rationale). Global
+                    # not_in_scope fallback only when no active
+                    # engagement — a confirmed lookalike is never left
+                    # unblocked.
+                    if eid:
+                        cur.execute(
+                            "INSERT INTO public.scope_targets "
+                            "(name, target, target_type, source, engagement_id) "
+                            "VALUES ('typosquats', %s, 'domain', "
+                            "'typosquat_review_bulk', %s::uuid) "
+                            "ON CONFLICT DO NOTHING",
+                            (target, eid),
+                        )
+                    else:
+                        cur.execute(
+                            "INSERT INTO public.scope_targets "
+                            "(name, target, target_type, source, engagement_id) "
+                            "VALUES ('not_in_scope', %s, 'domain', "
+                            "'typosquat_review_bulk', NULL) "
+                            "ON CONFLICT DO NOTHING",
+                            (target,),
+                        )
                 elif method in ("cert_pivot", "asn_pivot") and eid:
                     cur.execute(
                         "INSERT INTO public.scope_targets "

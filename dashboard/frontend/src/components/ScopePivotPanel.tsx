@@ -76,13 +76,13 @@ export function ScopePivotPanel({ engagementId: fixedEid }: { engagementId?: str
     const ids = Array.from(selectedIds)
     if (!ids.length) { setBulkSummary('nothing selected'); return }
     // Bias toward the honest action — a bulk Confirm on typosquats is
-    // destructive-adjacent (adds to the global not_in_scope deny-list),
+    // destructive-adjacent (adds to a typosquats scope the gate denies),
     // so warn when the selection spans methods or the count is large.
     const typoCount = suggestions.filter(s => selectedIds.has(s.id) && s.method === 'typosquat').length
     const promoteCount = ids.length - typoCount
     if (action === 'accept') {
       const parts: string[] = []
-      if (typoCount) parts.push(`${typoCount} typosquat → not_in_scope deny-list`)
+      if (typoCount) parts.push(`${typoCount} typosquat → this engagement's typosquats scope`)
       if (promoteCount) parts.push(`${promoteCount} pivot → engagement in-scope`)
       const msg = `Confirm ${ids.length} suggestions?\n\n${parts.join('\n')}\n\nThis is reversible per-row from the suggestion lists.`
       if (!window.confirm(msg)) return
@@ -127,9 +127,9 @@ export function ScopePivotPanel({ engagementId: fixedEid }: { engagementId?: str
       <p className="text-[11px] text-muted-foreground">
         <strong className="text-foreground">Typosquat pivot</strong>: generates lookalike variants
         (edit, QWERTY, homoglyph, bitsquat, IDN, TLD swap) of each in-scope apex, scores each, writes
-        pending suggestions, and auto-adds high-confidence (≥0.85) hits to the global
-        <code className="mx-1 text-amber-300">not_in_scope</code> deny-list. The scope gate refuses
-        dispatch to anything on the deny-list for every engagement.
+        pending suggestions, and auto-adds high-confidence (≥0.85) hits to this engagement's
+        <code className="mx-1 text-amber-300">typosquats</code> scope. The scope gate's deny-list
+        loader reads every engagement's typosquats scope, so refusal is cross-engagement.
       </p>
 
       {/* Run bar — hide engagement picker when panel is bound to a known engagement */}
@@ -153,7 +153,7 @@ export function ScopePivotPanel({ engagementId: fixedEid }: { engagementId?: str
           onClick={handleRun}
           disabled={!effectiveEid || runPivot.isPending}
           className="h-6 px-2 text-[11px] rounded bg-primary hover:bg-primary/80 text-primary-foreground disabled:opacity-40 inline-flex items-center gap-1"
-          title="Run the typosquat generator + scorer against this engagement's apex scope. Writes scope_suggestions and auto-adds high-confidence hits to the global not_in_scope deny-list."
+          title="Run the typosquat generator + scorer against this engagement's apex scope. Writes scope_suggestions and auto-adds high-confidence hits to this engagement's typosquats scope."
         >
           <Zap className="w-3 h-3" />
           {runPivot.isPending ? 'running…' : 'Run typosquat pivot'}
@@ -186,7 +186,7 @@ export function ScopePivotPanel({ engagementId: fixedEid }: { engagementId?: str
             onClick={() => runBulk('accept')}
             disabled={bulkReview.isPending}
             className="h-6 px-2 text-[11px] rounded bg-red-500/15 hover:bg-red-500/25 text-red-300 border border-red-500/30 disabled:opacity-40"
-            title="Confirm every selected suggestion. Typosquats go to the global not_in_scope deny-list; cert/ASN pivots are promoted to this engagement's in-scope list."
+            title="Confirm every selected suggestion. Typosquats go into this engagement's typosquats scope (gate still refuses dispatch); cert/ASN pivots are promoted to this engagement's in-scope list."
           >
             Confirm selected
           </button>
@@ -268,7 +268,7 @@ export function ScopePivotPanel({ engagementId: fixedEid }: { engagementId?: str
                         disabled={review.isPending}
                         className="h-6 px-2 text-[10px] rounded bg-red-500/15 hover:bg-red-500/25 text-red-300 border border-red-500/30"
                         title={s.method === 'typosquat'
-                          ? 'Confirm as a typosquat. Adds to the global not_in_scope deny-list; the scope gate will refuse all dispatch to this target.'
+                          ? "Confirm as a typosquat. Adds to this engagement's typosquats scope; the scope gate's deny-list loader reads it (and every engagement's typosquats scope) so dispatch is refused everywhere."
                           : 'Promote to the active engagement\'s in-scope list.'}
                       >Confirm</button>
                       <button
