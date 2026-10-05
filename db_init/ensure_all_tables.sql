@@ -3902,7 +3902,7 @@ CREATE TABLE IF NOT EXISTS scope_classification_rules (
     scope_name      text NOT NULL,
     priority        int NOT NULL DEFAULT 100,
     enabled         boolean NOT NULL DEFAULT true,
-    rule_type       text NOT NULL CHECK (rule_type IN ('domain_pattern','whois_org','asn','tls_issuer','ip_cidr','composite')),
+    rule_type       text NOT NULL CHECK (rule_type IN ('domain_pattern','whois_org','asn','tls_issuer','ip_cidr','composite','typosquat')),
     conditions      jsonb NOT NULL,
     auto_apply      boolean NOT NULL DEFAULT false,
     created_at      timestamptz DEFAULT now(),
@@ -3930,7 +3930,7 @@ CREATE TABLE IF NOT EXISTS scope_suggestions (
     suggested_scope text NOT NULL,
     confidence      float NOT NULL,
     reasoning       text NOT NULL DEFAULT '',
-    method          text NOT NULL CHECK (method IN ('rule','similarity','llm')),
+    method          text NOT NULL CHECK (method IN ('rule','similarity','llm','typosquat','cert_pivot','asn_pivot')),
     rule_id         uuid REFERENCES scope_classification_rules(id) ON DELETE SET NULL,
     similar_decisions uuid[],
     status          text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','accepted','rejected')),
@@ -4356,6 +4356,23 @@ EXCEPTION WHEN OTHERS THEN NULL; END $$;
 DO $$ BEGIN ALTER TABLE scope_classification_rules ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES engagements(id); EXCEPTION WHEN OTHERS THEN NULL; END $$;
 DO $$ BEGIN ALTER TABLE scope_decisions ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES engagements(id); EXCEPTION WHEN OTHERS THEN NULL; END $$;
 DO $$ BEGIN ALTER TABLE scope_suggestions ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES engagements(id); EXCEPTION WHEN OTHERS THEN NULL; END $$;
+
+-- Step 5: Relax CHECK constraints on scope_classification_rules.rule_type
+-- and scope_suggestions.method so the typosquat detector + cert/ASN pivot
+-- helpers can write their rule/method values.
+-- (Existing dbs created BEFORE the typosquat work have a stale CHECK that
+-- would reject the new values; drop + re-add with the expanded allow-list.)
+DO $$ BEGIN
+  ALTER TABLE scope_classification_rules DROP CONSTRAINT IF EXISTS scope_classification_rules_rule_type_check;
+  ALTER TABLE scope_classification_rules ADD CONSTRAINT scope_classification_rules_rule_type_check
+    CHECK (rule_type IN ('domain_pattern','whois_org','asn','tls_issuer','ip_cidr','composite','typosquat'));
+EXCEPTION WHEN OTHERS THEN NULL; END $$;
+
+DO $$ BEGIN
+  ALTER TABLE scope_suggestions DROP CONSTRAINT IF EXISTS scope_suggestions_method_check;
+  ALTER TABLE scope_suggestions ADD CONSTRAINT scope_suggestions_method_check
+    CHECK (method IN ('rule','similarity','llm','typosquat','cert_pivot','asn_pivot'));
+EXCEPTION WHEN OTHERS THEN NULL; END $$;
 
 -- ============================================================================
 -- TIER 18: Scan Pipelines (multi-stage parallel orchestration)
