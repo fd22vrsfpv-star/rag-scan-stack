@@ -495,30 +495,29 @@ def _add_to_typosquats_scope(cur, candidate: str, engagement_id: str) -> bool:
     the gate still refuses dispatch to anything landed here, including
     cross-engagement.
 
-    engagement_id is REQUIRED and set on the row — matches the project
-    invariant that per-engagement scope entries carry an engagement_id
-    (CLAUDE.md: "Scope entries are per-engagement collected config").
-    Falls back to a global not_in_scope insert when no engagement is
-    available, so a pivot run that lands typosquats before an operator
-    picks an engagement still blocks them.
+    engagement_id is REQUIRED. Per CLAUDE.md's "Scope entries are
+    per-engagement collected config" invariant, writing a scope row
+    without attribution is an orphan a purge cannot claim. If no
+    engagement is available the write is REFUSED (not silently
+    downgraded to the global not_in_scope list, which was the old
+    behaviour) — operator-asked tightening so a typosquat is never
+    recorded under the wrong engagement.
     """
+    if not engagement_id:
+        logger.warning(
+            "typosquats scope write refused for %s: no engagement_id "
+            "in context (CLAUDE.md requires engagement attribution)",
+            candidate,
+        )
+        return False
     try:
-        if engagement_id:
-            cur.execute(
-                "INSERT INTO public.scope_targets "
-                "(name, target, target_type, source, engagement_id) "
-                "VALUES ('typosquats', %s, 'domain', 'typosquat_auto', %s::uuid) "
-                "ON CONFLICT DO NOTHING",
-                (candidate, engagement_id),
-            )
-        else:
-            cur.execute(
-                "INSERT INTO public.scope_targets "
-                "(name, target, target_type, source, engagement_id) "
-                "VALUES ('not_in_scope', %s, 'domain', 'typosquat_auto', NULL) "
-                "ON CONFLICT DO NOTHING",
-                (candidate,),
-            )
+        cur.execute(
+            "INSERT INTO public.scope_targets "
+            "(name, target, target_type, source, engagement_id) "
+            "VALUES ('typosquats', %s, 'domain', 'typosquat_auto', %s::uuid) "
+            "ON CONFLICT DO NOTHING",
+            (candidate, engagement_id),
+        )
         return cur.rowcount > 0
     except Exception as e:  # noqa: BLE001
         logger.debug("typosquats scope write failed for %s: %s",
