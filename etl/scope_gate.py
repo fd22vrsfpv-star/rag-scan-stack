@@ -118,6 +118,14 @@ def load_not_in_scope_denylist(cur):
          engagement; the gate reads all of them so a lookalike flagged
          in engagement A also refuses dispatch from engagement B.
 
+      3. Every engagement's `new_for_review` scope (any engagement_id) —
+         the STAGING bucket cert-pivot / asn-pivot accepts land in. A
+         pivoted target is visible under the engagement but must be
+         reviewed and PROMOTED to a live scope before it is scannable, so
+         the gate refuses dispatch to it here (same treatment as
+         `typosquats`). Moving the target out of `new_for_review` into a
+         live scope is what makes it dispatchable.
+
     Returns [] on any query error (fail-open on the deny-list side: a
     deny-list that can't load must not accidentally refuse legitimate
     scope — the regular scope check still runs).
@@ -126,7 +134,7 @@ def load_not_in_scope_denylist(cur):
         cur.execute(
             "SELECT target, target_type FROM public.scope_targets "
             "WHERE (name = 'not_in_scope' AND engagement_id IS NULL "
-            "       OR name = 'typosquats') "
+            "       OR name IN ('typosquats', 'new_for_review')) "
             "AND target IS NOT NULL AND target <> ''"
         )
         rows = cur.fetchall()
