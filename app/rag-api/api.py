@@ -10,7 +10,7 @@ log = logging.getLogger("rag-api")
 from typing import List, Optional, Dict, Any
 from urllib.parse import urlparse
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Depends, Query, BackgroundTasks, Body
-from fastapi.responses import Response
+from fastapi.responses import Response, FileResponse
 from pydantic import BaseModel, Field
 import psycopg2
 from psycopg2.extras import Json, RealDictCursor
@@ -21761,6 +21761,22 @@ def mine_refine_patterns(min_hits: int = 3,
     return {"ok": True, "promoted": promoted, "count": len(promoted)}
 
 
+@app.get("/confirmed-facts/screenshot/{filename}", tags=["Exploit Store"])
+def get_fact_screenshot(filename: str, authorized: bool = Depends(auth)):
+    """Serve a PNG that `_capture_fact_screenshot` wrote during a probe. The
+    evidence string for a fact may contain a line `Screenshot: /confirmed-facts/
+    screenshot/<file>` — the UI reads that and embeds the response as an image
+    alongside the text snippet. Filename is restricted to the hex ids the
+    helper generates (no path traversal)."""
+    import re as _re
+    if not _re.fullmatch(r"[0-9a-f]{8,64}\.png", filename or ""):
+        raise HTTPException(400, "invalid screenshot filename")
+    fp = f"/app/fact_screenshots/{filename}"
+    if not os.path.exists(fp):
+        raise HTTPException(404, "screenshot not found")
+    return FileResponse(fp, media_type="image/png")
+
+
 @app.get("/confirmed-facts", tags=["Exploit Store"])
 def list_confirmed_facts(target: Optional[str] = None, cve: Optional[str] = None,
                           product: Optional[str] = None, host: Optional[str] = None,
@@ -23721,6 +23737,12 @@ def _run_one_building_block(probe, ip, port, product, analysis, auth,
             if srv: ev += f"\nServer: {srv}"
             if ct:  ev += f"\nContent-Type: {ct}"
             if snippet: ev += f"\n---\n{snippet}"
+            # Headless screenshot of the response — a visual next to the text
+            # snippet. Fail-soft: if the browser can't reach the target, the
+            # text evidence still lands.
+            shot = _capture_fact_screenshot(ip, port, "/")
+            if shot:
+                ev += f"\nScreenshot: {shot}"
             _record_confirmation(tgt, "target_reachable", "/", "confirmed",
                                  evidence=ev, method="probe", product=product)
             return True
@@ -23773,6 +23795,14 @@ def _run_one_building_block(probe, ip, port, product, analysis, auth,
         try:
             valid, why = _probe_session_valid(ip, port, session_cookie, product=product)
             if valid:
+                # Screenshot of the authenticated page (unauth preview — the
+                # /preview endpoint doesn't accept arbitrary cookies, so this
+                # shows what the operator SEES at that URL as an anon user; the
+                # auth-cookie text evidence is the proof of authenticated
+                # access). Append the path so UI can embed.
+                shot = _capture_fact_screenshot(ip, port, "/")
+                if shot:
+                    why = (why or "") + f"\nScreenshot: {shot}"
                 _record_confirmation(tgt, "session_valid", "auth", "confirmed",
                                      evidence=why, method="probe", product=product)
             return valid
@@ -23818,6 +23848,9 @@ def _run_one_building_block(probe, ip, port, product, analysis, auth,
                               + (f"\n(discovered — advisory named {tep})" if path != tep else "")
                               + (f"\nContent-Type: {er.headers.get('Content-Type')}" if er.headers.get('Content-Type') else "")
                               + (f"\n---\n{snippet}" if snippet else ""))
+                        shot = _capture_fact_screenshot(ip, port, path)
+                        if shot:
+                            ev += f"\nScreenshot: {shot}"
                         _record_confirmation(tgt, "endpoint_exists", path, "confirmed",
                                              evidence=ev,
                                              method="probe", claim_value=path, product=product)
@@ -24450,6 +24483,60 @@ def _probe_zabbix_sid_valid(ip, port, session_cookie, sid, hostid=None,
             return True, f"sid accepted by CSRF layer (status {r.status_code})"
     except Exception as e:  # noqa: BLE001
         return False, f"sid probe error: {e}"
+
+
+def _capture_fact_screenshot(ip, port, path="/", cookie=None,
+                              engagement_id=None, timeout=20):
+    """Headless-render the response to disk via playwright-scanner /preview and
+    return a URL path the UI can embed. Fail-soft: on ANY error returns None so
+    text evidence still lands even when the headless browser can't reach the
+    target (sandbox, scope refusal, timeout).
+
+    Operator ask: "should we also get a screenshot for the response" — adds a
+    visual on top of the text snippet already in evidence. For session_valid
+    this makes "it looked logged in" audit-worthy at a glance; for
+    endpoint_exists it shows what the discovered page actually looks like.
+
+    Stored under /app/fact_screenshots on rag-api; served by
+    GET /confirmed-facts/screenshot/{filename}."""
+    import httpx as _hx, base64 as _b64, hashlib as _hl, os as _os, time as _t
+    try:
+        scheme = "https" if int(port or 80) in (443, 8443) else "http"
+        url = f"{scheme}://{ip}:{port or 80}{path if path.startswith('/') else '/' + path}"
+        scanner = _os.environ.get("PLAYWRIGHT_SCANNER_URL",
+                                   "https://playwright-scanner:8014")
+        hdrs = {}
+        if engagement_id:
+            hdrs["X-Engagement-Id"] = str(engagement_id)
+        body = {"url": url, "width": 1280, "height": 800, "timeout": timeout}
+        if cookie:
+            # The /preview endpoint doesn't accept arbitrary request headers
+            # today — scope-gated anyway — so we can't inject the auth cookie
+            # from here. Still useful: an unauthenticated screenshot of the
+            # endpoint plus the auth-cookie text evidence is better than text
+            # alone, and some apps render identical dashboards for anon users
+            # when the cookie is scoped elsewhere. Operator reads both.
+            body["note"] = "unauth preview"
+        r = _hx.post(f"{scanner}/preview", json=body, headers=hdrs,
+                      verify=False, timeout=timeout + 5)
+        if r.status_code != 200:
+            return None
+        obj = r.json()
+        b64 = obj.get("screenshot_b64")
+        if not b64:
+            return None
+        png = _b64.b64decode(b64)
+        _os.makedirs("/app/fact_screenshots", exist_ok=True)
+        # Hash the URL + timestamp bucket so re-captures of the same target
+        # within a few minutes dedup; a fresh ledger write gets a fresh file.
+        tag = _hl.sha256(f"{url}:{int(_t.time()//60)}".encode()).hexdigest()[:16]
+        fp = f"/app/fact_screenshots/{tag}.png"
+        with open(fp, "wb") as f:
+            f.write(png)
+        return f"/confirmed-facts/screenshot/{tag}.png"
+    except Exception as e:  # noqa: BLE001
+        logging.debug("fact screenshot capture failed: %s", e)
+        return None
 
 
 def _probe_session_valid(ip, port, cookie, product=None, timeout=8):
