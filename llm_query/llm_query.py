@@ -352,6 +352,166 @@ def _azure_json_post(url: str, payload: Dict[str, Any],
         raise HTTPException(status_code=502, detail=f"Azure endpoint unreachable: {e}")
 
 
+# ---------- Azure Foundry Anthropic Passthrough ----------
+#
+# Azure AI Foundry serves Anthropic Claude deployments through a
+# dedicated client. The exact wiring is documented in Microsoft's own
+# code snippet, which we match 1:1:
+#
+#   from anthropic import AnthropicFoundry
+#   from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+#   token_provider = get_bearer_token_provider(
+#       DefaultAzureCredential(), "https://ai.azure.com/.default")
+#   client = AnthropicFoundry(
+#       azure_ad_token_provider=token_provider,
+#       base_url="https://<resource>.services.ai.azure.com/anthropic")
+#   client.messages.create(model="<deployment>", messages=..., max_tokens=...)
+#
+# Auth is Entra ID OAuth (NOT the raw api-key), via DefaultAzureCredential's
+# standard chain — environment vars (AZURE_CLIENT_ID/SECRET/TENANT_ID),
+# then workload / managed identity, then Azure CLI. The container running
+# this code needs at least one of those paths available.
+#
+# Base URL ends at /anthropic (resource-root prefix); the SDK appends
+# /v1/messages. Model name is the Foundry DEPLOYMENT name, not an
+# Anthropic model id.
+
+_FOUNDRY_ANTHROPIC_PREFIXES = ("claude-",)
+_FOUNDRY_ENTRA_SCOPE = "https://ai.azure.com/.default"
+
+
+def _is_anthropic_on_foundry(model: Optional[str]) -> bool:
+    """True when model id looks like an Anthropic Claude deployment that
+    should be served via Foundry's Anthropic passthrough rather than the
+    OpenAI chat-completions path."""
+    if not model:
+        return False
+    m = model.lower()
+    return any(m.startswith(p) for p in _FOUNDRY_ANTHROPIC_PREFIXES)
+
+
+def _foundry_resource_root(endpoint: Optional[str]) -> str:
+    """Strip /api/projects/<project> from a Foundry Project endpoint so
+    the resulting URL is the resource root the Anthropic passthrough
+    lives on. If the endpoint is already a resource root (or empty), it
+    is returned unchanged."""
+    base = (endpoint or "").rstrip("/")
+    if "/api/projects/" in base:
+        base = base.split("/api/projects/")[0].rstrip("/")
+    return base
+
+
+_foundry_anthropic_client_cache: Dict[str, Any] = {}
+
+
+def _foundry_anthropic_client(endpoint: Optional[str],
+                              api_key: Optional[str] = None):
+    """Build (and cache) an AnthropicFoundry client bound to the given
+    endpoint.
+
+    Auth precedence:
+      1. If `api_key` is provided, use it as a static bearer — this is
+         the simple path when the operator has a Foundry resource key
+         in llm.providers already (what we have today).
+      2. Otherwise fall back to DefaultAzureCredential + Entra OAuth
+         with scope https://ai.azure.com/.default — the production
+         pattern Microsoft documents.
+
+    Cache key is (base_url, mode) so a key-swap or an auth-mode flip
+    rebuilds the client cleanly instead of serving a stale closure.
+    """
+    base = _foundry_resource_root(endpoint)
+    if not base:
+        raise HTTPException(502, "Anthropic-on-Foundry needs an endpoint")
+    base_url = f"{base}/anthropic"
+    mode = "key" if api_key else "entra"
+    ck = f"{base_url}|{mode}"
+    cached = _foundry_anthropic_client_cache.get(ck)
+    if cached is not None:
+        return cached
+    try:
+        from anthropic import AnthropicFoundry  # type: ignore
+    except ImportError as e:
+        raise HTTPException(
+            502,
+            f"Anthropic-on-Foundry requires the `anthropic` package "
+            f"(missing: {e.name}). Install in the llm_query image.")
+    try:
+        if api_key:
+            client = AnthropicFoundry(api_key=api_key, base_url=base_url)
+        else:
+            from azure.identity import (  # type: ignore
+                DefaultAzureCredential, get_bearer_token_provider)
+            token_provider = get_bearer_token_provider(
+                DefaultAzureCredential(), _FOUNDRY_ENTRA_SCOPE)
+            client = AnthropicFoundry(
+                azure_ad_token_provider=token_provider,
+                base_url=base_url)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(
+            502,
+            f"Anthropic-on-Foundry client init failed ({mode}): "
+            f"{type(e).__name__}: {str(e)[:200]}")
+    _foundry_anthropic_client_cache[ck] = client
+    return client
+
+
+def _azure_anthropic_messages_post(
+    endpoint: Optional[str], api_key: Optional[str],
+    model: str, prompt: str, options: Optional[Dict[str, Any]]
+) -> tuple:
+    """Dispatch one prompt via AnthropicFoundry (Entra-authenticated).
+
+    `api_key` is used as a static bearer when present; otherwise
+    DefaultAzureCredential (Entra) kicks in. Both paths dispatch through
+    the official `AnthropicFoundry` SDK, so the response shape matches
+    `_usage_from("anthropic", data)` without extra translation."""
+    client = _foundry_anthropic_client(endpoint, api_key=api_key)
+    opts = options or {}
+    max_tokens = int(
+        opts.get("num_predict")
+        or opts.get("max_tokens")
+        or MAX_COMPLETION_TOKENS
+    )
+    kwargs: Dict[str, Any] = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if opts.get("temperature") is not None:
+        kwargs["temperature"] = opts["temperature"]
+    if opts.get("top_p") is not None:
+        kwargs["top_p"] = opts["top_p"]
+    try:
+        resp = client.messages.create(**kwargs)
+    except Exception as e:  # noqa: BLE001
+        # Anthropic SDK's APIError carries .status_code and .body; surface
+        # both so operators can distinguish Foundry deployment issues from
+        # Anthropic model-id issues.
+        status = getattr(e, "status_code", None) or 502
+        body = getattr(e, "body", None) or str(e)
+        raise HTTPException(status,
+            f"azure-foundry anthropic: {type(e).__name__}: {str(body)[:400]}")
+    # Normalize SDK response to a dict + extracted text, matching the
+    # shape _usage_from('anthropic', data) expects.
+    text = ""
+    content = getattr(resp, "content", None) or []
+    for block in content:
+        t = getattr(block, "text", None)
+        if t: text += t
+    usage = getattr(resp, "usage", None)
+    data = {
+        "content": [{"type": "text", "text": text}],
+        "usage": {
+            "input_tokens": getattr(usage, "input_tokens", None),
+            "output_tokens": getattr(usage, "output_tokens", None),
+        } if usage is not None else {},
+        "model": getattr(resp, "model", model),
+        "stop_reason": getattr(resp, "stop_reason", None),
+    }
+    return text, data
+
+
 # ---------- OpenAI Helpers ----------
 
 def _openai_headers(api_key: Optional[str] = None) -> Dict[str, str]:
@@ -758,6 +918,18 @@ def _generate_text(backend: str, model: str, prompt: str,
     top_p = (options or {}).get("top_p")
 
     if backend == "azure":
+        # Azure Foundry serves Anthropic Claude models through a
+        # passthrough at /anthropic/v1/messages on the RESOURCE root
+        # (not the project endpoint). The OpenAI chat-completions path
+        # returns "api_not_supported" for Anthropic deployments. Detect
+        # by model-id prefix and dispatch to the Anthropic Messages API
+        # helper. See _azure_anthropic_messages_post docstring for why
+        # Bearer + resource-root + anthropic-version are all required
+        # together (verified empirically via probe before shipping).
+        if _is_anthropic_on_foundry(model):
+            text, data = _azure_anthropic_messages_post(
+                endpoint, api_key, model, prompt, options)
+            return text, _usage_from("anthropic", data)
         payload: Dict[str, Any] = {
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": MAX_COMPLETION_TOKENS, "model": model,

@@ -6,7 +6,8 @@
    ENV OLLAMA_MODEL=qwen2.5:14b
 
    # Install necessary dependencies
-   RUN pip install requests fastapi uvicorn pydantic psycopg2-binary autogen
+   RUN pip install requests fastapi uvicorn pydantic psycopg2-binary autogen \
+       anthropic azure-identity
    RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl  wget iproute2 && \
     rm -rf /var/lib/apt/lists/*
