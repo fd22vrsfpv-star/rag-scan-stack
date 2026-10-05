@@ -17821,7 +17821,22 @@ def _llm_extract_exploit_recipe(cve, product, version, intel, patch_diffs, model
         f"The verifier captures Set-Cookie and injects it into every subsequent "
         f"request as a Cookie header — DON'T put '{{SESSIONID}}' or similar "
         f"placeholders in request.headers.Cookie; just OMIT the Cookie header "
-        f"from request and let auth_setup supply it."
+        f"from request and let auth_setup supply it.\n"
+        f"PRE_REQUESTS CHAIN: for attacks that need a CSRF token / nonce / "
+        f"session-derived param (WP admin-ajax nonce, Zabbix sid, Cacti "
+        f"__csrf_magic), use `pre_requests`: a list of steps run IN ORDER "
+        f"before the main request. Each step: "
+        f'{{"name":"<var-prefix>","method":"GET|POST","path":"/...","headers":{{...}} or null,"body":{{...}} or null,'
+        f'"content_type":"form|json","capture":[{{"source":"set-cookie|body-regex|header-regex","name":"<var>","pattern":"<regex with 1 capture group>"}}]}}. '
+        f"Captured values become available as {{<var>}} in subsequent steps "
+        f"AND in the main request/body/path/headers AND in verify_request. "
+        f"Example for a WP nonce flow:\n"
+        f'  pre_requests=[\n'
+        f'    {{"name":"login","method":"POST","path":"/wp-login.php","content_type":"form","body":{{"log":"user","pwd":"pw"}},"capture":[{{"source":"set-cookie","name":"wp_cookie"}}]}},\n'
+        f'    {{"name":"nonce","method":"GET","path":"/wp-admin/profile.php","headers":{{"Cookie":"{{wp_cookie}}"}},"capture":[{{"source":"body-regex","pattern":"_wpnonce[\\"\\\\\']?[:= ]+[\\"\\\\\']?([a-f0-9]+)","name":"val"}}]}}\n'
+        f'  ]\n'
+        f"Then the main request's body can include `_wpnonce: {{val}}` and "
+        f"headers can include `Cookie: {{wp_cookie}}`."
     )
     try:
         res = _llm_for_model(prompt, model=model, caller="cve_recipe_extract", num_predict=1024)
@@ -17939,6 +17954,11 @@ def _recipe_to_spec(cve, product, recipe):
     aus = recipe.get("auth_setup")
     if isinstance(aus, dict) and aus.get("type"):
         spec["auth_setup"] = aus
+    # Carry the pre_requests chain when LLM declared it (general CSRF/nonce
+    # fetch flow). See _perform_pre_requests.
+    prs = recipe.get("pre_requests")
+    if isinstance(prs, list) and prs:
+        spec["pre_requests"] = prs
     # Carry the verify_request shape when LLM declared read_back_after_action.
     vr = recipe.get("verify_request") or recipe.get("verify")
     if isinstance(vr, dict) and vr.get("path"):
@@ -18073,6 +18093,162 @@ def _cvebench_oracle_check(ip, timeout=10):
     return {"hit": hit, "vectors": vectors, "raw": body[:800]}
 
 
+def _perform_pre_requests(ip, port, spec, timeout=15):
+    """Execute spec.pre_requests[] in order, capturing extracted values into
+    a vars dict. Returns the vars dict so the caller can substitute {var}
+    placeholders in the main request and verify_request.
+
+    Priority #3 from the research cleanup list. Many failing CVEs need a
+    multi-step chain the agent couldn't do:
+      - WP priv-esc plugins: login → fetch nonce from profile page → use
+        nonce in main AJAX POST
+      - Zabbix SQLi: login → decode cookie → derive sid → use sid in
+        every POST
+      - Cacti RCE: login → GET /cacti/index.php → extract __csrf_magic
+    This is the general form; auth_setup is a shortcut for the simple
+    "login and capture cookie" case.
+
+    Spec shape (new):
+      spec.pre_requests = [
+        {
+          "name": "login",                      # var-prefix for captures
+          "method": "POST",
+          "path": "/wp-login.php",
+          "body": {"log": "<user>", "pwd": "<pass>"},
+          "content_type": "form",               # default: form
+          "capture": [
+            {"source": "set-cookie", "name": "session"}
+            // OR {"source": "body-regex", "pattern": "...(?P<v>...)...", "name": "nonce"}
+          ]
+        },
+        {
+          "name": "fetch_nonce",
+          "method": "GET",
+          "path": "/profile",
+          "headers": {"Cookie": "{login.session}"},
+          "capture": [
+            {"source": "body-regex", "pattern": "_wpnonce[\"']?:\\s*[\"']([a-f0-9]+)", "name": "nonce"}
+          ]
+        }
+      ]
+    Captures are accessible as `{<step_name>.<capture_name>}` AND as
+    `{<capture_name>}` (last-wins) in subsequent step headers/body/path
+    + in the main request + in verify_request.
+
+    Returns {"login.session": "...", "session": "...", "nonce": "..."}
+    Fail-soft: when a step fails or a capture doesn't match, the var is
+    simply absent — the main request will still fire with its original
+    placeholder (likely 4xx), and the refine loop records the failure."""
+    import re as _re
+    pres = spec.get("pre_requests")
+    if not isinstance(pres, list) or not pres:
+        return {}
+    vars_: dict = {}
+    def _subst(obj):
+        """Recursively substitute {var} placeholders in strings; leaves
+        unknown placeholders intact so the operator can see what was missing."""
+        if isinstance(obj, str):
+            def _rep(m):
+                k = m.group(1)
+                return str(vars_.get(k, m.group(0)))
+            return _re.sub(r"\{([a-zA-Z0-9_.]+)\}", _rep, obj)
+        if isinstance(obj, dict):
+            return {k: _subst(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_subst(x) for x in obj]
+        return obj
+    try:
+        import urllib.parse as _up
+        for step in pres:
+            if not isinstance(step, dict):
+                continue
+            name = step.get("name") or ""
+            method = (step.get("method") or "GET").upper()
+            path = _subst(step.get("path") or "/")
+            body = _subst(step.get("body") or {})
+            headers = _subst(step.get("headers") or {})
+            content_type = step.get("content_type") or "form"
+            # Build curl: use -i to capture response headers (needed for
+            # Set-Cookie); -s silent.
+            base = f"http://{ip}:{port or 80}"
+            curl = f"curl -sk -i -X {method} '{base}{path}'"
+            for k, v in headers.items():
+                # single-quote-escape header value
+                v_esc = str(v).replace("'", "'\\''")
+                curl += f" -H '{k}: {v_esc}'"
+            if body and method in ("POST", "PUT", "PATCH"):
+                if content_type == "form":
+                    curl += " -H 'Content-Type: application/x-www-form-urlencoded'"
+                    curl += " --data '" + _up.urlencode({k: str(v) for k, v in body.items()}) + "'"
+                elif content_type == "json":
+                    import json as _json
+                    curl += " -H 'Content-Type: application/json'"
+                    curl += " --data '" + _json.dumps(body).replace("'", "'\\''") + "'"
+                elif content_type == "xml":
+                    curl += " -H 'Content-Type: application/xml'"
+                    curl += " --data '" + str(body) + "'"
+            out = _curl_run(ip, port, curl, timeout=timeout) or ""
+            # Apply captures
+            for cap in (step.get("capture") or []):
+                if not isinstance(cap, dict):
+                    continue
+                src = cap.get("source") or ""
+                cname = cap.get("name") or ""
+                if not cname:
+                    continue
+                val = None
+                if src == "set-cookie":
+                    # Collect every Set-Cookie line, join with "; "
+                    cookies = _re.findall(r"^Set-Cookie:\s*([^;\r\n]+)",
+                                           out, _re.M | _re.I)
+                    if cookies:
+                        val = "; ".join(cookies)
+                elif src == "body-regex":
+                    pat = cap.get("pattern") or ""
+                    try:
+                        m = _re.search(pat, out)
+                        if m:
+                            val = m.group(1) if m.groups() else m.group(0)
+                    except Exception:  # noqa: BLE001
+                        pass
+                elif src == "header-regex":
+                    pat = cap.get("pattern") or ""
+                    try:
+                        m = _re.search(pat, out)
+                        if m:
+                            val = m.group(1) if m.groups() else m.group(0)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if val is not None:
+                    # Namespaced + bare — bare wins for same name across steps
+                    if name:
+                        vars_[f"{name}.{cname}"] = val
+                    vars_[cname] = val
+    except Exception as e:  # noqa: BLE001
+        logging.debug("pre_requests chain failed: %s", e)
+    return vars_
+
+
+def _substitute_vars_in_request(req, vars_):
+    """Return a new request dict with all {var} placeholders substituted
+    using vars_. Walks headers / body / path / query recursively."""
+    if not vars_:
+        return req
+    import re as _re
+    def _subst(obj):
+        if isinstance(obj, str):
+            def _rep(m):
+                k = m.group(1)
+                return str(vars_.get(k, m.group(0)))
+            return _re.sub(r"\{([a-zA-Z0-9_.]+)\}", _rep, obj)
+        if isinstance(obj, dict):
+            return {k: _subst(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_subst(x) for x in obj]
+        return obj
+    return _subst(req)
+
+
 def _perform_auth_setup(ip, port, spec, timeout=15):
     """Execute the auth setup declared on the spec (currently: form_login).
     Returns the captured Cookie value, or None when no auth setup / failure.
@@ -18124,6 +18300,18 @@ def _live_verify_recipe(ip, port, spec, timeout=30):
     import time as _t
     tmpl = (spec.get("injection") or {}).get("payload_template", "")
     req = spec.get("request") or {}
+    # Pre-requests chain: run spec.pre_requests[] in order, capturing values
+    # into a vars dict, then substitute {var} placeholders in the main request
+    # (headers / body / path / query) and in verify_request. Enables login →
+    # fetch-nonce → use-nonce chains for WP priv-esc, Zabbix sid derivation,
+    # Cacti __csrf_magic, etc. See _perform_pre_requests.
+    _pre_vars = _perform_pre_requests(ip, port, spec)
+    if _pre_vars:
+        req = _substitute_vars_in_request(req, _pre_vars)
+        if spec.get("verify_request"):
+            spec = dict(spec)
+            spec["verify_request"] = _substitute_vars_in_request(
+                spec["verify_request"], _pre_vars)
     # Auth setup: if the recipe declared `auth_setup`, perform the login and
     # merge the resulting Cookie into every subsequent request's headers.
     # Overrides any placeholder cookie value the LLM emitted (e.g.
