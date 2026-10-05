@@ -30782,27 +30782,26 @@ def review_scope_suggestion(
                 # Add to the engagement's `typosquats` scope. The scope
                 # gate's deny-list loader reads every engagement's
                 # typosquats scope, so block semantics are preserved
-                # (cross-engagement) while visibility is grouped per
-                # engagement. Falls back to the global `not_in_scope`
-                # deny-list when no active engagement — never leave a
-                # confirmed lookalike unblocked.
+                # cross-engagement while visibility is grouped per
+                # engagement. REFUSE the write (not fall back to global
+                # not_in_scope) when no active engagement — operator
+                # tightening so a confirmed typosquat is never recorded
+                # under the wrong engagement.
                 eid = _resolve_engagement_id(None)
-                if eid:
-                    cur.execute(
-                        "INSERT INTO public.scope_targets "
-                        "(name, target, target_type, source, engagement_id) "
-                        "VALUES ('typosquats', %s, 'domain', 'typosquat_review', %s::uuid) "
-                        "ON CONFLICT DO NOTHING",
-                        (target, eid),
+                if not eid:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=("Cannot confirm typosquat without an active "
+                                "engagement. Select an engagement in the "
+                                "header before confirming."),
                     )
-                else:
-                    cur.execute(
-                        "INSERT INTO public.scope_targets "
-                        "(name, target, target_type, source, engagement_id) "
-                        "VALUES ('not_in_scope', %s, 'domain', 'typosquat_review', NULL) "
-                        "ON CONFLICT DO NOTHING",
-                        (target,),
-                    )
+                cur.execute(
+                    "INSERT INTO public.scope_targets "
+                    "(name, target, target_type, source, engagement_id) "
+                    "VALUES ('typosquats', %s, 'domain', 'typosquat_review', %s::uuid) "
+                    "ON CONFLICT DO NOTHING",
+                    (target, eid),
+                )
             elif method in ("cert_pivot", "asn_pivot"):
                 # Add to the current engagement's in-scope list. The
                 # suggested_scope column names which engagement scope
@@ -30861,8 +30860,27 @@ def review_scope_suggestions_bulk(
     with get_db() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
         # Resolve the active engagement once; cert_pivot/asn_pivot accepts
         # all land on the same engagement for the batch (operator chose
-        # which engagement is active before clicking).
+        # which engagement is active before clicking). When any accept
+        # is of a typosquat, the engagement is REQUIRED — refuse the
+        # whole batch rather than scatter rows under a mix of engagement
+        # attributions.
         eid = _resolve_engagement_id(None) if action == "accept" else None
+        if action == "accept" and not eid:
+            # Pre-flight: if any accepted row would be a typosquat, we
+            # cannot proceed without engagement attribution.
+            cur.execute(
+                "SELECT COUNT(*) FROM public.scope_suggestions "
+                "WHERE id = ANY(%s::uuid[]) AND method = 'typosquat'",
+                ([str(x) for x in ids if x],),
+            )
+            n_typo = (cur.fetchone() or {}).get("count", 0)
+            if n_typo:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(f"Cannot confirm {n_typo} typosquat(s) without "
+                            f"an active engagement. Select an engagement "
+                            f"in the header before bulk-confirming."),
+                )
         for sid in ids:
             sid_s = str(sid).strip()
             if not sid_s:
@@ -30887,29 +30905,17 @@ def review_scope_suggestions_bulk(
                 target = row["target"]
                 method = row["method"]
                 if method == "typosquat":
-                    # Per-engagement `typosquats` scope (see single-row
-                    # endpoint for the design rationale). Global
-                    # not_in_scope fallback only when no active
-                    # engagement — a confirmed lookalike is never left
-                    # unblocked.
-                    if eid:
-                        cur.execute(
-                            "INSERT INTO public.scope_targets "
-                            "(name, target, target_type, source, engagement_id) "
-                            "VALUES ('typosquats', %s, 'domain', "
-                            "'typosquat_review_bulk', %s::uuid) "
-                            "ON CONFLICT DO NOTHING",
-                            (target, eid),
-                        )
-                    else:
-                        cur.execute(
-                            "INSERT INTO public.scope_targets "
-                            "(name, target, target_type, source, engagement_id) "
-                            "VALUES ('not_in_scope', %s, 'domain', "
-                            "'typosquat_review_bulk', NULL) "
-                            "ON CONFLICT DO NOTHING",
-                            (target,),
-                        )
+                    # Per-engagement `typosquats` scope. The pre-flight
+                    # above ensures eid is set when a typosquat is in
+                    # the batch, so this write never silently drops.
+                    cur.execute(
+                        "INSERT INTO public.scope_targets "
+                        "(name, target, target_type, source, engagement_id) "
+                        "VALUES ('typosquats', %s, 'domain', "
+                        "'typosquat_review_bulk', %s::uuid) "
+                        "ON CONFLICT DO NOTHING",
+                        (target, eid),
+                    )
                 elif method in ("cert_pivot", "asn_pivot") and eid:
                     cur.execute(
                         "INSERT INTO public.scope_targets "
