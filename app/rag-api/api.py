@@ -17517,6 +17517,58 @@ _SINK_GRAMMAR_TEMPLATES = {
 }
 
 
+def _pivot_carrier(spec, new_carrier, inj_param=None):
+    """Return a new spec with the {INJ} marker moved from its current carrier
+    to new_carrier (body|query|header). Priority #7 — payload-position pivot
+    on fail. The LLM freewheels one carrier and sometimes gets it wrong (SSRF
+    payload in body when the server reads from Host header; XSS payload in
+    body when the sink is in the referrer).
+
+    When moving to `header`, uses `inj_param` as the header name or picks a
+    sensible default: X-Forwarded-For (SSRF/XSS), Referer (XSS reflection),
+    or User-Agent (generic log-sink injection).
+
+    When moving to `query`, uses `inj_param` as the query key or picks the
+    existing primary param name from the body/original query.
+    """
+    import copy as _copy
+    new_spec = _copy.deepcopy(spec)
+    req = new_spec.setdefault("request", {})
+    # Collect existing carriers so we can STRIP {INJ} from them before placing
+    # in the new carrier (otherwise it ends up in two places).
+    def _strip_inj(obj):
+        if isinstance(obj, str):
+            return obj.replace("{INJ}", "")
+        if isinstance(obj, dict):
+            return {k: _strip_inj(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_strip_inj(x) for x in obj]
+        return obj
+    req["body"] = _strip_inj(req.get("body"))
+    req["query"] = _strip_inj(req.get("query"))
+    req["headers"] = _strip_inj(req.get("headers"))
+    # Now add {INJ} in the new carrier
+    if new_carrier == "header":
+        hdr = inj_param or "X-Forwarded-For"
+        req.setdefault("headers", {})
+        if not isinstance(req["headers"], dict):
+            req["headers"] = {}
+        req["headers"][hdr] = "{INJ}"
+    elif new_carrier == "query":
+        qn = inj_param or "id"
+        req.setdefault("query", {})
+        if not isinstance(req["query"], dict):
+            req["query"] = {}
+        req["query"][qn] = "{INJ}"
+    elif new_carrier == "body":
+        bn = inj_param or "data"
+        req.setdefault("body", {})
+        if not isinstance(req["body"], dict):
+            req["body"] = {}
+        req["body"][bn] = "{INJ}"
+    return new_spec
+
+
 def _extract_endpoint_candidates(intel_text, exclude=None, limit=4):
     """Scan advisory + exploit script text for HTTP paths plausibly named by
     the vuln. Returns up to `limit` distinct paths, with the exclude path
@@ -18768,6 +18820,41 @@ def _derive_cve_spec_single_pass(cve, product, version, ip, port, model=None,
                     "spec": spec, "evidence": fb_verdict["evidence"]}
     except Exception as e:  # noqa: BLE001
         logging.debug("oracle fallback failed: %s", e)
+    # 4a1. canary_missing / oob_no_callback → pivot the payload carrier
+    #      (body → header → query) and retry. Priority #7. The LLM freewheels
+    #      one carrier and sometimes gets it wrong (SSRF/XSS payload in body
+    #      when the server reads from Host/Referer; log-sink payload in query
+    #      when the sink is in a header). Up to 2 pivot attempts per fail.
+    if verdict.get("method") in ("canary_missing", "oob_no_callback"):
+        # Figure out current carrier from where {INJ} currently lives
+        _req = spec.get("request") or {}
+        def _has_inj(obj):
+            if isinstance(obj, str):
+                return "{INJ}" in obj
+            if isinstance(obj, dict):
+                return any(_has_inj(v) for v in obj.values())
+            if isinstance(obj, list):
+                return any(_has_inj(x) for x in obj)
+            return False
+        _cur_carrier = (
+            "body" if _has_inj(_req.get("body")) else
+            "query" if _has_inj(_req.get("query")) else
+            "header" if _has_inj(_req.get("headers")) else
+            None
+        )
+        _pivots = [c for c in ("header", "query", "body") if c != _cur_carrier]
+        for new_carrier in _pivots[:2]:
+            try:
+                pspec = _pivot_carrier(spec, new_carrier)
+            except Exception:  # noqa: BLE001
+                continue
+            pv = _live_verify_recipe(ip, port, pspec)
+            if pv["verified"]:
+                _store_derived_spec(cve, product, version, pspec, pv,
+                                    source="intel+carrier_pivot")
+                return {"verified": True, "source": "intel+carrier_pivot",
+                        "spec": pspec,
+                        "evidence": f"carrier pivot {_cur_carrier}→{new_carrier}: {pv.get('evidence')}"}
     # 4a2. timing_did_not_block → retry at endpoint candidates extracted from
     #      intel. Research cleanup #6. The LLM may have picked a plausible
     #      endpoint that doesn't actually route to the vulnerable SQL (Zabbix
