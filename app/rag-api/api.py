@@ -23729,16 +23729,41 @@ def _run_one_building_block(probe, ip, port, product, analysis, auth,
     if probe == "version":
         # DATA-DRIVEN: spec.version (JSON-RPC). Fallback: Server header.
         ver = None
+        from_app_spec = False
         _spec = _probe_spec(product)
         if _spec and _spec.get("transport") == "jsonrpc":
             ver = _spec_version(f"{base}{_spec.get('endpoint','/api_jsonrpc.php')}", _spec, timeout)
+            if ver:
+                from_app_spec = True
+        srv_hdr = None
         if not ver:
             try:
                 with _hx.Client(verify=False, timeout=timeout) as c:
-                    ver = c.get(base + "/").headers.get("Server")
+                    srv_hdr = c.get(base + "/").headers.get("Server")
+                    ver = srv_hdr
             except Exception:  # noqa: BLE001
                 ver = None
         if ver:
+            # A Server header like "Apache/2.4.65 (Debian)" is the HTTP SERVER
+            # BANNER, not the application version. Writing it as `version_applies`
+            # makes the Confirmed Facts panel show "Apache/2.4.65" where the
+            # operator expects "Zabbix 6.0" — misleading when the real app is a
+            # web app running behind Apache. Record server-banner-shaped values
+            # under a distinct claim_type so the UI (and downstream agents) treat
+            # them as what they are: webserver stack info. Operator ask: "the
+            # product shows Apache/2.4.65 when it should really be Zabbix."
+            import re as _re
+            is_server_banner = bool(_re.match(
+                r"^(Apache|nginx|gunicorn|uvicorn|cowboy|werkzeug|lighttpd|caddy|IIS|Jetty|Tomcat)/",
+                str(ver), _re.I))
+            if is_server_banner and not from_app_spec:
+                _record_confirmation(tgt, "server_banner",
+                                     "Server", "confirmed",
+                                     evidence=f"HTTP Server header: {ver}",
+                                     method="probe",
+                                     claim_value=str(ver), product=product)
+                # Don't block readiness — the app version is just unknown yet.
+                return False
             _record_confirmation(tgt, "version_applies", str(ver), "confirmed",
                                  evidence=f"detected version {ver}", method="probe",
                                  claim_value=str(ver), product=product)
@@ -24265,6 +24290,31 @@ def _register_web_session_access(ip, port, username, cookie, product=None,
                                 THEN 'rejected' ELSE 'live' END
             """, (str(ip), port or 80, handle, whoami,
                   f"authenticated web session ({product or 'web'})", eid))
+            # Mirror the foothold into credential_findings so the Credentials
+            # section on the asset ALSO shows this user. Previously an
+            # authenticated web session was registered as a foothold but never
+            # as a credential — operator saw username@stock in Confirmed
+            # Facts / foothold with nothing in Credentials. The cookie itself
+            # stays as a <known> marker (the plaintext lives in the foothold
+            # row's identity + web_auth_configs); the credential ledger is a
+            # discovery ledger, not a secret store. Operator ask: "it has
+            # username@stock but this doesn't show up in the credentials."
+            try:
+                cur.execute("""
+                    INSERT INTO public.credential_findings
+                      (ip, port, protocol, username, secret_value, secret_type,
+                       valid_cred, auth_type, severity, source, status,
+                       engagement_id, metadata)
+                    VALUES (%s,%s,'http',%s,'<known>','session_cookie',
+                            true,'cookie','medium','web_session_foothold',
+                            'valid',%s,%s)
+                    ON CONFLICT DO NOTHING
+                """, (str(ip), int(port or 80), username, eid,
+                      Json({"product": product, "foothold_handle": handle,
+                             "transport": "http_cookie",
+                             "source_hint": "registered when the authenticated session was validated"})))
+            except Exception as e:  # noqa: BLE001
+                logging.debug("mirror web_session->credential_findings failed: %s", e)
             c.commit()
         try:
             emit_webhook("foothold_web_session", "access",
