@@ -1,4 +1,4 @@
-export const BUILD_VERSION = '2026.10.05.1406'
+export const BUILD_VERSION = '2026.10.05.1630'
 // Severities offered as filter chips. 'recon' was removed: it was functionally
 // identical to 'info' — same SARIF level, same treatment in every export and
 // report, differing only in sort rank — so it is now written as 'info' and
@@ -149,6 +149,7 @@ export const SCAN_CATEGORIES: { name: string; desc: string; scans: ScanMeta[] }[
       { id: 'subfinder', label: 'Subfinder', desc: 'Subdomain enumeration', icon: 'Network', proxy: true, touchesTarget: false, passive: true, remote: true },
       { id: 'amass', label: 'Amass', desc: 'Advanced subdomain enumeration', icon: 'Network', proxy: true, touchesTarget: false, passive: true, remote: true },
       { id: 'dnsx', label: 'dnsx', desc: 'DNS resolution', icon: 'Globe2', proxy: false, touchesTarget: true, passive: false, remote: false },
+      { id: 'asnmap', label: 'asnmap', desc: 'IP/domain → ASN + CIDR mapping (feeds ASN scope-pivot)', icon: 'Network', proxy: true, touchesTarget: false, passive: true, remote: true },
       { id: 'httpx', label: 'httpx', desc: 'HTTP probe + tech detect', icon: 'Server', proxy: true, touchesTarget: true, passive: false, remote: true },
       { id: 'tlsx', label: 'TLSX', desc: 'TLS certificate analysis', icon: 'Lock', proxy: true, touchesTarget: true, passive: false, remote: true },
       { id: 'gau', label: 'GAU', desc: 'Historical URL discovery', icon: 'Globe2', proxy: true, touchesTarget: false, passive: true, remote: true },
