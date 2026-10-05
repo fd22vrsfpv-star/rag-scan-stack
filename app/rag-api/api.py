@@ -16968,7 +16968,9 @@ def _audit_target_source(ip, port, product=None, max_findings=12, engagement_id=
         ("ssrf_py",  r"(requests|httpx|urllib)\..*\(.*request\."),
     ]
     findings = []
-    search_dirs = ["/var/www/html", "/app", "/usr/share/nginx/html", "/var/www"]
+    search_dirs = ["/var/www/html", "/app", "/usr/share/nginx/html", "/var/www",
+                   "/usr/share/zabbix", "/usr/share/wordpress",
+                   "/var/lib/wordpress", "/opt/app", "/srv/http", "/home"]
     for vuln_class, pattern in probes:
         if len(findings) >= max_findings:
             break
@@ -16976,7 +16978,14 @@ def _audit_target_source(ip, port, product=None, max_findings=12, engagement_id=
             try:
                 r = subprocess.run(
                     ["docker", "exec", container, "sh", "-c",
+                     # Keep site-packages INCLUDED (CVE-Bench Python targets
+                     # install the vulnerable package into site-packages — no
+                     # app code outside it). Only exclude the Python stdlib
+                     # (cpython-*/lib) + build/node junk + tests.
                      f"grep -rEn --include='*.php' --include='*.py' "
+                     f"--exclude-dir=cpython-* --exclude-dir=node_modules "
+                     f"--exclude-dir=tests --exclude-dir=test --exclude-dir=.git "
+                     f"--exclude-dir=__pycache__ "
                      f"-m 3 {_sh_q(pattern)} {_sh_q(root)} 2>/dev/null | head -5"],
                     capture_output=True, text=True, timeout=10)
                 for ln in (r.stdout or "").splitlines():
@@ -16995,12 +17004,13 @@ def _audit_target_source(ip, port, product=None, max_findings=12, engagement_id=
     return findings[:max_findings]
 
 
-def _probe_target_endpoints(ip, port, timeout=10, max_endpoints=20):
+def _probe_target_endpoints(ip, port, timeout=10, max_endpoints=20, engagement_id=None):
     """ENDPOINT DISCOVERY: before LLM extraction, enumerate endpoints that
     ACTUALLY exist on the target (not advisory guesses). Fast, bounded, no auth.
     Returns [paths]. Research insight #4. Routes through the kali-listener
     (which has network reachability to target subnets) because rag-api itself
-    may not have a direct route to the target."""
+    may not have a direct route to the target. engagement_id is forwarded to
+    the listener's scope gate so cvebench targets aren't refused as out-of-scope."""
     import re as _re
     scheme = "https" if int(port or 80) in (443, 8443) else "http"
     base = f"{scheme}://{ip}:{port or 80}"
@@ -17012,7 +17022,7 @@ def _probe_target_endpoints(ip, port, timeout=10, max_endpoints=20):
             out = _curl_run(ip, port,
                             f"curl -skL -o /tmp/_ep.html -w 'HTTP:%{{http_code}}' {_sh_q(base + seed)}; "
                             f"head -c 20000 /tmp/_ep.html 2>/dev/null",
-                            timeout=timeout)
+                            timeout=timeout, engagement_id=engagement_id)
             m = _re.search(r"HTTP:(\d{3})", out or "")
             status = int(m.group(1)) if m else 0
             if status and status < 400:
@@ -17530,15 +17540,21 @@ def _re_search_safe(pattern, text):
         return False
 
 
-def _curl_run(ip, port, cmd, timeout=30):
+def _curl_run(ip, port, cmd, timeout=30, engagement_id=None):
     """Execute a curl via the kali-listener (scope-gated upstream) and return
-    its output. Used by the live-verify step so network traffic is still gated."""
+    its output. Pass engagement_id so the listener's scope gate reads the
+    engagement's scope rows (not the empty default-session scope) — without this,
+    probes to CVE-Bench targets get `out of scope: target X is not in the
+    configured scope` because the listener defaults to no engagement."""
     import httpx as _hx
     listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    headers = {"x-api-key": API_KEY}
+    if engagement_id:
+        headers["X-Engagement-Id"] = str(engagement_id)
     try:
         r = _hx.post(f"{listener.rstrip('/')}/vectors/run",
                      json={"command": cmd, "target": str(ip), "port": port, "timeout": timeout},
-                     headers={"x-api-key": API_KEY}, verify=False, timeout=timeout + 30)
+                     headers=headers, verify=False, timeout=timeout + 30)
         d = r.json() if r.status_code < 500 else {}
         return (d.get("output", "") if isinstance(d, dict) else "") or r.text
     except Exception as e:  # noqa: BLE001
@@ -17546,7 +17562,7 @@ def _curl_run(ip, port, cmd, timeout=30):
 
 
 def _derive_cve_spec(cve, product, version, ip, port, model=None, auth=None,
-                     allow_fuzz=True, max_passes=None):
+                     allow_fuzz=True, max_passes=None, engagement_id=None):
     """AUTO-DERIVATION PIPELINE with built-in MULTI-PASS CONVERGENCE. Operator ask:
     "kick more passes to converge the tentatives — increase the defaults." Each
     pass extracts a recipe (informed by the hints of what already failed),
@@ -17562,7 +17578,8 @@ def _derive_cve_spec(cve, product, version, ip, port, model=None, auth=None,
     last_result = None
     for pass_n in range(1, max_passes + 1):
         res = _derive_cve_spec_single_pass(cve, product, version, ip, port,
-                                           model=model, auth=auth, allow_fuzz=allow_fuzz)
+                                           model=model, auth=auth, allow_fuzz=allow_fuzz,
+                                           engagement_id=engagement_id)
         res["pass"] = pass_n
         res["max_passes"] = max_passes
         last_result = res
@@ -17592,8 +17609,9 @@ def _derive_cve_spec(cve, product, version, ip, port, model=None, auth=None,
 
 
 def _derive_cve_spec_single_pass(cve, product, version, ip, port, model=None,
-                                 auth=None, allow_fuzz=True):
-    """One pass of the derivation pipeline. See _derive_cve_spec for the loop."""
+                                 auth=None, allow_fuzz=True, engagement_id=None):
+    """One pass of the derivation pipeline. See _derive_cve_spec for the loop.
+    engagement_id controls per-engagement CTF-mode gating for source-audit intel."""
     _ensure_derived_cve_specs_table()
     # Short-circuit: already derived AND verified
     try:
@@ -17650,7 +17668,7 @@ def _derive_cve_spec_single_pass(cve, product, version, ip, port, model=None,
     except Exception:  # noqa: BLE001
         pass
     try:
-        eps = _probe_target_endpoints(ip, port)
+        eps = _probe_target_endpoints(ip, port, engagement_id=engagement_id)
         if eps:
             extras.append(f"\n--- ENDPOINTS DISCOVERED on this live target "
                           f"(pick from THESE, don't invent paths):\n  "
@@ -17658,11 +17676,7 @@ def _derive_cve_spec_single_pass(cve, product, version, ip, port, model=None,
     except Exception:  # noqa: BLE001
         pass
     try:
-        # Note: engagement_id plumbing from node_research → _derive_cve_spec_single_pass
-        # is a follow-up; for now the global app_settings 'ctf_mode' toggle acts
-        # as the fallback. When plumbed, _audit_target_source(engagement_id=...)
-        # will read per-engagement.
-        src = _audit_target_source(ip, port, product=product)
+        src = _audit_target_source(ip, port, product=product, engagement_id=engagement_id)
         if src:
             extras.append(f"\n--- SOURCE AUDIT (CTF mode) — vulnerable code pattern matches:\n"
                           + "\n".join(f"  * [{s['vuln_class']}] {s['file']}:{s['line']}: {s['snippet']}" for s in src[:10]))
@@ -22177,6 +22191,113 @@ def get_exploit_store(exploit_id: str, authorized: bool = Depends(auth)):
         if not r:
             raise HTTPException(404, "exploit not found")
         return dict(r)
+
+
+@app.get("/exploit-store/{exploit_id}/derivation-intel", tags=["Exploit Store"])
+def get_derivation_intel(exploit_id: str, authorized: bool = Depends(auth)):
+    """DERIVATION INTEL for manual review — surfaces the full agent-driven
+    derivation evidence an operator needs to decide whether a PoC can be trusted:
+    - the derived_cve_specs row (status, attempts, last_failure, hints)
+    - confirmed_facts for this target+product (session_valid, injection_vector,
+      action_permitted, object_ids, etc.)
+    - captured_credentials filed from the PoC output
+    - sqlmap hand-off (if generated)
+    - key trace entries from the PoC build log (cve_spec_derivation,
+      synth_seeded_from_confirmed, enforced_resolved_ids, enforced_request_contract,
+      challenge_building_blocks, readiness_gate, access_enumeration, poc_captured_credentials)
+    Operator: "surface this key info in the exploit workbench for manual review."
+    """
+    _ensure_exploit_store()
+    _ensure_derived_cve_specs_table()
+    _ensure_confirmed_facts_table()
+    out = {"exploit_id": exploit_id,
+           "derived_spec": None, "confirmed_facts": [], "captured_credentials": [],
+           "sqlmap_command": None, "key_trace": [],
+           "footholds": []}
+    try:
+        with get_db() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT cve, target_host, target_port, product, metadata, "
+                        "poc_log_path FROM exploit_store WHERE id=%s", (exploit_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "exploit not found")
+            cve = row["cve"]
+            target_host = row["target_host"]
+            target_port = row["target_port"] or 80
+            product = row["product"]
+            tgt = f"{target_host}:{target_port}"
+            meta = row.get("metadata") or {}
+            if isinstance(meta, dict):
+                out["sqlmap_command"] = meta.get("sqlmap_command")
+            # 1. derived_cve_specs
+            if cve:
+                cur.execute("SELECT cve, product, version, vuln_class, spec, verified, "
+                            "status, verify_method, verify_evidence, source, attempts, "
+                            "last_failure, refine_hints, derived_at, last_verified "
+                            "FROM derived_cve_specs WHERE cve=%s", (cve.upper(),))
+                r = cur.fetchone()
+                if r:
+                    out["derived_spec"] = dict(r)
+            # 2. confirmed_facts (product-scoped target facts)
+            cur.execute("SELECT claim_type, claim_key, claim_value, status, "
+                        "evidence, method, confidence, ttl_seconds, last_checked_at, "
+                        "cve, product "
+                        "FROM confirmed_facts "
+                        "WHERE target=%s AND (product IS NULL OR lower(product)=lower(%s)) "
+                        "ORDER BY last_checked_at DESC LIMIT 50",
+                        (tgt, product or ""))
+            out["confirmed_facts"] = [dict(r) for r in cur.fetchall()]
+            # 3. captured credentials
+            cur.execute("SELECT username, secret_value, secret_type, auth_type, "
+                        "severity, metadata, created_at "
+                        "FROM credential_findings "
+                        "WHERE host(ip)=%s AND port=%s AND source='cve_poc_builder' "
+                        "ORDER BY created_at DESC LIMIT 25",
+                        (str(target_host), int(target_port)))
+            out["captured_credentials"] = [dict(r) for r in cur.fetchall()]
+            # 4. foothold (web_session access that was registered)
+            cur.execute("SELECT kind, handle, transport, whoami, status, score, "
+                        "last_seen_at, metadata "
+                        "FROM obtained_access "
+                        "WHERE host(ip)=%s AND port=%s "
+                        "ORDER BY last_seen_at DESC LIMIT 10",
+                        (str(target_host), int(target_port)))
+            out["footholds"] = [dict(r) for r in cur.fetchall()]
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        logging.debug("derivation-intel db read failed: %s", e)
+    # 5. key trace entries from the PoC log file
+    try:
+        log_path = row.get("poc_log_path") if row else None
+        if log_path and os.path.exists(log_path):
+            import json as _j
+            key_phases = {
+                "cve_spec_derivation", "synth_seeded_from_confirmed",
+                "enforced_resolved_ids", "enforced_request_contract",
+                "challenge_building_blocks", "readiness_gate",
+                "recon:access_enumeration", "poc_captured_credentials",
+                "cve_spec_hit", "tool_handoff", "sqlmap_handoff",
+            }
+            trace = []
+            with open(log_path, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        rec = _j.loads(line)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    phase = rec.get("phase")
+                    if phase in key_phases:
+                        trace.append({"phase": phase, "ts": rec.get("ts"),
+                                      "iteration": rec.get("iteration"),
+                                      "response": (rec.get("response") or "")[:600],
+                                      "extra": rec.get("extra") or {}})
+                        if len(trace) >= 40:
+                            break
+            out["key_trace"] = trace
+    except Exception as e:  # noqa: BLE001
+        logging.debug("key_trace read failed: %s", e)
+    return out
 
 
 @app.post("/exploit-store", tags=["Exploit Store"])

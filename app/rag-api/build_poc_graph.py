@@ -943,7 +943,7 @@ def node_research(state: BuildPocState) -> Dict[str, Any]:
                 derived = _derive_cve_spec(
                     state["cve"], state.get("product"), state.get("version"),
                     state["ip"], state["port"], model=state.get("model"),
-                    auth=state.get("auth"))
+                    auth=state.get("auth"), engagement_id=state.get("eid"))
                 _poc_trace(state["run_id"], "cve_spec_derivation",
                            response=f"verified={derived.get('verified')} "
                                     f"source={derived.get('source')} "
