@@ -18883,7 +18883,19 @@ def _curl_from_cve_spec(ip, port, req, payload):
     ct = (req.get("content_type") or "").lower()
 
     def sub(v):
-        return v.replace("{INJ}", payload) if isinstance(v, str) else v
+        """Recursively substitute {INJ} inside strings AND inside nested
+        dicts/lists so nested-JSON body shapes like
+          {"settings": {"query": "{INJ}"}}
+        actually get the payload where the LLM intended it. Previously
+        this only touched top-level string values, so nested {INJ} went
+        over the wire literal (pandas-query/dtale case). Research cleanup #5."""
+        if isinstance(v, str):
+            return v.replace("{INJ}", payload)
+        if isinstance(v, dict):
+            return {k: sub(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [sub(x) for x in v]
+        return v
     # For path-traversal payloads we need slashes to go through literally so
     # the traversal actually traverses — only encode the non-slash special
     # chars. For non-traversal payloads encode everything (so `'`, spaces,
