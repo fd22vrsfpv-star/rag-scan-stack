@@ -18126,8 +18126,14 @@ def _recipe_to_spec(cve, product, recipe):
     # but LLM emitted `1 or 1=1; __import__('os').system('id')` (raw Python
     # semicolons). This flag would have caught the mismatch and the escalation
     # path could pick up on it.
+    # Pull sink_grammar from (in order): recipe top-level, recipe.payload,
+    # OR the attached _intel_summary (brief) — the LLM extracts the grammar
+    # into the brief but doesn't always propagate it to the recipe output,
+    # so the brief is the fallback source. Without this fallback the
+    # content-type auto-align below never fires on brief-only grammar.
     _sg = (recipe.get("sink_grammar")
-           or (recipe.get("payload") or {}).get("sink_grammar"))
+           or (recipe.get("payload") or {}).get("sink_grammar")
+           or ((spec.get("_intel_summary") or {}).get("payload") or {}).get("sink_grammar"))
     _pt_check = (spec.get("injection") or {}).get("payload_template", "")
     ok, hint = _validate_payload_matches_grammar(_pt_check, _sg)
     if not ok:
@@ -18756,6 +18762,15 @@ def _derive_cve_spec_single_pass(cve, product, version, ip, port, model=None,
                                               recipe.get("endpoint") or "")
     if _method_hint and _method_hint != (recipe.get("method") or "").upper():
         recipe["_method_hint"] = _method_hint
+    # Propagate the brief's sink_grammar onto the recipe so _recipe_to_spec
+    # can see it (recipe JSON schema doesn't include sink_grammar, but the
+    # brief does). Without this hop, content-type auto-align + grammar
+    # mismatch validator never fire. Dtale CVE-2024-3408 case: brief tagged
+    # pandas-query, recipe body stayed content_type=form instead of json.
+    if intel_summary:
+        _brief_sg = ((intel_summary.get("payload") or {}).get("sink_grammar") or "").strip()
+        if _brief_sg and _brief_sg != "unknown" and not recipe.get("sink_grammar"):
+            recipe["sink_grammar"] = _brief_sg
     # Use the GHSA-resolved product so stored specs carry the real name
     # (e.g. "Cacti", "Zabbix Server") instead of the "unknown" the caller
     # passed in. All downstream storage + listing filters key on this.
