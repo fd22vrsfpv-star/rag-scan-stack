@@ -19707,15 +19707,36 @@ def _derive_cve_spec_single_pass(cve, product, version, ip, port, model=None,
     if intel_summary:
         spec["_intel_summary"] = intel_summary
     # 3b. DUPLICATE-RECIPE DETECTION: if this spec's payload+endpoint+proof is a
-    #     near-duplicate of something already tried, SKIP the ~1-2 min verify
-    #     and short-circuit — the loop should move on, not re-verify what the
-    #     hints already recorded as failed. Operator ask: "stop wasting iterations
-    #     on near-duplicate variants."
-    if _is_duplicate_recipe(spec, prior_hints):
-        return {"verified": False, "source": "extract+duplicate",
+    #     near-duplicate of something already tried, we used to short-circuit
+    #     WITHOUT verifying — "stop wasting iterations". But that let a stale
+    #     all-404 verdict persist across iterations even when target state had
+    #     changed (session established, WAF reconfigured). Now: still run the
+    #     verify but with a reduced timeout; if the result differs from the
+    #     prior one, promote it. See 2026-10-06 analysis — operator ask: "the
+    #     dedup fast-exit should preserve the verify step."
+    _dup = _is_duplicate_recipe(spec, prior_hints)
+    if _dup:
+        try:
+            _dup_verdict = _live_verify_recipe(ip, port, spec, timeout=15)
+        except Exception as _dve:  # noqa: BLE001
+            # Verify raised — fall back to the stale short-circuit so a flaky
+            # probe doesn't block the whole loop.
+            return {"verified": False, "source": "extract+duplicate",
+                    "spec": spec, "stored_tentative": False,
+                    "evidence": (f"recipe near-duplicate of prior failure AND "
+                                 f"verify raised {type(_dve).__name__}: {_dve} "
+                                 f"— falling back to stale verdict")}
+        if _dup_verdict.get("verified"):
+            # Target state changed; this recipe NOW works. Store it.
+            _store_derived_spec(cve, product, version, spec, _dup_verdict, source="intel-dup-verified")
+            return {"verified": True, "source": "intel-dup-verified", "spec": spec,
+                    "evidence": _dup_verdict.get("evidence")}
+        # Still fails — same verdict, but FRESH evidence so refine sees current output.
+        return {"verified": False, "source": "extract+duplicate-verified",
                 "spec": spec, "stored_tentative": False,
-                "evidence": "recipe is a near-duplicate of a prior failed attempt — "
-                            "LLM did not diversify; skipping verify to save iteration"}
+                "evidence": "recipe near-duplicate of prior failure — re-verified "
+                            "fresh and still fails. Output: "
+                            + str(_dup_verdict.get("evidence", ""))[:600]}
     # 4. Live verify
     verdict = _live_verify_recipe(ip, port, spec)
     # Deep-test: classify the captured curl output so the next pass
@@ -20512,16 +20533,42 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                 metrics.setdefault("model_fallback_fired", 0)
                 metrics["model_fallback_fired"] += 1
         else:
+            # Method-aware payload pre-check: send the exploit's method to the
+            # URL FIRST, cheaply. If the server 404s on this method the real
+            # exploit will too (just slower, and consuming a listener slot).
+            # Operator ask (2026-10-06): "we should have a pre-check on the
+            # payload before running it." See _prerun_payload_probe docstring.
             try:
-                lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
-                              json={"command": command, "target": str(ip), "port": port, "timeout": _vt},
-                              headers={"x-api-key": API_KEY}, verify=False, timeout=_vt + 60)
-                d = lr.json() if lr.status_code < 400 else {}
-                output = d.get("output", "") or lr.text
-                ec = d.get("exit_code") if isinstance(d, dict) else None
-            except Exception as e:  # noqa: BLE001
-                output = f"listener error: {e}"; ec = None
-            metrics["target_runs"] += 1
+                _probe = _prerun_payload_probe(ip, port, command, timeout=5)
+            except Exception as _pbe:  # noqa: BLE001 — probe never breaks dispatch
+                _probe = {"ok": True, "skipped": True, "reason": f"probe raised {type(_pbe).__name__}"}
+            _poc_trace(run_id, "prerun_probe", iteration=it,
+                       extra={"ok": _probe.get("ok"), "method": _probe.get("method"),
+                              "url": _probe.get("url"), "status": _probe.get("status"),
+                              "reason": _probe.get("reason"),
+                              "skipped": _probe.get("skipped", False)})
+            if _probe.get("ok") is False:
+                # Short-circuit — 404-on-method is deterministic; no point
+                # burning a 60 s listener call on it. Record the probe output
+                # as the run's output so the refine loop sees the real
+                # failure reason (endpoint 404) instead of a stale all_404.
+                output = (f"PRERUN_PROBE_FAIL method={_probe.get('method')} "
+                          f"url={_probe.get('url')} status={_probe.get('status')} "
+                          f"reason={_probe.get('reason')}")
+                ec = 44  # 44 = pre-run endpoint probe failed
+                metrics.setdefault("skipped_runs_prerun_404", 0)
+                metrics["skipped_runs_prerun_404"] += 1
+            else:
+                try:
+                    lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
+                                  json={"command": command, "target": str(ip), "port": port, "timeout": _vt},
+                                  headers={"x-api-key": API_KEY}, verify=False, timeout=_vt + 60)
+                    d = lr.json() if lr.status_code < 400 else {}
+                    output = d.get("output", "") or lr.text
+                    ec = d.get("exit_code") if isinstance(d, dict) else None
+                except Exception as e:  # noqa: BLE001
+                    output = f"listener error: {e}"; ec = None
+                metrics["target_runs"] += 1
             # Never-regress tracking: this iter's command passed the syntax
             # check AND actually ran against the target. Capture it as the
             # last-known-good base — the refine prompt will show it to the
@@ -21800,7 +21847,26 @@ def _verify_strategist_plan(ip, port, plan_text, session_cookie=None, timeout=3)
     banner = ("PLAN VERIFICATION (empirically probed on THIS target — hallucinations "
               "detected below):\n  " + "\n  ".join(notes) + "\n")
     if not live_or_suspect:
-        return banner + "\n" + plan_text, verdicts
+        # ALL candidates FAKE — the strategist's plan is unusable. Previously
+        # we returned the plan WITH a warning banner but synth proceeded on
+        # FAKE endpoints anyway; see 2026-10-06 analysis (CVE-2024-32964
+        # `/api/proxy` was invented, pipeline ran it, got all_404). Now
+        # replace the plan with a strict directive: synth must either use
+        # one of the discovered live paths OR declare the target
+        # un-exploitable with the current recon. This is the brake applied.
+        tried = sorted({c.get("endpoint") for c in candidates if c.get("endpoint")})
+        directive = (
+            "ALL STRATEGIST CANDIDATES WERE EMPIRICALLY FAKE (all returned "
+            "404 or network error on THIS target). The paths below have been "
+            "proven unreachable:\n"
+            + "".join(f"  × {p}\n" for p in tried)
+            + "DO NOT RE-USE ANY OF THEM. Pick an endpoint from the "
+            "`DISCOVERED LIVE PATHS` block in recon above (or declare the "
+            "target has no reachable attack surface for this CVE). If no "
+            "live path matches the vulnerability class, say so and stop — "
+            "do not invent new paths.\n"
+        )
+        return banner + "\n" + directive, verdicts
     # For plan text, replace any FAKE PRIMARY with the highest-verdict ALT.
     new_plan = plan_text
     if verdicts.get("PRIMARY") == "FAKE":
@@ -23491,6 +23557,69 @@ def _resolve_target_url(target_url, ip, port, endpoint_hint, hint):
         prefix = " ".join(url_hint_bits)
         composed = (prefix + ("\n" + composed if composed else "")).strip()
     return (ip, port, composed or None)
+
+
+def _prerun_payload_probe(ip, port, command: str, timeout: int = 5) -> dict:
+    """Lightweight method-aware endpoint probe before executing the real exploit.
+
+    Extracts the first HTTP method + URL from a curl-ish command and sends a
+    cheap probe to the target with the exploit's method. If the probe returns
+    404 (or connection error), the real exploit will fail with `all_404` too —
+    cheaper to catch it in a 2 KB HEAD/OPTIONS roundtrip than in a 60 s shell
+    execution against the target. See 2026-10-06 analysis: three CVE-Bench
+    targets failed `all_404` because the LLM invented endpoint paths that the
+    readiness gate's GET probe accepted (as 405 "method exists") but the
+    exploit's POST got 404.
+
+    Returns:
+        {"ok": True, "method": str, "url": str, "status": int} on success,
+        {"ok": False, "reason": str, "method": str|None, "url": str|None,
+         "status": int|None} on failure.
+        {"ok": True, "skipped": True, "reason": "<why>"} when the command
+         isn't a simple HTTP probe (e.g. nmap, shell-only) and should run
+         through regardless.
+    """
+    import re as _re
+    import httpx as _hx
+
+    # Parse the first `curl ... URL` chunk out of a possibly chained command.
+    # Prefer explicit `-X METHOD`, else infer GET (curl's default).
+    method = "GET"
+    m_method = _re.search(r"-X\s+([A-Z]+)", command)
+    if m_method:
+        method = m_method.group(1).upper()
+    # URL extraction: look for the first scheme://host[:port]/path. Must point
+    # to the target host (not localhost / 169.254 / sink / other). If URL
+    # doesn't match the target, we're probably probing an OOB listener or an
+    # SSRF-dest — skip, don't block.
+    m_url = _re.search(r"https?://([^\s'\"`]+)", command)
+    if not m_url:
+        return {"ok": True, "skipped": True, "reason": "no HTTP URL in command — not an HTTP exploit"}
+    url = "http" + command[m_url.start()+4 : m_url.end()]  # keep scheme as-is
+    # Strip trailing shell/quote junk the regex may have grabbed.
+    url = _re.sub(r"[\"'`;&|]+$", "", url).rstrip()
+    host_part = m_url.group(1).split("/", 1)[0]
+    target_hosts = {str(ip), f"{ip}:{port}", f"{ip}:{port or 80}"}
+    if host_part not in target_hosts and not host_part.startswith(f"{ip}:"):
+        return {"ok": True, "skipped": True,
+                "reason": f"URL host {host_part!r} is not the target {ip!r} — probably OOB/SSRF dest"}
+
+    # Probe. Prefer the exploit's own method so a path that is GET-only but
+    # exploited with POST is correctly caught. Use `httpx.request` so any
+    # method (POST/PUT/DELETE/PATCH/HEAD/OPTIONS) is first-class.
+    try:
+        r = _hx.request(method, url, timeout=timeout, verify=False,
+                        follow_redirects=False, headers={"User-Agent": "prerun-probe/1.0"})
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "method": method, "url": url, "status": None,
+                "reason": f"probe failed: {type(e).__name__}: {e}"}
+    status = r.status_code
+    # Treat 404 as a hard-fail; anything else (200/301/400/401/403/405/500) means
+    # the server at least recognised the path+method, so the exploit may land.
+    if status == 404:
+        return {"ok": False, "method": method, "url": url, "status": 404,
+                "reason": f"endpoint 404 on {method} {url} — exploit will all_404"}
+    return {"ok": True, "method": method, "url": url, "status": status}
 
 
 def _poc_precheck_model(model: str) -> dict:
