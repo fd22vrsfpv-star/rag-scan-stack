@@ -957,6 +957,37 @@ function ApiKeyRow({ keyName, label, description, storedMasked, updatedAt }: {
   const upsert = useUpsertApiKey()
   const remove = useDeleteApiKey()
 
+  // AWS keys get a Test button so a bad/expired key is caught before Create
+  // 500s. The test endpoint reads the stored creds (sts:GetCallerIdentity) and
+  // surfaces the actual AWS error message instead of a bare "Internal Server
+  // Error". See 2026-10-06 CHANGES_MADE.
+  const isAwsTestable = keyName === 'aws_access_key_id'
+  const [testStatus, setTestStatus] = useState<'idle' | 'testing' | 'ok' | 'fail'>('idle')
+  const [testMsg, setTestMsg] = useState<string>('')
+
+  const handleTestAws = async () => {
+    setTestStatus('testing')
+    setTestMsg('')
+    try {
+      const resp = await fetch('/api/cloud/aws/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ region: 'us-east-1' }),
+      })
+      const body = await resp.json().catch(() => ({}))
+      if (resp.ok && body?.ok) {
+        setTestStatus('ok')
+        setTestMsg(`account ${body.account ?? '?'} · ${body.arn ?? ''}`)
+      } else {
+        setTestStatus('fail')
+        setTestMsg(body?.detail ?? `HTTP ${resp.status}`)
+      }
+    } catch (e) {
+      setTestStatus('fail')
+      setTestMsg(String(e))
+    }
+  }
+
   const handleSave = async () => {
     if (!value.trim()) return
     setStatus('saving')
@@ -1030,8 +1061,24 @@ function ApiKeyRow({ keyName, label, description, storedMasked, updatedAt }: {
             <Trash2 className="h-3.5 w-3.5" />
           </button>
         )}
+        {isAwsTestable && isStored && (
+          <button
+            onClick={handleTestAws}
+            disabled={testStatus === 'testing'}
+            title="Validate AWS credentials with sts:GetCallerIdentity"
+            className="px-2.5 py-1.5 text-xs rounded-md border border-blue-400/40 text-blue-400 hover:bg-blue-400/10 disabled:opacity-50"
+          >
+            {testStatus === 'testing' ? 'Testing…' : 'Test'}
+          </button>
+        )}
         {status === 'saved' && <span className="text-xs text-green-500">Saved!</span>}
         {status === 'error' && <span className="text-xs text-red-400">Failed</span>}
+        {isAwsTestable && testStatus === 'ok' && (
+          <span className="text-xs text-green-500" title={testMsg}>OK · {testMsg.slice(0, 40)}</span>
+        )}
+        {isAwsTestable && testStatus === 'fail' && (
+          <span className="text-xs text-red-400" title={testMsg}>Fail · {testMsg.slice(0, 60)}</span>
+        )}
       </div>
     </div>
   )

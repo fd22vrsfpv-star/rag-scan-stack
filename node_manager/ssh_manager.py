@@ -885,7 +885,17 @@ class SSHManager:
 
     @staticmethod
     def list_public_keys() -> list[str]:
-        """List SSH public key files (for DO droplet creation)."""
+        """List SSH public key files (for DO droplet creation + AWS EC2 import).
+
+        A public key legitimately ends in `.pub`, `.openssh`, or `.ppk` — the
+        very suffixes `IGNORE_SUFFIXES` strips from the PRIVATE-key list. Prior
+        to 2026-10-06 this reused `IGNORE_SUFFIXES` and returned an empty list
+        for every reasonably-named public key on disk, which left the "Public
+        Key" dropdown on the New Droplet form unfillable. See 2026-10-06
+        CHANGES_MADE. The content check below is the real filter — anything
+        that does not begin with an SSH public-key marker is dropped — so the
+        suffix filter is both wrong and redundant here.
+        """
         keys_dir = Path(SSH_KEYS_DIR)
         if not keys_dir.is_dir():
             return []
@@ -893,7 +903,12 @@ class SSHManager:
         for f in sorted(keys_dir.iterdir()):
             if not f.is_file() or f.name.startswith("."):
                 continue
-            if any(f.name.endswith(s) for s in SSHManager.IGNORE_SUFFIXES):
+            if f.name in SSHManager.IGNORE_NAMES:
+                continue
+            # Skip Windows-NTFS "Zone.Identifier" alternate-stream turds that
+            # occasionally end up next to a key file; everything else goes
+            # through the content check.
+            if f.name.endswith(":Zone.Identifier"):
                 continue
             # Check if file content looks like a public key
             try:
