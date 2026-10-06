@@ -535,7 +535,7 @@ services:
       - ./scan_audit/audit_writer.py:/scanner/audit_writer.py:ro
       - ./certs:/certs:ro
     healthcheck:
-      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8010/health || curl -f http://127.0.0.1:8010/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8010/health || exit 1"]
       interval: 20s
       timeout: 5s
       retries: 15
@@ -585,7 +585,7 @@ services:
     networks: [agents_net]
     ports: ["8011:8011"]
     healthcheck:
-      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8011/health || curl -f http://127.0.0.1:8011/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8011/health || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 5
@@ -595,6 +595,7 @@ services:
       - ./scan_results:/scan_results
       - ./scan_audit:/scan_audit
       - ./scan_audit/audit_writer.py:/runner/audit_writer.py:ro
+      - ./common:/runner/common:ro    # shared TLS-startup guard (common/tls_startup.py)
 
 
       - ./certs:/certs:ro
@@ -670,11 +671,12 @@ services:
       - ./scan_results:/scan_results
       - ./scan_audit:/scan_audit
       - ./scan_audit/audit_writer.py:/runner/audit_writer.py:ro
+      - ./common:/runner/common:ro    # shared TLS-startup guard (common/tls_startup.py)
     # SHM size needed for Chromium (gowitness screenshots) to avoid crashes
       - ./certs:/certs:ro
     shm_size: '1gb'
     healthcheck:
-      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8024/health || curl -f http://127.0.0.1:8024/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8024/health || exit 1"]
       interval: 20s
       timeout: 5s
       retries: 15
@@ -744,9 +746,10 @@ services:
       - ./scan_audit:/scan_audit
       - ./scan_audit/audit_writer.py:/runner/audit_writer.py:ro
       - ./certs:/certs:ro
+      - ./common:/runner/common:ro    # shared TLS-startup guard (common/tls_startup.py)
     cap_add: [NET_RAW]
     healthcheck:
-      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8023/health || curl -f http://127.0.0.1:8023/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8023/health || exit 1"]
       interval: 20s
       timeout: 5s
       retries: 15
@@ -860,8 +863,9 @@ services:
       - ./scan_audit:/scan_audit
       - ./scan_audit/audit_writer.py:/runner/audit_writer.py:ro
       - ./certs:/certs:ro
+      - ./common:/runner/common:ro    # shared TLS-startup guard (common/tls_startup.py)
     healthcheck:
-      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8025/health || curl -f http://127.0.0.1:8025/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8025/health || exit 1"]
       interval: 20s
       timeout: 5s
       retries: 15
@@ -1045,7 +1049,7 @@ services:
     ports:
       - "8013:8013"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8013/health || curl -f http://127.0.0.1:8013/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8013/health || exit 1"]
       interval: 20s
       timeout: 5s
       retries: 15
@@ -1291,7 +1295,7 @@ services:
       - ./knowledge:/knowledge:ro
       - ./certs:/certs:ro
     healthcheck:
-      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8015/health || curl -f http://127.0.0.1:8015/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8015/health || exit 1"]
       interval: 20s
       timeout: 5s
       retries: 15

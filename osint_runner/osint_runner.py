@@ -5262,4 +5262,6 @@ def run_subdomain_takeover(req: SubdomainTakeoverReq, background_tasks: Backgrou
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8024, log_level="info", ssl_certfile=os.environ.get("SSL_CERTFILE"), ssl_keyfile=os.environ.get("SSL_KEYFILE"))
+    from common.tls_startup import require_tls_or_exit
+    _ssl_certfile, _ssl_keyfile = require_tls_or_exit("osint-runner")
+    uvicorn.run(app, host="0.0.0.0", port=8024, log_level="info", ssl_certfile=_ssl_certfile, ssl_keyfile=_ssl_keyfile)

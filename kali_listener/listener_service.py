@@ -3566,4 +3566,6 @@ async def run_hashcat(req: HashcatReq, background_tasks: BackgroundTasks):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=API_PORT, ssl_certfile=os.environ.get("SSL_CERTFILE"), ssl_keyfile=os.environ.get("SSL_KEYFILE"))
+    from common.tls_startup import require_tls_or_exit
+    _ssl_certfile, _ssl_keyfile = require_tls_or_exit("kali-listener")
+    uvicorn.run(app, host="0.0.0.0", port=API_PORT, ssl_certfile=_ssl_certfile, ssl_keyfile=_ssl_keyfile)
