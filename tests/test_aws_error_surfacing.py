@@ -112,3 +112,72 @@ def test_do_list_public_keys_does_not_strip_pub_suffix():
         "list_public_keys must not filter by IGNORE_SUFFIXES — that set contains "
         "`.pub`, which is the very suffix the dropdown needs to include"
     )
+
+
+# ── DO error-surfacing + options-liveness guards ────────────────────────
+
+
+def test_do_create_surfaces_provider_error():
+    """The DO create path must raise with `DigitalOcean ... rejected: <code> —
+    <message>` instead of leaking a bare 500. Static check that the helper
+    is referenced at the right call sites — matches the AWS pattern."""
+    src = (REPO / "node_manager" / "node_manager.py").read_text()
+    assert "_do_error_response" in src, "_do_error_response helper missing"
+    # Both sites that previously raised HTTPException(500, "Failed to ...") now
+    # use the helper. If either reverts, 500s start leaking again.
+    assert '_do_error_response(resp, "create droplet")' in src, (
+        "DO droplet-create failure must raise via _do_error_response "
+        "so the UI sees the real reason, not a bare 500"
+    )
+    assert '_do_error_response(resp, "upload SSH key")' in src, (
+        "DO key-upload failure must raise via _do_error_response for the same reason"
+    )
+
+
+def test_do_options_is_live_not_hardcoded():
+    """`/cloud/do/options` must query DO so sizes/regions reflect reality
+    (DO retires slugs). Hardcoding let `s-1vcpu-1gb` stay offered in `nyc1`
+    weeks after DO removed it."""
+    import ast as _ast
+
+    src = (REPO / "node_manager" / "node_manager.py").read_text()
+    tree = _ast.parse(src)
+    func_src: str | None = None
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.AsyncFunctionDef) and node.name == "do_options":
+            func_src = _ast.get_source_segment(src, node)
+            break
+    assert func_src, "do_options missing"
+    # It must call DO's sizes endpoint and attach `regions` to each returned size.
+    assert "api.digitalocean.com/v2/sizes" in func_src, (
+        "do_options must query DO's /v2/sizes rather than return a hardcoded list"
+    )
+    assert '"regions":' in func_src or "'regions':" in func_src, (
+        "each returned size must carry its per-region availability list so the "
+        "frontend can disable combos DO will reject"
+    )
+
+
+def test_bff_safe_json_unwraps_upstream_detail():
+    """safe_json must extract `detail` from the upstream FastAPI error body so
+    the frontend sees a single-level string, not nested JSON."""
+    import importlib
+    import sys as _sys
+    _sys.path.insert(0, str(REPO / "dashboard" / "bff"))
+    utils = importlib.import_module("utils")
+    assert hasattr(utils, "_upstream_detail"), "_upstream_detail helper missing"
+    assert hasattr(utils, "raise_upstream"), "raise_upstream convenience missing"
+
+    class _R:
+        status_code = 400
+        text = '{"detail": "DigitalOcean create droplet rejected: unprocessable_entity — Size is not available in this region."}'
+
+        def json(self):
+            import json as _j
+            return _j.loads(self.text)
+
+    detail = utils._upstream_detail(_R())
+    assert "DigitalOcean" in detail and "Size is not available" in detail
+    assert detail.startswith("DigitalOcean"), (
+        f"detail should be the inner string, not nested JSON: {detail!r}"
+    )

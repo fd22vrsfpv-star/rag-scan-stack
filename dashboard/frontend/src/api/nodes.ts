@@ -524,8 +524,13 @@ export function useRestartWGClient() {
 // ── DigitalOcean Cloud Provisioning ─────────────────────────────────────────
 
 export interface DOOptions {
-  sizes: { slug: string; label: string; vcpus: number; memory: number; price: number }[]
+  // Each size now carries `regions` so the frontend can disable combos DO will
+  // reject. Older server returns omit `regions` and `live`; treat `regions`
+  // undefined as "all regions" so the dropdown doesn't collapse on upgrade.
+  sizes: { slug: string; label: string; vcpus: number; memory: number; price: number; regions?: string[] }[]
   regions: { slug: string; label: string }[]
+  live?: boolean
+  note?: string
 }
 
 export interface DODroplet {

@@ -4390,6 +4390,32 @@ class DOCreateRequest(BaseModel):
     do_token: Optional[str] = None
 
 
+def _do_error_response(resp, operation: str = "DigitalOcean call") -> HTTPException:
+    """Convert a DO API error response into an HTTPException with the real reason.
+
+    DO's error body is `{"id": "<code>", "message": "<human reason>"}`. Prior
+    code did `raise HTTPException(500, f"Failed to ...: {resp.text}")` — the UI
+    showed a bare 500 with a nested JSON string the user had to double-parse to
+    reach `message`. On 2026-10-06 the operator hit `s-1vcpu-1gb` not available
+    in `nyc1` and saw triple-wrapped JSON instead of "Size is not available in
+    this region." See 2026-10-06 CHANGES_MADE.
+    """
+    code = "unknown"
+    msg = (resp.text or "").strip() or f"HTTP {resp.status_code}"
+    try:
+        body = resp.json()
+        code = str(body.get("id") or body.get("code") or code)
+        msg = str(body.get("message") or body.get("detail") or msg)
+    except Exception:
+        pass
+    # Map DO's status to a useful outward status: validation → 400, auth → 401,
+    # not-found → 404, else keep DO's status so clients can distinguish.
+    status = resp.status_code
+    if status == 422:
+        status = 400
+    return HTTPException(status, f"DigitalOcean {operation} rejected: {code} — {msg}")
+
+
 def _get_do_token(override: Optional[str] = None) -> str:
     if override:
         return override
@@ -4410,9 +4436,56 @@ def _get_do_token(override: Optional[str] = None) -> str:
 
 
 @app.get("/cloud/do/options")
-async def do_options():
-    """Return available DO droplet sizes and regions."""
-    return {"sizes": DO_SIZES, "regions": DO_REGIONS}
+async def do_options(do_token: Optional[str] = Query(None)):
+    """Return DO droplet sizes + regions LIVE from the account.
+
+    Returning a hardcoded list silently drifted — on 2026-10-06 `s-1vcpu-1gb`
+    was offered in `nyc1`, which DO retired for AMD/Intel suffixes
+    (`s-1vcpu-1gb-amd`, `s-1vcpu-1gb-intel`) in that region. The dropdown let
+    the operator pick an unlaunchable combo and the UI showed 500. Each `size`
+    now carries `regions: [slug]` so the frontend can disable combos DO will
+    reject. Falls back to the baked-in list if the live call fails so a dead
+    API key does not empty the dropdown.
+    """
+    import httpx as _httpx
+    try:
+        token = _get_do_token(do_token)
+    except HTTPException:
+        return {"sizes": DO_SIZES, "regions": DO_REGIONS, "live": False,
+                "note": "No DO token configured — showing fallback list"}
+    hdrs = {"Authorization": f"Bearer {token}"}
+    try:
+        async with _httpx.AsyncClient(timeout=15, verify=False) as c:
+            s_resp = await c.get("https://api.digitalocean.com/v2/sizes?per_page=200", headers=hdrs)
+            r_resp = await c.get("https://api.digitalocean.com/v2/regions?per_page=200", headers=hdrs)
+    except Exception as e:
+        return {"sizes": DO_SIZES, "regions": DO_REGIONS, "live": False,
+                "note": f"DO API unreachable: {e}"}
+    if s_resp.status_code != 200 or r_resp.status_code != 200:
+        return {"sizes": DO_SIZES, "regions": DO_REGIONS, "live": False,
+                "note": f"DO API error — sizes {s_resp.status_code}, regions {r_resp.status_code}"}
+    sizes_raw = s_resp.json().get("sizes", [])
+    regions_raw = r_resp.json().get("regions", [])
+    # Keep only sizes that are `available` and attach their per-size region list
+    # so the frontend can filter. Price is monthly USD.
+    sizes = [
+        {
+            "slug": s["slug"],
+            "label": f"{s['vcpus']} vCPU / {int(s['memory']/1024)}GB (${int(s.get('price_monthly', 0))}/mo)",
+            "vcpus": s["vcpus"],
+            "memory": s["memory"],
+            "price": int(s.get("price_monthly", 0)),
+            "regions": sorted(s.get("regions") or []),
+        }
+        for s in sizes_raw if s.get("available", True)
+    ]
+    sizes.sort(key=lambda x: (x["price"], x["slug"]))
+    regions = [
+        {"slug": r["slug"], "label": r.get("name") or r["slug"]}
+        for r in regions_raw if r.get("available", True)
+    ]
+    regions.sort(key=lambda x: x["label"])
+    return {"sizes": sizes, "regions": regions, "live": True}
 
 
 _do_provision_status: dict = {}  # droplet_id -> status dict
@@ -4482,7 +4555,7 @@ async def create_do_droplet(req: DOCreateRequest):
             if resp.status_code in (200, 201):
                 fp = resp.json()["ssh_key"]["fingerprint"]
             else:
-                raise HTTPException(500, f"Failed to upload SSH key to DO: {resp.text}")
+                raise _do_error_response(resp, "upload SSH key")
 
         # Create droplet
         resp = await c.post("https://api.digitalocean.com/v2/droplets", headers=hdrs, json={
@@ -4490,7 +4563,9 @@ async def create_do_droplet(req: DOCreateRequest):
             "image": req.image, "ssh_keys": [fp], "tags": ["pentest-node"],
         })
         if resp.status_code not in (200, 201, 202):
-            raise HTTPException(500, f"Failed to create droplet: {resp.text}")
+            # DO 422 "Size is not available in this region", 404 image/region not found,
+            # 401 auth — surface the actual reason instead of a bare 500.
+            raise _do_error_response(resp, "create droplet")
         droplet_id = resp.json()["droplet"]["id"]
 
     # Determine SSH private key for tunnel connection

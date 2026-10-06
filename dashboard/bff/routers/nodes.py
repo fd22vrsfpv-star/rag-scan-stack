@@ -867,8 +867,10 @@ async def create_do_droplet(request: Request):
     body = await request.json()
     async with httpx.AsyncClient(timeout=180) as c:
         resp = await c.post(f"{s.tunnel_manager_url}/cloud/do/create", json=body)
-        if resp.status_code >= 400:
-            raise HTTPException(resp.status_code, resp.text)
+        # safe_json unwraps upstream FastAPI {"detail": "..."} so the
+        # "DigitalOcean create droplet rejected: ... — Size is not available in
+        # this region." message reaches the frontend as a single-level string
+        # instead of a nested JSON turducken. See 2026-10-06 CHANGES_MADE.
         return safe_json(resp)
 
 
@@ -907,8 +909,8 @@ async def create_aws_instance(request: Request):
     body = await request.json()
     async with httpx.AsyncClient(timeout=180) as c:
         resp = await c.post(f"{s.tunnel_manager_url}/cloud/aws/create", json=body, timeout=60)
-        if resp.status_code >= 400:
-            raise HTTPException(resp.status_code, resp.text)
+        # safe_json unwraps the upstream `detail` so the frontend sees the AWS
+        # reason as plain text, not nested JSON. See 2026-10-06 CHANGES_MADE.
         return safe_json(resp)
 
 
@@ -924,8 +926,6 @@ async def test_aws_credentials(request: Request):
     body = await request.json() if await request.body() else {}
     async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.post(f"{s.tunnel_manager_url}/cloud/aws/test", json=body, timeout=25)
-        if resp.status_code >= 400:
-            raise HTTPException(resp.status_code, resp.text)
         return safe_json(resp)
 
 
