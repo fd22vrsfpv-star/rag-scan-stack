@@ -20547,6 +20547,23 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                               "url": _probe.get("url"), "status": _probe.get("status"),
                               "reason": _probe.get("reason"),
                               "skipped": _probe.get("skipped", False)})
+            # OOB sink reachability check — exploits that chain
+            # `exploit && curl SINK` need the SINK to be alive to produce proof.
+            # Operator ask (2026-10-06): "let's work on a check for the oob
+            # listener." Doesn't block the run; records a diagnostic so the
+            # operator can tell "exploit didn't land" from "exploit landed but
+            # proof mechanism was broken."
+            try:
+                _oob = _prerun_oob_check(ip, port, command, timeout=3)
+            except Exception as _obe:  # noqa: BLE001
+                _oob = {"ok": True, "reason": f"oob check raised {type(_obe).__name__}"}
+            _poc_trace(run_id, "oob_sink_check", iteration=it,
+                       extra={"urls": _oob.get("urls", []),
+                              "unreachable": _oob.get("unreachable", []),
+                              "reason": _oob.get("reason")})
+            if _oob.get("unreachable"):
+                metrics.setdefault("oob_sinks_unreachable_total", 0)
+                metrics["oob_sinks_unreachable_total"] += len(_oob["unreachable"])
             if _probe.get("ok") is False:
                 # Short-circuit — 404-on-method is deterministic; no point
                 # burning a 60 s listener call on it. Record the probe output
@@ -23620,6 +23637,81 @@ def _prerun_payload_probe(ip, port, command: str, timeout: int = 5) -> dict:
         return {"ok": False, "method": method, "url": url, "status": 404,
                 "reason": f"endpoint 404 on {method} {url} — exploit will all_404"}
     return {"ok": True, "method": method, "url": url, "status": status}
+
+
+def _prerun_oob_check(ip, port, command: str, timeout: int = 3) -> dict:
+    """OOB listener / sink reachability pre-check.
+
+    Many exploits chain a target hit with a SINK POLL — e.g. for CVE-2024-32964:
+      curl -X POST http://TARGET/api/proxy -d 'http://SINK/canary' \
+        && sleep 1 && curl http://TARGET:9091/done
+
+    The last `curl` polls the CVE-Bench evaluator sink to see if the SSRF
+    callback landed. If the sink isn't reachable, the proof-of-exploit
+    mechanism is broken — the exploit may have landed on the target but
+    we'll never see the signal. This check extracts every URL beyond the
+    first in the command, classifies each as TARGET / OOB_LOCAL /
+    OOB_METADATA / OOB_EXTERNAL, and probes TARGET and OOB_LOCAL (safe to
+    reach from here) for reachability. Returns a diagnostic so the trace
+    carries "sink unreachable" context without aborting the run — a
+    half-working exploit can still produce useful data.
+
+    See 2026-10-06 operator ask: "let's work on a check for the oob listener."
+
+    Returns:
+      {"ok": True, "urls": [classifications], "unreachable": [...], "reason": "..."}
+      Never raises; probe errors become "ok" with a note so the dispatcher
+      never fails just because this check hiccuped.
+    """
+    import re as _re
+    import httpx as _hx
+
+    urls = _re.findall(r"https?://[^\s'\"`;)]+", command or "")
+    if len(urls) < 2:
+        return {"ok": True, "urls": [], "reason": "no OOB/sink URL in command"}
+
+    target_hosts = {str(ip), f"{ip}:{port}", f"{ip}:{port or 80}"}
+    classified = []
+    unreachable = []
+    # Skip the first URL (that's the exploit target, covered by _prerun_payload_probe).
+    for raw in urls[1:]:
+        u = _re.sub(r"[\"'`;&|)]+$", "", raw).rstrip()
+        try:
+            # Extract host portion for classification.
+            host_part = u.split("://", 1)[1].split("/", 1)[0]
+        except Exception:
+            continue
+        host = host_part.split(":", 1)[0]
+        if host_part in target_hosts or host == str(ip):
+            kind = "TARGET"
+        elif host in ("localhost", "127.0.0.1") or host.startswith("127."):
+            kind = "OOB_LOCAL"
+        elif host.startswith("169.254."):
+            kind = "OOB_METADATA"  # cloud metadata — don't probe (never reachable from here)
+        elif host in ("kali-listener", "rag-api"):
+            kind = "OOB_INTERNAL"
+        else:
+            kind = "OOB_EXTERNAL"
+        entry = {"url": u, "kind": kind}
+        # Only probe TARGET and OOB_INTERNAL — those we can reach from this host
+        # and expect to be up. External + metadata are informational-only.
+        if kind in ("TARGET", "OOB_INTERNAL"):
+            try:
+                r = _hx.get(u, timeout=timeout, verify=False, follow_redirects=False,
+                            headers={"User-Agent": "oob-reach/1.0"})
+                entry["status"] = r.status_code
+                if r.status_code >= 500:
+                    unreachable.append(f"{u} (HTTP {r.status_code})")
+            except Exception as e:  # noqa: BLE001
+                entry["error"] = f"{type(e).__name__}: {e}"
+                unreachable.append(f"{u} ({type(e).__name__})")
+        classified.append(entry)
+
+    if unreachable:
+        return {"ok": True, "urls": classified, "unreachable": unreachable,
+                "reason": "sink poll URL(s) unreachable — exploit may land but proof mechanism broken: "
+                          + "; ".join(unreachable[:3])}
+    return {"ok": True, "urls": classified, "reason": "all sink URLs reachable or informational"}
 
 
 def _poc_precheck_model(model: str) -> dict:
