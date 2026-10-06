@@ -912,6 +912,23 @@ async def create_aws_instance(request: Request):
         return safe_json(resp)
 
 
+@router.post("/api/cloud/aws/test")
+async def test_aws_credentials(request: Request):
+    """Validate AWS credentials with `sts:GetCallerIdentity` before Save.
+
+    Proxies to `node-manager /cloud/aws/test`. On a bad or expired key the
+    400 carries the real AWS error (code + message) so the Settings page can
+    refuse Save instead of persisting broken config and 500-ing on create.
+    """
+    s = get_settings()
+    body = await request.json() if await request.body() else {}
+    async with httpx.AsyncClient(timeout=30) as c:
+        resp = await c.post(f"{s.tunnel_manager_url}/cloud/aws/test", json=body, timeout=25)
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
 @router.get("/api/cloud/aws/status/{instance_id}")
 async def aws_provision_status(instance_id: str):
     return await _nm_get(f"/cloud/aws/status/{instance_id}")

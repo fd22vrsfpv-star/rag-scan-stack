@@ -6,6 +6,7 @@ Scanners route traffic through these proxies to scan remote networks.
 """
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -5146,6 +5147,43 @@ AWS_AMIS = {
 _ec2_provision_status: dict = {}  # instance_id -> status dict
 
 
+def _aws_client_error_to_http(e, operation: str = "AWS call") -> HTTPException:
+    """Convert a boto3 ClientError into a user-visible 400 with the AWS message.
+
+    Without this, a `ClientError` escapes as a bare `500 "Internal Server Error"`
+    — the operator sees no reason, and the real cause lives only in
+    `docker logs node-manager`. The create-EC2 flow on 2026-10-06 hit exactly
+    this: AWS replied `AuthFailure ... was not able to validate the provided
+    access credentials`, FastAPI returned 500, the UI showed "Internal Server
+    Error", and nobody could tell whether the key was wrong, the permission was
+    missing, or the service was down. See 2026-10-06 CHANGES_MADE.
+    """
+    try:
+        err = e.response.get("Error", {}) if hasattr(e, "response") else {}
+        code = err.get("Code") or type(e).__name__
+        msg = err.get("Message") or str(e)
+    except Exception:
+        code = type(e).__name__
+        msg = str(e)
+    return HTTPException(400, f"AWS {operation} rejected: {code} — {msg}")
+
+
+def _aws_error_boundary(fn):
+    """Decorator: catch botocore ClientError at a handler boundary and surface
+    the AWS reason to the UI. Passes HTTPException and non-AWS exceptions
+    through unchanged so existing explicit `raise HTTPException(400, ...)` and
+    unrelated bugs still read truthfully."""
+    @functools.wraps(fn)
+    async def _wrap(*args, **kwargs):
+        try:
+            return await fn(*args, **kwargs)
+        except HTTPException:
+            raise
+        except ClientError as e:
+            raise _aws_client_error_to_http(e, fn.__name__)
+    return _wrap
+
+
 def _get_aws_session(region: str = "us-east-1", override_key: str = None, override_secret: str = None):
     """Get boto3 session from override, env, or DB."""
     key_id = override_key or os.environ.get("AWS_ACCESS_KEY_ID")
@@ -5186,6 +5224,35 @@ async def aws_options():
     return {"instance_types": AWS_INSTANCE_TYPES, "regions": AWS_REGIONS, "amis": AWS_AMIS}
 
 
+class AWSTestRequest(BaseModel):
+    region: str = "us-east-1"
+    aws_key: Optional[str] = None
+    aws_secret: Optional[str] = None
+
+
+@app.post("/cloud/aws/test")
+@_aws_error_boundary
+async def test_aws_credentials(req: AWSTestRequest):
+    """Validate AWS credentials with `sts:GetCallerIdentity`.
+
+    Returns `{ok, account, arn, user_id, region}` on success. On a bad key,
+    expired key, wrong account, or missing `sts:GetCallerIdentity` permission,
+    the ClientError is converted by `_aws_error_boundary` into a 400 with the
+    real AWS message so the Settings page can refuse Save instead of persisting
+    broken config and 500-ing later on create. See 2026-10-06 CHANGES_MADE.
+    """
+    session = _get_aws_session(req.region, req.aws_key, req.aws_secret)
+    sts = session.client("sts")
+    who = sts.get_caller_identity()
+    return {
+        "ok": True,
+        "account": who.get("Account"),
+        "arn": who.get("Arn"),
+        "user_id": who.get("UserId"),
+        "region": req.region,
+    }
+
+
 @app.get("/cloud/aws/status/{instance_id}")
 async def ec2_provision_status(instance_id: str):
     status = _ec2_provision_status.get(instance_id)
@@ -5195,8 +5262,17 @@ async def ec2_provision_status(instance_id: str):
 
 
 @app.post("/cloud/aws/create")
+@_aws_error_boundary
 async def create_ec2_instance(req: AWSCreateRequest):
-    """Create an AWS EC2 instance, wait for IP, SSH, then auto-connect tunnel."""
+    """Create an AWS EC2 instance, wait for IP, SSH, then auto-connect tunnel.
+
+    `@_aws_error_boundary` surfaces any `boto3.ClientError` (AuthFailure,
+    UnauthorizedOperation, DryRunOperation, InvalidKeyPair.NotFound,
+    insufficient quota, …) to the UI as a 400 with the AWS message instead
+    of a bare 500. The background `_provision()` thread catches its own
+    exceptions and writes to `_ec2_provision_status`, so the decorator only
+    covers the sync setup path.
+    """
     session = _get_aws_session(req.region, req.aws_key, req.aws_secret)
     ec2 = session.resource("ec2")
     ec2_client = session.client("ec2")
