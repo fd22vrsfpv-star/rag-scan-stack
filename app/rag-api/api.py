@@ -13206,7 +13206,25 @@ def _ollama_tags():
 
 
 def _is_local_model(model):
-    return bool(model) and model in _ollama_tags()
+    """True iff `model` names a tag loaded in local ollama.
+
+    Ollama tags carry an implicit ":latest" suffix: `llama3` is listed as
+    `llama3:latest`. Prior exact-match let `llama3:latest` through but rejected
+    the bare `llama3` operators actually type — then `_llm_for_model` fell to
+    `llm_generate` which 404'd on llm_query, and the build-poc pre-check
+    rejected a model that is actually usable. See 2026-10-06 CHANGES_MADE.
+    """
+    if not model:
+        return False
+    tags = _ollama_tags()
+    if model in tags:
+        return True
+    # Try with/without the implicit :latest suffix either way around.
+    if ":" not in model and f"{model}:latest" in tags:
+        return True
+    if model.endswith(":latest") and model[: -len(":latest")] in tags:
+        return True
+    return False
 
 
 def _llm_for_model(prompt, model=None, caller="llm", num_predict=1024, temperature=0.2):
