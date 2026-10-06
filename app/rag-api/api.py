@@ -14720,6 +14720,14 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
     assertion = {"expect_regex": canary, "canary": canary, "cve_anchored": True}
     rationale = ""; llm_model = None
     metrics = _new_poc_metrics()
+    # Track the last LLM result so we can tell "LLM errored (404, timeout,
+    # auth failure, rate limit)" apart from "LLM returned text but no usable
+    # JSON" when the gate below falls through to deterministic_probe. Prior
+    # code collapsed both into a bare `curl`, which made a model-not-found
+    # look identical to a model that answered with junk. See 2026-10-06
+    # CHANGES_MADE (the three-CVE deeptest batch failure).
+    last_res: dict | None = None
+    last_err: str | None = None
     for _ in range(2):
         try:
             res = _llm_for_model(prompt, model=model, caller="cve_poc_synth")
@@ -14727,9 +14735,20 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
             if isinstance(res, dict) and res.get("model"):
                 llm_model = res["model"]
             _acc_llm_metrics(metrics, res)
-        except Exception:  # noqa: BLE001
+            last_res = res if isinstance(res, dict) else {"response": text, "ok": True}
+            if isinstance(res, dict) and res.get("ok") is False:
+                last_err = str(res.get("error") or "unknown LLM error")
+        except Exception as _exc:  # noqa: BLE001
             text = ""
-        _poc_trace(run_id, "synthesize", prompt=prompt, response=text, llm_model=llm_model)
+            last_err = f"{type(_exc).__name__}: {_exc}"
+            last_res = {"response": "", "ok": False, "error": last_err, "model": model}
+        # Trace: carry the real failure signal so an operator can diagnose
+        # a silent empty response without tailing the service log. The old
+        # trace recorded only `response_len:0, llm_model:None` which named
+        # nothing — see the 2026-10-06 investigation.
+        _poc_trace(run_id, "synthesize", prompt=prompt, response=text, llm_model=llm_model,
+                   extra={"model_requested": model, "ok": bool(last_res and last_res.get("ok")),
+                          "error": last_err})
         obj = _poc_extract_json(text)
         if obj and obj.get("command"):
             command = str(obj["command"]).strip()
@@ -14761,9 +14780,24 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
             rationale = str(obj.get("rationale", ""))[:500]
             break
     synth_kind = "llm_poc"
+    llm_error_reason: str | None = None
+    llm_error_model: str | None = None
     if not command:
         command = f"curl -sSi -m 15 {tgt}/"
-        synth_kind = "deterministic_probe"
+        # Distinguish "the LLM errored" (model not found, timeout, 404, auth)
+        # from "the LLM answered with no usable command (empty/malformed JSON)".
+        # Both previously collapsed into `deterministic_probe`, so a bad model
+        # name read identical to a weak LLM answer and nobody could tell. Now:
+        #   llm_error         → the call itself failed; the operator needs to
+        #                       pick a different model / fix the backend
+        #   deterministic_probe → the LLM responded but gave no command; the
+        #                        model worked, the prompt or the LLM gave up
+        if last_res and last_res.get("ok") is False:
+            synth_kind = "llm_error"
+            llm_error_reason = last_err or "LLM call failed"
+            llm_error_model = (last_res.get("model") if isinstance(last_res, dict) else None) or model
+        else:
+            synth_kind = "deterministic_probe"
     # Post-augment: for blind/OOB classes with a detected CVE-Bench sink, wrap the
     # LLM's command with a sink-verification tail so we get a proof even if the LLM
     # forgot the listener pattern. Widen the assertion to also match the OOB marker
@@ -14783,7 +14817,11 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
     return {"command": command, "assertion": assertion, "rationale": rationale,
             "synth_kind": synth_kind, "run_id": run_id, "canary": canary,
             "origin_family": _poc_target_family(command), "llm_model": llm_model,
-            "metrics": metrics}
+            "metrics": metrics,
+            # Only populated when synth_kind == "llm_error"; let the UI render
+            # "model X returned 404" instead of a silent fallback.
+            "llm_error_reason": llm_error_reason,
+            "llm_error_model": llm_error_model}
 
 
 def _poc_semantic_verify_enabled():
@@ -23437,6 +23475,30 @@ def _resolve_target_url(target_url, ip, port, endpoint_hint, hint):
     return (ip, port, composed or None)
 
 
+def _poc_precheck_model(model: str) -> dict:
+    """Probe `model` with a 1-token prompt so a bad model fails the endpoint
+    fast with the real reason, instead of silently 404-ing deep in the synth
+    loop and burning 5–15 minutes on a `deterministic_probe` fallback.
+
+    Returns `{"ok": True, "model": <resolved>}` on success, or
+    `{"ok": False, "error": "<reason>", "model": <requested>}` on failure.
+    A local ollama tag that IS loaded short-circuits the probe (we already
+    know it works). See 2026-10-06 CHANGES_MADE.
+    """
+    try:
+        if _is_local_model(model):
+            return {"ok": True, "model": model, "reason": "local tag already loaded"}
+        res = _llm_for_model("hi", model=model, caller="poc_model_precheck", num_predict=4)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}", "model": model}
+    if not isinstance(res, dict):
+        return {"ok": False, "error": "unexpected probe return shape", "model": model}
+    if res.get("ok") is False:
+        return {"ok": False, "error": str(res.get("error") or "unknown LLM error"),
+                "model": res.get("model") or model}
+    return {"ok": True, "model": res.get("model") or model}
+
+
 @app.post("/software/build-poc", tags=["Assets"])
 def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     """PoC-builder: research -> synthesize -> run-and-refine. Invoking this authorizes
@@ -23472,6 +23534,17 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     elif not _poc_grant_active(ip, port, eid):
         raise HTTPException(403, "PoC building is not released for this endpoint. An operator "
                                  "must release it (grant) first; it stays granted until revoked.")
+    # Fail-fast model pre-check: if the operator pinned a specific model, probe
+    # it once with a 1-token prompt. Prior behaviour was to accept any string
+    # and discover 5–15 minutes later that llm_query didn't recognize it (then
+    # fall through to `deterministic_probe`). See 2026-10-06 CHANGES_MADE
+    # (the three-CVE deeptest batch failure on `azure-main:DeepSeek-V4-Flash`).
+    if body.model:
+        _mp = _poc_precheck_model(body.model)
+        if not _mp.get("ok"):
+            raise HTTPException(400,
+                f"LLM model {body.model!r} is not available: {_mp.get('error')}. "
+                f"Pick another model, or clear the field to use the task-route default.")
     auth = None
     if body.username or body.password or body.bruteforce:
         auth = {"username": body.username, "password": body.password,
