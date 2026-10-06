@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { Link } from 'react-router-dom'
 import PageHelp from '@/components/PageHelp'
 import QRCode from 'react-qr-code'
@@ -1250,7 +1250,7 @@ function CloudProvision() {
   const [provisioningId, setProvisioningId] = useState<string | null>(null)
   const { data: provStatus } = useDOProvisionStatus(provisioningId)
 
-  const sizes = optionsData?.sizes ?? []
+  const allSizes = optionsData?.sizes ?? []
   const regions = optionsData?.regions ?? []
   const keys = pubKeysData?.keys ?? []
   const doNodes = (nodesData?.nodes ?? []).filter((n: any) => {
@@ -1259,6 +1259,23 @@ function CloudProvision() {
   })
 
   const privKeys = privKeysData?.keys ?? []
+
+  // Only sizes DO actually offers in the selected region. A size with no
+  // `regions` field is from the fallback catalog — assume all regions so a
+  // dropped backend upgrade does not collapse the picker. See 2026-10-06
+  // CHANGES_MADE: `s-1vcpu-1gb` was retired from `nyc1` and the hardcoded
+  // dropdown let the operator pick an unlaunchable combo.
+  const sizes = allSizes.filter(s => !s.regions || s.regions.length === 0 || s.regions.includes(form.region))
+
+  // If the current size is not valid for the newly-selected region, auto-pick
+  // the first available one so Create does not 400 with "Size is not available
+  // in this region". React effect fires on region change AND when options load.
+  useEffect(() => {
+    if (sizes.length === 0) return
+    if (!sizes.some(s => s.slug === form.size)) {
+      setForm(f => ({ ...f, size: sizes[0].slug }))
+    }
+  }, [form.region, allSizes])
 
   const handleCreate = () => {
     if (!form.name || !form.key_name || !form.ssh_key_name) return
