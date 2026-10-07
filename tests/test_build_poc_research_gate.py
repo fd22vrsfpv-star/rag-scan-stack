@@ -738,3 +738,44 @@ def test_supplied_credentials_failing_falls_through_to_default_credentials():
     assert 'if (s or {}).get("cookie_header") or not auth.get("bruteforce"):' in est
     assert "_supplied_note = (s or {}).get(\"note\")" in est
     assert '"login_url": lp,' in est, "the failure must say which login page was used"
+
+
+# ── round-10 false positive: `.*` assertion + canary echoed in a 302 ──────
+
+def test_trivial_assertions_are_detected():
+    ns = _load(["_assertion_is_trivial"])
+    f = ns["_assertion_is_trivial"]
+    for rx in ("", ".*", ".+", "^.*$", "(?s).*", "[\\s\\S]*", "\\w*", None):
+        assert f(rx) is True, rx
+    for rx in ("POCz1130b99267", "root:x:", "uid=\\d+", "attack_success\":true"):
+        assert f(rx) is False, rx
+
+
+REAL_302_BODY = ("HTTP/1.1 302 FOUND\r\nServer: Werkzeug/3.0.6 Python/3.11.16\r\nContent-Type: text/html; charset=utf-8\r\n"
+                 "Location: /login?next=%2Fdtale%2Ftest-filter%2F1%3Fquery%3DPOCabc123def\r\n\r\n"
+                 "<!doctype html>\n<html lang=en>\n<title>Redirecting...</title>\n<h1>Redirecting...</h1>\n"
+                 "<p>You should be redirected automatically to the target URL: "
+                 "<a href=\"/login?next=%2Fdtale%2Ftest-filter%2F1%3Fquery%3DPOCabc123def\">/login?next=...</a>.")
+
+
+def test_redirect_guard_catches_the_href_echo_in_a_werkzeug_body():
+    ns = _load(["_canary_only_in_redirect"])
+    assert ns["_canary_only_in_redirect"](REAL_302_BODY, "POCabc123def") is True
+    assert ns["_canary_only_in_redirect"]("HTTP/1.1 200 OK\r\n\r\n<pre>POCabc123def</pre>", "POCabc123def") is False
+
+
+def test_raw_verdict_refuses_a_trivial_regex_without_the_canary():
+    body = _func_src("_poc_assertion_verdict")
+    i_triv = body.find("if rx and _assertion_is_trivial(rx):")
+    i_regex = body.find('"method": "regex", "confidence": 1.0')
+    assert 0 < i_triv < i_regex, "the trivial check must run before the regex pass"
+    assert '"method": "assertion_trivial"' in body
+
+
+def test_read_back_verifier_requires_canary_or_a_real_regex_and_never_a_3xx_alone():
+    body = _func_src("_live_verify_recipe")
+    assert "_rx_ok = bool(_rx) and not _assertion_is_trivial(_rx)" in body
+    assert "hit = (canary in out) or (_rx_ok and not _is_3xx_only)" in body
+    assert '"method": "assertion_trivial"' in body
+    seed = _func_src("_assemble_from_cve_spec")
+    assert 'a["expect_regex"] = canary' in seed, "a seeded trivial regex must be replaced by the canary anchor"
