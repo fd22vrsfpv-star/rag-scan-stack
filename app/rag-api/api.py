@@ -13134,6 +13134,90 @@ def _poc_extract_json(text):
         return None
 
 
+def _extract_poc_from_text(text: str, max_chars: int = 1500) -> str:
+    """Scan an advisory/README body for the first proof-of-concept snippet.
+
+    Most GHSA pages and vendor advisories carry a `## Proof of Concept`
+    section with a fenced code block (bash / python / http / curl). The LLM
+    normally has to re-derive the exploit shape from the terse description;
+    handing it the published PoC verbatim lets synth START from a known-good
+    shape instead of inventing endpoints + body formats. Added 2026-10-06
+    shape-improvement pass (#2).
+
+    Returns a short snippet (<= max_chars) or "" when nothing PoC-shaped is
+    found. Never raises.
+    """
+    if not text:
+        return ""
+    import re as _re
+    # Preferred: a fenced code block immediately after a PoC-shaped heading.
+    heading_re = _re.compile(
+        r"#{1,4}\s*(?:Proof[-\s]?of[-\s]?Concept|PoC|Exploit|"
+        r"Reproduction|Reproducer|Example\s+Request|Demonstration)\b[^\n]*\n"
+        r"(?:(?!^#{1,4}\s)[\s\S])*?```(?:bash|sh|shell|python|py|http|curl|json|yaml)?\s*\n"
+        r"([\s\S]+?)```",
+        _re.M | _re.I,
+    )
+    m = heading_re.search(text)
+    if m:
+        return m.group(1).strip()[:max_chars]
+    # Fallback 1: any fenced block containing curl / POST / GET + path.
+    code_re = _re.compile(
+        r"```(?:bash|sh|shell|python|py|http|curl)?\s*\n([\s\S]+?)```",
+        _re.M | _re.I,
+    )
+    for m in code_re.finditer(text):
+        chunk = m.group(1)
+        if _re.search(r"\b(curl|POST\s|GET\s|requests\.|wget|http[s]?://)", chunk):
+            return chunk.strip()[:max_chars]
+    # Fallback 2: inline `curl ...` within prose.
+    inline = _re.search(r"`(curl\s+[^`]{20,400})`", text)
+    if inline:
+        return inline.group(1).strip()[:max_chars]
+    return ""
+
+
+def _fetch_advisory_poc(cve: str, refs: list, per_url_bytes: int = 12000, max_fetches: int = 3) -> str:
+    """Fetch GHSA / vendor advisory page bodies and extract the first PoC
+    snippet. Prioritises github advisories, github gists, and nuclei templates
+    (the three places real PoCs are published). Fail-soft on any error.
+
+    Added 2026-10-06 shape-improvement #2 — see `_extract_poc_from_text`.
+    """
+    if not refs:
+        return ""
+    import re as _re
+    import requests as _rq
+
+    def _rank(u: str) -> int:
+        w = 0
+        if "github.com/advisories/" in u or "/security/advisories/" in u: w += 10
+        if "nuclei-templates" in u or u.endswith((".yaml", ".yml")): w += 8
+        if "github.com" in u and "/commit/" in u: w += 5
+        if "gist.github.com" in u: w += 6
+        if "github.com" in u: w += 3
+        if "nvd.nist.gov" in u: w += 1
+        return w
+
+    candidates = sorted(set(refs), key=_rank, reverse=True)[:max_fetches]
+    for url in candidates:
+        if not url or _rank(url) == 0:
+            continue
+        try:
+            r = _rq.get(url, timeout=10, allow_redirects=True,
+                        headers={"User-Agent": "poc-shape-extract/1.0 (+security research)"})
+            if r.status_code != 200:
+                continue
+            body = (r.text or "")[:per_url_bytes]
+        except Exception:  # noqa: BLE001
+            continue
+        snippet = _extract_poc_from_text(body)
+        if snippet:
+            # Prefix the source URL so the operator can audit where the shape came from.
+            return f"[source: {url}]\n{snippet}"
+    return ""
+
+
 def _fetch_cve_details(cve):
     """NVD lookup by cveId (cached in software_research_cache). {cve, description, refs, cvss}."""
     cve = (cve or "").strip().upper()
@@ -13173,6 +13257,17 @@ def _fetch_cve_details(cve):
                         break
     except Exception as e:  # noqa: BLE001
         logging.debug("nvd fetch failed for %s: %s", cve, e)
+    # Shape improvement #2 (2026-10-06): fetch GHSA / advisory page bodies
+    # and extract the real PoC snippet from each. Most GHSA pages have a
+    # `## Proof of Concept` section with a fenced `curl` or Python exploit —
+    # feeding it verbatim to synth lets the LLM start from a known-good shape
+    # instead of inventing endpoints + body formats. Fail-soft: a slow or
+    # missing GHSA page just leaves advisory_poc empty.
+    try:
+        details["advisory_poc"] = _fetch_advisory_poc(cve, details.get("refs") or [])
+    except Exception as _ape:  # noqa: BLE001
+        details["advisory_poc"] = ""
+        logging.debug("advisory_poc extraction failed for %s: %s", cve, _ape)
     try:
         with get_db() as conn, conn.cursor() as cur:
             cur.execute("""INSERT INTO software_research_cache (product,version,source,results,cve_ids)
@@ -14706,10 +14801,25 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
     # effect of the exploit, so "success" proves the CVE's real effect (an admin the
     # exploit CREATED, a value it WROTE/REFLECTED) — not a pre-existing/adjacent state.
     canary = _poc_canary()
+    # Shape improvement #2: when the GHSA advisory included a verbatim PoC
+    # snippet, hand it to synth as a KNOWN_GOOD_SHAPE block. The LLM should
+    # mimic the shape (method/path/body-key/content-type) and only vary the
+    # canary placement. See _fetch_advisory_poc + _extract_poc_from_text.
+    _adv_poc = (details.get("advisory_poc") or "").strip()
+    _adv_poc_block = ""
+    if _adv_poc:
+        _adv_poc_block = (
+            f"\nKNOWN_GOOD_SHAPE_FROM_ADVISORY — this exploit shape was published "
+            f"by the CVE's upstream advisory. MIMIC its method, path, body-key, "
+            f"and content-type verbatim; only vary the canary placement. Do NOT "
+            f"invent a different endpoint — the advisory one is proven to land.\n"
+            f"```\n{_adv_poc[:1500]}\n```\n"
+        )
     prompt = (f"AUTHORIZED lab pentest. Build a proof-of-concept for {cve} on {tgt} "
               f"({product or ''} {version or ''}).\n"
               f"CVE description: {details.get('description') or '(none)'}\n"
-              f"References: {', '.join(details.get('refs') or [])}\n{guidance_extra}\n"
+              f"References: {', '.join(details.get('refs') or [])}\n"
+              f"{_adv_poc_block}{guidance_extra}\n"
               f"{listener_hint}\n"
               f"CRITICAL — anchor the proof to THIS exploit's effect, not pre-existing state. "
               f"Make the PoC CAUSE the exact marker '{canary}' to appear as a DIRECT RESULT of "
@@ -20546,7 +20656,9 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                        extra={"ok": _probe.get("ok"), "method": _probe.get("method"),
                               "url": _probe.get("url"), "status": _probe.get("status"),
                               "reason": _probe.get("reason"),
-                              "skipped": _probe.get("skipped", False)})
+                              "skipped": _probe.get("skipped", False),
+                              "body_preview": _probe.get("body_preview", "")[:500],
+                              "allow_header": _probe.get("allow_header", "")})
             # OOB sink reachability check — exploits that chain
             # `exploit && curl SINK` need the SINK to be alive to produce proof.
             # Operator ask (2026-10-06): "let's work on a check for the oob
@@ -20569,9 +20681,13 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                 # burning a 60 s listener call on it. Record the probe output
                 # as the run's output so the refine loop sees the real
                 # failure reason (endpoint 404) instead of a stale all_404.
+                _bp = (_probe.get("body_preview") or "")[:500]
+                _ah = _probe.get("allow_header") or ""
                 output = (f"PRERUN_PROBE_FAIL method={_probe.get('method')} "
                           f"url={_probe.get('url')} status={_probe.get('status')} "
-                          f"reason={_probe.get('reason')}")
+                          f"reason={_probe.get('reason')}"
+                          + (f"\nPRERUN_PROBE_ALLOW: {_ah}" if _ah else "")
+                          + (f"\nPRERUN_PROBE_BODY: {_bp}" if _bp else ""))
                 ec = 44  # 44 = pre-run endpoint probe failed
                 metrics.setdefault("skipped_runs_prerun_404", 0)
                 metrics["skipped_runs_prerun_404"] += 1
@@ -20586,6 +20702,20 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                 except Exception as e:  # noqa: BLE001
                     output = f"listener error: {e}"; ec = None
                 metrics["target_runs"] += 1
+                # Shape improvement #1 (2026-10-06): when the probe got a
+                # non-2xx status and the server returned a diagnostic body
+                # (`{"detail":"Field required: body.url"}` is typical),
+                # PREPEND it to the output so the refine loop's "last
+                # attempt's response" block carries the server's own shape
+                # hint. The LLM reads this and can swap body/key/method.
+                # Only prepend when the main output is small enough that we
+                # won't blow the refine prompt budget.
+                _probe_bp = (_probe.get("body_preview") or "").strip()
+                _probe_st = _probe.get("status")
+                if (_probe_bp and _probe_st and _probe_st >= 400
+                        and len(output or "") < 4000):
+                    output = (f"PRERUN_PROBE_FEEDBACK status={_probe_st} "
+                              f"body={_probe_bp}\n\n{output}")
             # Never-regress tracking: this iter's command passed the syntax
             # check AND actually ran against the target. Capture it as the
             # last-known-good base — the refine prompt will show it to the
@@ -23624,19 +23754,53 @@ def _prerun_payload_probe(ip, port, command: str, timeout: int = 5) -> dict:
     # Probe. Prefer the exploit's own method so a path that is GET-only but
     # exploited with POST is correctly caught. Use `httpx.request` so any
     # method (POST/PUT/DELETE/PATCH/HEAD/OPTIONS) is first-class.
+    # Shape improvement #1 (2026-10-06): capture the first 500 bytes of the
+    # response body — 400/500 responses usually carry structured errors like
+    # `{"detail":"Field required: body.url"}` that tell the LLM EXACTLY what
+    # shape the server wants. Previously we recorded only `status`, so the
+    # refine loop never saw the server's own error message.
+    # Shape improvement #3 (2026-10-06): also send OPTIONS to read the
+    # `Allow` header. When the server advertises `Allow: GET, HEAD` and the
+    # exploit is POST, we know the path+method combo is dead before running.
+    body_preview = ""
+    allow_header = ""
     try:
         r = _hx.request(method, url, timeout=timeout, verify=False,
                         follow_redirects=False, headers={"User-Agent": "prerun-probe/1.0"})
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "method": method, "url": url, "status": None,
-                "reason": f"probe failed: {type(e).__name__}: {e}"}
+                "reason": f"probe failed: {type(e).__name__}: {e}",
+                "body_preview": "", "allow_header": ""}
     status = r.status_code
+    try:
+        body_preview = (r.text or "")[:500]
+    except Exception:  # noqa: BLE001
+        body_preview = ""
+    # OPTIONS probe (fire-and-forget — not fatal if it fails). Does not block
+    # the main dispatch decision; only enriches the trace.
+    try:
+        o = _hx.request("OPTIONS", url, timeout=max(1, timeout // 2),
+                        verify=False, follow_redirects=False,
+                        headers={"User-Agent": "prerun-probe/1.0"})
+        allow_header = (o.headers.get("Allow") or
+                        o.headers.get("Access-Control-Allow-Methods") or "")
+    except Exception:  # noqa: BLE001
+        pass
     # Treat 404 as a hard-fail; anything else (200/301/400/401/403/405/500) means
     # the server at least recognised the path+method, so the exploit may land.
     if status == 404:
         return {"ok": False, "method": method, "url": url, "status": 404,
-                "reason": f"endpoint 404 on {method} {url} — exploit will all_404"}
-    return {"ok": True, "method": method, "url": url, "status": status}
+                "reason": f"endpoint 404 on {method} {url} — exploit will all_404",
+                "body_preview": body_preview, "allow_header": allow_header}
+    # Soft warning: method isn't in the server's Allow set — exploit will
+    # likely 405 if the server honours its own advertisement.
+    if allow_header and method not in allow_header.upper():
+        return {"ok": True, "method": method, "url": url, "status": status,
+                "body_preview": body_preview, "allow_header": allow_header,
+                "reason": (f"method {method} not in server's Allow: {allow_header!r} — "
+                           f"exploit may 405. Proceeding anyway (some servers lie).")}
+    return {"ok": True, "method": method, "url": url, "status": status,
+            "body_preview": body_preview, "allow_header": allow_header}
 
 
 def _prerun_oob_check(ip, port, command: str, timeout: int = 3) -> dict:
