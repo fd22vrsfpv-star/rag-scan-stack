@@ -283,3 +283,140 @@ def test_contract_pattern_is_in_the_knowledge_file():
     p = next(x for x in d["patterns"] if x["id"] == "artifact_requirements_contract")
     for word in ("needed", "have", "follow_ups", "skill_candidate", "follow_up_items", "build_poc_artifact_required"):
         assert word in p["guidance"], word
+
+
+# ── gather check (operator ask 2026-10-07: "make sure everything is actually
+#    gathered and ready before creating a payload" — strict) ──────────────────
+
+def _load_gather():
+    src = API.read_text(); tree = _ast.parse(src); ns = {"os": os}
+    for node in tree.body:
+        if isinstance(node, _ast.Assign) and getattr(node.targets[0], "id", "") in (
+                "_GATHER_FIELD_REQUIRED_CLASSES", "_GATHER_OOB_CLASSES", "_GATHER_FOLLOW_UP", "_BUILD_POC_GATHER_CHECK"):
+            exec(_ast.get_source_segment(src, node), ns)
+    node = next(x for x in _ast.walk(tree) if isinstance(x, _ast.FunctionDef) and x.name == "_gather_decide")
+    exec(_ast.get_source_segment(src, node), ns)
+    return ns
+
+
+def _items(**st):
+    base = {"target_reachable": "gathered", "vuln_class": "gathered", "endpoint": "gathered", "method": "gathered",
+            "evidence": "gathered", "input_field": "gathered", "auth": "n/a", "oob_sink": "n/a", "artifact": "n/a"}
+    base.update(st)
+    return [{"item": k, "status": v, "value": None, "source": "test"} for k, v in base.items()]
+
+
+def test_gather_decide_ready_when_all_required_gathered():
+    ns = _load_gather()
+    d = ns["_gather_decide"](_items(), "sqli")
+    assert d["ready"] is True and d["missing"] == [] and d["summary"].startswith("READY"), d
+
+
+def test_gather_decide_34359_shape_is_not_ready_on_endpoint_method_field():
+    """Round-2 CVE-2024-34359: endpoint=/ invented, method unknown, field unknown → must NOT be ready."""
+    ns = _load_gather()
+    d = ns["_gather_decide"](_items(endpoint="missing", method="missing", input_field="missing"), "ssti")
+    assert d["ready"] is False and d["missing"] == ["endpoint", "input_field", "method"], d
+    assert len(d["follow_ups"]) == 3 and "OPTIONS" in d["follow_ups"][2]
+
+
+def test_gather_decide_class_specific_requirements():
+    ns = _load_gather()
+    # blind class needs a sink; a non-blind class does not
+    assert ns["_gather_decide"](_items(oob_sink="missing"), "ssrf")["missing"] == ["oob_sink"]
+    assert ns["_gather_decide"](_items(oob_sink="missing"), "auth-bypass")["ready"] is True
+    # injection class needs the field; auth-bypass does not
+    assert ns["_gather_decide"](_items(input_field="missing"), "xss")["missing"] == ["input_field"]
+    assert ns["_gather_decide"](_items(input_field="n/a"), "auth-bypass")["ready"] is True
+    # auth required only when the collector marked it (missing/gathered), never when n/a
+    assert ns["_gather_decide"](_items(auth="missing"), "sqli")["missing"] == ["auth"]
+    # artifact flagged → required
+    assert ns["_gather_decide"](_items(artifact="missing"), "ssti")["missing"] == ["artifact"]
+    # evidence: unverified (description only) is tolerated, missing is not
+    assert ns["_gather_decide"](_items(evidence="unverified"), "sqli")["ready"] is True
+    assert ns["_gather_decide"](_items(evidence="missing"), "sqli")["missing"] == ["evidence"]
+
+
+def test_gather_check_default_is_strict_and_runs_between_plan_verify_and_synth():
+    assert '_BUILD_POC_GATHER_CHECK = (os.environ.get("BUILD_POC_GATHER_CHECK") or "strict")' in API.read_text()
+    g = GRAPH.read_text()
+    assert 'g.add_edge("plan_verify", "gather_check")' in g and 'g.add_edge("gather_check", "synth")' in g
+    assert 'g.add_edge("plan_verify", "synth")' not in g, "the old direct edge must be gone or the check is bypassed"
+
+
+def test_gather_check_halts_synth_and_refine_when_strict_and_not_ready():
+    node = _func_src("node_gather_check", GRAPH)
+    assert 'if mode == "strict" and not man.get("ready")' in node and 'upd["gather_blocked"] = True' in node
+    synth = _func_src("node_synth", GRAPH)
+    i_gate = synth.find('state.get("gather_blocked")'); i_synth = synth.find("_synthesize_cve_poc_with_shadow(")
+    assert 0 < i_gate < i_synth, "synth must check gather_blocked BEFORE calling the LLM"
+    refine = _func_src("node_run_refine", GRAPH)
+    i_g = refine.find('gather_blocked'); i_a = refine.find('built.get("artifact_required")'); i_r = refine.find("_run_refine_poc(")
+    assert 0 < i_g < i_a < i_r
+    assert '"verification_method": "gather_incomplete"' in refine
+
+
+def test_gather_manifest_fills_cheap_gaps_before_judging():
+    body = _func_src("_gather_manifest")
+    for src_name in ("plan_verify", "local_source", "candidate_probe", "cli.options(", "_probe_session_valid(", "_artifact_requirements("):
+        assert src_name in body, f"collector must try {src_name}"
+    assert "_gather_decide(items, vc)" in body
+
+
+def test_gather_manifest_is_recorded_and_injected():
+    rec = _func_src("_record_gather_manifest")
+    assert '"gather_check"' in rec and "'gather_incomplete'" in rec and 'emit_webhook("build_poc_gather_check"' in rec
+    assert "ON CONFLICT (title, COALESCE(target,''), COALESCE(rule_id,''))" in rec
+    node = _func_src("node_gather_check", GRAPH)
+    assert "_gather_manifest_text(man)" in node and '"guidance": guidance' in node, "confirmed facts must reach synth guidance"
+
+
+def test_gather_pattern_is_in_the_knowledge_file():
+    import yaml
+    d = yaml.safe_load(YAML.read_text())
+    p = next(x for x in d["patterns"] if x["id"] == "gather_check_before_payload")
+    for word in ("endpoint", "method", "OOB", "strict", "gather_incomplete", "build_poc_gather_check"):
+        assert word in p["guidance"], word
+
+
+# ── source miner (dynamic, real round-4 strings) ──────────────────────────
+
+ADV_36779 = ('[source: https://github.com/CveSecLook/cve/issues/42]\npython sqlmap.py -u "http://localhost/stock/php_action/editCategories.php" '
+             '--data="editCategoriesName=1&editCategoriesStatus=1&editCategoriesId=7" --method=POST --dbms=mysql --level=5 --risk=3 --batch --dbs --dump')
+DV_4320 = ("{'cve': 'CVE-2024-4320', 'notes': \"AUTO-DERIVED from advisory + patch diff. Evidence: The vulnerability is in the "
+           "'/install_extension' endpoint where the 'name' parameter is passed to ExtensionBuilder().build_extension() without proper sanitization")
+DV_32980 = ("{'cve': 'CVE-2024-32980', 'notes': 'AUTO-DERIVED from advisory + patch diff. Evidence: The fix commit shows that the vulnerable code "
+            "was using the Host header directly in outbound requests without proper sanitization")
+
+
+def test_miner_reads_a_sqlmap_advisory():
+    ns = _load(["_gather_mine_sources"])
+    m = ns["_gather_mine_sources"](ADV_36779, "")
+    assert m["paths"] == ["/stock/php_action/editCategories.php"], m
+    assert m["fields"][:3] == ["editCategoriesName", "editCategoriesStatus", "editCategoriesId"], m
+    assert m["methods"] == ["POST"], m
+
+
+def test_miner_reads_derived_vector_prose():
+    ns = _load(["_gather_mine_sources"])
+    m = ns["_gather_mine_sources"]("", DV_4320)
+    assert "/install_extension" in m["paths"] and m["fields"] == ["name"], m
+    h = ns["_gather_mine_sources"]("", DV_32980)
+    assert h["headers"] == ["Host"] and h["paths"] == [], h
+
+
+def test_collector_uses_mined_paths_fields_methods():
+    body = _func_src("_gather_manifest")
+    assert "_gather_mine_sources(" in body and 'probe_list = list(mined["paths"])' in body
+    assert 'mined["fields"][0]' in body and "(header)" in body and '"advisory_poc"' in body
+    # "/" accepted only on a LIVE verdict
+    assert 'v == "LIVE" and c["endpoint"] not in ("", "none")' in body and 'v == "SUSPECT" and c["endpoint"] not in ("/", "", "none")' in body
+    # header vectors: root accepted as the endpoint when the root answers
+    assert 'if not endpoint and mined["headers"]:' in body and '"root_probe:HTTP' in body
+    assert 'mined from advisory/derived' in _func_src("_gather_manifest_text"), "synth must see every mined field, not just the first"
+
+
+def test_miner_ignores_the_source_citation_url():
+    ns = _load(["_gather_mine_sources"])
+    m = ns["_gather_mine_sources"]("[source: https://github.com/x/y/issues/42]\nnothing else here", "")
+    assert m["paths"] == [] and m["fields"] == [], m

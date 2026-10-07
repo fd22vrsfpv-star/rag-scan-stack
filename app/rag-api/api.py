@@ -13850,6 +13850,394 @@ def _record_artifact_requirements(req: dict, cve: str, ip, port, eid=None, run_i
     return out
 
 
+_BUILD_POC_GATHER_CHECK = (os.environ.get("BUILD_POC_GATHER_CHECK") or "strict").strip().lower()
+_GATHER_FIELD_REQUIRED_CLASSES = {"sqli", "ssrf", "ssti", "lfi", "cmdi", "xss", "idor", "path-traversal", "xxe"}
+_GATHER_OOB_CLASSES = {"ssrf", "xxe", "cmdi"}
+_GATHER_FOLLOW_UP = {
+    "target_reachable": "Confirm the target answers HTTP on this ip:port (container up, port mapped) before anything else.",
+    "vuln_class": "Determine the vulnerability class from the advisory / fix diff / CWE; the crafter cannot pick a payload family without it.",
+    "endpoint": "Find the vulnerable route: local source, the JSON self-documentation at /, forms/links from recon, the advisory PoC, then probe each candidate (not-404).",
+    "method": "Confirm the HTTP method the route accepts (OPTIONS Allow header, or a HEAD/GET/POST probe that is not 405).",
+    "input_field": "Find the parameter / JSON key / multipart field the sink reads: local source request.* accessors, the advisory PoC, discovered params, or the fix diff.",
+    "auth": "Obtain a VALID session (login via the Auth Profile) — the exploit needs authentication and no live session is in hand.",
+    "oob_sink": "Bring up / configure the OOB listener and confirm it is reachable from here; a blind class cannot be verified without it.",
+    "artifact": "Supply the external artifact (see artifact_requirements) — a request body alone cannot reach this sink.",
+    "evidence": "Fetch the advisory PoC / fix diff / derived vector; a bare CVE title is not enough to craft from.",
+}
+
+
+def _gather_mine_sources(advisory_poc: str = "", derived_vector: str = "") -> dict:
+    """PURE: pull endpoint paths, input field names, methods and header
+    names out of the advisory PoC text and the derived vector notes. Real
+    shapes this handles (2026-10-07 round 4):
+      - sqlmap command: `-u "http://host/stock/php_action/editCategories.php"
+        --data="editCategoriesName=1&..." --method=POST`
+      - derived notes: `the '/install_extension' endpoint where the 'name'
+        parameter is passed ...`
+      - derived notes: `using the Host header directly in outbound requests`
+    Returns {"paths": [...], "fields": [...], "methods": [...], "headers": [...]}
+    in discovery order, de-duplicated.
+    """
+    import re as _re
+    # drop the `[source: https://…]` citation line: it is where the PoC came
+    # from, not a path on the target
+    adv = _re.sub(r"\[source:[^\]]*\]", " ", advisory_poc or "")
+    dv = derived_vector or ""
+    paths, fields, methods, headers = [], [], [], []
+    # URLs → paths (advisory first: it is a literal PoC)
+    for m in _re.finditer(r"https?://[^/\s\"'`]+(/[^\s\"'`?#]+)", adv):
+        paths.append(m.group(1))
+    # quoted or backticked path tokens near "endpoint"/"route"/"url"
+    for text in (adv, dv):
+        for m in _re.finditer(r"['\"`](/[A-Za-z0-9_./-]{2,})['\"`]", text):
+            paths.append(m.group(1))
+        for m in _re.finditer(r"(?:endpoint|route|path|url)\s*[=:]\s*['\"`]?(/[A-Za-z0-9_./-]{2,})", text, _re.I):
+            paths.append(m.group(1))
+    # form/query params: --data="a=1&b=2", ?a=1&b=2, -d 'a=1'
+    for m in _re.finditer(r"(?:--data(?:-raw|-binary)?|-d)\s*=?\s*['\"]([^'\"]+)['\"]", adv):
+        for kv in m.group(1).split("&"):
+            if "=" in kv:
+                fields.append(kv.split("=", 1)[0].strip())
+    for m in _re.finditer(r"[?&]([A-Za-z_][\w\[\]]*)=", adv):
+        fields.append(m.group(1))
+    # JSON keys in a literal body
+    for m in _re.finditer(r"[{,]\s*\"([A-Za-z_]\w*)\"\s*:", adv):
+        fields.append(m.group(1))
+    # prose: the 'name' parameter / `id` param / "file" field / key
+    for text in (adv, dv):
+        for m in _re.finditer(r"['\"`]([A-Za-z_][\w\[\]-]*)['\"`]\s*(?:parameter|param|field|key|argument)", text, _re.I):
+            fields.append(m.group(1))
+        for m in _re.finditer(r"(?:parameter|param|field|key)\s+['\"`]([A-Za-z_][\w\[\]-]*)['\"`]", text, _re.I):
+            fields.append(m.group(1))
+    # methods: --method=POST, -X POST, "POST /path"
+    for m in _re.finditer(r"(?:--method[= ]|-X\s+|\b)(GET|POST|PUT|PATCH|DELETE)\b(?=\s+/|\b)", adv, _re.I):
+        methods.append(m.group(1).upper())
+    if _re.search(r"--data|--data-raw|-d\s", adv) and "POST" not in methods:
+        methods.append("POST")
+    # headers: "the Host header", "X-Forwarded-For header"
+    for text in (adv, dv):
+        for m in _re.finditer(r"\b([A-Z][A-Za-z0-9-]{1,30})\s+header\b", text):
+            headers.append(m.group(1))
+    def _uniq(xs):
+        out, seen = [], set()
+        for x in xs:
+            if x and x not in seen:
+                seen.add(x); out.append(x)
+        return out
+    bad_fields = {"http", "https", "localhost", "target"}
+    return {"paths": _uniq(p for p in paths if p not in ("/", "/.", "/..")),
+            "fields": _uniq(f for f in fields if f.lower() not in bad_fields),
+            "methods": _uniq(methods), "headers": _uniq(headers)}
+
+
+def _gather_decide(items: list, vuln_class: str) -> dict:
+    """PURE decision over gathered items (no network): which items are
+    required for this class, which are missing, is the run ready, and the
+    follow-up per missing item. `items` = [{"item", "status", "value",
+    "source"}], status in gathered|missing|unverified|n/a.
+
+    Required for every class: target_reachable, vuln_class, endpoint,
+    method, evidence (at least a description). Plus input_field for
+    injection classes, oob_sink for blind/OOB classes, auth when the
+    exploit needs it (its status is never n/a then), artifact when flagged.
+    `unverified` satisfies only `evidence`; everything else must be
+    `gathered`.
+    """
+    vc = (vuln_class or "unknown").lower()
+    required = {"target_reachable", "vuln_class", "endpoint", "method", "evidence"}
+    if vc in _GATHER_FIELD_REQUIRED_CLASSES:
+        required.add("input_field")
+    if vc in _GATHER_OOB_CLASSES:
+        required.add("oob_sink")
+    by = {i["item"]: i for i in items}
+    for name in ("auth", "artifact"):
+        if by.get(name, {}).get("status") in ("missing", "gathered"):
+            required.add(name)
+    missing = []
+    for name in sorted(required):
+        st = by.get(name, {}).get("status", "missing")
+        ok = st == "gathered" or (name == "evidence" and st == "unverified")
+        if not ok:
+            missing.append(name)
+    follow_ups = [_GATHER_FOLLOW_UP.get(m, f"Gather `{m}`.") for m in missing]
+    gathered = [n for n in sorted(required) if n not in missing]
+    return {"ready": not missing, "required": sorted(required), "missing": missing,
+            "gathered": gathered, "follow_ups": follow_ups,
+            "summary": ("READY — " + ", ".join(gathered)) if not missing
+                       else ("NOT READY — missing: " + ", ".join(missing))}
+
+
+def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan_verdicts=None,
+                     session_info=None, auth=None, analysis=None, recon_text="", run_id=None,
+                     timeout=4) -> dict:
+    """Operator ask 2026-10-07: "make sure everything is actually gathered and
+    ready before creating a payload." Runs AFTER plan_verify (so LIVE/FAKE
+    verdicts exist) and BEFORE synth. Deterministic; every probe is a 2 KB
+    GET/HEAD/OPTIONS against the in-scope target only. Cheap gaps are filled
+    here (local source, JSON self-doc, candidate probe, OPTIONS) before the
+    verdict. Returns the manifest {ready, mode, vuln_class, items[],
+    missing[], follow_ups[], facts{}, summary}.
+    """
+    import httpx as _hx, re as _re
+    port = int(port or 80)
+    scheme = "https" if port in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port}"
+    cookie = (auth or {}).get("_auto_cookie") or (session_info or {}).get("cookie")
+    hdrs = {"Cookie": cookie} if cookie else {}
+    items, facts = [], {}
+
+    def add(item, status, value=None, source=None):
+        items.append({"item": item, "status": status, "value": value, "source": source})
+
+    try:
+        details = _fetch_cve_details(cve) or {}
+    except Exception:  # noqa: BLE001
+        details = {}
+    try:
+        spec = _extract_target_spec(cve, ip, port, product, version, eid, canary="GATHERCHK", details=details)
+    except Exception as _se:  # noqa: BLE001
+        spec = {"vuln_class": "unknown", "description": details.get("description") or "",
+                "candidate_endpoints": [], "input_source": {}, "_spec_error": str(_se)[:120]}
+    vc = (spec.get("vuln_class") or "unknown").lower()
+    ls = _local_source_routes(cve)
+
+    # 1. target reachable
+    try:
+        with _hx.Client(verify=False, timeout=timeout, follow_redirects=False) as cli:
+            r0 = cli.get(base + "/", headers=hdrs)
+        add("target_reachable", "gathered", f"HTTP {r0.status_code}", "probe")
+    except Exception as e:  # noqa: BLE001
+        add("target_reachable", "missing", f"{type(e).__name__}", "probe")
+
+    # 2. vuln class
+    add("vuln_class", "gathered" if vc != "unknown" else "missing", vc, "nvd+classifier")
+
+    # 3. evidence
+    src = spec.get("input_source") or {}
+    if spec.get("advisory_poc") or spec.get("derived_vector") or src.get("evidence_from") == "fix_diff" or ls.get("routes"):
+        add("evidence", "gathered",
+            "; ".join(x for x in [("advisory_poc" if spec.get("advisory_poc") else ""),
+                                  ("derived_vector" if spec.get("derived_vector") else ""),
+                                  ("fix_diff" if src.get("evidence_from") == "fix_diff" else ""),
+                                  ("local_source" if ls.get("routes") else "")] if x), "research")
+    elif spec.get("description"):
+        add("evidence", "unverified", "description only", "nvd")
+    else:
+        add("evidence", "missing", None, "nvd")
+
+    # 4. endpoint (+ param) — plan_verify verdicts first, then local source, then candidate probes
+    endpoint = field = ep_source = None
+    cands = []
+    for m in _re.finditer(r"(PRIMARY|ALT\d):\s+class=(\S+)\s+endpoint=(\S+)\s+param=(\S+)", plan_text or ""):
+        cands.append({"label": m.group(1), "endpoint": m.group(3), "param": m.group(4)})
+    verdicts = plan_verdicts or {}
+    mined = _gather_mine_sources(spec.get("advisory_poc") or "", str(spec.get("derived_vector") or ""))
+    facts["mined"] = mined
+    for c in cands:
+        v = verdicts.get(c["label"])
+        # "/" is accepted only on a LIVE verdict (34359's strategist invented
+        # `endpoint=/` and it was SUSPECT at best); any other path on LIVE/SUSPECT.
+        if (v == "LIVE" and c["endpoint"] not in ("", "none")) or (v == "SUSPECT" and c["endpoint"] not in ("/", "", "none")):
+            endpoint, ep_source = c["endpoint"], f"plan_verify:{v}"
+            if c["param"] not in ("", "none", "-", "n/a"):
+                field = c["param"]
+            break
+    if not endpoint and ls.get("routes"):
+        rt = next((r for r in ls["routes"] if r["path"] != "/"), None)
+        if rt:
+            endpoint, ep_source = rt["path"], "local_source"
+    if not endpoint:
+        probe_list = list(mined["paths"])
+        probe_list += [c for c in (spec.get("candidate_endpoints") or []) if isinstance(c, str) and c.startswith("/") and c != "/"]
+        probe_list += _re.findall(r"Endpoints \(from JSON body\): ([^\n]+)", recon_text or "")[:1] and \
+                      [x.strip() for x in _re.findall(r"Endpoints \(from JSON body\): ([^\n]+)", recon_text or "")[0].split(",")] or []
+        seen = set()
+        try:
+            with _hx.Client(verify=False, timeout=timeout, follow_redirects=False) as cli:
+                for ep in probe_list[:8]:
+                    if ep in seen:
+                        continue
+                    seen.add(ep)
+                    try:
+                        rp = cli.head(base + ep, headers=hdrs)
+                        if rp.status_code == 405:
+                            rp = cli.get(base + ep, headers=hdrs)
+                        if rp.status_code != 404:
+                            endpoint, ep_source = ep, f"candidate_probe:HTTP {rp.status_code}" + (" (advisory/derived path)" if ep in mined["paths"] else "")
+                            break
+                    except Exception:  # noqa: BLE001
+                        continue
+        except Exception:  # noqa: BLE001
+            pass
+    # header-borne vectors (Host / X-Forwarded-For …) ride on any path: the
+    # root is the endpoint when the root answers and nothing better is known
+    if not endpoint and mined["headers"]:
+        try:
+            if r0.status_code < 400:
+                endpoint, ep_source = "/", f"root_probe:HTTP {r0.status_code} (header vector {mined['headers'][0]})"
+        except NameError:
+            pass
+    add("endpoint", "gathered" if endpoint else "missing", endpoint, ep_source)
+    facts["endpoint"] = endpoint
+
+    # 5. method — local source first, else OPTIONS, else HEAD/POST probe
+    method_val = None
+    if endpoint:
+        rt = next((r for r in (ls.get("routes") or []) if r["path"] == endpoint), None)
+        if rt:
+            method_val, m_source = ",".join(rt["methods"]), "local_source"
+        elif mined["methods"] and endpoint in mined["paths"]:
+            method_val, m_source = ",".join(mined["methods"]), "advisory_poc"
+        else:
+            m_source = "probe"
+            try:
+                with _hx.Client(verify=False, timeout=timeout, follow_redirects=False) as cli:
+                    ro = cli.options(base + endpoint, headers=hdrs)
+                    allow = ro.headers.get("allow") or ro.headers.get("access-control-allow-methods")
+                    if allow:
+                        method_val = allow.replace(" ", "")
+                    else:
+                        ok_methods = []
+                        for mth in ("GET", "POST"):
+                            rr = cli.request(mth, base + endpoint, headers=hdrs)
+                            if rr.status_code != 405:
+                                ok_methods.append(mth)
+                        method_val = ",".join(ok_methods) or None
+            except Exception:  # noqa: BLE001
+                pass
+    add("method", "gathered" if method_val else "missing", method_val, m_source if endpoint else None)
+    facts["method"] = method_val
+
+    # 6. input field
+    f_source = "plan_verify" if field else None
+    if not field and ls.get("fields"):
+        fd = ls["fields"][0]
+        field, f_source = fd["name"], f"local_source:{fd['carrier']}"
+    if not field and mined["fields"]:
+        field, f_source = mined["fields"][0], "advisory/derived"
+    if not field and mined["headers"]:
+        field, f_source = f"{mined['headers'][0]} (header)", "derived_vector"
+    if not field and spec.get("advisory_poc"):
+        mm = _re.search(r"[?&]([A-Za-z_][\w\[\]]*)=", spec["advisory_poc"]) or _re.search(r'"([A-Za-z_]\w*)"\s*:', spec["advisory_poc"])
+        if mm:
+            field, f_source = mm.group(1), "advisory_poc"
+    if not field and spec.get("derived_vector"):
+        mm = _re.search(r"param(?:eter)?[=: ]+['\"]?([A-Za-z_][\w\[\]]*)", str(spec["derived_vector"]))
+        if mm:
+            field, f_source = mm.group(1), "derived_vector"
+    add("input_field", "gathered" if field else ("missing" if vc in _GATHER_FIELD_REQUIRED_CLASSES else "n/a"), field, f_source)
+    facts["input_field"] = field
+
+    # 7. auth
+    pre_blob = ""
+    try:
+        pre_blob = " ".join(str(x) for x in ((analysis or {}).get("preconditions") or [])).lower()
+    except Exception:  # noqa: BLE001
+        pass
+    desc = (spec.get("description") or "").lower()
+    needs_auth = any(k in pre_blob for k in ("auth", "login", "session", "logged", "credential", "cookie")) or \
+                 any(k in desc for k in ("authenticated", "logged-in", "logged in", "requires login", "admin privileges", "with admin"))
+    if needs_auth:
+        if cookie:
+            try:
+                valid, why = _probe_session_valid(ip, port, cookie, product=product)
+            except Exception as e:  # noqa: BLE001
+                valid, why = False, f"probe error {type(e).__name__}"
+            add("auth", "gathered" if valid else "missing", why, "session_probe")
+        else:
+            add("auth", "missing", "exploit needs authentication; no session cookie in hand", "analysis")
+    else:
+        add("auth", "n/a", "not required by advisory/preconditions", "analysis")
+
+    # 8. OOB sink
+    sink = spec.get("oob_sink_url")
+    if vc in _GATHER_OOB_CLASSES:
+        if sink:
+            try:
+                with _hx.Client(verify=False, timeout=timeout) as cli:
+                    rs = cli.get(sink)
+                add("oob_sink", "gathered" if rs.status_code < 500 else "missing", f"{sink} HTTP {rs.status_code}", "probe")
+            except Exception as e:  # noqa: BLE001
+                add("oob_sink", "missing", f"{sink} {type(e).__name__}", "probe")
+        else:
+            add("oob_sink", "missing", "no OOB listener configured for this target", "config")
+    else:
+        add("oob_sink", "n/a", sink, "config")
+
+    # 9. artifact
+    if spec.get("artifact_required") and float(src.get("confidence") or 0) >= 0.7:
+        try:
+            areq = _artifact_requirements(cve, ip, port, spec, run_id=run_id)
+        except Exception:  # noqa: BLE001
+            areq = {}
+        add("artifact", "missing", areq.get("summary") or "external artifact required", f"classifier:{src.get('evidence_from')}")
+        facts["artifact_requirements"] = areq
+    else:
+        add("artifact", "n/a", None, "classifier")
+
+    decision = _gather_decide(items, vc)
+    return {"cve": cve, "target": f"{ip}:{port}", "run_id": run_id, "mode": _BUILD_POC_GATHER_CHECK,
+            "vuln_class": vc, "items": items, "facts": facts, **decision}
+
+
+def _gather_manifest_text(man: dict) -> str:
+    """Compact block for the synth prompt: confirmed facts first, then gaps."""
+    lines = [f"GATHER CHECK ({man.get('mode')}): {man.get('summary')}"]
+    for i in man.get("items") or []:
+        if i["status"] in ("gathered", "unverified"):
+            lines.append(f"  [{i['status']}] {i['item']} = {i.get('value')}  (via {i.get('source')})")
+    for i in man.get("items") or []:
+        if i["status"] == "missing":
+            lines.append(f"  [MISSING] {i['item']}: {i.get('value') or ''}")
+    mined = (man.get("facts") or {}).get("mined") or {}
+    if any(mined.get(k) for k in ("paths", "fields", "methods", "headers")):
+        lines.append("  mined from advisory/derived: " + "; ".join(
+            f"{k}={mined[k]}" for k in ("paths", "methods", "fields", "headers") if mined.get(k)))
+    return "\n".join(lines)
+
+
+def _record_gather_manifest(man: dict, cve: str, ip, port, eid=None, run_id=None) -> dict:
+    """Trace always; follow-up row + webhook when NOT ready (idempotent per target)."""
+    import uuid as _u
+    from psycopg2.extras import Json
+    out = {"follow_up_id": None}
+    try:
+        _poc_trace(run_id, "gather_check", response=_gather_manifest_text(man), extra={"gather_manifest": man})
+    except Exception:  # noqa: BLE001
+        pass
+    if not man.get("ready"):
+        title = f"Build-PoC {cve}: gather check incomplete ({', '.join(man.get('missing') or [])})"
+        notes = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(man.get("follow_ups") or []))
+        try:
+            with get_db() as conn, conn.cursor() as cur:
+                cur.execute("""INSERT INTO follow_up_items
+                    (id, finding_source, title, target, severity, reason, priority, flagged_by, rule_id,
+                     confidence, tags, notes, engagement_id, metadata)
+                    VALUES (%s,'build_poc',%s,%s,'medium',%s,'high','build_poc_gather_check','gather_incomplete',
+                            %s,%s,%s,%s,%s)
+                    ON CONFLICT (title, COALESCE(target,''), COALESCE(rule_id,''))
+                    DO UPDATE SET metadata = EXCLUDED.metadata, notes = EXCLUDED.notes,
+                                  reason = EXCLUDED.reason, updated_at = now()
+                    RETURNING id""",
+                    (str(_u.uuid4()), title, man.get("target"), man.get("summary"), 1.0,
+                     ["build-poc", "gather-check"] + [str(m) for m in (man.get("missing") or [])],
+                     notes, (str(eid) if eid else None), Json(man)))
+                row = cur.fetchone(); conn.commit()
+                out["follow_up_id"] = str(row[0]) if row else None
+        except Exception as e:  # noqa: BLE001
+            logging.warning("gather_check follow-up write failed: %s", e)
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("build_poc_gather_check", "build_poc", {
+            "engagement_id": str(eid) if eid else None, "cve": cve, "target": f"{ip}:{port}", "run_id": run_id,
+            "ready": bool(man.get("ready")), "mode": man.get("mode"), "vuln_class": man.get("vuln_class"),
+            "missing": man.get("missing"), "facts": {k: v for k, v in (man.get("facts") or {}).items() if k != "artifact_requirements"},
+            "follow_up_id": out["follow_up_id"]})
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def _rag_hints_for(query: str, top_k: int = 4, sources: list | None = None) -> list:
     """Recall research/refinement patterns from rag_documents for a query.
     Same SQL + raised ivfflat.probes as /rag/knowledge/search. Fail-soft:
