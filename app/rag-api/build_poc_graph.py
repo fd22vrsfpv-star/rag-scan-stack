@@ -60,6 +60,8 @@ class BuildPocState(TypedDict, total=False):
     readiness_blocked: bool           # strict-gate: hard blocker → skip the run-refine loop
     readiness_blockers: List[str]     # why it was blocked (for the result)
     gather_blocked: bool              # strict gather check: required facts missing → skip synth + refine
+    deep_recon_done: bool             # one deeper-recon pass per run (gaps / early stop)
+    deep_recon: Dict[str, Any]        # what the pass ran and found
     gather_manifest: Dict[str, Any]   # the manifest (items/missing/follow_ups/facts) for the result
     cred_hints: List[str]
     admin_paths_mined: List[str]
@@ -1099,6 +1101,16 @@ def node_gather_check(state: BuildPocState) -> Dict[str, Any]:
     except Exception as e:  # noqa: BLE001
         _poc_trace(state["run_id"], "gather_check", response=f"(skipped: {type(e).__name__}: {e})")
         return {}
+    if state.get("deep_recon"):
+        # second pass after deep recon: carry what was tried + the proposed
+        # solutions into the manifest so the follow-up row answers "what do I
+        # need" AND "what could get it" (operator ask 2026-10-07)
+        dr = state.get("deep_recon") or {}
+        man["deep_recon"] = {k: v for k, v in dr.items() if k in ("ran", "seconds", "skipped", "solutions")}
+        if dr.get("solutions"):
+            man["follow_ups"] = (man.get("follow_ups") or []) + [
+                f"[{g}] " + "; ".join(x.get("solution", "") for x in (v or [])[:3])
+                for g, v in dr["solutions"].items() if g in (man.get("missing") or [])]
     rec = _record_gather_manifest(man, state["cve"], state["ip"], state["port"],
                                   eid=state.get("eid"), run_id=state["run_id"])
     guidance = (_gather_manifest_text(man) + "\n" + (state.get("guidance") or "")).strip()
@@ -1109,6 +1121,38 @@ def node_gather_check(state: BuildPocState) -> Dict[str, Any]:
                                                               "signal": man.get("summary")}}}
     if mode == "strict" and not man.get("ready"):
         upd["gather_blocked"] = True
+    return upd
+
+
+def node_deep_recon(state: BuildPocState) -> Dict[str, Any]:
+    """2026-10-07 (operator ask): when the gather check leaves gaps, or the run
+    stops at 0 / early iterations without success, run a deeper recon and a
+    broader set of scans targeted at the gaps (default-credential check +
+    limited spray, authenticated crawl, access inventory, ZAP spider, arjun,
+    verb sweep), then go around ONCE more: gather_check → synth → run_refine."""
+    from api import _deep_recon_for_gaps, _poc_trace
+    man = state.get("gather_manifest") or {}
+    res = _deep_recon_for_gaps(
+        state["cve"], state["ip"], state["port"], state.get("product"), state.get("eid"), state["run_id"], man,
+        auth=state.get("auth"), session_info=state.get("session_info"),
+        cred_hints=state.get("cred_hints"), admin_paths=state.get("admin_paths_mined"),
+        recon_text=" ".join(state.get("segments") or [])[:30000], id_pool=state.get("id_pool") or {})
+    _poc_trace(state["run_id"], "deep_recon",
+               response=f"ran={res.get('ran')} ids={list((res.get('id_pool') or {}).keys())[:8]} "
+                        f"paths={len(res.get('candidate_paths') or [])} session={bool((res.get('auth') or {}).get('_auto_cookie'))} "
+                        f"seconds={res.get('seconds')} skipped={res.get('skipped')}",
+               extra={"deep_recon": {k: v for k, v in res.items() if k != "segments"}})
+    upd: Dict[str, Any] = {"deep_recon_done": True, "deep_recon": {k: v for k, v in res.items() if k != "segments"},
+                           "segments": res.get("segments") or [],
+                           "id_pool": {**(state.get("id_pool") or {}), **(res.get("id_pool") or {})},
+                           "gather_blocked": False,
+                           "recon_metrics": {**state.get("recon_metrics", {}),
+                                             "deep_recon": {"seconds": res.get("seconds"), "steps": res.get("ran"),
+                                                            "signal": "deeper recon after a gap / early stop"}}}
+    if res.get("auth"):
+        upd["auth"] = res["auth"]
+    if res.get("session_info"):
+        upd["session_info"] = res["session_info"]
     return upd
 
 
@@ -1520,6 +1564,7 @@ def build_graph():
 
     # Synth + execution + save
     g.add_node("gather_check", node_gather_check)
+    g.add_node("deep_recon", node_deep_recon)
     g.add_node("synth", node_synth)
     g.add_node("run_refine", node_run_refine)
     g.add_node("save_store", node_save_store)
@@ -1594,9 +1639,29 @@ def build_graph():
     g.add_edge("assemble_guidance", "strategist")
     g.add_edge("strategist", "plan_verify")
     g.add_edge("plan_verify", "gather_check")
-    g.add_edge("gather_check", "synth")
+    # Gaps → one deeper-recon pass → gather again; early/0-iteration stop → same pass → go around once.
+    def _route_after_gather(state):
+        from api import _BUILD_POC_DEEP_RECON
+        man = state.get("gather_manifest") or {}
+        if (_BUILD_POC_DEEP_RECON == "on" and state.get("gather_blocked") and not state.get("deep_recon_done")
+                and set(man.get("missing") or []) - {"artifact"}):
+            return "deep_recon"
+        return "synth"
+    g.add_conditional_edges("gather_check", _route_after_gather,
+                            {"deep_recon": "deep_recon", "synth": "synth"})
+    g.add_edge("deep_recon", "gather_check")
     g.add_edge("synth", "run_refine")
-    g.add_edge("run_refine", "save_store")
+
+    def _route_after_refine(state):
+        from api import _BUILD_POC_DEEP_RECON, _BUILD_POC_EARLY_STOP_ITERS
+        res = state.get("result") or {}
+        early = (not res.get("success")) and int(res.get("iterations") or 0) <= _BUILD_POC_EARLY_STOP_ITERS
+        if (_BUILD_POC_DEEP_RECON == "on" and early and not state.get("deep_recon_done")
+                and not res.get("artifact_required")):
+            return "deep_recon"
+        return "save_store"
+    g.add_conditional_edges("run_refine", _route_after_refine,
+                            {"deep_recon": "deep_recon", "save_store": "save_store"})
     g.add_edge("save_store", "tool_handoff")
     g.add_edge("tool_handoff", END)
 

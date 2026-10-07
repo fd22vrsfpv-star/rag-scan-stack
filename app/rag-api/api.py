@@ -14136,6 +14136,282 @@ def _parse_openapi_paths_line(recon_text: str) -> list:
     return out
 
 
+_BUILD_POC_DEEP_RECON = (os.environ.get("BUILD_POC_DEEP_RECON") or "on").strip().lower()
+_BUILD_POC_EARLY_STOP_ITERS = int(os.environ.get("BUILD_POC_EARLY_STOP_ITERS") or "2")
+_BUILD_POC_DEEP_RECON_BUDGET_SEC = int(os.environ.get("BUILD_POC_DEEP_RECON_BUDGET_SEC") or "480")
+
+
+def _deep_recon_plan(missing: list, has_session: bool, vuln_class: str = "") -> list:
+    """PURE: which broader scans to run, in order, for the gaps a gather check
+    (or an early-stopped run) left. Operator ask 2026-10-07: "if we get to 0
+    iterations or early, do a deeper recon and broader set of scans — e.g.
+    look up the common default accounts/passwords or do a limited spray".
+
+    Steps (each maps to one bounded helper in `_deep_recon_for_gaps`):
+      default_creds     — product/common default pairs via run_default_cred_check
+                          (max_auto_attempts / approval above it); mined creds
+      auth_crawl        — Playwright crawl WITH the session (ids live behind login)
+      access_inventory  — post-login object inventory (ids, scripts, users)
+      zap_spider        — unauthenticated spider (paths, forms)
+      arjun_params      — parameter discovery on the known/crawled endpoints
+      verb_sweep        — OPTIONS/GET/POST/PUT/DELETE on candidate endpoints
+    An `artifact` gap is not a recon gap: nothing is planned for it.
+    """
+    m = set(missing or [])
+    steps: list = []
+    if "artifact" in m and m <= {"artifact"}:
+        return steps
+    needs_login = ("auth" in m) or (not has_session and ("endpoint_id" in m or "endpoint" in m))
+    if needs_login:
+        steps.append("default_creds")
+    if "endpoint_id" in m or "endpoint" in m:
+        steps += ["auth_crawl", "access_inventory", "zap_spider"]
+    if "input_field" in m:
+        steps.append("arjun_params")
+    if "method" in m or "endpoint" in m:
+        steps.append("verb_sweep")
+    if not steps:
+        # early stop with a READY manifest: widen the surface anyway
+        steps = ["auth_crawl", "zap_spider", "arjun_params"]
+    out = []
+    for st in steps:
+        if st not in out:
+            out.append(st)
+    return out
+
+
+_BUILD_POC_GAP_SOLUTIONS_LLM = (os.environ.get("BUILD_POC_GAP_SOLUTIONS_LLM") or "on").strip().lower()
+_DEEP_RECON_STEPS = ("default_creds", "auth_crawl", "access_inventory", "zap_spider", "arjun_params", "verb_sweep")
+_GAP_SOLUTIONS = {
+    "auth": [
+        ("documented default accounts for the product + the common pairs, bounded by max_auto_attempts", "default_creds"),
+        ("credentials mined from README/docs/config files seen during recon", "default_creds"),
+        ("a limited spray above the auto cap — parked for operator approval, never fired unattended", None),
+        ("self-registration or password-reset flow if the app exposes one", "auth_crawl"),
+        ("for the auth-bypass class: the mechanism the fix diff names (e.g. a known signing secret) IS the exploit — the session is its output", None),
+    ],
+    "endpoint": [
+        ("the target's own route table: OpenAPI/swagger document, local source, JSON self-documentation at /", "zap_spider"),
+        ("an authenticated crawl — most routes only render after login", "auth_crawl"),
+        ("the advisory path with its deployment prefix stripped, probed with every verb", "verb_sweep"),
+    ],
+    "endpoint_id": [
+        ("the listing/index route that enumerates the objects (instances, users, items) — needs the session", "access_inventory"),
+        ("ids in links of the authenticated crawl (/thing/<id>)", "auth_crawl"),
+        ("the root redirect Location and any id-bearing URL in recon", "zap_spider"),
+    ],
+    "method": [("OPTIONS Allow header, then a verb sweep (404 and 405 both mean 'try the next')", "verb_sweep")],
+    "input_field": [
+        ("parameter discovery on the known endpoints (arjun)", "arjun_params"),
+        ("request.* accessors in local source; form fields from the crawl; the advisory PoC body", "auth_crawl"),
+    ],
+    "oob_sink": [("bring the OOB listener up / confirm it is reachable from the target's network; or verify in-band via a body diff", None)],
+    "evidence": [("fetch the advisory PoC, the fix commits' diff, exploit-db/searchsploit entries, the vendor advisory", None)],
+    "artifact": [("supply the external artifact per artifact_requirements (format, payload location, tooling)", None)],
+}
+
+
+def _solutions_for_gaps(missing: list, *, product: str = "", vuln_class: str = "", facts: dict | None = None,
+                        has_session: bool = False, use_llm: bool | None = None, model=None, run_id=None) -> dict:
+    """The "ask what do I need, then come up with solutions" step (operator,
+    2026-10-07). Deterministic table first, RAG recall of the knowledge base
+    second, an optional LLM ask third (fail-soft, caller `gap_solutions`).
+    Every solution carries its source and, when the pipeline can run it, the
+    deep-recon step name; the rest become operator follow-ups. Returns
+    {"question", "needs", "solutions": {gap: [...]}, "plan": [...steps]}.
+    """
+    needs = [m for m in (missing or [])]
+    sols: dict = {}
+    for gap in needs:
+        sols[gap] = [{"solution": txt, "step": step, "source": "table"} for txt, step in _GAP_SOLUTIONS.get(gap, [])]
+        try:
+            for h in _rag_hints_for(f"how to obtain {gap} for {product or 'the target'} {vuln_class} exploit recon", top_k=2) or []:
+                title = (h.get("title") or "")[:120]
+                if title:
+                    sols[gap].append({"solution": title, "step": None, "source": "rag", "similarity": h.get("similarity")})
+        except Exception:  # noqa: BLE001
+            pass
+    use_llm = _BUILD_POC_GAP_SOLUTIONS_LLM == "on" if use_llm is None else use_llm
+    if use_llm and needs:
+        try:
+            prompt = (
+                "AUTHORIZED lab pentest, data-gathering only. A PoC build is STUCK: these facts are missing: "
+                f"{needs}. Known facts: {str({k: v for k, v in (facts or {}).items() if k != 'mined'})[:600]}. "
+                f"Product: {product or 'unknown'}; vulnerability class: {vuln_class or 'unknown'}; session: {has_session}. "
+                "For EACH missing item propose up to 3 ways to OBTAIN it (reconnaissance / enumeration / documentation / "
+                "default-credential lookup), most likely first. Map each to one executable step name from "
+                f"{list(_DEEP_RECON_STEPS)} when one fits, else null. Return ONLY a JSON list of objects "
+                "{\"gap\": str, \"solution\": str, \"step\": str|null}. No prose.")
+            res = _llm_for_model(prompt, model=model, caller="gap_solutions")
+            text = res.get("response", "") if isinstance(res, dict) else str(res or "")
+            obj = _poc_extract_json(text)
+            items = obj if isinstance(obj, list) else (obj.get("solutions") if isinstance(obj, dict) else None)
+            for it in (items or [])[:15]:
+                if not isinstance(it, dict) or it.get("gap") not in sols:
+                    continue
+                step = it.get("step") if it.get("step") in _DEEP_RECON_STEPS else None
+                sols[it["gap"]].append({"solution": str(it.get("solution") or "")[:200], "step": step, "source": "llm"})
+        except Exception as e:  # noqa: BLE001
+            logging.debug("gap_solutions llm failed: %s", e)
+    plan = _deep_recon_plan(needs, has_session, vuln_class)
+    for gap in needs:
+        for s_ in sols[gap]:
+            if s_.get("step") and s_["step"] not in plan:
+                plan.append(s_["step"])
+    out = {"question": "What do I need?", "needs": needs, "solutions": sols, "plan": plan}
+    if run_id:
+        try:
+            _poc_trace(run_id, "deep_recon:solutions",
+                       response="\n".join(f"{g}: " + "; ".join(x["solution"][:90] + (f" [{x['step']}]" if x.get("step") else "") for x in sols[g][:5]) for g in needs)[:2000],
+                       extra={"gap_solutions": out})
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def _deep_recon_for_gaps(cve, ip, port, product, eid, run_id, manifest: dict, *, auth=None,
+                         session_info=None, cred_hints=None, admin_paths=None, recon_text="",
+                         id_pool=None, budget_sec=None) -> dict:
+    """Execute the deep-recon plan. Fail-closed on authorization (re-checks the
+    PoC grant), bounded by a wall budget and by each helper's own caps. Every
+    step is traced `deep_recon:<step>`. Returns what the gather check needs
+    next: {"ran": [...], "segments": [...], "id_pool": {...}, "auth": {...},
+    "session_info": {...}|None, "candidate_paths": [...], "seconds": n,
+    "skipped": reason|None}.
+    """
+    import time as _t, httpx as _hx
+    t0 = _t.time()
+    budget = int(budget_sec or _BUILD_POC_DEEP_RECON_BUDGET_SEC)
+    out = {"ran": [], "segments": [], "id_pool": dict(id_pool or {}), "auth": dict(auth or {}),
+           "session_info": session_info, "candidate_paths": [], "seconds": 0, "skipped": None}
+    try:
+        if not _poc_grant_active(ip, port):
+            out["skipped"] = "no active PoC grant for this target (fail-closed)"
+            return out
+    except Exception as _ge:  # noqa: BLE001
+        out["skipped"] = f"grant check failed: {type(_ge).__name__}"
+        return out
+    missing = list((manifest or {}).get("missing") or [])
+    si = session_info if isinstance(session_info, dict) else {}
+    cookie = (auth or {}).get("_auto_cookie") or si.get("cookie_header")
+    # "What do I need?" → solutions (table + RAG + LLM) → the executable ones become the plan
+    sol = _solutions_for_gaps(missing, product=product or "", vuln_class=(manifest or {}).get("vuln_class") or "",
+                              facts=(manifest or {}).get("facts") or {}, has_session=bool(cookie), run_id=run_id)
+    out["solutions"] = sol.get("solutions") or {}
+    plan = sol.get("plan") or _deep_recon_plan(missing, bool(cookie), (manifest or {}).get("vuln_class") or "")
+    _poc_trace(run_id, "deep_recon:plan", response=f"missing={missing} steps={plan}",
+               extra={"missing": missing, "steps": plan, "has_session": bool(cookie)})
+    all_text = recon_text or ""
+
+    def _left():
+        return budget - (_t.time() - t0)
+
+    for step in plan:
+        if _left() <= 0:
+            _poc_trace(run_id, "deep_recon:budget_exhausted", response=f"after {out['ran']}")
+            break
+        st0 = _t.time()
+        note = ""
+        try:
+            if step == "default_creds":
+                # 1. product + common default pairs (bounded by default_cred_check.yaml;
+                #    a large spray is parked for approval, never fired unattended)
+                res = _establish_session_for_build(ip, port, {**(auth or {}), "bruteforce": True}, eid, product=product)
+                if res and res.get("cookie_header"):
+                    cookie = res["cookie_header"]
+                    out["session_info"] = res
+                    out["auth"]["_auto_cookie"] = cookie
+                    note = f"session established via default credentials (user {res.get('username')})"
+                else:
+                    note = "no default credential pair worked: " + str((res or {}).get("note") or "")[:160]
+                    # 2. credentials mined from docs/READMEs during recon
+                    if cred_hints:
+                        login = _try_mined_credentials(ip, port, cred_hints, admin_paths or [])
+                        if login and login.get("cookie_header"):
+                            cookie = login["cookie_header"]
+                            out["auth"]["_auto_cookie"] = cookie
+                            out["session_info"] = {"ok": True, "cookie_header": cookie,
+                                                   "username": (login.get("cred") or "?"), "method": "mined"}
+                            note += f"; mined credential worked at {login.get('path')}"
+            elif step == "auth_crawl":
+                a = {**(auth or {}), **({"_auto_cookie": cookie} if cookie else {})}
+                txt, urls = _playwright_sitemap(ip, port, auth=a, timeout=min(180, max(30, int(_left()))))
+                if txt:
+                    out["segments"].append(txt)
+                    all_text += "\n" + txt
+                out["candidate_paths"] += [u for u in (urls or []) if isinstance(u, str)][:60]
+                note = f"{len(urls or [])} urls ({'authenticated' if cookie else 'unauthenticated'} crawl)"
+            elif step == "access_inventory":
+                if not cookie:
+                    note = "skipped: no session"
+                else:
+                    inv = _enumerate_access_inventory(ip, port, product=product, auth=auth, session_cookie=cookie)
+                    if inv:
+                        out["id_pool"].update(_collect_id_pool("", inv, None))
+                        out["segments"].append("ACCESS INVENTORY (deep recon): " + str(inv)[:1500])
+                        all_text += "\n" + str(inv)[:4000]
+                    note = f"inventory keys={list((inv or {}).keys())[:8]}"
+            elif step == "zap_spider":
+                z = _zap_recon(ip, port, spider_timeout=min(120, max(30, int(_left()))))
+                paths = _extract_zap_paths(z) if z else []
+                if z:
+                    out["segments"].append(z)
+                    all_text += "\n" + z
+                out["candidate_paths"] += paths[:60]
+                note = f"{len(paths)} spidered paths"
+            elif step == "arjun_params":
+                targets = [x for x in ([(manifest or {}).get("facts", {}).get("endpoint")] + out["candidate_paths"]) if x][:5]
+                if not targets:
+                    note = "skipped: no endpoints to probe"
+                else:
+                    txt, per_path = _scout_arjun_paths(ip, port, targets, max_targets=3,
+                                                       timeout_per_path=min(45, max(15, int(_left() / 3))))
+                    if txt:
+                        out["segments"].append(txt)
+                        all_text += "\n" + txt
+                    note = f"{sum(len(v or []) for v in (per_path or {}).values())} params on {len(per_path or {})} paths"
+            elif step == "verb_sweep":
+                targets = [x for x in ([(manifest or {}).get("facts", {}).get("endpoint")] + out["candidate_paths"]) if x][:8]
+                base = f"{'https' if int(port) in (443, 8443) else 'http'}://{ip}:{port}"
+                lines = []
+                with _hx.Client(verify=False, timeout=4, follow_redirects=False,
+                                headers={"Cookie": cookie} if cookie else {}) as cli:
+                    for tp in targets:
+                        allowed = []
+                        for mth in ("GET", "POST", "PUT", "DELETE", "PATCH"):
+                            try:
+                                rr = cli.request(mth, base + tp)
+                                if rr.status_code not in (404, 405, 501):
+                                    allowed.append(f"{mth}:{rr.status_code}")
+                            except Exception:  # noqa: BLE001
+                                continue
+                        if allowed:
+                            lines.append(f"  {tp} -> {' '.join(allowed)}")
+                if lines:
+                    seg = "VERB SWEEP (deep recon; method:status per path):\n" + "\n".join(lines)
+                    out["segments"].append(seg)
+                    all_text += "\n" + seg
+                note = f"{len(lines)} paths answer a non-GET verb"
+            out["ran"].append(step)
+        except Exception as e:  # noqa: BLE001
+            note = f"error {type(e).__name__}: {str(e)[:120]}"
+        _poc_trace(run_id, f"deep_recon:{step}", response=note[:1200],
+                   extra={"seconds": round(_t.time() - st0, 2)})
+    # ids from everything we crawled
+    out["id_pool"].update({k: v for k, v in _collect_id_pool(all_text).items() if k not in out["id_pool"]})
+    out["seconds"] = round(_t.time() - t0, 2)
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("build_poc_deep_recon", "build_poc", {
+            "engagement_id": str(eid) if eid else None, "cve": cve, "target": f"{ip}:{port}", "run_id": run_id,
+            "missing": missing, "steps": out["ran"], "session": bool(cookie),
+            "ids": list(out["id_pool"].keys())[:10], "candidate_paths": len(out["candidate_paths"]),
+            "seconds": out["seconds"]})
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def _gather_decide(items: list, vuln_class: str) -> dict:
     """PURE decision over gathered items (no network): which items are
     required for this class, which are missing, is the run ready, and the

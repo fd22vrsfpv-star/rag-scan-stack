@@ -597,3 +597,86 @@ def test_refine_loop_sees_gathered_facts_and_reask_keeps_context():
 def test_miner_ignores_stopword_tokens_as_fields():
     ns = _load(["_gather_mine_sources"])
     assert ns["_gather_mine_sources"]("", "the value passed 'in' parameter form is unsafe")["fields"] == []
+
+
+# ── deep recon on gaps / early stop (operator ask 2026-10-07) ─────────────
+
+def _load_deep():
+    src = API.read_text(); tree = _ast.parse(src); ns = {"os": os}
+    for node in tree.body:
+        if isinstance(node, _ast.Assign) and getattr(node.targets[0], "id", "") in ("_BUILD_POC_DEEP_RECON", "_BUILD_POC_EARLY_STOP_ITERS", "_BUILD_POC_DEEP_RECON_BUDGET_SEC"):
+            exec(_ast.get_source_segment(src, node), ns)
+    node = next(x for x in _ast.walk(tree) if isinstance(x, _ast.FunctionDef) and x.name == "_deep_recon_plan")
+    exec(_ast.get_source_segment(src, node), ns)
+    return ns
+
+
+def test_deep_recon_plan_3408_shape_tries_default_creds_then_authenticated_enumeration():
+    """CVE-2024-3408 round 6: missing endpoint, endpoint_id, method; no session."""
+    ns = _load_deep()
+    plan = ns["_deep_recon_plan"](["endpoint", "endpoint_id", "method"], has_session=False, vuln_class="auth-bypass")
+    assert plan[0] == "default_creds", plan
+    assert plan[1:4] == ["auth_crawl", "access_inventory", "zap_spider"] and plan[-1] == "verb_sweep", plan
+
+
+def test_deep_recon_plan_is_targeted_and_bounded():
+    ns = _load_deep()
+    assert ns["_deep_recon_plan"](["artifact"], True) == [], "an artifact gap is not a recon gap"
+    assert ns["_deep_recon_plan"](["input_field"], True) == ["arjun_params"]
+    assert ns["_deep_recon_plan"](["auth"], False)[0] == "default_creds"
+    with_session = ns["_deep_recon_plan"](["endpoint_id"], True)
+    assert "default_creds" not in with_session and with_session[0] == "auth_crawl"
+    assert ns["_deep_recon_plan"]([], True) == ["auth_crawl", "zap_spider", "arjun_params"], "early stop with a READY manifest still widens the surface"
+    assert len(set(ns["_deep_recon_plan"](["auth", "endpoint", "endpoint_id", "method", "input_field"], False))) == 6
+
+
+def test_deep_recon_executor_is_gated_bounded_and_reuses_the_credential_checker():
+    body = _func_src("_deep_recon_for_gaps")
+    assert "_poc_grant_active(ip, port)" in body and "fail-closed" in body
+    assert "_BUILD_POC_DEEP_RECON_BUDGET_SEC" in body and "budget_exhausted" in body
+    assert '"bruteforce": True' in body and "_establish_session_for_build(" in body, "default creds go through run_default_cred_check (max_auto_attempts / approval)"
+    assert "_try_mined_credentials(" in body and "_playwright_sitemap(" in body and "_enumerate_access_inventory(" in body
+    assert "_zap_recon(" in body and "_scout_arjun_paths(" in body and "VERB SWEEP" in body
+    assert 'emit_webhook("build_poc_deep_recon"' in body and '"deep_recon:plan"' in body
+
+
+def test_graph_loops_once_through_deep_recon_on_gaps_and_early_stop():
+    g = GRAPH.read_text()
+    assert 'g.add_node("deep_recon", node_deep_recon)' in g
+    assert 'g.add_conditional_edges("gather_check", _route_after_gather' in g and 'g.add_edge("deep_recon", "gather_check")' in g
+    assert 'g.add_conditional_edges("run_refine", _route_after_refine' in g
+    assert 'g.add_edge("gather_check", "synth")' not in g and 'g.add_edge("run_refine", "save_store")' not in g
+    assert 'not state.get("deep_recon_done")' in g, "exactly one pass per run"
+    assert 'set(man.get("missing") or []) - {"artifact"}' in g, "an artifact-only gap must not trigger recon"
+    assert 'int(res.get("iterations") or 0) <= _BUILD_POC_EARLY_STOP_ITERS' in g
+    node = _func_src("node_deep_recon", GRAPH)
+    assert '"deep_recon_done": True' in node and '"gather_blocked": False' in node
+    assert '_BUILD_POC_EARLY_STOP_ITERS = int(os.environ.get("BUILD_POC_EARLY_STOP_ITERS") or "2")' in API.read_text()
+
+
+def test_solutions_step_asks_what_do_i_need_and_maps_executable_steps():
+    """Operator: 'when stuck, ask what do I need and come up with solutions'."""
+    src = API.read_text(); tree = _ast.parse(src); ns = {"os": os, "logging": __import__("logging")}
+    for node in tree.body:
+        if isinstance(node, _ast.Assign) and getattr(node.targets[0], "id", "") in (
+                "_BUILD_POC_GAP_SOLUTIONS_LLM", "_DEEP_RECON_STEPS", "_GAP_SOLUTIONS"):
+            exec(_ast.get_source_segment(src, node), ns)
+    for name in ("_deep_recon_plan", "_solutions_for_gaps"):
+        node = next(x for x in _ast.walk(tree) if isinstance(x, _ast.FunctionDef) and x.name == name)
+        exec(_ast.get_source_segment(src, node), ns)
+    out = ns["_solutions_for_gaps"](["auth", "endpoint_id"], product="dtale", vuln_class="auth-bypass",
+                                    has_session=False, use_llm=False)
+    assert out["question"] == "What do I need?" and out["needs"] == ["auth", "endpoint_id"]
+    assert all(s["source"] == "table" for s in out["solutions"]["auth"]), "RAG/LLM are additive; table always present"
+    assert out["solutions"]["auth"][0]["step"] == "default_creds"
+    assert any(s["step"] is None for s in out["solutions"]["auth"]), "non-executable solutions stay as operator follow-ups"
+    assert out["plan"][0] == "default_creds" and "access_inventory" in out["plan"]
+    assert set(out["plan"]) <= set(ns["_DEEP_RECON_STEPS"])
+
+
+def test_deep_pass_runs_the_solutions_step_and_second_manifest_carries_them():
+    body = _func_src("_deep_recon_for_gaps")
+    assert "_solutions_for_gaps(missing" in body and 'out["solutions"]' in body
+    assert 'caller="gap_solutions"' in _func_src("_solutions_for_gaps")
+    g = _func_src("node_gather_check", GRAPH)
+    assert 'man["deep_recon"]' in g and 'dr["solutions"]' in g
