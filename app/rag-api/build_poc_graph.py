@@ -1142,7 +1142,10 @@ def node_deep_recon(state: BuildPocState) -> Dict[str, Any]:
                         f"paths={len(res.get('candidate_paths') or [])} session={bool((res.get('auth') or {}).get('_auto_cookie'))} "
                         f"seconds={res.get('seconds')} skipped={res.get('skipped')}",
                extra={"deep_recon": {k: v for k, v in res.items() if k != "segments"}})
+    from api import _BUILD_POC_SECOND_PASS_ITERS
     upd: Dict[str, Any] = {"deep_recon_done": True, "deep_recon": {k: v for k, v in res.items() if k != "segments"},
+                           # the go-around is a SECOND chance, not a second budget (round 11: 50 more iterations)
+                           "max_iters": min(int(state.get("max_iters") or 0) or _BUILD_POC_SECOND_PASS_ITERS, _BUILD_POC_SECOND_PASS_ITERS),
                            "segments": res.get("segments") or [],
                            "id_pool": {**(state.get("id_pool") or {}), **(res.get("id_pool") or {})},
                            "gather_blocked": False,

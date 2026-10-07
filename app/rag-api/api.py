@@ -14188,6 +14188,7 @@ def _parse_openapi_paths_line(recon_text: str) -> list:
 _BUILD_POC_DEEP_RECON = (os.environ.get("BUILD_POC_DEEP_RECON") or "on").strip().lower()
 _BUILD_POC_EARLY_STOP_ITERS = int(os.environ.get("BUILD_POC_EARLY_STOP_ITERS") or "2")
 _BUILD_POC_DEEP_RECON_BUDGET_SEC = int(os.environ.get("BUILD_POC_DEEP_RECON_BUDGET_SEC") or "480")
+_BUILD_POC_SECOND_PASS_ITERS = int(os.environ.get("BUILD_POC_SECOND_PASS_ITERS") or "10")
 
 
 def _deep_recon_plan(missing: list, has_session: bool, vuln_class: str = "") -> list:
@@ -14220,8 +14221,10 @@ def _deep_recon_plan(missing: list, has_session: bool, vuln_class: str = "") -> 
     if "method" in m or "endpoint" in m:
         steps.append("verb_sweep")
     if not steps:
-        # early stop with a READY manifest: widen the surface anyway
-        steps = ["auth_crawl", "zap_spider", "arjun_params"]
+        # early stop with a READY manifest: widen the surface anyway — and
+        # without a session the bounded default-credential check comes first
+        # (round 11: the widen set ran unauthenticated and found nothing)
+        steps = ([] if has_session else ["default_creds"]) + ["auth_crawl", "zap_spider", "arjun_params"]
     out = []
     for st in steps:
         if st not in out:
@@ -21892,7 +21895,7 @@ def _live_verify_recipe(ip, port, spec, timeout=30):
     on proof_model: timing (scaling-confirmed) | read_back (single-request canary)
     | read_back_after_action (two-request exploit→read-back) | oob_callback
     (listener catches target's outbound hit). Returns {verified, method, evidence}."""
-    import time as _t
+    import time as _t, re as _re
     tmpl = (spec.get("injection") or {}).get("payload_template", "")
     req = spec.get("request") or {}
     # Pre-requests chain: run spec.pre_requests[] in order, capturing values
@@ -23226,12 +23229,17 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                 _cu = _command_credential_unsourced(command, known_values=list(_known_cred_values or []))
                 if _cu.get("unsourced"):
                     metrics["credential_unsourced"] = metrics.get("credential_unsourced", 0) + 1
+                    _cu_key = hash(tuple(sorted(_cu.get("kinds") or [])) + (command[:400],))
+                    _seen_cu = metrics.setdefault("_credential_unsourced_seen", [])
+                    if _cu_key in _seen_cu:
+                        raise StopIteration  # already traced this exact command's credential
+                    _seen_cu.append(_cu_key)
                     _poc_trace(run_id, "credential_unsourced", iteration=it,
                                extra={"kinds": _cu.get("kinds"),
                                       "note": "the command carries a session/auth credential that no recon "
                                               "or login step produced (advisory; legitimate only for the "
                                               "auth-bypass class where the token IS the exploit)"})
-            except Exception:  # noqa: BLE001
+            except (Exception, StopIteration):  # noqa: BLE001
                 pass
             try:
                 _probe = _prerun_payload_probe(ip, port, command, timeout=5)
