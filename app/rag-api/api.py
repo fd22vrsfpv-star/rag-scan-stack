@@ -13559,16 +13559,22 @@ def _classify_input_source(details: dict | None, fix_diff_text: str = "") -> dic
     "evidence": str}.
     """
     import re as _re
-    text = " ".join([(details or {}).get("description") or "",
-                     (details or {}).get("advisory_poc") or "",
-                     fix_diff_text or ""])
+    # Provenance matters: a match in the FIX DIFF is code-level evidence
+    # (confidence 0.9) and may halt a real run; a match in the advisory PoC
+    # (0.7) or only in the prose description (0.5) annotates but does not.
+    parts = [("fix_diff", fix_diff_text or "", 0.9),
+             ("advisory", (details or {}).get("advisory_poc") or "", 0.7),
+             ("description", (details or {}).get("description") or "", 0.5)]
     for source, pat in _INPUT_SOURCE_SIGNATURES:
-        m = _re.search(pat, text, _re.I | _re.S)
-        if m:
-            return {"source": source,
-                    "artifact_required": source in ("template_in_file", "deserialized_object", "uploaded_file"),
-                    "evidence": text[max(0, m.start() - 60): m.end() + 60].replace("\n", " ")[:200]}
-    return {"source": "request", "artifact_required": False, "evidence": ""}
+        for origin, text, conf in parts:
+            m = _re.search(pat, text, _re.I | _re.S)
+            if m:
+                return {"source": source,
+                        "artifact_required": source in ("template_in_file", "deserialized_object", "uploaded_file"),
+                        "evidence": text[max(0, m.start() - 60): m.end() + 60].replace("\n", " ")[:200],
+                        "evidence_from": origin, "confidence": conf}
+    return {"source": "request", "artifact_required": False, "evidence": "",
+            "evidence_from": None, "confidence": 0.0}
 
 
 def _fetch_fix_diff_text(refs: list, max_commits: int = 2, max_chars: int = 6000) -> str:
@@ -13671,6 +13677,165 @@ def _local_source_routes(cve: str, max_files: int = 12, max_bytes: int = 60_000)
         return {"found": True, "dir": tdir, "routes": routes, "fields": fields,
                 "files": [os.path.relpath(f, tdir) for f in files], "text": "\n".join(lines)}
     return {"found": False, "dir": None, "routes": [], "fields": [], "files": [], "text": ""}
+
+
+_BUILD_POC_ARTIFACT_HALT = (os.environ.get("BUILD_POC_ARTIFACT_HALT") or "on").strip().lower()
+
+_ARTIFACT_FORMAT_HINTS = [
+    ("GGUF model file", r"\bgguf\b|llama[-_ ]?cpp|chat_template"),
+    ("Python pickle", r"\bpickle\b|RestrictedUnpickler|\.pkl\b|torch\.load"),
+    ("YAML document", r"\byaml\b"),
+    ("Java serialized object", r"readObject\(|ObjectInputStream|ysoserial"),
+    ("PHP serialized object", r"unserialize\("),
+    ("archive (zip/tar)", r"\bzip(?:file)?\b|\btar(?:file)?\b|zip ?slip"),
+    ("XML/SVG document", r"\bsvg\b|\bxxe\b|\bxml\b"),
+]
+
+_ARTIFACT_LOCATION_BY_SOURCE = {
+    "template_in_file": "the template string the target renders out of the file's metadata (the fix diff names the field)",
+    "deserialized_object": "the serialized object graph the target deserializes",
+    "uploaded_file": "the uploaded file's content (and its name/extension, if the handler keys on them)",
+    "path_in_filename": "the filename the target joins into a filesystem path",
+}
+
+
+def _artifact_requirements(cve: str, ip, port, target_spec: dict, run_id=None) -> dict:
+    """The "what is still needed" step (operator ask, 2026-10-07): when the
+    input-source classifier says a request alone cannot reach the sink,
+    identify the items the operator (or a future `artifact_<source>` skill)
+    must supply and the ordered follow-ups — instead of a bare halt.
+
+    Deterministic, zero LLM, zero network. Reads: the classifier verdict,
+    the target spec (canary, OOB sink, candidate endpoints) and, for lab
+    targets, the local source (routes + request field names). Describes
+    the vector; builds nothing.
+    """
+    import re as _re
+    spec = target_spec or {}
+    src = spec.get("input_source") or {}
+    source = src.get("source") or "request"
+    canary = spec.get("canary") or ""
+    sink = spec.get("oob_sink_url") or ""
+    text = " ".join([spec.get("description") or "", spec.get("advisory_poc") or "", src.get("evidence") or ""])
+    fmt = next((name for name, pat in _ARTIFACT_FORMAT_HINTS if _re.search(pat, text, _re.I)),
+               "file in the format the target parses (format not determined — read the fix diff)")
+    location = _ARTIFACT_LOCATION_BY_SOURCE.get(source, "the input the target processes")
+
+    ls = _local_source_routes(cve)
+    routes = ls.get("routes") or []
+    fields = ls.get("fields") or []
+    posts = [r for r in routes if "POST" in (r.get("methods") or []) or "PUT" in (r.get("methods") or [])]
+    _dl = _re.compile(r"upload|file|model|import|load|attach|media|avatar", _re.I)
+    _tr = _re.compile(r"run|complet|exec|render|parse|process|open|convert|preview|generate", _re.I)
+    delivery = next((r for r in posts if _dl.search(r["path"])), posts[0] if posts else None)
+    trigger = next((r for r in posts if r is not delivery and _tr.search(r["path"])),
+                   next((r for r in posts if r is not delivery), None))
+    delivery_field = next((f["name"] for f in fields if f["carrier"] == "files"), None)
+    trigger_field = next((f["name"] for f in fields if f["carrier"] in ("json", "form")), None)
+    cands = [c for c in (spec.get("candidate_endpoints") or []) if isinstance(c, str)][:6]
+
+    def _route_str(r):
+        return f"{'/'.join(r.get('methods') or ['POST'])} {r['path']}" if r else None
+
+    delivery_s = _route_str(delivery) or (f"one of the candidate endpoints {cands}" if cands else "UNKNOWN — discover the upload/import route first")
+    trigger_s = _route_str(trigger) or "UNKNOWN — discover the route that parses/renders the artifact"
+
+    needed = [
+        {"item": "artifact", "status": "missing", "format": fmt,
+         "payload_location": location,
+         "placed_in": (f"multipart field `{delivery_field}`" if delivery_field else "the upload field of the delivery route"),
+         "why": f"input source is {source!r}: the sink reads from the artifact, not from a request field"},
+        {"item": "format tooling", "status": "unknown",
+         "detail": f"a library or CLI in the runner image that reads AND writes {fmt} metadata (verify it is installed before the build step)"},
+        {"item": "delivery route", "status": "known" if delivery else "missing", "value": delivery_s},
+        {"item": "trigger route", "status": "known" if trigger else "missing", "value": trigger_s,
+         "field": trigger_field},
+    ]
+    have = [x for x in [
+        {"item": "canary", "value": canary} if canary else None,
+        {"item": "oob_sink", "value": sink} if sink else None,
+        {"item": "candidate_endpoints", "value": cands} if cands else None,
+        {"item": "local_source", "value": ls.get("dir")} if ls.get("found") else None,
+        {"item": "auth", "value": "session cookie available"} if spec.get("auth_cookie") else None,
+        {"item": "evidence", "value": f"{src.get('evidence_from')}: {src.get('evidence', '')[:160]}"} if src.get("evidence") else None,
+    ] if x]
+    skill_name = f"artifact_{source}"
+    follow_ups = [
+        f"Baseline: obtain a minimal VALID {fmt} the target accepts; deliver it unchanged via {delivery_s} and confirm a 2xx before mutating anything.",
+        f"Locate {location}. Evidence ({src.get('evidence_from') or 'n/a'}): {src.get('evidence', '')[:160]!r}.",
+        f"Prepare a test artifact whose {location.split(' (')[0]} carries ONLY the canary probe "
+        f"({'reflect ' + canary if canary else 'a canary'}{' or call the OOB sink ' + sink if sink else ''}); nothing beyond the probe.",
+        f"Deliver via {delivery_s}" + (f" (field `{delivery_field}`)" if delivery_field else "") +
+        f"; then trigger via {trigger_s}" + (f" referencing the uploaded name in `{trigger_field}`" if trigger_field else "") + ".",
+        "Verify with the existing verifier (canary in response or at the sink); on success store the PoC with the artifact attached as evidence (kind=artifact).",
+        f"Promote: record format, payload location, tooling and the delivery/trigger routes as the `{skill_name}` skill inputs so the next {source} CVE needs no manual step.",
+    ]
+    if not delivery:
+        follow_ups.insert(0, "Discover the upload/import route first: read local source if present, else the JSON self-documentation at /, forms from recon, and the advisory.")
+    summary = (f"{cve}: a {fmt} artifact is required (input source {source}); "
+               f"deliver via {delivery_s}, trigger via {trigger_s}.")
+    return {
+        "cve": cve, "target": f"{ip}:{port}", "run_id": run_id,
+        "class": source, "confidence": float(src.get("confidence") or 0.0),
+        "summary": summary, "needed": needed, "have": have, "follow_ups": follow_ups,
+        "skill_candidate": {
+            "name": skill_name, "kind": "artifact_builder", "status": "proposed", "first_case": cve,
+            "inputs": ["format", "payload_location", "canary", "oob_sink", "delivery_route", "delivery_field",
+                       "trigger_route", "trigger_field", "auth"],
+            "outputs": ["artifact_path", "delivery_response", "trigger_response", "verdict"],
+            "contract": ("deterministic: build a benign test artifact carrying only the canary, deliver, "
+                         "trigger, verify through the existing canary/sink verifier; scope-gated and "
+                         "MAX_CONCURRENT_SCANS-bounded like every dispatcher; never auto-promoted"),
+        },
+    }
+
+
+def _record_artifact_requirements(req: dict, cve: str, ip, port, eid=None, run_id=None) -> dict:
+    """Persist the requirements where an operator will see them: the run
+    trace, a `follow_up_items` row (follow-up queue — action items, exempt
+    from engagement attribution by design, but we attach the engagement
+    when known), and a webhook event. Idempotent per (cve, target): the
+    unique index on (title, target, rule_id) turns the re-fire on every
+    iteration into an UPDATE of the same row."""
+    import uuid as _u
+    from psycopg2.extras import Json
+    out = {"follow_up_id": None, "webhook": False}
+    try:
+        _poc_trace(run_id, "artifact_requirements", response=req.get("summary"),
+                   extra={"artifact_requirements": req})
+    except Exception:  # noqa: BLE001
+        pass
+    title = f"Build-PoC {cve}: artifact required ({req.get('class')})"
+    notes = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(req.get("follow_ups") or []))
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""INSERT INTO follow_up_items
+                (id, finding_source, title, target, severity, reason, priority, flagged_by, rule_id,
+                 confidence, tags, notes, engagement_id, metadata)
+                VALUES (%s,'build_poc',%s,%s,'medium',%s,'high','build_poc_artifact_gate','artifact_required',
+                        %s,%s,%s,%s,%s)
+                ON CONFLICT (title, COALESCE(target,''), COALESCE(rule_id,''))
+                DO UPDATE SET metadata = EXCLUDED.metadata, notes = EXCLUDED.notes,
+                              reason = EXCLUDED.reason, updated_at = now()
+                RETURNING id""",
+                (str(_u.uuid4()), title, req.get("target"), req.get("summary"),
+                 req.get("confidence"), ["build-poc", "artifact-required", str(req.get("class")), "skill-candidate"],
+                 notes, (str(eid) if eid else None), Json(req)))
+            row = cur.fetchone(); conn.commit()
+            out["follow_up_id"] = str(row[0]) if row else None
+    except Exception as e:  # noqa: BLE001
+        logging.warning("artifact_requirements follow-up write failed: %s", e)
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("build_poc_artifact_required", "build_poc", {
+            "engagement_id": str(eid) if eid else None, "cve": cve, "target": f"{ip}:{port}",
+            "run_id": run_id, "class": req.get("class"), "confidence": req.get("confidence"),
+            "summary": req.get("summary"), "needed": [n.get("item") + ":" + n.get("status", "") for n in req.get("needed") or []],
+            "follow_up_id": out["follow_up_id"], "skill_candidate": (req.get("skill_candidate") or {}).get("name")})
+        out["webhook"] = True
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 def _rag_hints_for(query: str, top_k: int = 4, sources: list | None = None) -> list:
@@ -13986,6 +14151,15 @@ def _decomposed_synthesize_cve_poc(cve, ip, port, product, version, eid,
         out["synth_kind"] = "decomposed_artifact_required"
         out["artifact_required"] = True
         out["input_source"] = src
+        # Identify what is still needed + the ordered follow-ups (operator
+        # ask 2026-10-07; this block is the contract a future
+        # `artifact_<source>` skill consumes) and surface it.
+        try:
+            req = _artifact_requirements(cve, ip, port, target_spec, run_id=run_id)
+            out["artifact_requirements"] = req
+            out.update(_record_artifact_requirements(req, cve, ip, port, eid=eid, run_id=run_id))
+        except Exception as _are:  # noqa: BLE001
+            out["artifact_requirements"] = {"error": f"{type(_are).__name__}: {_are}"}
         return out
 
     # Stage 2: narrow LLM craft
@@ -14175,10 +14349,16 @@ def _synthesize_cve_poc_with_shadow(cve, ip, port, product, version, eid,
     — the scaffold stub isn't ready to be authoritative. See
     `BUILD_POC_DECOMPOSED` doc at the top of this section.
     """
-    legacy = _synthesize_cve_poc(cve, ip, port, product, version, eid,
-                                 run_id=run_id, guidance_extra=guidance_extra, model=model)
     mode = _BUILD_POC_DECOMPOSED_MODE
+    new = None
+    halted = False
     if mode in ("shadow", "on"):
+        # Decomposed path FIRST (2026-10-07): its extraction stage carries the
+        # "is an artifact needed" verdict. On code-level evidence (fix diff /
+        # advisory, confidence >= 0.7) and BUILD_POC_ARTIFACT_HALT=on, the
+        # real run halts here with the requirements block instead of paying
+        # for a legacy LLM synth and 50 request-body iterations that cannot
+        # reach the sink (CVE-2024-34359, round 2).
         try:
             new = _decomposed_synthesize_cve_poc(
                 cve, ip, port, product, version, eid,
@@ -14187,6 +14367,26 @@ def _synthesize_cve_poc_with_shadow(cve, ip, port, product, version, eid,
             new = {"command": "", "assertion": {},
                    "synth_kind": "decomposed_error",
                    "error": f"{type(e).__name__}: {e}"}
+        if (new.get("artifact_required") and _BUILD_POC_ARTIFACT_HALT == "on"
+                and float((new.get("input_source") or {}).get("confidence") or 0) >= 0.7):
+            halted = True
+    if halted:
+        req = new.get("artifact_requirements") or {}
+        legacy = {
+            "command": f"# artifact_required — {req.get('summary') or new.get('llm_error_reason')}",
+            "assertion": {"expect_regex": new.get("canary"), "canary": new.get("canary"),
+                          "cve_anchored": True, "_artifact_required": True},
+            "rationale": "halted before synth: " + (req.get("summary") or ""),
+            "synth_kind": "artifact_required", "artifact_required": True,
+            "artifact_requirements": req, "input_source": new.get("input_source"),
+            "follow_up_id": new.get("follow_up_id"),
+            "run_id": run_id, "canary": new.get("canary"), "origin_family": ("", ""),
+            "llm_model": None, "metrics": new.get("metrics") or {},
+        }
+    else:
+        legacy = _synthesize_cve_poc(cve, ip, port, product, version, eid,
+                                     run_id=run_id, guidance_extra=guidance_extra, model=model)
+    if new is not None:
         try:
             _poc_shadow_record(
                 run_id=(legacy or {}).get("run_id") or run_id or "unknown",
@@ -14198,6 +14398,8 @@ def _synthesize_cve_poc_with_shadow(cve, ip, port, product, version, eid,
         # Phase 3b: dispatch the decomposed command once and record its own
         # verdict in a separate row, so success data exists before Phase 4.
         try:
+            if halted:
+                raise RuntimeError("halted: artifact_required — nothing to dispatch")
             disp = _shadow_dispatch_decomposed(
                 new, cve, ip, port, eid,
                 run_id=(legacy or {}).get("run_id") or run_id or "unknown", model=model)

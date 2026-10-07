@@ -121,3 +121,18 @@ patterns:
           path: /completion
           json: {model_file_name: "<artifact_basename>"}
           expect_regex: "<CANARY>"
+
+  - id: artifact_requirements_contract
+    title: "When an artifact is required, output the requirements block — the contract a future artifact skill consumes"
+    triggers: ["artifact_required", "template_in_file", "deserialized_object", "uploaded_file", "skill candidate"]
+    guidance: >
+      Do not stop at "artifact required". Produce the requirements block: `needed` (the artifact —
+      format, payload location, which field it goes in; the format tooling; the delivery route; the
+      trigger route and its field), `have` (canary, OOB sink, candidate endpoints, local source,
+      auth, evidence), ordered `follow_ups` (baseline a valid file first; locate the rendered field
+      from the fix diff; prepare a test artifact carrying only the canary; deliver then trigger;
+      verify through the existing verifier; promote to a skill) and `skill_candidate`
+      (name `artifact_<source>`, inputs/outputs, deterministic + scope-gated contract). It lands in
+      the run trace, a follow_up_items row (rule_id artifact_required, idempotent per target) and
+      the `build_poc_artifact_required` webhook. The block describes the vector; the artifact itself
+      is built by an operator or by the skill once it exists.

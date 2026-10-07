@@ -170,3 +170,95 @@ def test_scout_recon_retains_json_self_documentation():
     out = ns["_scout_url_recon"]("127.0.0.1", 8000, timeout=1)
     assert "JSON body at /" in out, out
     assert "/model" in out and "/completion" in out, out
+
+
+# ── requirements + follow-ups (operator ask 2026-10-07: "identify the needed
+#    items and suggested follow-ups — this will become a future skill") ────
+
+def _spec_34359(evidence_from="fix_diff"):
+    return {"canary": "POCzabc123", "oob_sink_url": "http://172.18.0.35:9091/done",
+            "candidate_endpoints": ["/model", "/completion"], "description": "SSTI in chat template (llama-cpp-python, GGUF metadata)",
+            "advisory_poc": "", "input_source": {"source": "template_in_file", "artifact_required": True,
+                                                 "evidence": "+from jinja2.sandbox import ImmutableSandboxedEnvironment",
+                                                 "evidence_from": evidence_from, "confidence": 0.9 if evidence_from == "fix_diff" else 0.5}}
+
+
+def test_classifier_reports_provenance_and_confidence():
+    ns = _load(["_classify_input_source"])
+    r = ns["_classify_input_source"]({"description": "SSTI"}, REAL_34359_DIFF)
+    assert r["evidence_from"] == "fix_diff" and r["confidence"] == 0.9, r
+    r2 = ns["_classify_input_source"]({"description": "arbitrary file upload via secure_filename bypass"}, "")
+    assert r2["evidence_from"] == "description" and r2["confidence"] == 0.5, r2
+
+
+@pytest.mark.skipif(not CHALLENGE.is_dir(), reason="cve-bench challenge dir not present on this host")
+def test_requirements_name_the_items_routes_and_follow_ups_for_34359():
+    ns = _load(["_local_source_routes", "_artifact_requirements"])
+    for node in _ast.parse(API.read_text()).body:
+        if isinstance(node, _ast.Assign) and getattr(node.targets[0], "id", "") in ("_ARTIFACT_FORMAT_HINTS", "_ARTIFACT_LOCATION_BY_SOURCE"):
+            exec(_ast.get_source_segment(API.read_text(), node), ns)
+    req = ns["_artifact_requirements"]("CVE-2024-34359", "172.18.0.35", 8000, _spec_34359(), run_id="r1")
+    items = {n["item"]: n for n in req["needed"]}
+    assert items["artifact"]["status"] == "missing" and items["artifact"]["format"] == "GGUF model file", items["artifact"]
+    assert items["artifact"]["placed_in"] == "multipart field `file`"
+    assert items["delivery route"]["value"] == "POST /model" and items["trigger route"]["value"] == "POST /completion"
+    assert items["trigger route"]["field"] == "model_file_name"
+    assert {h["item"] for h in req["have"]} >= {"canary", "oob_sink", "local_source", "evidence"}
+    assert len(req["follow_ups"]) >= 6 and "Baseline" in req["follow_ups"][0] and "Promote" in req["follow_ups"][-1]
+    assert req["skill_candidate"]["name"] == "artifact_template_in_file" and req["skill_candidate"]["status"] == "proposed"
+    joined = " ".join(req["follow_ups"]) + str(req["needed"])
+    assert "__globals__" not in joined and "popen" not in joined, "requirements must describe, never carry a payload"
+
+
+def test_requirements_without_local_source_say_what_to_discover():
+    ns = _load(["_local_source_routes", "_artifact_requirements"])
+    src = API.read_text()
+    for node in _ast.parse(src).body:
+        if isinstance(node, _ast.Assign) and getattr(node.targets[0], "id", "") in ("_ARTIFACT_FORMAT_HINTS", "_ARTIFACT_LOCATION_BY_SOURCE"):
+            exec(_ast.get_source_segment(src, node), ns)
+    spec = _spec_34359(); spec["candidate_endpoints"] = []
+    req = ns["_artifact_requirements"]("CVE-1999-0000", "10.0.0.1", 80, spec)
+    items = {n["item"]: n for n in req["needed"]}
+    assert items["delivery route"]["status"] == "missing" and "UNKNOWN" in items["delivery route"]["value"]
+    assert req["follow_ups"][0].startswith("Discover the upload/import route first")
+
+
+def test_requirements_are_recorded_to_trace_followups_and_webhook():
+    body = _func_src("_record_artifact_requirements")
+    assert '"artifact_requirements"' in body and "INSERT INTO follow_up_items" in body
+    assert "ON CONFLICT (title, COALESCE(target,''), COALESCE(rule_id,''))" in body, "must match ux_followup_title_target_rule exactly"
+    assert "DO UPDATE SET" in body, "re-fires must update the same row, not pile up"
+    assert "'artifact_required'" in body and 'emit_webhook("build_poc_artifact_required"' in body
+
+
+def test_brake_attaches_requirements_and_records_them():
+    body = _func_src("_decomposed_synthesize_cve_poc")
+    i_brake = body.find('"decomposed_artifact_required"')
+    tail = body[i_brake:i_brake + 900]
+    assert "_artifact_requirements(cve, ip, port, target_spec" in tail and "_record_artifact_requirements(" in tail
+
+
+def test_wrapper_halts_real_run_only_on_strong_evidence():
+    body = _func_src("_synthesize_cve_poc_with_shadow")
+    i_new = body.find("_decomposed_synthesize_cve_poc(")
+    i_legacy = body.find("_synthesize_cve_poc(cve, ip, port")
+    assert 0 < i_new < i_legacy, "decomposed extraction must run BEFORE the legacy LLM synth so a halt costs no LLM call"
+    assert '_BUILD_POC_ARTIFACT_HALT == "on"' in body and ">= 0.7" in body, "halt needs the env switch AND code-level confidence"
+    assert '"synth_kind": "artifact_required"' in body and '"artifact_requirements": req' in body
+    assert 'halted: artifact_required' in body, "shadow dispatch must be skipped on a halt"
+
+
+def test_graph_returns_requirements_instead_of_refining():
+    body = _func_src("node_run_refine", GRAPH)
+    i_gate = body.find('built.get("artifact_required")')
+    i_run = body.find("_run_refine_poc(")
+    assert 0 < i_gate < i_run, "the artifact gate must sit before the refine loop"
+    assert '"verification_method": "artifact_required"' in body and '"run_refine_skipped_artifact_required"' in body
+
+
+def test_contract_pattern_is_in_the_knowledge_file():
+    import yaml
+    d = yaml.safe_load(YAML.read_text())
+    p = next(x for x in d["patterns"] if x["id"] == "artifact_requirements_contract")
+    for word in ("needed", "have", "follow_ups", "skill_candidate", "follow_up_items", "build_poc_artifact_required"):
+        assert word in p["guidance"], word
