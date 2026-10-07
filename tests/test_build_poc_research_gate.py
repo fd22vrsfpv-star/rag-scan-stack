@@ -340,7 +340,9 @@ def test_gather_decide_class_specific_requirements():
 def test_gather_check_default_is_strict_and_runs_between_plan_verify_and_synth():
     assert '_BUILD_POC_GATHER_CHECK = (os.environ.get("BUILD_POC_GATHER_CHECK") or "strict")' in API.read_text()
     g = GRAPH.read_text()
-    assert 'g.add_edge("plan_verify", "gather_check")' in g and 'g.add_edge("gather_check", "synth")' in g
+    assert 'g.add_edge("plan_verify", "gather_check")' in g
+    # since the deep-recon loop (2026-10-07) the gather→synth edge is conditional
+    assert 'g.add_conditional_edges("gather_check", _route_after_gather' in g and '{"deep_recon": "deep_recon", "synth": "synth"}' in g
     assert 'g.add_edge("plan_verify", "synth")' not in g, "the old direct edge must be gone or the check is bypassed"
 
 
