@@ -152,3 +152,17 @@ patterns:
       follow-up per gap (follow_up_items rule_id gather_incomplete; webhook
       build_poc_gather_check); confirmed facts are injected into the synth guidance so the
       payload is built against verified endpoint/method/field, never a guess.
+
+  - id: deep_recon_on_gaps_or_early_stop
+    title: "0 iterations or an early stop means gather more data, not give up: deeper recon + broader scans, then go around once"
+    triggers: ["gather_incomplete", "0 iterations", "early stop", "no_progress", "missing auth", "missing endpoint_id", "default credentials", "password spray"]
+    guidance: >
+      When the gather check halts or the loop stops within the first couple of iterations
+      without success, run one deeper pass targeted at the gaps before giving up: no session →
+      look up the product's documented default accounts and the common pairs and run the bounded
+      default-credential check (max_auto_attempts; a larger spray is parked for approval, never
+      fired unattended), then any credentials mined from docs; a missing route or id → an
+      authenticated crawl, the post-login access inventory and a ZAP spider, harvesting ids from
+      every URL seen; a missing input → arjun on the known endpoints; a missing method → a verb
+      sweep. Then re-run the gather check and, if READY, synth and refine once more. One pass per
+      run; an artifact gap is not a recon gap.
