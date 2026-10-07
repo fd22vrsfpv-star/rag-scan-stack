@@ -14060,6 +14060,25 @@ def _path_variants(path: str, max_strip: int = 2) -> list:
     return out
 
 
+def _assertion_is_trivial(rx) -> bool:
+    """PURE: an expect_regex that matches ANY output proves nothing. Round 10
+    (CVE-2024-3408): a derived recipe carried `.*`, the run "passed" with
+    method=regex confidence=1.0 on a redirect page, and the exploit was stored
+    as verified. Trivial = empty, matches the empty string, or matches a random
+    control token (so dot-star, dot-plus, a bare anchor, a whitespace-class star all count)."""
+    import re as _re, secrets as _s
+    r = (rx or "").strip() if isinstance(rx, str) else ""
+    if not r:
+        return True
+    try:
+        if _re.search(r, "", _re.I):
+            return True
+        tok = "ctrl" + _s.token_hex(8)
+        return bool(_re.fullmatch(r, tok, _re.I)) or (bool(_re.search(r, tok, _re.I)) and len(r) <= 6)
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def _canary_only_in_redirect(out: str, canary: str) -> bool:
     """True when the captured output is a 3xx whose only canary occurrence is
     in the Location header (the unauthenticated bounce echoing the probe).
@@ -14070,7 +14089,11 @@ def _canary_only_in_redirect(out: str, canary: str) -> bool:
         return False
     if not _re.search(r"^HTTP/\S+\s+3\d\d\b", text, _re.M):
         return False
+    # URL echoes: the Location header, any href="…" (Werkzeug's redirect body
+    # repeats the target URL in a link), and any query string (?next=…)
     stripped = _re.sub(r"^location:[^\n]*$", "", text, flags=_re.I | _re.M)
+    stripped = _re.sub(r"href\s*=\s*[\"'][^\"']*[\"']", "href=''", stripped, flags=_re.I)
+    stripped = _re.sub(r"[?&][^\s\"'<>]*", "", stripped)
     return canary not in stripped
 
 
@@ -18518,6 +18541,12 @@ def _poc_assertion_verdict(assertion, output, exit_code=None,
     # Canary-anchored verdicts: if the assertion names a canary and it's missing,
     # regex-only pass is refused. Semantic will also refuse (grounded on canary).
     rx = a.get("expect_regex")
+    if rx and _assertion_is_trivial(rx):
+        if canary and canary_present:
+            return {"passed": True, "method": "canary_loose", "confidence": 0.85,
+                    "reason": f"expect_regex {rx!r} matches anything (ignored) but the canary appeared in output"}
+        return {"passed": False, "method": "assertion_trivial", "confidence": 1.0,
+                "reason": f"expect_regex {rx!r} matches any output — unverifiable; no canary in output"}
     if rx:
         try:
             if _re.search(rx, out, _re.I):
@@ -21939,8 +21968,13 @@ def _live_verify_recipe(ip, port, spec, timeout=30):
             # curl command now runs with -i -S so this covers set-cookie,
             # error responses, HTTP 500 tracebacks (pandas-query / Jinja2
             # SSTI echo the canary there, not in the normal body).
-            hit = canary in out or _re_search_safe(
-                assertion.get("expect_regex", ""), out)
+            _rx = assertion.get("expect_regex", "")
+            _rx_ok = bool(_rx) and not _assertion_is_trivial(_rx) and _re_search_safe(_rx, out)
+            _is_3xx_only = bool(_re.search(r"^HTTP/\S+\s+3\d\d\b", out, _re.M)) and not _re.search(r"^HTTP/\S+\s+2\d\d\b", out, _re.M)
+            hit = (canary in out) or (_rx_ok and not _is_3xx_only)
+            if not hit and _rx and _assertion_is_trivial(_rx) and canary not in out:
+                return {"verified": False, "method": "assertion_trivial",
+                        "evidence": f"expect_regex {_rx!r} matches any output and the canary {canary} did not appear\n---\n{out[:1500]}"}
             # Preserve the first 3KB of the full output in evidence so an
             # operator can see WHY the canary did or didn't appear without
             # re-running. Longer than the previous 100-char trailer.
@@ -22812,6 +22846,8 @@ def _assemble_from_cve_spec(cve, ip, port, canary):
     a = dict(spec.get("assertion") or {"min_seconds": 5, "max_seconds": 30})
     if canary:
         a["canary"] = canary
+        if a.get("expect_regex") is not None and _assertion_is_trivial(a.get("expect_regex")):
+            a["expect_regex"] = canary      # round 10: a seeded `.*` passed on any output
         a["cve_anchored"] = True
     return {"command": cmd, "assertion": a, "origin": f"cve_spec:{cve}"}
 
