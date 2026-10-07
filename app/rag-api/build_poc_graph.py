@@ -1132,6 +1132,22 @@ def node_run_refine(state: BuildPocState) -> Dict[str, Any]:
                 "verified": False, "success": False, "iters": 0,
                 "off_target": False, "reflection": False}
     built = state.get("built") or {}
+    # 2026-10-07: synth halted because the sink is fed by a FILE the operator
+    # must supply (artifact_required). Nothing to refine — return the
+    # requirements + follow-ups as the run's result instead of 50 iterations.
+    if built.get("artifact_required"):
+        req = built.get("artifact_requirements") or {}
+        _poc_trace(state["run_id"], "run_refine_skipped_artifact_required",
+                   response=req.get("summary"), extra={"artifact_requirements": req,
+                                                       "follow_up_id": built.get("follow_up_id")})
+        return {"result": {"ok": True, "success": False, "verified": False, "blocked": True,
+                           "verification_method": "artifact_required",
+                           "artifact_required": True, "artifact_requirements": req,
+                           "follow_up_id": built.get("follow_up_id"),
+                           "reason": "artifact required: " + (req.get("summary") or "see artifact_requirements"),
+                           "iterations": 0, "metrics": built.get("metrics") or {}},
+                "verified": False, "success": False, "iters": 0,
+                "off_target": False, "reflection": False}
     result = _run_refine_poc(
         state["cve"], state["ip"], state["port"],
         built["command"], built["assertion"], state.get("eid"),
