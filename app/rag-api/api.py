@@ -14365,7 +14365,7 @@ def _deep_recon_for_gaps(cve, ip, port, product, eid, run_id, manifest: dict, *,
                 if txt:
                     out["segments"].append(txt)
                     all_text += "\n" + txt
-                out["candidate_paths"] += [u for u in (urls or []) if isinstance(u, str)][:60]
+                out["candidate_paths"] += [pth for pth in (_url_to_path(u) for u in (urls or []) if isinstance(u, str)) if pth and pth != "/"][:60]
                 note = f"{len(urls or [])} urls ({'authenticated' if cookie else 'unauthenticated'} crawl)"
             elif step == "access_inventory":
                 if not cookie:
@@ -14379,11 +14379,11 @@ def _deep_recon_for_gaps(cve, ip, port, product, eid, run_id, manifest: dict, *,
                     note = f"inventory keys={list((inv or {}).keys())[:8]}"
             elif step == "zap_spider":
                 z = _zap_recon(ip, port, spider_timeout=min(120, max(30, int(_left()))))
-                paths = _extract_zap_paths(z) if z else []
+                paths = [_url_to_path(x) for x in (_extract_zap_paths(z) if z else [])]
                 if z:
                     out["segments"].append(z)
                     all_text += "\n" + z
-                out["candidate_paths"] += paths[:60]
+                out["candidate_paths"] += [x for x in paths if x and x != "/"][:60]
                 note = f"{len(paths)} spidered paths"
             elif step == "arjun_params":
                 targets = [x for x in ([(manifest or {}).get("facts", {}).get("endpoint")] + out["candidate_paths"]) if x][:5]
@@ -18626,6 +18626,56 @@ _LOGIN_PATH_CANDIDATES = ("/wp-login.php", "/login", "/user/login", "/admin/logi
                           "/accounts/login/", "/auth/login", "/signin", "/")
 
 
+def _url_to_path(u: str) -> str:
+    """'http://h:9090/a/b?x=1' -> '/a/b'; '/a' -> '/a'; '' -> ''."""
+    from urllib.parse import urlsplit as _us
+    u = (u or "").strip()
+    if not u:
+        return ""
+    if u.startswith("http://") or u.startswith("https://"):
+        return _us(u).path or "/"
+    return u if u.startswith("/") else "/" + u
+
+
+def _discover_login_url(ip, port, timeout=6):
+    """The page that actually carries the login form. Round 9 (CVE-2024-3408):
+    the default-credential path fetched `/`, which is a 302 to `/login`, and
+    reported "no login form found on page". Order: the root redirect's Location,
+    then the known candidates; the first page whose form parses wins. Returns
+    an absolute URL or None. Read-only GETs."""
+    import httpx as _hx
+    try:
+        import auth_autopopulate as _ap
+    except Exception:  # noqa: BLE001
+        return None
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    cands = []
+    try:
+        with _hx.Client(verify=False, timeout=timeout, follow_redirects=False) as cli:
+            r0 = cli.get(base + "/")
+            loc = r0.headers.get("location") if 300 <= r0.status_code < 400 else None
+            if loc:
+                cands.append(loc if loc.startswith("http") else base + (loc if loc.startswith("/") else "/" + loc))
+            cands += [base + p for p in _LOGIN_PATH_CANDIDATES]
+            seen = set()
+            for url in cands:
+                if url in seen:
+                    continue
+                seen.add(url)
+                try:
+                    r = cli.get(url, follow_redirects=True)
+                except Exception:  # noqa: BLE001
+                    continue
+                if r.status_code != 200:
+                    continue
+                if _ap.parse_login_form(r.text or ""):
+                    return str(r.url)
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 def _establish_web_session(ip, port, username, password, login_url=None, timeout=12):
     """Log in to a web app with supplied creds and return the authenticated session
     cookie(s), so an exploit that needs auth can use them. Reuses auth_autopopulate's
@@ -18800,6 +18850,12 @@ def _establish_session_for_build(ip, port, auth, eid=None, product=None):
     auth = auth or {}
     username, password = auth.get("username"), auth.get("password")
     login_url = auth.get("login_url")
+    if not login_url:
+        try:
+            login_url = _discover_login_url(ip, port)
+        except Exception:  # noqa: BLE001
+            login_url = None
+    _supplied_note = None
     if username and password:
         s = _establish_web_session(ip, port, username, password, login_url=login_url)
         # VALIDATE the session actually logged in — a cookie being set is NOT
@@ -18820,7 +18876,11 @@ def _establish_session_for_build(ip, port, auth, eid=None, product=None):
                                 "validated": True}
         except Exception as e:  # noqa: BLE001
             logging.debug("session validate/retry failed: %s", e)
-        return {**s, "username": username, "method": "supplied"}
+        if (s or {}).get("cookie_header") or not auth.get("bruteforce"):
+            return {**s, "username": username, "method": "supplied"}
+        # supplied creds failed and the caller asked for the default-credential
+        # path as well: fall through (round 9: the deep pass never reached it)
+        _supplied_note = (s or {}).get("note") or "supplied credentials failed"
     if auth.get("bruteforce"):
         try:
             try:
@@ -18831,13 +18891,18 @@ def _establish_session_for_build(ip, port, auth, eid=None, product=None):
             lp = login_url or f"{scheme}://{ip}:{port or 80}/"
             with get_db() as conn, conn.cursor() as cur:
                 res = run_default_cred_check(cur, str(ip), lp, engagement_id=eid, force=True)
-                conn.commit()
+                try:
+                    conn.commit()
+                except Exception:  # noqa: BLE001
+                    pass
             u = res.get("username"); p = res.get("password") or res.get("secret") or password
             if res.get("ok") and u and p:
                 s = _establish_web_session(ip, port, u, p, login_url=login_url)
                 return {**s, "username": u, "method": "bruteforce"}
             return {"ok": False, "cookie_header": "", "username": u, "method": "bruteforce",
-                    "note": res.get("reason") or "no default credential found"}
+                    "login_url": lp,
+                    "note": ((_supplied_note + "; ") if _supplied_note else "")
+                            + (res.get("reason") or "no default credential found")}
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "cookie_header": "", "username": None, "method": "bruteforce",
                     "note": f"{type(e).__name__}: {e}"[:150]}
