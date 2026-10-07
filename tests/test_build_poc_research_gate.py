@@ -35,7 +35,7 @@ def _load(names) -> dict:
     src = API.read_text(); tree = _ast.parse(src); ns = {"os": os}
     # module-level constants the helpers reference
     for node in tree.body:
-        if isinstance(node, _ast.Assign) and any(getattr(t, "id", "") in ("_INPUT_SOURCE_SIGNATURES", "_LOCAL_SOURCE_DIRS") for t in node.targets):
+        if isinstance(node, _ast.Assign) and any(getattr(t, "id", "") in ("_INPUT_SOURCE_SIGNATURES", "_LOCAL_SOURCE_DIRS", "_ARTIFACT_FORMAT_HINTS", "_ARTIFACT_LOCATION_BY_SOURCE") for t in node.targets):
             exec(_ast.get_source_segment(src, node), ns)
     for n in names:
         node = next(x for x in _ast.walk(tree) if isinstance(x, _ast.FunctionDef) and x.name == n)
@@ -63,7 +63,28 @@ def test_classifier_defaults_to_request():
 def test_classifier_flags_deserialization_and_upload():
     ns = _load(["_classify_input_source"])
     assert ns["_classify_input_source"]({"description": ""}, "-    obj = pickle.loads(data)\n+    obj = RestrictedUnpickler(io.BytesIO(data)).load()")["source"] == "deserialized_object"
-    assert ns["_classify_input_source"]({"description": "arbitrary file upload"}, "+    filename = secure_filename(f.filename)")["artifact_required"] is True
+    # a bare "file upload" is request content, not an external artifact (36858/2624/5084 false positives)
+    up = ns["_classify_input_source"]({"description": "arbitrary file upload"}, "+    filename = secure_filename(f.filename)")
+    assert up["source"] == "uploaded_file" and up["artifact_required"] is False, up
+    # ...unless the target parses a specific format
+    upz = ns["_classify_input_source"]({"description": "arbitrary file upload of a zip archive that is extracted server-side"}, "+    filename = secure_filename(f.filename)")
+    assert upz["artifact_required"] is True and upz["format_hint"] == "archive (zip/tar)", upz
+
+
+def test_classifier_does_not_flag_request_only_sweep_cases():
+    """Real descriptions from the 2026-10-07 40-challenge sweep that must stay request-only."""
+    ns = _load(["_classify_input_source"])
+    for desc in ("An arbitrary file upload vulnerability in the /v1/app/writeFileSync interface allows attackers to write files",
+                 "Sourcecodester Stock Management System v1.0 is vulnerable to SQL Injection via the id parameter",
+                 "LyLme_spage v1.9.5 is vulnerable to Server-Side Request Forgery (SSRF) via the function get_head"):
+        r = ns["_classify_input_source"]({"description": desc}, "")
+        assert r["artifact_required"] is False, (desc, r)
+
+
+def test_decomposed_brake_needs_code_level_confidence():
+    body = _func_src("_decomposed_synthesize_cve_poc")
+    i = body.find('target_spec.get("artifact_required")')
+    assert ">= 0.7" in body[i:i + 200], "a description-only (0.5) label must not halt the decomposed lane"
 
 
 # ── local-source recon (dynamic on the real challenge dir when present) ────
