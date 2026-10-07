@@ -248,6 +248,12 @@ services:
       DETECTION_RULES_DIR: /knowledge/detection_rules
       SCOPE_RULES_DIR: /knowledge/scope_rules
       EXPLOITDB_CSV: /exploitdb/files_exploits.csv
+      # B-rollout decomposed-synth shadow mode (added 2026-10-07):
+      #   off (default) — only legacy single-prompt synth runs
+      #   shadow        — legacy authoritative; decomposed runs in parallel;
+      #                   divergence recorded to build_poc_shadow_runs
+      #   on            — decomposed authoritative (post-Phase-4 flip)
+      BUILD_POC_DECOMPOSED: ${BUILD_POC_DECOMPOSED:-off}
       NEWS_RUNNER_URL: ${NEWS_RUNNER_URL:-http://news-runner:8028}
       # Ollama — used by cloud_triage_agent, takeover_hunter, vault_import_agent.
       # OLLAMA_BASE_URL points at the llm_query proxy (a drop-in Ollama that
