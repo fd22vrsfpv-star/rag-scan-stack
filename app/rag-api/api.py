@@ -13953,6 +13953,8 @@ def _gather_decide(items: list, vuln_class: str) -> dict:
     for name in ("auth", "artifact"):
         if by.get(name, {}).get("status") in ("missing", "gathered"):
             required.add(name)
+    if vc == "auth-bypass":
+        required.discard("auth")
     missing = []
     for name in sorted(required):
         st = by.get(name, {}).get("status", "missing")
@@ -14137,7 +14139,11 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
     desc = (spec.get("description") or "").lower()
     needs_auth = any(k in pre_blob for k in ("auth", "login", "session", "logged", "credential", "cookie")) or \
                  any(k in desc for k in ("authenticated", "logged-in", "logged in", "requires login", "admin privileges", "with admin"))
-    if needs_auth:
+    if vc == "auth-bypass":
+        # The session is what the exploit PRODUCES. Demanding one first blocked
+        # CVE-2024-3408 in round 5 ("missing: auth") by construction.
+        add("auth", "n/a", "auth-bypass class: a session is the exploit's output, not a prerequisite", "class_rule")
+    elif needs_auth:
         if cookie:
             try:
                 valid, why = _probe_session_valid(ip, port, cookie, product=product)

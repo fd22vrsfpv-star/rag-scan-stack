@@ -420,3 +420,14 @@ def test_miner_ignores_the_source_citation_url():
     ns = _load(["_gather_mine_sources"])
     m = ns["_gather_mine_sources"]("[source: https://github.com/x/y/issues/42]\nnothing else here", "")
     assert m["paths"] == [] and m["fields"] == [], m
+
+
+def test_gather_never_requires_a_session_for_auth_bypass():
+    """Round 5, CVE-2024-3408: strict gate halted with 'missing: auth' — for an
+    auth-bypass CVE the session is the exploit's OUTPUT. Sabotage: drop the
+    class rule and this fails."""
+    ns = _load_gather()
+    d = ns["_gather_decide"](_items(auth="missing", input_field="n/a"), "auth-bypass")
+    assert d["ready"] is True and "auth" not in d["required"], d
+    body = _func_src("_gather_manifest")
+    assert 'if vc == "auth-bypass":' in body and "exploit's output" in body
