@@ -706,3 +706,35 @@ def test_unsourced_credential_detector():
     assert r3["kinds"] == ["basic"] and r3["unsourced"]
     body = _func_src("_run_refine_poc")
     assert '"credential_unsourced"' in body and body.find("_command_credential_unsourced(command") < body.find("_prerun_payload_probe(ip, port, command")
+
+
+# ── round-9 fixes: the login path the deep pass depends on ────────────────
+
+def test_url_to_path_normalises_crawl_urls():
+    ns = _load(["_url_to_path"])
+    f = ns["_url_to_path"]
+    assert f("http://172.18.0.36:9090/dtale/main/1?x=1") == "/dtale/main/1"
+    assert f("/login") == "/login" and f("login") == "/login" and f("") == ""
+    body = _func_src("_deep_recon_for_gaps")
+    assert "_url_to_path(u) for u in (urls or [])" in body and "_url_to_path(x) for x in (_extract_zap_paths(z)" in body
+
+
+def test_login_page_is_discovered_before_any_login_attempt():
+    """Round 9: the default-credential path fetched `/` (a 302 to /login) and said
+    'no login form found on page'; the parser recognises /login fine."""
+    body = _func_src("_discover_login_url")
+    assert 'r0.headers.get("location")' in body and "_LOGIN_PATH_CANDIDATES" in body and "parse_login_form(" in body
+    est = _func_src("_establish_session_for_build")
+    i_disc = est.find("login_url = _discover_login_url(ip, port)")
+    i_sup = est.find("_establish_web_session(ip, port, username, password, login_url=login_url)")
+    i_bf = est.find('if auth.get("bruteforce"):')
+    assert 0 < i_disc < i_sup < i_bf, "discovery must precede both the supplied-credential and the default-credential paths"
+
+
+def test_supplied_credentials_failing_falls_through_to_default_credentials():
+    """Round 9: the deep pass passed operator creds + bruteforce and the establisher
+    returned after the supplied attempt (0.12 s) — the default-credential path never ran."""
+    est = _func_src("_establish_session_for_build")
+    assert 'if (s or {}).get("cookie_header") or not auth.get("bruteforce"):' in est
+    assert "_supplied_note = (s or {}).get(\"note\")" in est
+    assert '"login_url": lp,' in est, "the failure must say which login page was used"
