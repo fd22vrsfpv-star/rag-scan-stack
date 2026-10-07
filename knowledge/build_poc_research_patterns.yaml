@@ -136,3 +136,19 @@ patterns:
       the run trace, a follow_up_items row (rule_id artifact_required, idempotent per target) and
       the `build_poc_artifact_required` webhook. The block describes the vector; the artifact itself
       is built by an operator or by the skill once it exists.
+
+  - id: gather_check_before_payload
+    title: "Gather check: every required fact is confirmed before a payload is crafted"
+    triggers: ["before synth", "readiness", "not ready", "missing endpoint", "missing method", "missing field", "gather check"]
+    guidance: >
+      Do not craft until the manifest is complete. Required for every class: target reachable,
+      vulnerability class known, endpoint confirmed LIVE (plan_verify, local source, or a probed
+      candidate), method confirmed (OPTIONS Allow or a non-405 probe), evidence (advisory PoC /
+      fix diff / derived vector / local source; a bare description is unverified). Injection
+      classes also need the input field name; blind classes (ssrf/xxe/cmdi) need a reachable OOB
+      sink; authenticated exploits need a session that passes the live probe; artifact classes
+      need the artifact. Fill cheap gaps first (local source, JSON self-doc, candidate probes,
+      OPTIONS). In strict mode a missing required item halts the run with the manifest and one
+      follow-up per gap (follow_up_items rule_id gather_incomplete; webhook
+      build_poc_gather_check); confirmed facts are injected into the synth guidance so the
+      payload is built against verified endpoint/method/field, never a guess.

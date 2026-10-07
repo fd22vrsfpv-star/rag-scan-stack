@@ -239,3 +239,17 @@ its elapsed time, and is bounded by a stage-level wall clock (the run's
 `research_timeout` in the trace instead of an 80-minute silence.
 **Enforced by:** not enforced.
 
+### test_post_enumeration: the netexec parser fails to import in the sidecar
+**Found:** 2026-10-07 (running the suite in the `python:3.12-slim` sidecar with `PYTHONPATH=.`)
+**Evidence:** `tests/test_post_enumeration.py::test_the_registry_handles_netexec_and_its_aliases`
+and `::test_an_unproductive_parse_counts_zero_not_unknown` fail with
+`WARNING tool_output_parsers: parser for netexec failed: No module named 'parse_netexec'`
+and `assert None is not None`. `etl/parse_netexec.py` exists; `etl/tool_output_parsers.py`
+line 38 tries `from etl.parse_netexec import …`, line 40 falls back to `from parse_netexec
+import …`, and only the FALLBACK's error is reported, so whatever made the first import
+fail is hidden. `git diff --stat HEAD -- etl/` is empty on the branch that observed it.
+**Where:** `etl/tool_output_parsers.py` lines 38–41 and `etl/parse_netexec.py`.
+**Done when:** the first import's exception is logged (not swallowed by the fallback) and
+both tests pass in the sidecar, or they skip with a reason naming the missing dependency.
+**Enforced by:** `tests/test_post_enumeration.py` (currently red for this reason).
+

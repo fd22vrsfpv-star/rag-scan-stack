@@ -59,6 +59,8 @@ class BuildPocState(TypedDict, total=False):
     tool_handoff: Dict[str, Any]      # derived specialist tool(s) + test result (sqlmap…)
     readiness_blocked: bool           # strict-gate: hard blocker → skip the run-refine loop
     readiness_blockers: List[str]     # why it was blocked (for the result)
+    gather_blocked: bool              # strict gather check: required facts missing → skip synth + refine
+    gather_manifest: Dict[str, Any]   # the manifest (items/missing/follow_ups/facts) for the result
     cred_hints: List[str]
     admin_paths_mined: List[str]
     detected_frameworks: List[str]
@@ -1065,6 +1067,46 @@ def node_plan_verify(state: BuildPocState) -> Dict[str, Any]:
     return {"strategy": strategy, "plan_verdicts": verdicts, "guidance": guidance}
 
 
+def node_gather_check(state: BuildPocState) -> Dict[str, Any]:
+    """2026-10-07 (operator ask): "make sure everything is actually gathered
+    and ready before creating a payload." Runs after plan_verify (LIVE/FAKE
+    verdicts exist) and before synth. Strict by default
+    (BUILD_POC_GATHER_CHECK=strict|warn|off): a missing REQUIRED item halts
+    the run with the manifest + follow-ups as the result instead of letting
+    synth guess. warn: inject the manifest into guidance and continue. The
+    manifest's confirmed facts (endpoint/method/field) are injected into
+    guidance in every mode so synth crafts against verified facts."""
+    from api import (_gather_manifest, _gather_manifest_text, _record_gather_manifest,
+                     _BUILD_POC_GATHER_CHECK, _poc_trace)
+    mode = _BUILD_POC_GATHER_CHECK
+    if mode == "off":
+        return {}
+    try:
+        man = _gather_manifest(
+            state["cve"], state["ip"], state["port"], state.get("product"), state.get("version"),
+            state.get("eid"), plan_text=state.get("strategy") or "",
+            plan_verdicts=state.get("plan_verdicts") or {},
+            session_info=state.get("session_info"), auth=state.get("auth"),
+            analysis=((state.get("research_out") or {}).get("analysis")
+                      if isinstance(state.get("research_out"), dict) else None),
+            recon_text=" ".join(state.get("segments") or [])[:20000],
+            run_id=state["run_id"])
+    except Exception as e:  # noqa: BLE001
+        _poc_trace(state["run_id"], "gather_check", response=f"(skipped: {type(e).__name__}: {e})")
+        return {}
+    rec = _record_gather_manifest(man, state["cve"], state["ip"], state["port"],
+                                  eid=state.get("eid"), run_id=state["run_id"])
+    guidance = (_gather_manifest_text(man) + "\n" + (state.get("guidance") or "")).strip()
+    upd: Dict[str, Any] = {"guidance": guidance, "gather_manifest": {**man, "follow_up_id": rec.get("follow_up_id")},
+                           "recon_metrics": {**state.get("recon_metrics", {}),
+                                             "gather_check": {"ready": man.get("ready"),
+                                                              "missing": man.get("missing"),
+                                                              "signal": man.get("summary")}}}
+    if mode == "strict" and not man.get("ready"):
+        upd["gather_blocked"] = True
+    return upd
+
+
 # ── synth + run-refine loop ────────────────────────────────────────────────────
 def node_synth(state: BuildPocState) -> Dict[str, Any]:
     # Route through the shadow wrapper (B rollout). Legacy result is returned
@@ -1075,6 +1117,13 @@ def node_synth(state: BuildPocState) -> Dict[str, Any]:
     # flow. See CHANGES_MADE.
     from api import (_synthesize_cve_poc_with_shadow, _assemble_confirmed_poc_command,
                      _assemble_from_cve_spec, _poc_trace)
+    if state.get("gather_blocked"):
+        man = state.get("gather_manifest") or {}
+        _poc_trace(state["run_id"], "synth_skipped_gather_incomplete", response=man.get("summary"))
+        return {"built": {"command": "# gather_incomplete — " + (man.get("summary") or ""),
+                          "assertion": {}, "synth_kind": "gather_incomplete",
+                          "gather_blocked": True, "gather_manifest": man,
+                          "canary": None, "metrics": {}}}
     built = _synthesize_cve_poc_with_shadow(
         state["cve"], state["ip"], state["port"],
         state.get("product"), state.get("version"), state.get("eid"),
@@ -1132,6 +1181,18 @@ def node_run_refine(state: BuildPocState) -> Dict[str, Any]:
                 "verified": False, "success": False, "iters": 0,
                 "off_target": False, "reflection": False}
     built = state.get("built") or {}
+    if state.get("gather_blocked") or built.get("gather_blocked"):
+        man = state.get("gather_manifest") or built.get("gather_manifest") or {}
+        _poc_trace(state["run_id"], "run_refine_skipped_gather_incomplete",
+                   response=man.get("summary"), extra={"missing": man.get("missing"),
+                                                      "follow_up_id": man.get("follow_up_id")})
+        return {"result": {"ok": True, "success": False, "verified": False, "blocked": True,
+                           "verification_method": "gather_incomplete",
+                           "gather_manifest": man, "follow_up_id": man.get("follow_up_id"),
+                           "reason": "gather check (strict): " + (man.get("summary") or "required facts missing"),
+                           "iterations": 0, "metrics": built.get("metrics") or {}},
+                "verified": False, "success": False, "iters": 0,
+                "off_target": False, "reflection": False}
     # 2026-10-07: synth halted because the sink is fed by a FILE the operator
     # must supply (artifact_required). Nothing to refine — return the
     # requirements + follow-ups as the run's result instead of 50 iterations.
@@ -1452,6 +1513,7 @@ def build_graph():
     g.add_node("plan_verify", node_plan_verify)
 
     # Synth + execution + save
+    g.add_node("gather_check", node_gather_check)
     g.add_node("synth", node_synth)
     g.add_node("run_refine", node_run_refine)
     g.add_node("save_store", node_save_store)
@@ -1525,7 +1587,8 @@ def build_graph():
     g.add_edge("readiness_gate", "assemble_guidance")
     g.add_edge("assemble_guidance", "strategist")
     g.add_edge("strategist", "plan_verify")
-    g.add_edge("plan_verify", "synth")
+    g.add_edge("plan_verify", "gather_check")
+    g.add_edge("gather_check", "synth")
     g.add_edge("synth", "run_refine")
     g.add_edge("run_refine", "save_store")
     g.add_edge("save_store", "tool_handoff")
