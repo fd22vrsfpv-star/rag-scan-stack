@@ -13905,7 +13905,7 @@ _GATHER_FOLLOW_UP = {
 }
 
 
-def _gather_mine_sources(advisory_poc: str = "", derived_vector: str = "") -> dict:
+def _gather_mine_sources(advisory_poc: str = "", derived_vector: str = "", description: str = "") -> dict:
     """PURE: pull endpoint paths, input field names, methods and header
     names out of the advisory PoC text and the derived vector notes. Real
     shapes this handles (2026-10-07 round 4):
@@ -13921,7 +13921,9 @@ def _gather_mine_sources(advisory_poc: str = "", derived_vector: str = "") -> di
     # drop the `[source: https://…]` citation line: it is where the PoC came
     # from, not a path on the target
     adv = _re.sub(r"\[source:[^\]]*\]", " ", advisory_poc or "")
-    dv = derived_vector or ""
+    # round 12: derivation failed, so the only place naming `/update-settings`
+    # was the NVD description — treat it like derived prose
+    dv = (derived_vector or "") + ("\n" + description if description else "")
     paths, fields, methods, headers = [], [], [], []
     # URLs → paths (advisory first: it is a literal PoC)
     for m in _re.finditer(r"https?://[^/\s\"'`]+(/[^\s\"'`?#]+)", adv):
@@ -14568,7 +14570,7 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
     for m in _re.finditer(r"(PRIMARY|ALT\d):\s+class=(\S+)\s+endpoint=(\S+)\s+param=(\S+)", plan_text or ""):
         cands.append({"label": m.group(1), "endpoint": m.group(3), "param": m.group(4)})
     verdicts = plan_verdicts or {}
-    mined = _gather_mine_sources(spec.get("advisory_poc") or "", str(spec.get("derived_vector") or ""))
+    mined = _gather_mine_sources(spec.get("advisory_poc") or "", str(spec.get("derived_vector") or ""), spec.get("description") or "")
     facts["mined"] = mined
     needs_id_path = None
     for c in cands:

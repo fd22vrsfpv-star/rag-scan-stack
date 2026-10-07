@@ -805,3 +805,11 @@ def test_read_back_verifier_has_its_regex_import():
     check referenced _re in a function that only imported time."""
     body = _func_src("_live_verify_recipe")
     assert "import time as _t, re as _re" in body
+
+
+def test_miner_reads_backticked_paths_from_the_nvd_description():
+    """Round 12: derivation failed, and the only source naming the endpoint was the description."""
+    ns = _load(["_gather_mine_sources"])
+    m = ns["_gather_mine_sources"]("", "", "the application fails to restrict custom filter queries, enabling attackers to execute code by bypassing the restriction on the `/update-settings` endpoint")
+    assert "/update-settings" in m["paths"], m
+    assert 'spec.get("description") or ""' in _func_src("_gather_manifest")
