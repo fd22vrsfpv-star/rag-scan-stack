@@ -13947,7 +13947,8 @@ def _gather_mine_sources(advisory_poc: str = "", derived_vector: str = "") -> di
         # `'name' parameter` — the keyword must follow on the SAME line and the
         # quoted token must not be an assigned value (`SECRET_KEY = "Dtale"`)
         for m in _re.finditer(r"(?<![=:]\s)(?<![=:])['\"`]([A-Za-z_][\w\[\]-]*)['\"`][ \t]+(?:parameter|param|field|key|argument)\b", text, _re.I):
-            fields.append(m.group(1))
+            if len(m.group(1)) >= 2 and m.group(1).lower() not in ("in", "an", "is", "of", "to", "the", "on", "at", "by", "or"):
+                fields.append(m.group(1))
         for m in _re.finditer(r"(?:parameter|param|field|key)\s+['\"`]([A-Za-z_][\w\[\]-]*)['\"`]", text, _re.I):
             fields.append(m.group(1))
     # methods: --method=POST, -X POST, "POST /path"
@@ -22634,7 +22635,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                     product=None, version=None, max_iters=3, canary=None,
                     origin_family=None, llm_model=None, metrics=None, model=None,
                     recon_source_used=None, arjun_discovered=None,
-                    focused_urls_from_body=None, resolved_ids=None):
+                    focused_urls_from_body=None, resolved_ids=None, gather_facts=None):
     """Increment 2: run the PoC against the target; on failure, refine via the LLM,
     re-run — up to max_iters. Verbose trail -> filesystem.
 
@@ -23274,8 +23275,14 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                 f"literal `'` as %27, keep each curl on ONE line, no "
                 f"backslash-escape of single quotes inside single-quoted strings."
             )
+        # 2026-10-07: the gather check's verified facts reach the REFINE prompt
+        # too (round 6: synth had them, the refiner did not, and it drifted to
+        # invented endpoints for 48 iterations).
+        gather_note = (("\nGATHERED FACTS (verified before synth — endpoint, method and input are "
+                        "AUTHORITATIVE; refine the payload/verification, do NOT invent other endpoints):\n"
+                        + str(gather_facts)[:1500]) if gather_facts else "")
         rprompt = (f"AUTHORIZED lab pentest. The PoC for {cve} on http://{ip}:{port} did NOT "
-                   f"succeed.\nCommand: {command}\nOutput:\n{(output or '')[:1500]}{precond}"
+                   f"succeed.\nCommand: {command}\nOutput:\n{(output or '')[:1500]}{precond}{gather_note}"
                    f"{shell_syntax_note}{refusal_note}{rag_pattern_notes}{regress_note}{model_switch_note}{path_discovery_note}{waf_hit_note}{escalation_guidance}{anchor_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
                    f"appear. Return ONE JSON object only: {{\"command\": \"<better command, may "
                    f"chain curl calls with ; and shell vars to fetch a token first>\", "
@@ -23323,12 +23330,15 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             # never dispatch the same command again — one corrective re-ask,
             # then stop as no_progress.
             try:
+                # Round 6 (CVE-2024-32980): a context-free re-ask produced unrelated
+                # generic requests that drove 48 iterations of drift. The re-ask
+                # keeps the FULL refine prompt and only prepends the rejection.
                 _dup_prompt = (
                     "IDENTICAL_COMMAND_REJECTED: you returned EXACTLY the previous command, which "
                     f"already ran and failed. Its output was: {(output or '')[:300]!r}. Return a DIFFERENT "
-                    "command that changes exactly ONE variable (header value format, path, method, "
-                    "parameter, or how the result is verified) as JSON "
-                    "{\"command\": \"...\", \"assertion\": {\"expect_regex\": \"...\"}}. No prose.")
+                    "command against the SAME target and CVE endpoint that changes exactly ONE variable "
+                    "(header value format, path, method, parameter, or how the result is verified). "
+                    "Do not invent new endpoints. Same JSON shape, no prose.\n\n" + rprompt)
                 _rd = _llm_for_model(_dup_prompt, model=model, caller="cve_poc_refine_identical")
                 _rtext = _rd.get("response", "") if isinstance(_rd, dict) else str(_rd or "")
                 _acc_llm_metrics(metrics, _rd)
@@ -23338,10 +23348,15 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             except Exception as _ide:  # noqa: BLE001
                 _obj2 = None
                 logging.debug("identical-resend re-ask failed: %s", _ide)
-            if _obj2 and _obj2.get("command") and str(_obj2["command"]).strip() != _new_cmd:
+            _c2 = str((_obj2 or {}).get("command") or "").strip()
+            _fam2 = _poc_target_family(_c2) if _c2 else None
+            if _c2 and _c2 != _new_cmd and not (orig and orig[1] and _fam2 and _fam2[1] and _fam2[1] != orig[1]):
                 obj = _obj2
-                _new_cmd = str(obj["command"]).strip()
+                _new_cmd = _c2
             else:
+                if _c2 and _c2 != _new_cmd:
+                    _poc_trace(run_id, "refine_identical_rejected_drift", iteration=it,
+                               extra={"reason": f"re-ask answer drifted to {_fam2} (CVE endpoint {orig}); not dispatched"})
                 metrics["identical_resend_stop"] = metrics.get("identical_resend_stop", 0) + 1
                 _poc_trace(run_id, "refine_no_progress", iteration=it,
                            extra={"reason": "LLM resent the identical command twice; stopping"})

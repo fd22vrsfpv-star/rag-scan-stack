@@ -1169,7 +1169,7 @@ def node_run_refine(state: BuildPocState) -> Dict[str, Any]:
     fires from inside _run_refine_poc.
     Recon-source-used is threaded in so the zap-active escalation knows whether
     zap-active already ran as primary recon."""
-    from api import _run_refine_poc, _poc_trace
+    from api import _run_refine_poc, _poc_trace, _gather_manifest_text
     # Readiness short-circuit (strict gate): a hard precondition blocker means
     # the exploit cannot land no matter how many iterations we run. Refuse to
     # hammer — return a BLOCKED result naming what's missing so the operator
@@ -1230,6 +1230,7 @@ def node_run_refine(state: BuildPocState) -> Dict[str, Any]:
         # host-level scan. Catches URLs ZAP's own spider would never reach.
         arjun_discovered=state.get("arjun_discovered"),
         focused_urls_from_body=state.get("focused_urls"),
+        gather_facts=(_gather_manifest_text(state["gather_manifest"]) if state.get("gather_manifest") else None),
         # Resolved object-ids from the login's post-access inventory /
         # precondition enumeration — enforced into every command so the model
         # can't substitute an invented id for one the login actually proved.

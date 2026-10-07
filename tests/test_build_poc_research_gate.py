@@ -578,3 +578,22 @@ def test_plan_verify_checks_existence_with_the_plans_method():
     body = _func_src("_verify_strategist_plan")
     assert r'(?:\s+method=(\S+))?' in body, "candidate regex must capture method="
     assert 'if st == 404 and pmethod not in ("GET", "HEAD"):' in body and "_fetch(endpoint, method=pmethod)" in body
+
+
+def test_refine_loop_sees_gathered_facts_and_reask_keeps_context():
+    """Round 6 CVE-2024-32980: synth had the manifest, the refiner did not; the
+    context-free identical re-ask answered with unrelated generic requests and
+    the loop drifted for 48 iterations."""
+    body = _func_src("_run_refine_poc")
+    assert "gather_facts=None" in body and "GATHERED FACTS" in body and "{gather_note}" in body
+    i_note = body.find("gather_note = "); i_prompt = body.find('rprompt = (f"AUTHORIZED lab pentest.')
+    assert 0 < i_note < i_prompt
+    assert 'Do not invent new endpoints. Same JSON shape, no prose.\\n\\n" + rprompt' in body, "re-ask must carry the full refine prompt"
+    assert '"refine_identical_rejected_drift"' in body, "a drifted re-ask answer must be rejected, not dispatched"
+    g = _func_src("node_run_refine", GRAPH)
+    assert "gather_facts=(_gather_manifest_text(" in g
+
+
+def test_miner_ignores_stopword_tokens_as_fields():
+    ns = _load(["_gather_mine_sources"])
+    assert ns["_gather_mine_sources"]("", "the value passed 'in' parameter form is unsafe")["fields"] == []
