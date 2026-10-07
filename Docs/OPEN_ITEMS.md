@@ -216,3 +216,26 @@ approval path, gated behind an explicit policy flag (Tier 3).
 **Where:** `osint_runner/osint_runner.py` — the gowitness dispatch path. Any other `osint_runner` scan without a `proxy` set has the same problem (sweep: `grep -nE "subprocess|requests\.|httpx\." osint_runner/osint_runner.py | wc -l` → 100s of call sites; need an audit).
 **Done when:** engagements can declare a mandatory proxy (per-engagement `require_proxy=true` on `engagements` or `scope_targets`); the OSINT dispatcher fail-closes a scan whose target is in such an engagement when no `proxy` is configured; `scan_audit/audit.jsonl` records the actual proxy node_id used (or `required_proxy_missing` + reason); and the OpSec console labels local-execution scans as 🚨 ATTRIBUTION LEAK rather than the neutral "local". Agreement test with `tests/test_dispatch_invariants.py` so the sibling scope-gate rule is proven not duplicated.
 **Enforced by:** not enforced.
+
+## Build-PoC deep-test loop
+
+### The research/derivation stage can silently take 80 minutes
+**Found:** 2026-10-07 (cvebench round 3, CVE-2024-36675, qwen3-coder:30b)
+**Evidence:** the run's trace (`/app/poc_logs/CVE-2024-36675_172.18.0.35_1791378542.jsonl`,
+35 rows) shows `recon:product_cve_enumeration` at 09:15:06 and the next row,
+`cve_spec_derivation` ("verified=False source=extract+duplicate-verified"), at
+10:35:28 — a **4815 s** gap with no trace row in between. The whole run took 5453 s
+for 2 iterations (success=True by regex at iteration 2). rag-api logged nothing
+in that window (0 non-health lines) and `llm_query` logged nothing either, so
+whatever blocked did so without a single log line. Round 2's run of the same CVE
+took 759 s.
+**Where:** `app/rag-api/build_poc_graph.py::node_research` → `_research_exploit`
+and `_derive_cve_spec` in `app/rag-api/api.py`; neither emits a trace row per
+LLM call or per `_live_verify_recipe` attempt, so the stage is a black box
+between two trace rows.
+**Done when:** the stage traces each LLM call and each live-verify attempt with
+its elapsed time, and is bounded by a stage-level wall clock (the run's
+`wall_timeout_sec` does not cap a single stage) so a hung upstream shows up as
+`research_timeout` in the trace instead of an 80-minute silence.
+**Enforced by:** not enforced.
+
