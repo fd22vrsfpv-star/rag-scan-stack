@@ -197,3 +197,50 @@ def test_decomposed_pipeline_does_not_call_legacy():
         "decomposed path must not call legacy synth — breaks shadow-mode "
         "independence AND would recurse infinitely"
     )
+
+
+# ── Phase 3b (2026-10-07): shadow-dispatch the decomposed command ──────────
+
+
+def test_shadow_dispatch_helper_is_fail_closed_and_probed():
+    body = _func_src("_shadow_dispatch_decomposed")
+    assert body, "_shadow_dispatch_decomposed missing"
+    assert "_poc_grant_active(ip, port, eid)" in body, (
+        "shadow dispatch must re-check the PoC grant — a shadow lane never assumes authorization"
+    )
+    assert "_poc_shell_syntax_check(command)" in body, "must dry-parse before sending to the listener"
+    assert "_prerun_payload_probe(ip, port, command" in body, "must probe before dispatch"
+    assert "_prerun_oob_check(ip, port, command" in body, "must run the OOB sink check"
+    # Only real decomposed commands are dispatched, never the stub/fallback.
+    assert '"decomposed_fallback"' in body and '"decomposed_phase1_scaffold"' in body, (
+        "must skip fallback/scaffold synth_kinds"
+    )
+
+
+def test_shadow_dispatch_uses_same_verifier_and_downgrades_latency():
+    body = _func_src("_shadow_dispatch_decomposed")
+    assert body, "_shadow_dispatch_decomposed missing"
+    assert "_poc_assertion_verdict_with_semantic(" in body, "must use the same verifier as the legacy loop"
+    assert '"latency_unconfirmed"' in body, (
+        "a latency verdict must be recorded as latency_unconfirmed, not passed — "
+        "no scaled-payload confirmation runs here (CLAUDE.md blind-timing rule)"
+    )
+    assert "emit_webhook(" in body and '"build_poc_shadow_dispatch"' in body, (
+        "an action that sends traffic must emit a webhook event (CLAUDE.md)"
+    )
+
+
+def test_wrapper_records_decomposed_dispatch_row():
+    body = _func_src("_synthesize_cve_poc_with_shadow")
+    assert body, "_synthesize_cve_poc_with_shadow missing"
+    assert "_shadow_dispatch_decomposed(" in body, "wrapper must invoke the shadow dispatch"
+    assert 'phase="decomposed_dispatch"' in body, "dispatch verdict must land in its own shadow row"
+    assert body.rstrip().endswith("return legacy"), "wrapper must still return the legacy result"
+
+
+def test_shadow_runs_stats_expose_decomposed_pass_rate():
+    body = _func_src("build_poc_shadow_runs")
+    assert body, "build_poc_shadow_runs missing"
+    assert "decomposed_dispatched" in body and "decomposed_passed" in body, (
+        "stats must expose decomposed dispatch count + pass count so Phase 4 can score"
+    )
