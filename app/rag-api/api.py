@@ -13112,6 +13112,287 @@ def _poc_shadow_record(run_id: str, iteration: int, phase: str,
         logging.debug("poc_shadow_record failed: %s", e)
 
 
+# ─── Phase 2 of B rollout: curl→httpx execution lane ─────────────────────
+#
+# Parses a curl command into a structured HTTP request spec and executes it
+# via httpx.Client, so we capture r.status_code, r.headers, r.json(),
+# r.elapsed, r.cookies, r.history natively — none of the "parse the -i output
+# with regex" dance the current shell lane requires. Chained curls
+# (cmd1 && cmd2 && cmd3) run under one Session so cookies persist naturally.
+#
+# Falls back to shell execution for any command that uses non-HTTP tools
+# (nmap, nc, python one-liners) or shell features (pipes to grep, process
+# substitution, backticks). Added 2026-10-06.
+
+
+def _can_execute_in_python(command: str) -> tuple:
+    """Return (can_execute: bool, reason: str) — True iff `command` is a
+    pure chain of curl invocations joined by `&&` or `;`.
+
+    Rejects:
+      - any non-curl tool (nmap, nc, python, bash -c, sh, wget, awk, grep, sed)
+      - shell pipes (`|`), process substitution (`<(...)`, `>(...)`), command
+        substitution with backticks or `$(...)`
+      - heredocs, redirections to files
+      - env-var expansion that can't be resolved by the parser
+    """
+    if not command or not command.strip():
+        return (False, "empty command")
+    import re as _re
+    # Shell features that make Python execution unsafe to attempt.
+    if "`" in command or "$(" in command or "<(" in command or ">(" in command:
+        return (False, "shell command/process substitution present")
+    if "|" in command and "||" not in command.replace("||", "", 1).replace("||", ""):
+        # A real pipe `|`, not the `||` operator — too conservative, split and check.
+        # Walk the string, flag any single `|` that isn't part of `||`.
+        i = 0
+        while i < len(command):
+            if command[i] == "|":
+                if i + 1 < len(command) and command[i+1] == "|":
+                    i += 2; continue
+                if i > 0 and command[i-1] == "|":
+                    i += 1; continue
+                return (False, "shell pipe (|) present")
+            i += 1
+    if _re.search(r"\b(nmap|nc|wget|python3?|bash|sh|awk|grep|sed|hashcat|sqlmap|ncat|socat)\b", command):
+        return (False, "non-curl tool in command")
+    # Split on && / ;; / ; (but not inside quotes — crude approximation; good enough
+    # for the common `curl ... && sleep N && curl ...` pattern).
+    import shlex as _shlex
+    try:
+        tokens = _shlex.split(command)
+    except Exception as e:  # noqa: BLE001
+        return (False, f"shlex split failed: {e}")
+    # Walk tokens, finding each `curl` command. Any token that isn't curl / && /
+    # ; / sleep (literal `sleep N`) disqualifies.
+    allowed_bins = {"curl", "sleep", "&&", ";", "echo", "true", "false"}
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t in allowed_bins:
+            # `sleep 1` consumes the next token as a number.
+            if t == "sleep" and i + 1 < len(tokens) and tokens[i+1].isdigit():
+                i += 2; continue
+            i += 1
+            continue
+        return (False, f"unsupported token: {t!r}")
+    return (True, "pure curl chain")
+
+
+def _curl_to_request(curl_cmd: str) -> dict:
+    """Parse ONE curl invocation into a structured HTTP request spec.
+
+    Returns {method, url, headers, body, query, cookies, auth, verify, timeout, follow_redirects}
+    or raises ValueError if the command isn't a valid curl invocation this parser handles.
+
+    Supported flags: -X/--request, -H/--header, -d/--data, --data-raw,
+    --data-urlencode, --data-binary, -G/--get, -F/--form, -b/--cookie,
+    -c/--cookie-jar, -u/--user, -k/--insecure, -L/--location,
+    --max-time, -A/--user-agent, -e/--referer, -o/--output (dropped).
+    """
+    import shlex as _shlex
+    tokens = _shlex.split(curl_cmd)
+    if not tokens or tokens[0] != "curl":
+        raise ValueError(f"not a curl command (first token = {tokens[0] if tokens else '(empty)'!r})")
+
+    req = {"method": "GET", "url": "", "headers": {}, "body": None,
+           "query": {}, "cookies": {}, "auth": None,
+           "verify": True, "timeout": 30, "follow_redirects": False}
+    use_get_params = False  # -G converts -d body into query string
+
+    i = 1
+    while i < len(tokens):
+        t = tokens[i]
+        if t in ("-X", "--request"):
+            req["method"] = tokens[i+1].upper(); i += 2
+        elif t in ("-H", "--header"):
+            raw = tokens[i+1]
+            if ":" in raw:
+                k, _, v = raw.partition(":")
+                req["headers"][k.strip()] = v.strip()
+            i += 2
+        elif t in ("-d", "--data", "--data-raw", "--data-binary"):
+            req["body"] = tokens[i+1]
+            if req["method"] == "GET":
+                req["method"] = "POST"  # curl implicit
+            i += 2
+        elif t == "--data-urlencode":
+            raw = tokens[i+1]
+            if "=" in raw:
+                k, _, v = raw.partition("=")
+                req["query"][k] = v if use_get_params else v
+                if not use_get_params:
+                    # It's a POST body in url-encoded form; concatenate.
+                    cur = req["body"] or ""
+                    from urllib.parse import quote as _q
+                    req["body"] = (cur + "&" if cur else "") + f"{k}={_q(v)}"
+                    if req["method"] == "GET":
+                        req["method"] = "POST"
+            i += 2
+        elif t in ("-G", "--get"):
+            use_get_params = True; req["method"] = "GET"
+            i += 1
+        elif t in ("-F", "--form"):
+            # Multipart form — complex; punt by storing in a `_form` list.
+            req.setdefault("_form", []).append(tokens[i+1])
+            if req["method"] == "GET":
+                req["method"] = "POST"
+            i += 2
+        elif t in ("-b", "--cookie"):
+            raw = tokens[i+1]
+            # Can be "k=v; k2=v2" or a cookie-jar filename. We only parse the first form.
+            if "=" in raw:
+                for pair in raw.split(";"):
+                    if "=" in pair:
+                        k, _, v = pair.partition("=")
+                        req["cookies"][k.strip()] = v.strip()
+            i += 2
+        elif t in ("-c", "--cookie-jar"):
+            i += 2  # jar file — handled by Session state; drop the arg
+        elif t in ("-u", "--user"):
+            raw = tokens[i+1]
+            if ":" in raw:
+                u, _, p = raw.partition(":")
+                req["auth"] = (u, p)
+            i += 2
+        elif t in ("-k", "--insecure"):
+            req["verify"] = False; i += 1
+        elif t in ("-L", "--location"):
+            req["follow_redirects"] = True; i += 1
+        elif t == "--max-time":
+            try:
+                req["timeout"] = int(tokens[i+1])
+            except Exception:  # noqa: BLE001
+                pass
+            i += 2
+        elif t in ("-A", "--user-agent"):
+            req["headers"]["User-Agent"] = tokens[i+1]; i += 2
+        elif t in ("-e", "--referer"):
+            req["headers"]["Referer"] = tokens[i+1]; i += 2
+        elif t in ("-o", "--output", "--output-dir"):
+            i += 2  # drop
+        elif t in ("-s", "--silent", "-S", "--show-error", "-i", "--include",
+                   "-v", "--verbose", "-f", "--fail", "--compressed",
+                   "-n", "--netrc", "-4", "-6", "--http1.0", "--http1.1", "--http2"):
+            i += 1  # no-arg flags we ignore
+        elif t.startswith("-"):
+            # Unknown flag — be conservative; take one arg if available.
+            if i + 1 < len(tokens) and not tokens[i+1].startswith("-"):
+                i += 2
+            else:
+                i += 1
+        else:
+            # The URL (first positional non-flag).
+            if not req["url"]:
+                req["url"] = t
+            i += 1
+
+    if not req["url"]:
+        raise ValueError("no URL extracted from curl command")
+    # Fold query dict into URL if we had -G.
+    if use_get_params and req["query"]:
+        from urllib.parse import urlencode as _uenc
+        sep = "&" if "?" in req["url"] else "?"
+        req["url"] = req["url"] + sep + _uenc(req["query"])
+    return req
+
+
+def _execute_http_chain(commands: list, chain_timeout: int = 180) -> dict:
+    """Execute a chain of parsed curl requests via httpx.Client (one Session so
+    cookies persist across steps). Returns a dict with:
+      {ok, output (concatenated response bodies), exit_code,
+       steps: [{status, headers, body_preview, elapsed_ms, cookies, error?}]}
+
+    Fail-soft: a step that raises records its exception + continues to the next.
+    Mirrors shell `curl && curl` behaviour (next command runs only if prior
+    succeeded) — on non-2xx or exception, remaining steps are skipped and
+    exit_code reflects the first failure (same as `&&` chaining).
+    """
+    import httpx as _hx, time as _t
+    steps = []
+    output_parts = []
+    exit_code = 0
+    with _hx.Client(timeout=chain_timeout, verify=False, follow_redirects=False,
+                    http2=False) as client:
+        for req in commands:
+            if not req:
+                continue
+            step = {"status": None, "headers": {}, "body_preview": "",
+                    "elapsed_ms": 0, "cookies": {}, "url": req.get("url"),
+                    "method": req.get("method")}
+            t0 = _t.time()
+            try:
+                r = client.request(
+                    req.get("method") or "GET",
+                    req["url"],
+                    headers=req.get("headers") or None,
+                    content=req.get("body"),
+                    cookies=req.get("cookies") or None,
+                    auth=req.get("auth"),
+                    timeout=req.get("timeout") or 30,
+                    follow_redirects=bool(req.get("follow_redirects")),
+                )
+                step["status"] = r.status_code
+                step["headers"] = dict(r.headers)
+                step["body_preview"] = (r.text or "")[:1500]
+                step["cookies"] = dict(r.cookies)
+                output_parts.append(f"HTTP/{r.http_version} {r.status_code}\n"
+                                    + "\n".join(f"{k}: {v}" for k, v in r.headers.items())
+                                    + "\n\n" + (r.text or "")[:4000])
+                if r.status_code >= 400:
+                    exit_code = r.status_code
+                    # Mirror `&&` — don't execute remaining steps
+                    steps.append(step)
+                    break
+            except Exception as e:  # noqa: BLE001
+                step["error"] = f"{type(e).__name__}: {e}"
+                exit_code = 7  # curl's connect-failed code
+                steps.append(step)
+                break
+            finally:
+                step["elapsed_ms"] = int((_t.time() - t0) * 1000)
+            steps.append(step)
+
+    return {"ok": exit_code == 0, "output": "\n\n".join(output_parts),
+            "exit_code": exit_code, "steps": steps}
+
+
+def _execute_curl_chain_in_python(command: str, chain_timeout: int = 180) -> dict:
+    """High-level helper: given a shell command, if it's a pure curl chain
+    (per `_can_execute_in_python`), parse each `curl ...` segment and run via
+    `_execute_http_chain`. Returns `{can_execute: bool, reason: str, result?: dict}`.
+
+    `result` has the shape returned by `_execute_http_chain`. When
+    can_execute is False, caller should fall back to shell dispatch.
+    """
+    can, reason = _can_execute_in_python(command)
+    if not can:
+        return {"can_execute": False, "reason": reason}
+    # Split chain on `&&` / `;` — crude, but we already filtered pipes/subs upstream.
+    import re as _re
+    segments = _re.split(r"\s*(?:&&|;)\s*", command.strip())
+    parsed = []
+    for seg in segments:
+        seg = seg.strip()
+        if not seg:
+            continue
+        if seg.startswith("sleep "):
+            continue  # ignore sleep in Python lane — Session doesn't need it
+        if seg.startswith("curl "):
+            try:
+                parsed.append(_curl_to_request(seg))
+            except Exception as e:  # noqa: BLE001
+                return {"can_execute": False, "reason": f"parse failed on segment: {e}"}
+        else:
+            # Shouldn't happen (filter upstream catches it), but be defensive.
+            return {"can_execute": False, "reason": f"segment not supported: {seg[:60]!r}"}
+    try:
+        result = _execute_http_chain(parsed, chain_timeout=chain_timeout)
+    except Exception as e:  # noqa: BLE001
+        return {"can_execute": False, "reason": f"httpx chain execute raised: {e}"}
+    return {"can_execute": True, "reason": "ok", "result": result}
+
+
 def _decomposed_synthesize_cve_poc(cve, ip, port, product, version, eid,
                                    run_id=None, guidance_extra="", model=None):
     """SKELETON — Phase 1 of the B rollout.
@@ -20933,6 +21214,39 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                         and len(output or "") < 4000):
                     output = (f"PRERUN_PROBE_FEEDBACK status={_probe_st} "
                               f"body={_probe_bp}\n\n{output}")
+                # Phase 2 shadow — run the SAME command via the Python
+                # httpx lane for structured capture + comparison. Observed-
+                # only in Phase 1/2 (legacy shell result stays authoritative).
+                # Falls through quietly when BUILD_POC_DECOMPOSED is "off" or
+                # when the command isn't a pure curl chain (nmap, python,
+                # pipes). See _execute_curl_chain_in_python docstring.
+                if _BUILD_POC_DECOMPOSED_MODE in ("shadow", "on"):
+                    try:
+                        _py = _execute_curl_chain_in_python(command, chain_timeout=_vt)
+                        if _py.get("can_execute"):
+                            _poc_shadow_record(
+                                run_id=run_id, iteration=it, phase="dispatch",
+                                cve=cve, ip=str(ip), port=port,
+                                legacy={"output": (output or "")[:4000],
+                                        "exit_code": ec,
+                                        "command": command[:600]},
+                                new={"output": (_py["result"]["output"] or "")[:4000],
+                                     "exit_code": _py["result"]["exit_code"],
+                                     "steps": _py["result"]["steps"],
+                                     "note": _py.get("reason", "")})
+                        else:
+                            # Record a lightweight note so an operator can see
+                            # how often the Python lane is skipped + why.
+                            _poc_shadow_record(
+                                run_id=run_id, iteration=it, phase="dispatch_skipped",
+                                cve=cve, ip=str(ip), port=port,
+                                legacy={"output": (output or "")[:200],
+                                        "exit_code": ec,
+                                        "command": command[:600]},
+                                new={"skipped": True,
+                                     "reason": _py.get("reason", "unknown")})
+                    except Exception as _she:  # noqa: BLE001
+                        logging.debug("python-shadow dispatch raised: %s", _she)
             # Never-regress tracking: this iter's command passed the syntax
             # check AND actually ran against the target. Capture it as the
             # last-known-good base — the refine prompt will show it to the
