@@ -13853,6 +13853,112 @@ def _decomposed_stub(run_id, cve, canary, metrics, reason: str,
     }
 
 
+def _shadow_dispatch_decomposed(new: dict, cve, ip, port, eid, run_id, model=None,
+                                timeout: int = 60) -> dict:
+    """Phase 3b (2026-10-07): run the DECOMPOSED command once per build and
+    record its own verdict, so round 3 answers "would decomposition have
+    landed it" instead of only "did its shape differ".
+
+    Observed-only: never touches the authoritative legacy result. Fail-closed
+    on authorization (re-checks the PoC grant for this ip:port even though the
+    enclosing build already passed it). Probes before dispatch (same
+    _prerun_payload_probe / _prerun_oob_check brakes as the legacy loop) so a
+    dead path costs a 2 KB roundtrip, not a 60 s listener call. Latency-based
+    verdicts are NOT accepted as passed here (CLAUDE.md: a timing verdict
+    needs the scaled-payload confirmation); they are recorded as
+    `latency_unconfirmed` so the claim stays honest.
+
+    Returns the dict written into the shadow row's `new_result` under
+    `dispatch`.
+    """
+    import httpx as _hx, time as _t
+    out = {"attempted": False}
+    command = (new or {}).get("command") or ""
+    sk = (new or {}).get("synth_kind") or ""
+    if not command or command.startswith("#") or not sk.startswith("decomposed_") \
+            or sk in ("decomposed_fallback", "decomposed_phase1_scaffold"):
+        out["skipped"] = f"no dispatchable decomposed command (synth_kind={sk!r})"
+        return out
+    # Authorization: fail closed. The enclosing build-poc call already granted
+    # this ip:port, but a shadow lane must never be the thing that assumes it.
+    try:
+        if not _poc_grant_active(ip, port, eid):
+            out["skipped"] = "PoC grant not active for target — refused (fail-closed)"
+            return out
+    except Exception as e:  # noqa: BLE001
+        out["skipped"] = f"grant check raised {type(e).__name__} — refused (fail-closed)"
+        return out
+    ok, err = _poc_shell_syntax_check(command)
+    if not ok:
+        out["skipped"] = f"shell syntax refused: {err[:200]}"
+        return out
+    try:
+        probe = _prerun_payload_probe(ip, port, command, timeout=5)
+    except Exception as e:  # noqa: BLE001
+        probe = {"ok": True, "skipped": True, "reason": f"probe raised {type(e).__name__}"}
+    out["probe"] = {k: probe.get(k) for k in ("ok", "method", "url", "status", "reason", "allow_header")}
+    if probe.get("ok") is False:
+        out["skipped"] = f"prerun probe failed: {probe.get('reason')}"
+        return out
+    try:
+        oob = _prerun_oob_check(ip, port, command, timeout=3)
+        out["oob"] = {"unreachable": oob.get("unreachable", []), "reason": oob.get("reason")}
+    except Exception:  # noqa: BLE001
+        pass
+    listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    out["attempted"] = True
+    t0 = _t.time()
+    try:
+        lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
+                      json={"command": command, "target": str(ip), "port": port, "timeout": timeout},
+                      headers={"x-api-key": API_KEY}, verify=False, timeout=timeout + 60)
+        d = lr.json() if lr.status_code < 400 else {}
+        output = d.get("output", "") or lr.text
+        ec = d.get("exit_code") if isinstance(d, dict) else None
+    except Exception as e:  # noqa: BLE001
+        output = f"listener error: {e}"; ec = None
+    elapsed = round(_t.time() - t0, 3)
+    out["output"] = (output or "")[:4000]
+    out["exit_code"] = ec
+    out["elapsed_seconds"] = elapsed
+    # Same verifier as the legacy loop.
+    try:
+        v = _poc_assertion_verdict_with_semantic(
+            (new or {}).get("assertion") or {}, output, ec,
+            rationale=(new or {}).get("rationale", ""), model=model, elapsed_seconds=elapsed)
+    except Exception as e:  # noqa: BLE001
+        v = {"passed": False, "method": "verdict_error", "confidence": 0.0,
+             "reason": f"{type(e).__name__}: {e}"}
+    method = v.get("method") or ""
+    passed = bool(v.get("passed"))
+    if passed and method in ("latency", "latency_anchored"):
+        # Not confirmed with a scaled payload here — do not claim it.
+        passed = False
+        method = "latency_unconfirmed"
+    out["verdict"] = {"passed": passed, "method": method,
+                      "confidence": v.get("confidence"), "reason": (v.get("reason") or "")[:300]}
+    # Structured capture via the Python lane too (it's assembler output, so it
+    # should be a pure curl chain).
+    try:
+        py = _execute_curl_chain_in_python(command, chain_timeout=timeout)
+        if py.get("can_execute"):
+            out["python_lane"] = {"exit_code": py["result"].get("exit_code"),
+                                  "sink_hit": py["result"].get("sink_hit"),
+                                  "steps": py["result"].get("steps")}
+        else:
+            out["python_lane"] = {"skipped": py.get("reason")}
+    except Exception as e:  # noqa: BLE001
+        out["python_lane"] = {"error": f"{type(e).__name__}: {e}"}
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("build_poc_shadow_dispatch", "build_poc", {
+            "engagement_id": str(eid) if eid else None, "cve": cve, "target": f"{ip}:{port}",
+            "run_id": run_id, "synth_kind": sk, "passed": passed, "method": method})
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def _synthesize_cve_poc_with_shadow(cve, ip, port, product, version, eid,
                                     run_id=None, guidance_extra="", model=None):
     """Shadow wrapper around `_synthesize_cve_poc`.
@@ -13888,6 +13994,23 @@ def _synthesize_cve_poc_with_shadow(cve, ip, port, product, version, eid,
                 legacy=legacy, new=new)
         except Exception:  # noqa: BLE001
             pass
+        # Phase 3b: dispatch the decomposed command once and record its own
+        # verdict in a separate row, so success data exists before Phase 4.
+        try:
+            disp = _shadow_dispatch_decomposed(
+                new, cve, ip, port, eid,
+                run_id=(legacy or {}).get("run_id") or run_id or "unknown", model=model)
+            _poc_shadow_record(
+                run_id=(legacy or {}).get("run_id") or run_id or "unknown",
+                iteration=0, phase="decomposed_dispatch",
+                cve=cve, ip=str(ip), port=port,
+                legacy={"command": (legacy or {}).get("command", "")[:600],
+                        "synth_kind": (legacy or {}).get("synth_kind")},
+                new={"command": (new or {}).get("command", "")[:600],
+                     "synth_kind": (new or {}).get("synth_kind"),
+                     "dispatch": disp})
+        except Exception as _sde:  # noqa: BLE001
+            logging.debug("shadow decomposed dispatch raised: %s", _sde)
     return legacy
 
 
@@ -24955,7 +25078,9 @@ def build_poc_shadow_runs(limit: int = Query(50, ge=1, le=500),
             cur.execute(f"""
                 SELECT count(*)::int total,
                        sum(CASE WHEN (divergence->>'identical')::boolean THEN 1 ELSE 0 END)::int identical_count,
-                       sum(CASE WHEN (divergence->>'same_command')::boolean THEN 1 ELSE 0 END)::int same_command_count
+                       sum(CASE WHEN (divergence->>'same_command')::boolean THEN 1 ELSE 0 END)::int same_command_count,
+                       sum(CASE WHEN phase='decomposed_dispatch' AND (new_result->'dispatch'->>'attempted')::boolean THEN 1 ELSE 0 END)::int decomposed_dispatched,
+                       sum(CASE WHEN phase='decomposed_dispatch' AND (new_result->'dispatch'->'verdict'->>'passed')::boolean THEN 1 ELSE 0 END)::int decomposed_passed
                   FROM build_poc_shadow_runs {where}""", params)
             stats = dict(cur.fetchone() or {})
         return {"ok": True, "mode": _BUILD_POC_DECOMPOSED_MODE,
