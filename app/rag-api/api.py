@@ -14074,6 +14074,32 @@ def _canary_only_in_redirect(out: str, canary: str) -> bool:
     return canary not in stripped
 
 
+def _command_credential_unsourced(command: str, known_values: list | None = None) -> dict:
+    """PURE: does the command carry a session/auth credential (cookie, bearer,
+    basic) that none of the pipeline's own sources produced? Round 8
+    (CVE-2024-3408): synth emitted a session cookie while `authenticated` was
+    False — nothing in recon had issued it. Advisory only: for the auth-bypass
+    class a crafted token can be the exploit itself; for every other class it
+    is a hallucinated prerequisite the refiner should be told about.
+    Returns {"present": bool, "unsourced": bool, "kinds": [...]}."""
+    import re as _re
+    cmd = command or ""
+    kinds, values = [], []
+    for m in _re.finditer(r"(?:--cookie|-b)\s+['\"]?([^'\"\s]+)", cmd):
+        kinds.append("cookie"); values.append(m.group(1))
+    for m in _re.finditer(r"(?i)cookie:\s*([^'\"\n]+)", cmd):
+        kinds.append("cookie-header"); values.append(m.group(1))
+    for m in _re.finditer(r"(?i)authorization:\s*(?:bearer|basic)\s+([^'\"\s]+)", cmd):
+        kinds.append("authorization"); values.append(m.group(1))
+    for m in _re.finditer(r"(?:-u|--user)\s+['\"]?([^'\"\s]+:[^'\"\s]+)", cmd):
+        kinds.append("basic"); values.append(m.group(1))
+    if not kinds:
+        return {"present": False, "unsourced": False, "kinds": []}
+    known = [k for k in (known_values or []) if k]
+    sourced = any(any(kv in v or v in kv for kv in known) for v in values)
+    return {"present": True, "unsourced": not sourced, "kinds": sorted(set(kinds))}
+
+
 def _inband_diff_signal(baseline_status, baseline_len, run_status, run_len, threshold=0.10) -> dict:
     """PURE: did the mutated request get a materially different response than
     the unmodified baseline of the same path?"""
@@ -23013,6 +23039,14 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         s = _re_dup.sub(r"\s+", " ", s)                         # whitespace
         s = _re_dup.sub(r"'[a-f0-9]{32,}'", "'{HEX}'", s)       # hex blobs
         return s[:300]
+    _stop_reason = None
+    _known_cred_values = []
+    try:
+        _si = (metrics or {}).get("_session_cookie_header") if isinstance(metrics, dict) else None
+        if _si:
+            _known_cred_values.append(str(_si))
+    except Exception:  # noqa: BLE001
+        pass
     for it in range(1, max(1, max_iters) + 1):
         iters = it
         # Enforce enumerated object-ids BEFORE running: the login proved these
@@ -23087,6 +23121,17 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             # exploit will too (just slower, and consuming a listener slot).
             # Operator ask (2026-10-06): "we should have a pre-check on the
             # payload before running it." See _prerun_payload_probe docstring.
+            try:
+                _cu = _command_credential_unsourced(command, known_values=list(_known_cred_values or []))
+                if _cu.get("unsourced"):
+                    metrics["credential_unsourced"] = metrics.get("credential_unsourced", 0) + 1
+                    _poc_trace(run_id, "credential_unsourced", iteration=it,
+                               extra={"kinds": _cu.get("kinds"),
+                                      "note": "the command carries a session/auth credential that no recon "
+                                              "or login step produced (advisory; legitimate only for the "
+                                              "auth-bypass class where the token IS the exploit)"})
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 _probe = _prerun_payload_probe(ip, port, command, timeout=5)
             except Exception as _pbe:  # noqa: BLE001 — probe never breaks dispatch
@@ -23634,6 +23679,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                     _poc_trace(run_id, "refine_identical_rejected_drift", iteration=it,
                                extra={"reason": f"re-ask answer drifted to {_fam2} (CVE endpoint {orig}); not dispatched"})
                 metrics["identical_resend_stop"] = metrics.get("identical_resend_stop", 0) + 1
+                _stop_reason = "identical_resend"
                 _poc_trace(run_id, "refine_no_progress", iteration=it,
                            extra={"reason": "LLM resent the identical command twice; stopping"})
                 break
@@ -23647,6 +23693,8 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             _refine_dup_streak = 0
         _cmd_signatures.append(_sig)
         if _refine_dup_streak >= _REFINE_DUP_EXIT_AT:
+            _stop_reason = "dup_exit"
+            metrics["refine_dup_exit"] = metrics.get("refine_dup_exit", 0) + 1
             _poc_trace(run_id, "refine_dup_exit", iteration=it,
                        extra={"streak": _refine_dup_streak,
                               "signature": _sig[:150],
@@ -23754,6 +23802,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
     return {"ok": True, "success": success, "verified": verified, "off_target": off_target,
             "drifted": drifted, "anchored": anchored, "reflection": reflection, "canary": canary,
             "iterations": iters, "final_command": command, "final_assertion": assertion,
+            "stop_reason": _stop_reason or ("success" if success else "max_iters"),
             "llm_model": llm_model, "built_at": built_at, "metrics": metrics,
             "security_test_id": security_test_id, "log_path": log_path,
             "verification_method": verification_method,

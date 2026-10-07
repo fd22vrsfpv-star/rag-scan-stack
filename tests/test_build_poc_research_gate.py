@@ -682,3 +682,27 @@ def test_deep_pass_runs_the_solutions_step_and_second_manifest_carries_them():
     assert 'caller="gap_solutions"' in _func_src("_solutions_for_gaps")
     g = _func_src("node_gather_check", GRAPH)
     assert 'man["deep_recon"]' in g and 'dr["solutions"]' in g
+
+
+def test_refine_result_carries_stop_reason_and_give_up_triggers_deep_recon():
+    """Round 8 CVE-2024-3408: refine_no_progress at iteration 3 — above the
+    early threshold of 2 — so the deep pass never fired."""
+    body = _func_src("_run_refine_poc")
+    assert '_stop_reason = "identical_resend"' in body and '_stop_reason = "dup_exit"' in body
+    assert '"stop_reason": _stop_reason or ("success" if success else "max_iters")' in body
+    g = GRAPH.read_text()
+    assert 'res.get("stop_reason") in ("identical_resend", "dup_exit")' in g and "gave_up or int(" in g
+
+
+def test_unsourced_credential_detector():
+    ns = _load(["_command_credential_unsourced"])
+    f = ns["_command_credential_unsourced"]
+    assert f("curl -s http://t/x")["present"] is False
+    r = f("curl -s --cookie 'session=abc.def.ghi' http://t/x", known_values=[])
+    assert r["present"] and r["unsourced"] and r["kinds"] == ["cookie"], r
+    r2 = f("curl -s -H 'Cookie: session=abc.def.ghi' http://t/x", known_values=["session=abc.def.ghi"])
+    assert r2["present"] and r2["unsourced"] is False, r2
+    r3 = f("curl -u admin:admin http://t/x", known_values=[])
+    assert r3["kinds"] == ["basic"] and r3["unsourced"]
+    body = _func_src("_run_refine_poc")
+    assert '"credential_unsourced"' in body and body.find("_command_credential_unsourced(command") < body.find("_prerun_payload_probe(ip, port, command")

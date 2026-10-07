@@ -1265,7 +1265,7 @@ def node_run_refine(state: BuildPocState) -> Dict[str, Any]:
         product=state.get("product"), version=state.get("version"),
         max_iters=state["max_iters"],
         canary=built.get("canary"), origin_family=built.get("origin_family"),
-        llm_model=built.get("llm_model"), metrics=built.get("metrics"),
+        llm_model=built.get("llm_model"),
         model=state.get("model"),
         recon_source_used=state.get("recon_source"),
         # Hand arjun's live findings + any operator-supplied focused URLs
@@ -1275,6 +1275,9 @@ def node_run_refine(state: BuildPocState) -> Dict[str, Any]:
         arjun_discovered=state.get("arjun_discovered"),
         focused_urls_from_body=state.get("focused_urls"),
         gather_facts=(_gather_manifest_text(state["gather_manifest"]) if state.get("gather_manifest") else None),
+        metrics={**(built.get("metrics") or {}),
+                 "_session_cookie_header": ((state.get("session_info") or {}).get("cookie_header")
+                                            or (state.get("auth") or {}).get("_auto_cookie") or "")},
         # Resolved object-ids from the login's post-access inventory /
         # precondition enumeration — enforced into every command so the model
         # can't substitute an invented id for one the login actually proved.
@@ -1655,7 +1658,12 @@ def build_graph():
     def _route_after_refine(state):
         from api import _BUILD_POC_DEEP_RECON, _BUILD_POC_EARLY_STOP_ITERS
         res = state.get("result") or {}
-        early = (not res.get("success")) and int(res.get("iterations") or 0) <= _BUILD_POC_EARLY_STOP_ITERS
+        gave_up = (res.get("stop_reason") in ("identical_resend", "dup_exit")
+                   or bool((res.get("metrics") or {}).get("identical_resend_stop"))
+                   or bool((res.get("metrics") or {}).get("refine_dup_exit")))
+        # "early" = the loop gave up (whatever the count — round 8 stopped at
+        # iteration 3 and never widened) OR it ended within the first iterations
+        early = (not res.get("success")) and (gave_up or int(res.get("iterations") or 0) <= _BUILD_POC_EARLY_STOP_ITERS)
         if (_BUILD_POC_DEEP_RECON == "on" and early and not state.get("deep_recon_done")
                 and not res.get("artifact_required")):
             return "deep_recon"
