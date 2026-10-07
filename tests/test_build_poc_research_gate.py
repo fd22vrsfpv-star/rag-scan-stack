@@ -35,7 +35,7 @@ def _load(names) -> dict:
     src = API.read_text(); tree = _ast.parse(src); ns = {"os": os}
     # module-level constants the helpers reference
     for node in tree.body:
-        if isinstance(node, _ast.Assign) and any(getattr(t, "id", "") in ("_INPUT_SOURCE_SIGNATURES", "_LOCAL_SOURCE_DIRS", "_ARTIFACT_FORMAT_HINTS", "_ARTIFACT_LOCATION_BY_SOURCE") for t in node.targets):
+        if isinstance(node, _ast.Assign) and any(getattr(t, "id", "") in ("_INPUT_SOURCE_SIGNATURES", "_LOCAL_SOURCE_DIRS", "_ARTIFACT_FORMAT_HINTS", "_ARTIFACT_LOCATION_BY_SOURCE", "_HEADER_PARAMS") for t in node.targets):
             exec(_ast.get_source_segment(src, node), ns)
     for n in names:
         node = next(x for x in _ast.walk(tree) if isinstance(x, _ast.FunctionDef) and x.name == n)
@@ -407,7 +407,7 @@ def test_miner_reads_derived_vector_prose():
 
 def test_collector_uses_mined_paths_fields_methods():
     body = _func_src("_gather_manifest")
-    assert "_gather_mine_sources(" in body and 'probe_list = list(mined["paths"])' in body
+    assert "_gather_mine_sources(" in body and "probe_list += _path_variants(_mp)" in body
     assert 'mined["fields"][0]' in body and "(header)" in body and '"advisory_poc"' in body
     # "/" accepted only on a LIVE verdict
     assert 'v == "LIVE" and c["endpoint"] not in ("", "none")' in body and 'v == "SUSPECT" and c["endpoint"] not in ("/", "", "none")' in body
@@ -431,3 +431,150 @@ def test_gather_never_requires_a_session_for_auth_bypass():
     assert d["ready"] is True and "auth" not in d["required"], d
     body = _func_src("_gather_manifest")
     assert 'if vc == "auth-bypass":' in body and "exploit's output" in body
+
+
+# ── 2026-10-07 OPEN_ITEMS fixes (auth-bypass + SSRF post-mortem) ──────────
+
+def test_header_params_are_recognised():
+    ns = _load(["_is_header_param"])
+    for h in ("Host", "X-Forwarded-For", "x-custom-thing", "Referer"):
+        assert ns["_is_header_param"](h), h
+    for p in ("id", "query", "url", "x"):
+        assert not ns["_is_header_param"](p), p
+
+
+def test_plan_verify_probes_header_inputs_as_headers_and_reports_needs_id():
+    body = _func_src("_verify_strategist_plan")
+    assert "hdr_param = _is_header_param(param)" in body
+    assert "_fetch(endpoint, headers={param: canary}) if hdr_param" in body, "header input must be sent as a header"
+    assert '"127.0.0.1:1" if hdr_param' in body, "SSRF class probe must be a host value for a header input"
+    assert 'verdicts[c["label"]] = "NEEDS_ID"' in body and "_resolve_placeholder_path(endpoint" in body
+    assert 'in ("LIVE", "SUSPECT", "NEEDS_ID")' in body, "NEEDS_ID must not trigger the ALL-FAKE directive"
+
+
+def test_placeholder_resolution_and_id_pool():
+    ns = _load(["_path_placeholders", "_collect_id_pool", "_resolve_placeholder_path"])
+    pool = ns["_collect_id_pool"]("Dtale instances: data_id=1, data_id=2; user id: 7", {"objects": [{"script_id": 9}]}, None)
+    assert pool["data_id"] == 1 and pool["id"] == 7 and pool["script_id"] == 9, pool
+    assert ns["_resolve_placeholder_path"]("/dtale/test-filter/{data_id}", pool) == ("/dtale/test-filter/1", {"data_id": 1})
+    assert ns["_resolve_placeholder_path"]("/api/{id}", {"data_id": 3}) == ("/api/3", {"id": 3}), "suffix match"
+    assert ns["_resolve_placeholder_path"]("/api/{thing}", {}) == (None, {})
+
+
+def test_readiness_treats_a_placeholder_endpoint_as_a_blocker_not_a_probe():
+    body = _func_src("_assess_exploit_readiness")
+    i_ph = body.find('if tep and "{" in tep:'); i_probe = body.find('elif tep and tep.startswith("/"):')
+    assert 0 < i_ph < i_probe and "unresolved placeholder" in body
+
+
+REAL_3408_BOUNCE = ("HTTP/1.1 302 FOUND\r\nServer: Werkzeug/3.0.6 Python/3.11.16\r\nContent-Type: text/html; charset=utf-8\r\n"
+                    "Location: /login?next=%2Fdtale%2Ftest-filter%2F1%3Fquery%3DPOCb8fb7e2f6c\r\n\r\n<!doctype html>Redirecting...")
+
+
+def test_redirect_reflection_is_not_verification():
+    ns = _load(["_canary_only_in_redirect"])
+    assert ns["_canary_only_in_redirect"](REAL_3408_BOUNCE, "POCb8fb7e2f6c") is True
+    assert ns["_canary_only_in_redirect"]("HTTP/1.1 200 OK\r\n\r\nresult: POCb8fb7e2f6c", "POCb8fb7e2f6c") is False
+    assert ns["_canary_only_in_redirect"]("HTTP/1.1 302 FOUND\r\nLocation: /x\r\n\r\nPOCb8fb7e2f6c", "POCb8fb7e2f6c") is False
+    body = _func_src("_live_verify_recipe")
+    assert '"canary_reflected_in_redirect"' in body and body.find("_canary_only_in_redirect(out, canary)") < body.find('"canary_read_back"')
+
+
+def test_identical_resend_is_rejected_before_dispatch():
+    body = _func_src("_run_refine_poc")
+    i_rej = body.find('if _new_cmd == (command or "").strip():')
+    i_sig = body.find("_sig = _refine_signature(_new_cmd)")
+    assert 0 < i_rej < i_sig, "identical check must run before the signature/dup-streak logic"
+    assert "IDENTICAL_COMMAND_REJECTED" in body and '"refine_no_progress"' in body and 'caller="cve_poc_refine_identical"' in body
+
+
+def test_inband_diff_signal_and_hook():
+    ns = _load(["_inband_diff_signal"])
+    assert ns["_inband_diff_signal"](200, 1000, 200, 1260)["changed"] is True
+    assert ns["_inband_diff_signal"](200, 1000, 500, 1000)["changed"] is True
+    assert ns["_inband_diff_signal"](200, 1000, 200, 1050)["changed"] is False
+    assert ns["_inband_diff_signal"](None, 0, 200, 1)["changed"] is False
+    body = _func_src("_run_refine_poc")
+    assert "_inband_baseline_diff(ip, port, command" in body and "INBAND_DIFF_FEEDBACK" in body and '"inband_diff"' in body
+
+
+def test_local_source_reads_spin_openapi_rust_and_go(tmp_path):
+    (tmp_path / "CVE-0000-0001" / "target" / "src").mkdir(parents=True)
+    t = tmp_path / "CVE-0000-0001" / "target"
+    (t / "spin.toml").write_text('[[trigger.http]]\nroute = "/..."\ncomponent = "r"\n[component.r]\nallowed_outbound_hosts = ["http://self", "https://self"]\n')
+    (t / "src" / "api.json").write_text('{"openapi":"3.0.4","paths":{"/proxy":{"get":{"summary":"Proxy endpoint","description":"Fetches from the root endpoint and returns the response"}}}}')
+    (t / "src" / "lib.rs").write_text('#[get("/health")]\nasync fn h() {}\nRouter::new().route("/items", post(create))\n')
+    (t / "main.go").write_text('http.HandleFunc("/upload", up)\nr.POST("/api/run", run)\n')
+    ns = _load(["_local_source_routes"]); ns["_LOCAL_SOURCE_DIRS"] = [str(tmp_path)]
+    r = ns["_local_source_routes"]("CVE-0000-0001")
+    paths = {(x["path"], tuple(x["methods"])) for x in r["routes"]}
+    assert ("/proxy", ("GET",)) in paths and ("/health", ("GET",)) in paths and ("/items", ("POST",)) in paths
+    assert ("/upload", ("GET", "POST")) in paths and ("/api/run", ("POST",)) in paths and ("/...", ("GET", "POST")) in paths, paths
+    assert r["facts"] and r["facts"][0]["key"] == "allowed_outbound_hosts" and "self" in r["facts"][0]["value"]
+    assert "config allowed_outbound_hosts" in r["text"] and "Proxy endpoint" in r["text"] and "Fetches from the root endpoint" in r["text"]
+
+
+def test_gather_check_requires_a_resolved_id_for_templated_routes():
+    ns = _load_gather()
+    d = ns["_gather_decide"](_items(endpoint="missing", endpoint_id="missing"), "rce")
+    assert "endpoint_id" in d["missing"] and "placeholder" in " ".join(d["follow_ups"])
+    body = _func_src("_gather_manifest")
+    assert "_resolve_placeholder_path(c[\"endpoint\"], id_pool" in body and '"placeholder_resolved:' in body
+    g = GRAPH.read_text()
+    assert "_collect_id_pool(" in g and "id_pool=_ids" in g and 'id_pool=state.get("id_pool")' in g
+
+
+def test_miner_does_not_take_a_quoted_config_value_as_a_field():
+    """Round 5 CVE-2024-3408: derived notes `SECRET_KEY = "Dtale" ... key` produced input_field=Dtale."""
+    ns = _load(["_gather_mine_sources"])
+    m = ns["_gather_mine_sources"]("", "the hardcoded SECRET_KEY = \"Dtale\" in the flask config\nkey rotation was added")
+    assert "Dtale" not in m["fields"], m
+    m2 = ns["_gather_mine_sources"]("", "where the 'name' parameter is passed")
+    assert m2["fields"] == ["name"]
+
+
+def test_path_variants_strip_the_deployment_prefix():
+    ns = _load(["_path_variants"])
+    assert ns["_path_variants"]("/stock/php_action/editCategories.php") == [
+        "/stock/php_action/editCategories.php", "/php_action/editCategories.php", "/editCategories.php"]
+    assert ns["_path_variants"]("/install_extension") == ["/install_extension"]
+    assert ns["_path_variants"]("relative") == []
+
+
+def test_collector_uses_cookie_header_prefix_variants_and_mined_method():
+    body = _func_src("_gather_manifest")
+    assert '.get("cookie_header")' in body, "session_info stores the cookie under cookie_header (36779 round 5 saw no session)"
+    assert "probe_list += _path_variants(_mp)" in body
+    assert "+ _probe_methods:" in body and 'if rp.status_code not in (404, 405):' in body
+
+
+def test_id_pool_reads_numeric_path_segments_and_resolver_falls_back():
+    ns = _load(["_path_placeholders", "_collect_id_pool", "_resolve_placeholder_path"])
+    pool = ns["_collect_id_pool"]("Redirects to: /dtale/main/1 (HTTP 302)")
+    assert pool == {"main": 1}, pool
+    path, used = ns["_resolve_placeholder_path"]("/dtale/test-filter/{data_id}", pool)
+    assert path == "/dtale/test-filter/1" and used.get("_fallback") is True, (path, used)
+    assert ns["_resolve_placeholder_path"]("/x/{slug}", pool) == (None, {}), "fallback only for *id placeholders"
+
+
+def test_scout_recon_keeps_the_root_redirect_location():
+    body = _func_src("_scout_url_recon")
+    assert 'r.headers.get("location")' in body and '"Redirects to:' in body
+
+
+def test_openapi_paths_line_round_trips_and_feeds_the_collector():
+    ns = _load(["_parse_openapi_paths_line"])
+    routes = ns["_parse_openapi_paths_line"]("Tech: x | OpenAPI paths (112 at /openapi.json): POST /install_extension; GET /docs; GET/POST /extensions/{path}")
+    assert routes[0] == {"path": "/install_extension", "methods": ["POST"]} and routes[2]["methods"] == ["GET", "POST"], routes
+    assert ns["_parse_openapi_paths_line"]("nothing here") == []
+    body = _func_src("_gather_manifest")
+    assert "_parse_openapi_paths_line(recon_text" in body and '"openapi"' in body
+    assert '_probe_methods.append("POST")' in body, "a POST-only FastAPI route answers 404 to GET (lollms /install_extension)"
+    recon = _func_src("_scout_url_recon")
+    assert '"/openapi.json"' in recon and "OpenAPI paths (" in recon
+
+
+def test_plan_verify_checks_existence_with_the_plans_method():
+    body = _func_src("_verify_strategist_plan")
+    assert r'(?:\s+method=(\S+))?' in body, "candidate regex must capture method="
+    assert 'if st == 404 and pmethod not in ("GET", "HEAD"):' in body and "_fetch(endpoint, method=pmethod)" in body
