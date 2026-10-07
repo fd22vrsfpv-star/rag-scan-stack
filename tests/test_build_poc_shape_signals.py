@@ -129,3 +129,74 @@ def test_fetch_cve_details_populates_advisory_poc():
         "the result must be stored on details['advisory_poc'] so the synth "
         "prompt can read it"
     )
+
+
+# ── 2026-10-07: advisory PoC must come from the GitHub advisories API ───────
+#
+# The rendered GHSA page is ~200 KB of HTML using <pre>; the 12 KB cap cut
+# before content and the ``` fence regex never matched, so advisory_poc was
+# "" for every CVE in the overnight batch. The API returns the description
+# as raw markdown. These exec the real extractor against that exact shape.
+
+
+def _load_extractor():
+    src = API.read_text()
+    tree = _ast.parse(src)
+    ns: dict = {}
+    node = next(n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef) and n.name == "_extract_poc_from_text")
+    exec(_ast.get_source_segment(src, node), ns)
+    return ns["_extract_poc_from_text"]
+
+
+GHSA_MXHQ_DESCRIPTION = (
+    "### Summary\nlobe-chat has an unauthorized SSRF in /api/proxy.\n\n"
+    "### Proof of Concept\n```\nPOST /api/proxy HTTP/2\nHost: xxxxxxxxxxxxxxxxx\n"
+    "Cookie: LOBE_LOCALE=zh-CN; LOBE_THEME_PRIMARY_COLOR=undefined\n"
+    "Content-Type: text/plain;charset=UTF-8\n\nhttp://169.254.169.254/latest/meta-data/\n```\n\n### Impact\nSSRF.\n"
+)
+
+
+def test_dynamic_extractor_pulls_request_block_from_ghsa_markdown():
+    extract = _load_extractor()
+    snippet = extract(GHSA_MXHQ_DESCRIPTION)
+    assert snippet.startswith("POST /api/proxy HTTP/2"), snippet
+    assert "169.254.169.254" in snippet
+
+
+def test_dynamic_extractor_handles_html_pre_blocks_via_fence_conversion():
+    """Pass-2 pages are converted <pre> -> ``` before extraction; prove the
+    extractor accepts the converted shape (the conversion itself lives in
+    _fetch_advisory_poc as a closure)."""
+    extract = _load_extractor()
+    converted = "intro\n\n```\ncurl -X POST http://t/api/proxy -d 'http://169.254.169.254/'\n```"
+    assert "curl -X POST" in extract(converted)
+
+
+def test_fetch_advisory_poc_uses_github_advisories_api_first():
+    body = _func_src("_fetch_advisory_poc")
+    assert body, "_fetch_advisory_poc missing"
+    assert "api.github.com/advisories/" in body, (
+        "must fetch the advisory via the GitHub API (raw markdown), not only the rendered page"
+    )
+    assert "GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}" in body, "must extract GHSA ids from refs"
+    assert "<pre" in body and "```" in body, "page fallback must convert <pre> blocks to fences"
+    assert "GITHUB_PAT" in body, "must use a PAT when available (60/hr unauthenticated limit)"
+
+
+def test_fetch_cve_details_backfill_retries_on_empty_with_debounce():
+    body = _func_src("_fetch_cve_details")
+    assert body, "_fetch_cve_details missing"
+    assert 'not cached.get("advisory_poc")' in body, (
+        "backfill must retry when advisory_poc is EMPTY, not only when the key is missing"
+    )
+    assert "_advisory_poc_checked" in body, "retry must be debounced so no-PoC CVEs don't refetch every synth"
+
+
+def test_fetch_advisory_poc_reads_github_issues_via_api():
+    """CVE-2024-36675's only ref is a GitHub issue, not a GHSA; the rendered
+    issue page is React and yields nothing. The issues API returns the
+    markdown body."""
+    body = _func_src("_fetch_advisory_poc")
+    assert body, "_fetch_advisory_poc missing"
+    assert "api.github.com/repos/" in body, "must read GitHub issues via the repos API"
+    assert "/issues/(\\d+)" in body, "must recognise github.com/{owner}/{repo}/issues/{n} refs"
