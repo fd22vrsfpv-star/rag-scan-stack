@@ -1048,9 +1048,15 @@ def node_plan_verify(state: BuildPocState) -> Dict[str, Any]:
 
 # ── synth + run-refine loop ────────────────────────────────────────────────────
 def node_synth(state: BuildPocState) -> Dict[str, Any]:
-    from api import (_synthesize_cve_poc, _assemble_confirmed_poc_command,
+    # Route through the shadow wrapper (B rollout). Legacy result is returned
+    # unchanged; when BUILD_POC_DECOMPOSED is shadow/on the decomposed synth
+    # also runs and both land in build_poc_shadow_runs. Fix 2026-10-07: the
+    # overnight batch recorded ZERO synthesize rows because this LangGraph
+    # node bypassed the wrapper — the only wired call site was a different
+    # flow. See CHANGES_MADE.
+    from api import (_synthesize_cve_poc_with_shadow, _assemble_confirmed_poc_command,
                      _assemble_from_cve_spec, _poc_trace)
-    built = _synthesize_cve_poc(
+    built = _synthesize_cve_poc_with_shadow(
         state["cve"], state["ip"], state["port"],
         state.get("product"), state.get("version"), state.get("eid"),
         run_id=state["run_id"], guidance_extra=state.get("guidance") or "",

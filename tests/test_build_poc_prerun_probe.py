@@ -89,9 +89,11 @@ def test_prerun_probe_hooked_before_dispatch():
         "the pre-run probe short-circuits must bump a metric so the operator "
         "can audit how often the brake fired across a batch"
     )
-    # The dispatch must come AFTER the probe hook (within ~2 KB) — otherwise
-    # we're probing but still running the heavy exploit regardless.
-    post = src[hook_pos : hook_pos + 2000]
+    # The dispatch must come AFTER the probe hook — otherwise we're probing
+    # but still running the heavy exploit regardless. Window widened
+    # 2000 → 8000 on 2026-10-07: the OOB check + shape-feedback + Python-lane
+    # shadow blocks now sit between the hook and the dispatch.
+    post = src[hook_pos : hook_pos + 8000]
     assert "vectors/run" in post, (
         "the listener /vectors/run dispatch must appear within the same "
         "block as the probe hook, not before it"
