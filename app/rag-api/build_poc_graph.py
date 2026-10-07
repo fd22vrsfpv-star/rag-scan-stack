@@ -79,6 +79,7 @@ class BuildPocState(TypedDict, total=False):
     recon_guidance: str
     strategy: str
     plan_verdicts: Dict[str, str]
+    id_pool: Dict[str, Any]           # ids seen in recon/enumeration, for templated paths
     guidance: str
     built: Optional[Dict[str, Any]]
 
@@ -1044,14 +1045,18 @@ def node_strategist(state: BuildPocState) -> Dict[str, Any]:
 
 
 def node_plan_verify(state: BuildPocState) -> Dict[str, Any]:
-    from api import _verify_strategist_plan, _poc_trace
+    from api import _verify_strategist_plan, _poc_trace, _collect_id_pool
     strategy = state.get("strategy") or ""
     if not strategy:
         return {}
     try:
         _auto_cookie = (state.get("auth") or {}).get("_auto_cookie")
+        # ids already seen (recon text, enumeration output) resolve templated
+        # paths like /dtale/test-filter/{data_id} before they are probed
+        _ids = _collect_id_pool(" ".join(state.get("segments") or [])[:30000],
+                                state.get("access_inventory"), state.get("precond_result"))
         strategy_verified, verdicts = _verify_strategist_plan(
-            state["ip"], state["port"], strategy, session_cookie=_auto_cookie)
+            state["ip"], state["port"], strategy, session_cookie=_auto_cookie, id_pool=_ids)
         if verdicts:
             _poc_trace(state["run_id"], "recon:plan_verified",
                        response=f"verdicts: {verdicts}",
@@ -1064,7 +1069,7 @@ def node_plan_verify(state: BuildPocState) -> Dict[str, Any]:
     guidance = state.get("guidance") or ""
     if strategy:
         guidance = strategy + " " + guidance
-    return {"strategy": strategy, "plan_verdicts": verdicts, "guidance": guidance}
+    return {"strategy": strategy, "plan_verdicts": verdicts, "guidance": guidance, "id_pool": _ids if strategy else {}}
 
 
 def node_gather_check(state: BuildPocState) -> Dict[str, Any]:
@@ -1090,7 +1095,7 @@ def node_gather_check(state: BuildPocState) -> Dict[str, Any]:
             analysis=((state.get("research_out") or {}).get("analysis")
                       if isinstance(state.get("research_out"), dict) else None),
             recon_text=" ".join(state.get("segments") or [])[:20000],
-            run_id=state["run_id"])
+            run_id=state["run_id"], id_pool=state.get("id_pool") or {})
     except Exception as e:  # noqa: BLE001
         _poc_trace(state["run_id"], "gather_check", response=f"(skipped: {type(e).__name__}: {e})")
         return {}

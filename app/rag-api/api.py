@@ -13644,7 +13644,7 @@ def _local_source_routes(cve: str, max_files: int = 12, max_bytes: int = 60_000)
     "fields": [...], "files": [...], "text": "<guidance block>"}.
     Fail-soft; `found=False` when no directory exists.
     """
-    import glob as _glob, re as _re
+    import glob as _glob, re as _re, json as _json
     cve = (cve or "").strip().upper()
     for base in _LOCAL_SOURCE_DIRS:
         tdir = os.path.join(base, cve, "target")
@@ -13654,8 +13654,13 @@ def _local_source_routes(cve: str, max_files: int = 12, max_bytes: int = 60_000)
             _glob.glob(os.path.join(tdir, "**", "*.py"), recursive=True)
             + _glob.glob(os.path.join(tdir, "Dockerfile*"))
             + _glob.glob(os.path.join(tdir, "**", "entrypoint*"), recursive=True)
-            + _glob.glob(os.path.join(tdir, "**", "*.sh"), recursive=True)))[:max_files]
-        routes, fields, seen_bytes = [], [], 0
+            + _glob.glob(os.path.join(tdir, "**", "*.sh"), recursive=True)
+            + _glob.glob(os.path.join(tdir, "**", "*.rs"), recursive=True)
+            + _glob.glob(os.path.join(tdir, "**", "*.go"), recursive=True)
+            + _glob.glob(os.path.join(tdir, "**", "spin.toml"), recursive=True)
+            + _glob.glob(os.path.join(tdir, "**", "*.json"), recursive=True)
+            + _glob.glob(os.path.join(tdir, "**", "*.y*ml"), recursive=True)))[:max_files]
+        routes, fields, facts, seen_bytes = [], [], [], 0
         for f in files:
             try:
                 txt = open(f, errors="ignore").read(max_bytes - seen_bytes)
@@ -13674,6 +13679,36 @@ def _local_source_routes(cve: str, max_files: int = 12, max_bytes: int = 60_000)
             # Request field names: request.files["x"], request.json["x"], request.form.get("x"), request.args["x"]
             for m in _re.finditer(r"request\.(files|json|form|args)(?:\.get\(|\[)\s*['\"]([^'\"]+)['\"]", txt):
                 fields.append({"carrier": m.group(1), "name": m.group(2), "file": rel})
+            # Rust (actix/rocket attribute macros, axum .route) and Go (net/http, gin/echo)
+            if rel.endswith(".rs"):
+                for m in _re.finditer(r"#\[(get|post|put|delete|patch)\(\s*\"([^\"]+)\"", txt):
+                    routes.append({"path": m.group(2), "methods": [m.group(1).upper()], "file": rel})
+                for m in _re.finditer(r"\.route\(\s*\"([^\"]+)\"\s*,\s*(get|post|put|delete|patch)\(", txt):
+                    routes.append({"path": m.group(1), "methods": [m.group(2).upper()], "file": rel})
+            if rel.endswith(".go"):
+                for m in _re.finditer(r"HandleFunc\(\s*\"([^\"]+)\"", txt):
+                    routes.append({"path": m.group(1), "methods": ["GET", "POST"], "file": rel})
+                for m in _re.finditer(r"\.(GET|POST|PUT|DELETE|PATCH)\(\s*\"([^\"]+)\"", txt):
+                    routes.append({"path": m.group(2), "methods": [m.group(1)], "file": rel})
+            # Spin manifest: routes + the outbound allow-list (an advisory precondition)
+            if rel.endswith("spin.toml"):
+                for m in _re.finditer(r"^\s*route\s*=\s*\"([^\"]+)\"", txt, _re.M):
+                    routes.append({"path": m.group(1), "methods": ["GET", "POST"], "file": rel})
+                for m in _re.finditer(r"^\s*(allowed_outbound_hosts|allowed_http_hosts)\s*=\s*(\[[^\]]*\])", txt, _re.M):
+                    facts.append({"key": m.group(1), "value": m.group(2), "file": rel})
+            # OpenAPI document: every path + method + summary is a route
+            if rel.endswith((".json", ".yaml", ".yml")) and "paths" in txt[:20000]:
+                try:
+                    doc = _json.loads(txt) if rel.endswith(".json") else __import__("yaml").safe_load(txt)
+                    for pth, ops in ((doc or {}).get("paths") or {}).items():
+                        for mth, op in (ops or {}).items():
+                            if str(mth).lower() in ("get", "post", "put", "delete", "patch"):
+                                _sum = ((op or {}).get("summary") or "")
+                                _desc = ((op or {}).get("description") or "")
+                                routes.append({"path": pth, "methods": [str(mth).upper()], "file": rel,
+                                               "summary": (_sum + (" — " + _desc if _desc and _desc != _sum else ""))[:160]})
+                except Exception:  # noqa: BLE001
+                    pass
             if seen_bytes >= max_bytes:
                 break
         # De-dup preserving order
@@ -13686,16 +13721,19 @@ def _local_source_routes(cve: str, max_files: int = 12, max_bytes: int = 60_000)
             return out
         routes = _uniq(routes, lambda r: (r["path"], tuple(r["methods"])))
         fields = _uniq(fields, lambda f: (f["carrier"], f["name"]))
-        if not routes and not fields:
-            return {"found": True, "dir": tdir, "routes": [], "fields": [], "files": [os.path.relpath(f, tdir) for f in files],
+        facts = _uniq(facts, lambda f: (f["key"], f["value"]))
+        if not routes and not fields and not facts:
+            return {"found": True, "dir": tdir, "routes": [], "fields": [], "facts": [], "files": [os.path.relpath(f, tdir) for f in files],
                     "text": f"LOCAL SOURCE at {tdir}: {len(files)} file(s) read, no route decorators or request fields recognised."}
         lines = [f"LOCAL TARGET SOURCE (read from disk at {tdir} — AUTHORITATIVE; do not invent paths):"]
         for r in routes:
-            lines.append(f"  route {','.join(r['methods'])} {r['path']}  ({r['file']})")
+            lines.append(f"  route {','.join(r['methods'])} {r['path']}  ({r['file']})" + (f" — {r['summary']}" if r.get("summary") else ""))
         for fd in fields:
             carrier = {"files": "multipart file field", "json": "JSON body key", "form": "form field", "args": "query param"}.get(fd["carrier"], fd["carrier"])
             lines.append(f"  input {carrier} `{fd['name']}`  ({fd['file']})")
-        return {"found": True, "dir": tdir, "routes": routes, "fields": fields,
+        for fc in facts:
+            lines.append(f"  config {fc['key']} = {fc['value']}  ({fc['file']})")
+        return {"found": True, "dir": tdir, "routes": routes, "fields": fields, "facts": facts,
                 "files": [os.path.relpath(f, tdir) for f in files], "text": "\n".join(lines)}
     return {"found": False, "dir": None, "routes": [], "fields": [], "files": [], "text": ""}
 
@@ -13863,6 +13901,7 @@ _GATHER_FOLLOW_UP = {
     "oob_sink": "Bring up / configure the OOB listener and confirm it is reachable from here; a blind class cannot be verified without it.",
     "artifact": "Supply the external artifact (see artifact_requirements) — a request body alone cannot reach this sink.",
     "evidence": "Fetch the advisory PoC / fix diff / derived vector; a bare CVE title is not enough to craft from.",
+    "endpoint_id": "The route has a placeholder id: enumerate it (instances/list index route, discovered ids, access inventory) and substitute a real value before probing.",
 }
 
 
@@ -13905,7 +13944,9 @@ def _gather_mine_sources(advisory_poc: str = "", derived_vector: str = "") -> di
         fields.append(m.group(1))
     # prose: the 'name' parameter / `id` param / "file" field / key
     for text in (adv, dv):
-        for m in _re.finditer(r"['\"`]([A-Za-z_][\w\[\]-]*)['\"`]\s*(?:parameter|param|field|key|argument)", text, _re.I):
+        # `'name' parameter` — the keyword must follow on the SAME line and the
+        # quoted token must not be an assigned value (`SECRET_KEY = "Dtale"`)
+        for m in _re.finditer(r"(?<![=:]\s)(?<![=:])['\"`]([A-Za-z_][\w\[\]-]*)['\"`][ \t]+(?:parameter|param|field|key|argument)\b", text, _re.I):
             fields.append(m.group(1))
         for m in _re.finditer(r"(?:parameter|param|field|key)\s+['\"`]([A-Za-z_][\w\[\]-]*)['\"`]", text, _re.I):
             fields.append(m.group(1))
@@ -13930,6 +13971,170 @@ def _gather_mine_sources(advisory_poc: str = "", derived_vector: str = "") -> di
             "methods": _uniq(methods), "headers": _uniq(headers)}
 
 
+_HEADER_PARAMS = {"host", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip",
+                  "referer", "origin", "user-agent", "cookie", "authorization", "x-original-url",
+                  "x-rewrite-url", "x-http-method-override", "forwarded"}
+
+
+def _is_header_param(name: str) -> bool:
+    """A strategist `param` that names a REQUEST HEADER (Host, X-Forwarded-For,
+    any X-*). Round 4 CVE-2024-32980: `param=Host` was probed as `?Host=canary`
+    and marked FAKE — a header input can never verify through the query string."""
+    n = (name or "").strip().lower()
+    return n in _HEADER_PARAMS or (n.startswith("x-") and len(n) > 2)
+
+
+def _path_placeholders(path: str) -> list:
+    import re as _re
+    return _re.findall(r"\{([A-Za-z_]\w*)\}", path or "")
+
+
+def _collect_id_pool(recon_text: str = "", access_inventory=None, precond_result=None) -> dict:
+    """Ids the pipeline has already seen, keyed by name: `data_id=3`, `id: 7`,
+    `/users/42/` in recon, and any *id / *ids keys in the enumeration output."""
+    import re as _re
+    pool: dict = {}
+    for m in _re.finditer(r"\b([a-z_]*id)\s*[=:/]\s*(\d{1,8})\b", recon_text or "", _re.I):
+        pool.setdefault(m.group(1).lower(), int(m.group(2)))
+    # `/dtale/main/1`, `/users/42` — a numeric path segment keyed by the segment before it
+    for m in _re.finditer(r"/([A-Za-z_][\w-]{1,30})/(\d{1,8})(?=[/?\s\"'<)]|$)", recon_text or ""):
+        pool.setdefault(m.group(1).lower(), int(m.group(2)))
+    def _walk(obj, key=""):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                _walk(v, str(k))
+        elif isinstance(obj, (list, tuple)):
+            for v in obj:
+                _walk(v, key)
+        elif isinstance(obj, (int, str)) and key.lower().endswith(("id", "ids")):
+            try:
+                pool.setdefault(key.lower()[:-1] if key.lower().endswith("ids") else key.lower(), int(str(obj)))
+            except (TypeError, ValueError):
+                pass
+    for src in (access_inventory, precond_result):
+        if src:
+            _walk(src)
+    return pool
+
+
+def _resolve_placeholder_path(path: str, id_pool: dict | None) -> tuple:
+    """`/dtale/test-filter/{data_id}` + {"data_id": 1} → ("/dtale/test-filter/1",
+    {"data_id": 1}). A placeholder with no id → (None, {}). Exact name first,
+    then any pool entry whose name ends with the placeholder's last word
+    (`{id}` ← `data_id`)."""
+    pool = {str(k).lower(): v for k, v in (id_pool or {}).items()}
+    used, out = {}, path or ""
+    for ph in _path_placeholders(path):
+        key = ph.lower()
+        val = pool.get(key)
+        if val is None:
+            tail = key.split("_")[-1]
+            val = next((v for k, v in pool.items() if k.endswith(tail)), None)
+        if val is None and pool and key.endswith("id"):
+            # no name match — any id seen is worth one probe (a wrong id
+            # answers 404/400 and the candidate verifies FAKE, nothing lost)
+            val = next(iter(pool.values()))
+            used["_fallback"] = True
+        if val is None:
+            return None, {}
+        used[ph] = val
+        out = out.replace("{" + ph + "}", str(val))
+    return out, used
+
+
+def _path_variants(path: str, max_strip: int = 2) -> list:
+    """An advisory path often carries the reporter's deployment prefix:
+    `/stock/php_action/editCategories.php` (404 here) vs
+    `/php_action/editCategories.php` (200). Yield the path, then the same
+    path with 1..max_strip leading segments removed. Never yields "/"."""
+    out = []
+    p = (path or "").strip()
+    if not p.startswith("/"):
+        return out
+    segs = [x for x in p.split("/") if x]
+    for k in range(0, min(max_strip, max(0, len(segs) - 1)) + 1):
+        cand = "/" + "/".join(segs[k:])
+        if cand != "/" and cand not in out:
+            out.append(cand)
+    return out
+
+
+def _canary_only_in_redirect(out: str, canary: str) -> bool:
+    """True when the captured output is a 3xx whose only canary occurrence is
+    in the Location header (the unauthenticated bounce echoing the probe).
+    Round 5 CVE-2024-3408: derivation said verified=True on exactly this."""
+    import re as _re
+    text = out or ""
+    if not canary or canary not in text:
+        return False
+    if not _re.search(r"^HTTP/\S+\s+3\d\d\b", text, _re.M):
+        return False
+    stripped = _re.sub(r"^location:[^\n]*$", "", text, flags=_re.I | _re.M)
+    return canary not in stripped
+
+
+def _inband_diff_signal(baseline_status, baseline_len, run_status, run_len, threshold=0.10) -> dict:
+    """PURE: did the mutated request get a materially different response than
+    the unmodified baseline of the same path?"""
+    if baseline_status is None or run_status is None:
+        return {"changed": False, "reason": "no baseline"}
+    if baseline_status != run_status:
+        return {"changed": True, "reason": f"status {baseline_status} -> {run_status}"}
+    b, r = int(baseline_len or 0), int(run_len or 0)
+    if max(b, r) and abs(r - b) / max(b, r) >= threshold:
+        return {"changed": True, "reason": f"body length {b}B -> {r}B"}
+    return {"changed": False, "reason": "same status, body within 10%"}
+
+
+def _inband_baseline_diff(ip, port, command: str, timeout: int = 5) -> dict:
+    """Re-issue the iteration's FIRST curl via httpx and the plain GET baseline
+    of the same path; compare. Only for commands the Python lane can parse.
+    Returns {"checked": bool, ...signal, baseline_status, baseline_len,
+    run_status, run_len, run_preview}."""
+    import httpx as _hx, re as _re
+    head, _, _ = _strip_sink_tail(command or "")
+    head = _strip_shell_redirects(head)
+    ok, _why = _can_execute_in_python(head)
+    if not ok:
+        return {"checked": False, "reason": _why}
+    first = _re.split(r"\s*(?:&&|;)\s*", head.strip())[0]
+    try:
+        req = _curl_to_request(first)
+    except Exception as e:  # noqa: BLE001
+        return {"checked": False, "reason": f"parse: {type(e).__name__}"}
+    url = req.get("url") or ""
+    if not url or str(ip) not in url:
+        return {"checked": False, "reason": "first request is not against the target"}
+    base_url = url.split("?", 1)[0]
+    try:
+        with _hx.Client(verify=False, timeout=timeout, follow_redirects=False) as cli:
+            rb = cli.get(base_url)
+            rr = cli.request(req.get("method") or "GET", url, headers=req.get("headers") or {},
+                             content=(req.get("body") or None), cookies=req.get("cookies") or None)
+    except Exception as e:  # noqa: BLE001
+        return {"checked": False, "reason": f"{type(e).__name__}"}
+    sig = _inband_diff_signal(rb.status_code, len(rb.text or ""), rr.status_code, len(rr.text or ""))
+    return {"checked": True, **sig, "baseline_status": rb.status_code, "baseline_len": len(rb.text or ""),
+            "run_status": rr.status_code, "run_len": len(rr.text or ""), "run_preview": (rr.text or "")[:600],
+            "url": url, "baseline_url": base_url}
+
+
+def _parse_openapi_paths_line(recon_text: str) -> list:
+    """PURE: `OpenAPI paths (112 at /openapi.json): POST /install_extension; GET /docs; …`
+    → [{"path": "/install_extension", "methods": ["POST"]}, …]."""
+    import re as _re
+    m = _re.search(r"OpenAPI paths \(\d+ at [^)]+\): ([^\n]+)", recon_text or "")
+    if not m:
+        return []
+    out = []
+    for item in m.group(1).split(";"):
+        item = item.strip()
+        mm = _re.match(r"([A-Z/]+)\s+(/\S*)", item)
+        if mm:
+            out.append({"path": mm.group(2), "methods": mm.group(1).split("/")})
+    return out
+
+
 def _gather_decide(items: list, vuln_class: str) -> dict:
     """PURE decision over gathered items (no network): which items are
     required for this class, which are missing, is the run ready, and the
@@ -13950,7 +14155,7 @@ def _gather_decide(items: list, vuln_class: str) -> dict:
     if vc in _GATHER_OOB_CLASSES:
         required.add("oob_sink")
     by = {i["item"]: i for i in items}
-    for name in ("auth", "artifact"):
+    for name in ("auth", "artifact", "endpoint_id"):
         if by.get(name, {}).get("status") in ("missing", "gathered"):
             required.add(name)
     if vc == "auth-bypass":
@@ -13971,7 +14176,7 @@ def _gather_decide(items: list, vuln_class: str) -> dict:
 
 def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan_verdicts=None,
                      session_info=None, auth=None, analysis=None, recon_text="", run_id=None,
-                     timeout=4) -> dict:
+                     timeout=4, id_pool=None) -> dict:
     """Operator ask 2026-10-07: "make sure everything is actually gathered and
     ready before creating a payload." Runs AFTER plan_verify (so LIVE/FAKE
     verdicts exist) and BEFORE synth. Deterministic; every probe is a 2 KB
@@ -13984,7 +14189,8 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
     port = int(port or 80)
     scheme = "https" if port in (443, 8443) else "http"
     base = f"{scheme}://{ip}:{port}"
-    cookie = (auth or {}).get("_auto_cookie") or (session_info or {}).get("cookie")
+    cookie = ((auth or {}).get("_auto_cookie") or (session_info or {}).get("cookie_header")
+              or (session_info or {}).get("cookie"))
     hdrs = {"Cookie": cookie} if cookie else {}
     items, facts = [], {}
 
@@ -14035,8 +14241,18 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
     verdicts = plan_verdicts or {}
     mined = _gather_mine_sources(spec.get("advisory_poc") or "", str(spec.get("derived_vector") or ""))
     facts["mined"] = mined
+    needs_id_path = None
     for c in cands:
         v = verdicts.get(c["label"])
+        if v == "NEEDS_ID" or ("{" in c["endpoint"] and v not in ("LIVE", "SUSPECT")):
+            _resolved, _used = _resolve_placeholder_path(c["endpoint"], id_pool or {})
+            if _resolved:
+                endpoint, ep_source = _resolved, f"placeholder_resolved:{_used}"
+                if c["param"] not in ("", "none", "-", "n/a"):
+                    field = c["param"]
+                break
+            needs_id_path = needs_id_path or c["endpoint"]
+            continue
         # "/" is accepted only on a LIVE verdict (34359's strategist invented
         # `endpoint=/` and it was SUSPECT at best); any other path on LIVE/SUSPECT.
         if (v == "LIVE" and c["endpoint"] not in ("", "none")) or (v == "SUSPECT" and c["endpoint"] not in ("/", "", "none")):
@@ -14049,23 +14265,39 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
         if rt:
             endpoint, ep_source = rt["path"], "local_source"
     if not endpoint:
-        probe_list = list(mined["paths"])
+        probe_list = []
+        for _mp in mined["paths"]:
+            probe_list += _path_variants(_mp)          # advisory path, then prefix-stripped
         probe_list += [c for c in (spec.get("candidate_endpoints") or []) if isinstance(c, str) and c.startswith("/") and c != "/"]
+        # routes the target itself published (OpenAPI) that match a mined path or a mined field name
+        _oa_routes = _parse_openapi_paths_line(recon_text or "")
+        _oa_methods = {r["path"]: r["methods"] for r in _oa_routes}
+        for r in _oa_routes:
+            if any(r["path"] == v for mp in mined["paths"] for v in _path_variants(mp)) or \
+               any(f.lower() in r["path"].lower() for f in mined["fields"][:3]):
+                if r["path"] not in probe_list:
+                    probe_list.append(r["path"])
+        _probe_methods = ["HEAD", "GET"] + [m for m in mined["methods"] if m not in ("HEAD", "GET")]
+        if "POST" not in _probe_methods:
+            _probe_methods.append("POST")       # a POST-only route (FastAPI) answers 404 to GET
         probe_list += _re.findall(r"Endpoints \(from JSON body\): ([^\n]+)", recon_text or "")[:1] and \
                       [x.strip() for x in _re.findall(r"Endpoints \(from JSON body\): ([^\n]+)", recon_text or "")[0].split(",")] or []
         seen = set()
         try:
             with _hx.Client(verify=False, timeout=timeout, follow_redirects=False) as cli:
-                for ep in probe_list[:8]:
+                for ep in probe_list[:12]:
                     if ep in seen:
                         continue
                     seen.add(ep)
                     try:
-                        rp = cli.head(base + ep, headers=hdrs)
-                        if rp.status_code == 405:
-                            rp = cli.get(base + ep, headers=hdrs)
-                        if rp.status_code != 404:
-                            endpoint, ep_source = ep, f"candidate_probe:HTTP {rp.status_code}" + (" (advisory/derived path)" if ep in mined["paths"] else "")
+                        rp = None
+                        for _m in (_oa_methods.get(ep) or []) + _probe_methods:   # published method first
+                            rp = cli.request(_m, base + ep, headers=hdrs)
+                            if rp.status_code not in (404, 405):
+                                break
+                        if rp is not None and rp.status_code != 404:
+                            _note = " (advisory/derived path)" if ep in mined["paths"] else (" (prefix-stripped advisory path)" if any(ep in _path_variants(x) for x in mined["paths"]) else "")
+                            endpoint, ep_source = ep, f"candidate_probe:{_m} HTTP {rp.status_code}{_note}"
                             break
                     except Exception:  # noqa: BLE001
                         continue
@@ -14081,6 +14313,11 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
             pass
     add("endpoint", "gathered" if endpoint else "missing", endpoint, ep_source)
     facts["endpoint"] = endpoint
+    if not endpoint and needs_id_path:
+        add("endpoint_id", "missing", f"{needs_id_path} needs {_path_placeholders(needs_id_path)}; ids seen: {id_pool or {}}", "plan_verify:NEEDS_ID")
+        facts["needs_id"] = needs_id_path
+    else:
+        add("endpoint_id", "n/a", None, None)
 
     # 5. method — local source first, else OPTIONS, else HEAD/POST probe
     method_val = None
@@ -14090,6 +14327,8 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
             method_val, m_source = ",".join(rt["methods"]), "local_source"
         elif mined["methods"] and endpoint in mined["paths"]:
             method_val, m_source = ",".join(mined["methods"]), "advisory_poc"
+        elif _parse_openapi_paths_line(recon_text or "") and any(r["path"] == endpoint for r in _parse_openapi_paths_line(recon_text or "")):
+            method_val, m_source = ",".join(next(r["methods"] for r in _parse_openapi_paths_line(recon_text or "") if r["path"] == endpoint)), "openapi"
         else:
             m_source = "probe"
             try:
@@ -21338,6 +21577,10 @@ def _live_verify_recipe(ip, port, spec, timeout=30):
             # operator can see WHY the canary did or didn't appear without
             # re-running. Longer than the previous 100-char trailer.
             tail = out[:3000]
+            if hit and _canary_only_in_redirect(out, canary):
+                return {"verified": False, "method": "canary_reflected_in_redirect",
+                        "evidence": f"canary {canary} appears only in a 3xx Location header "
+                                    f"(the unauthenticated bounce echoing the probe)\n---\n{tail}"}
             if hit:
                 return {"verified": True, "method": "canary_read_back",
                         "evidence": f"canary {canary} appeared in response\n---\n{tail}"}
@@ -22710,6 +22953,25 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                           "method": verification_method,
                           "confidence": verification_confidence,
                           "reason": _verdict.get("reason", "")})
+        if not success:
+            # 2026-10-07: in-band evidence. CVE-2024-32980's /proxy "returns the
+            # response" — the proxied body came back and was never compared
+            # with the baseline. Re-issue the first request + the plain GET of
+            # the same path and tell the refiner when they differ.
+            try:
+                _ib = _inband_baseline_diff(ip, port, command, timeout=5)
+                if _ib.get("checked"):
+                    _poc_trace(run_id, "inband_diff", iteration=it,
+                               extra={k: v for k, v in _ib.items() if k != "run_preview"})
+                    if _ib.get("changed"):
+                        output = (f"INBAND_DIFF_FEEDBACK: the response to your request DIFFERS from the "
+                                  f"unmodified baseline of the same path (baseline HTTP {_ib['baseline_status']} "
+                                  f"{_ib['baseline_len']}B vs yours HTTP {_ib['run_status']} {_ib['run_len']}B; "
+                                  f"{_ib['reason']}). This is in-band evidence the input is honoured — verify "
+                                  f"from the body, not only the OOB sink. Body preview: {_ib['run_preview'][:400]!r}\n"
+                                  ) + (output or "")
+            except Exception as _ibe:  # noqa: BLE001
+                logging.debug("inband diff failed: %s", _ibe)
         # BLIND-TIMING CONFIRMATION — PROJECT RULE: a latency verdict is
         # ALWAYS re-run with a scaled payload (SLEEP(N) → SLEEP(N+7)) to
         # distinguish actual time-based SQLi from a target that is just
@@ -23056,6 +23318,34 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         if not obj or not obj.get("command"):
             break
         _new_cmd = str(obj["command"]).strip()
+        if _new_cmd == (command or "").strip():
+            # 2026-10-07 (CVE-2024-32980 round 4: iterations 1-3 byte-identical):
+            # never dispatch the same command again — one corrective re-ask,
+            # then stop as no_progress.
+            try:
+                _dup_prompt = (
+                    "IDENTICAL_COMMAND_REJECTED: you returned EXACTLY the previous command, which "
+                    f"already ran and failed. Its output was: {(output or '')[:300]!r}. Return a DIFFERENT "
+                    "command that changes exactly ONE variable (header value format, path, method, "
+                    "parameter, or how the result is verified) as JSON "
+                    "{\"command\": \"...\", \"assertion\": {\"expect_regex\": \"...\"}}. No prose.")
+                _rd = _llm_for_model(_dup_prompt, model=model, caller="cve_poc_refine_identical")
+                _rtext = _rd.get("response", "") if isinstance(_rd, dict) else str(_rd or "")
+                _acc_llm_metrics(metrics, _rd)
+                _poc_trace(run_id, "refine_identical_rejected", iteration=it,
+                           prompt=_dup_prompt[:300], response=_rtext[:400], llm_model=llm_model)
+                _obj2 = _poc_extract_json(_rtext)
+            except Exception as _ide:  # noqa: BLE001
+                _obj2 = None
+                logging.debug("identical-resend re-ask failed: %s", _ide)
+            if _obj2 and _obj2.get("command") and str(_obj2["command"]).strip() != _new_cmd:
+                obj = _obj2
+                _new_cmd = str(obj["command"]).strip()
+            else:
+                metrics["identical_resend_stop"] = metrics.get("identical_resend_stop", 0) + 1
+                _poc_trace(run_id, "refine_no_progress", iteration=it,
+                           extra={"reason": "LLM resent the identical command twice; stopping"})
+                break
         # Near-duplicate break: did the LLM just return essentially the same
         # command as the previous iteration(s)? If so, further iterations will
         # repeat the same shape and burn the budget. Stop and tell the operator.
@@ -23835,7 +24125,7 @@ def _deep_enum_framework(ip, port, framework, intel_list=None, timeout=3):
               "guessing at generic endpoints.")
 
 
-def _verify_strategist_plan(ip, port, plan_text, session_cookie=None, timeout=3):
+def _verify_strategist_plan(ip, port, plan_text, session_cookie=None, timeout=3, id_pool=None):
     """Detect strategist hallucinations by empirically probing every proposed
     (endpoint, param, class) tuple BEFORE synth wastes iters on a made-up vector.
     Three checks per candidate:
@@ -23856,22 +24146,23 @@ def _verify_strategist_plan(ip, port, plan_text, session_cookie=None, timeout=3)
     # Extract PRIMARY + ALTs from the plan text (regex over the compact string form).
     candidates = []
     for m in _re.finditer(
-        r"(PRIMARY|ALT\d):\s+class=(\S+)\s+endpoint=(\S+)\s+param=(\S+)",
+        r"(PRIMARY|ALT\d):\s+class=(\S+)\s+endpoint=(\S+)\s+param=(\S+)(?:\s+method=(\S+))?",
         plan_text,
     ):
         candidates.append({"label": m.group(1), "class": m.group(2),
-                           "endpoint": m.group(3), "param": m.group(4)})
+                           "endpoint": m.group(3), "param": m.group(4),
+                           "method": (m.group(5) or "GET").upper()})
     if not candidates:
         return plan_text, {}
     hdrs = {}
     if session_cookie:
         hdrs["Cookie"] = session_cookie
     # Get baseline of the endpoint (no param) so we can diff against a probe.
-    def _fetch(path, params=None):
+    def _fetch(path, params=None, headers=None, method="GET"):
         try:
             with _hx.Client(verify=False, follow_redirects=False, timeout=timeout,
                              headers=hdrs) as cli:
-                r = cli.get(base + path, params=params or {})
+                r = cli.request(method, base + path, params=params or {}, headers=headers or {})
                 return r.status_code, len(r.text or ""), (r.text or "")[:600]
         except Exception:  # noqa: BLE001
             return None, 0, ""
@@ -23879,8 +24170,31 @@ def _verify_strategist_plan(ip, port, plan_text, session_cookie=None, timeout=3)
     notes = []
     for c in candidates:
         endpoint = c["endpoint"]; param = c["param"]; cls = c["class"].upper()
-        # 1. Endpoint existence check
+        # 0. Templated path (`/x/{data_id}`): resolve from ids already seen or
+        #    report NEEDS_ID — never probe the literal braces (2026-10-07,
+        #    CVE-2024-3408: readiness said "exists 200", verify said FAKE,
+        #    both for the string "{data_id}").
+        if "{" in endpoint:
+            _resolved, _used = _resolve_placeholder_path(endpoint, id_pool or {})
+            if _resolved:
+                notes.append(f"{c['label']} placeholder {endpoint} resolved -> {_resolved} (ids {_used})")
+                endpoint = _resolved; c["endpoint"] = _resolved
+            else:
+                verdicts[c["label"]] = "NEEDS_ID"
+                notes.append(f"{c['label']} endpoint={endpoint} NEEDS_ID (placeholder "
+                             f"{_path_placeholders(endpoint)} — enumerate the id first; not probed)")
+                continue
+        hdr_param = _is_header_param(param)
+        pmethod = c.get("method") or "GET"
+        # 1. Endpoint existence check — with the PLAN'S method as well: a
+        #    FastAPI POST-only route answers 404 to GET and 422 to POST
+        #    (lollms /install_extension, 2026-10-07), so GET-only = FAKE.
         st, ln, body = _fetch(endpoint)
+        if st == 404 and pmethod not in ("GET", "HEAD"):
+            st_m, ln_m, body_m = _fetch(endpoint, method=pmethod)
+            if st_m is not None and st_m != 404:
+                notes.append(f"{c['label']} endpoint={endpoint} exists for {pmethod} (HTTP {st_m}; GET was 404)")
+                st, ln, body = st_m, ln_m, body_m
         if st is None:
             verdicts[c["label"]] = "FAKE"
             notes.append(f"{c['label']} endpoint={endpoint} FAKE (network error)")
@@ -23893,7 +24207,9 @@ def _verify_strategist_plan(ip, port, plan_text, session_cookie=None, timeout=3)
         # 2. Param-honored check — send a benign canary as the param value; if the
         # response is byte-identical to baseline, the app ignores this param.
         canary = "z3st4v"
-        st2, ln2, body2 = _fetch(endpoint, {param: canary})
+        # header-carried input: send the canary IN THE HEADER, not the query
+        st2, ln2, body2 = (_fetch(endpoint, headers={param: canary}) if hdr_param
+                           else _fetch(endpoint, {param: canary}))
         if st2 is None:
             verdicts[c["label"]] = "SUSPECT"
             notes.append(f"{c['label']} param={param} SUSPECT (probe error)")
@@ -23902,7 +24218,7 @@ def _verify_strategist_plan(ip, port, plan_text, session_cookie=None, timeout=3)
         if not param_honored:
             verdicts[c["label"]] = "FAKE"
             notes.append(
-                f"{c['label']} endpoint={endpoint} exists but param `{param}` is IGNORED "
+                f"{c['label']} endpoint={endpoint} exists but {'header' if hdr_param else 'param'} `{param}` is IGNORED "
                 f"(baseline={base_len}, probed={ln2} — no delta)")
             continue
         # 3. Class-plausible check
@@ -23915,9 +24231,10 @@ def _verify_strategist_plan(ip, port, plan_text, session_cookie=None, timeout=3)
         elif "LFI" in cls or "TRAVERSAL" in cls:
             class_probe = "../../../../etc/passwd"; expect_signal = "root:x:|nobody:|www-data"
         elif "SSRF" in cls:
-            class_probe = "http://127.0.0.1:1/"; expect_signal = None
+            class_probe = ("127.0.0.1:1" if hdr_param else "http://127.0.0.1:1/"); expect_signal = None
         if class_probe:
-            st3, ln3, body3 = _fetch(endpoint, {param: class_probe})
+            st3, ln3, body3 = (_fetch(endpoint, headers={param: class_probe}) if hdr_param
+                               else _fetch(endpoint, {param: class_probe}))
             hit = False
             if expect_signal:
                 if _re.search(expect_signal, body3, _re.I):
@@ -23942,7 +24259,7 @@ def _verify_strategist_plan(ip, port, plan_text, session_cookie=None, timeout=3)
     # Rewrite the plan text: strip FAKE, annotate SUSPECT/LIVE. Never strip everything
     # (synth needs something to work on) — if all candidates went FAKE, keep them with
     # a warning banner so synth knows recon didn't back the plan.
-    live_or_suspect = [c for c in candidates if verdicts.get(c["label"]) in ("LIVE", "SUSPECT")]
+    live_or_suspect = [c for c in candidates if verdicts.get(c["label"]) in ("LIVE", "SUSPECT", "NEEDS_ID")]
     banner = ("PLAN VERIFICATION (empirically probed on THIS target — hallucinations "
               "detected below):\n  " + "\n  ".join(notes) + "\n")
     if not live_or_suspect:
@@ -24984,6 +25301,11 @@ def _scout_url_recon(ip, port, timeout=8):
             try:
                 r = cli.get(base + "/")
                 html = (r.text or "")[:60000]
+                _loc = r.headers.get("location") if 300 <= r.status_code < 400 else None
+                if _loc:
+                    # the redirect target is often the first real route (and
+                    # carries an object id: dtale `/` -> `/dtale/main/1`)
+                    parts.append(f"Redirects to: {_loc[:300]} (HTTP {r.status_code})")
                 # 2026-10-07: a JSON body at `/` is the app describing itself
                 # (CVE-2024-34359's target returned {"message": ..., "usage": {...}}
                 # naming both routes). It used to be discarded here and the
@@ -25025,6 +25347,25 @@ def _scout_url_recon(ip, port, timeout=8):
                         break
             except Exception:  # noqa: BLE001
                 pass
+            # 2026-10-07: a published OpenAPI document lists EVERY route with
+            # its method (lollms: /openapi.json, 112 paths). Ask for it.
+            for _oa in ("/openapi.json", "/swagger.json", "/api/openapi.json", "/v1/openapi.json", "/api-docs"):
+                try:
+                    ro = cli.get(base + _oa)
+                    if ro.status_code != 200 or "json" not in (ro.headers.get("content-type") or "").lower():
+                        continue
+                    _doc = _json.loads(ro.text or "")
+                    _paths = (_doc or {}).get("paths") or {}
+                    if not _paths:
+                        continue
+                    _items = []
+                    for _pth, _ops in list(_paths.items())[:60]:
+                        _ms = [str(k).upper() for k in (_ops or {}).keys() if str(k).lower() in ("get", "post", "put", "delete", "patch")]
+                        _items.append(f"{'/'.join(_ms) or 'GET'} {_pth}")
+                    parts.append(f"OpenAPI paths ({len(_paths)} at {_oa}): " + "; ".join(_items))
+                    break
+                except Exception:  # noqa: BLE001
+                    continue
             # robots.txt
             try:
                 r2 = cli.get(base + "/robots.txt")
@@ -29360,7 +29701,10 @@ def _assess_exploit_readiness(ip, port, analysis, session_info=None,
     #    aims at a path this install doesn't expose (wrong version, disabled
     #    feature, different router).
     tep = (a.get("target_endpoint") or "").strip()
-    if tep and tep.startswith("/"):
+    if tep and "{" in tep:
+        blockers.append(f"advisory endpoint {tep} has an unresolved placeholder "
+                        f"{_path_placeholders(tep)} — enumerate the id before it can be probed")
+    elif tep and tep.startswith("/"):
         try:
             with _hx.Client(verify=False, timeout=6, follow_redirects=True,
                              headers={"Cookie": cookie} if cookie else {}) as cli:
