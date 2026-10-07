@@ -56,6 +56,7 @@ RAG_LOADED_OTHER = {
     # dedicated loader embeds (title + guidance) into rag_documents and copies
     # the structured triggers into refine_error_patterns table.
     "refine_error_patterns.yaml": "etl/load_refine_patterns.py",
+    "build_poc_research_patterns.yaml": "etl/load_research_patterns.py",
 }
 
 # YAMLs that ARE embedded into rag_documents, mapped to the loader that does it.

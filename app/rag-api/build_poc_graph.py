@@ -224,6 +224,25 @@ def node_basic_recon(state: BuildPocState) -> Dict[str, Any]:
     if b:
         seg.append(b)
         _poc_trace(state["run_id"], "recon:basic", response=b[:1200])
+    # Lab-only (2026-10-07): if the challenge's own source is on disk, read its
+    # routes + request field names and put them ahead of everything else the
+    # strategist sees. CVE-2024-34359's target documented its two routes in
+    # 40 lines of Flask; recon never looked and 50 iterations hit the wrong
+    # path. Fail-soft; no-op when no local source dir exists.
+    try:
+        from api import _local_source_routes
+        ls = _local_source_routes(state["cve"])
+        if ls.get("found"):
+            if ls.get("text"):
+                seg.insert(0, ls["text"])
+            _poc_trace(state["run_id"], "recon:local_source", response=(ls.get("text") or "")[:1500],
+                       extra={"dir": ls.get("dir"), "routes": ls.get("routes"), "fields": ls.get("fields"),
+                              "files": ls.get("files")})
+            metrics["local_source"] = {"routes": len(ls.get("routes") or []),
+                                       "fields": len(ls.get("fields") or []),
+                                       "signal": "literal routes + request fields from target source on disk"}
+    except Exception as _lse:  # noqa: BLE001
+        _poc_trace(state["run_id"], "recon:local_source", response=f"(skipped: {type(_lse).__name__}: {_lse})")
     return {"segments": seg,
             "recon_metrics": {**state.get("recon_metrics", {}), **metrics}}
 

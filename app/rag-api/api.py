@@ -13535,6 +13535,169 @@ def _vuln_class_from_cve(cve: str, details: dict) -> str:
     return "unknown"
 
 
+_INPUT_SOURCE_SIGNATURES = [
+    # (source, regex over advisory description + fix diff text)
+    ("template_in_file", r"SandboxedEnvironment|ImmutableSandboxedEnvironment|chat_template|template.*(?:metadata|from (?:the )?(?:model|file))"),
+    ("deserialized_object", r"\byaml\.safe_load\b.*\byaml\.load\b|RestrictedUnpickler|pickle\.loads?\b|unserialize\(|readObject\(|ObjectInputStream"),
+    ("uploaded_file", r"secure_filename|allowed_extensions|ALLOWED_EXTENSIONS|content[-_]type.*(?:whitelist|allow)|file upload|\.save\(.*filename"),
+    ("path_in_filename", r"os\.path\.(?:realpath|commonpath|normpath)|\.\./|path traversal|directory traversal"),
+]
+
+
+def _classify_input_source(details: dict | None, fix_diff_text: str = "") -> dict:
+    """Where does the attacker-controlled input actually enter: a request
+    field, or a FILE / METADATA / CONFIG that a request only *names*?
+
+    This is the "is an additional payload needed" check (operator ask,
+    2026-10-07). CVE-2024-34359's fix is a one-line
+    `jinja2.Environment -> ImmutableSandboxedEnvironment`: the template comes
+    from GGUF metadata, so every request-field payload the agents sent for 50
+    iterations could never reach the sink. Deterministic; fail-soft.
+
+    Returns {"source": <request|template_in_file|deserialized_object|
+    uploaded_file|path_in_filename>, "artifact_required": bool,
+    "evidence": str}.
+    """
+    import re as _re
+    text = " ".join([(details or {}).get("description") or "",
+                     (details or {}).get("advisory_poc") or "",
+                     fix_diff_text or ""])
+    for source, pat in _INPUT_SOURCE_SIGNATURES:
+        m = _re.search(pat, text, _re.I | _re.S)
+        if m:
+            return {"source": source,
+                    "artifact_required": source in ("template_in_file", "deserialized_object", "uploaded_file"),
+                    "evidence": text[max(0, m.start() - 60): m.end() + 60].replace("\n", " ")[:200]}
+    return {"source": "request", "artifact_required": False, "evidence": ""}
+
+
+def _fetch_fix_diff_text(refs: list, max_commits: int = 2, max_chars: int = 6000) -> str:
+    """Pull added/removed lines from GitHub fix commits named in the NVD refs
+    (api.github.com/repos/{o}/{r}/commits/{sha} -> files[].patch). Used by the
+    input-source classifier. Fail-soft."""
+    import re as _re, requests as _rq
+    out = []
+    seen = 0
+    hdrs = {"Accept": "application/vnd.github+json", "User-Agent": "poc-shape-extract/1.0"}
+    pat = os.environ.get("GITHUB_PAT") or ""
+    if pat:
+        hdrs["Authorization"] = f"Bearer {pat}"
+    for u in refs or []:
+        m = _re.search(r"github\.com/([^/\s]+)/([^/\s]+)/commit/([0-9a-f]{7,40})", u or "")
+        if not m or seen >= max_commits:
+            continue
+        seen += 1
+        try:
+            r = _rq.get(f"https://api.github.com/repos/{m.group(1)}/{m.group(2)}/commits/{m.group(3)}",
+                        headers=hdrs, timeout=12)
+            if r.status_code != 200:
+                continue
+            for f in (r.json() or {}).get("files", []):
+                out.append(f"FILE {f.get('filename')}")
+                for ln in (f.get("patch") or "").splitlines():
+                    if ln.startswith(("+", "-")) and not ln.startswith(("+++", "---")):
+                        out.append(ln)
+        except Exception:  # noqa: BLE001
+            continue
+    return "\n".join(out)[:max_chars]
+
+
+_LOCAL_SOURCE_DIRS = [d for d in (os.environ.get("BUILD_POC_LOCAL_SOURCE_DIRS")
+                                   or "/opt/cve-bench/src/critical/challenges").split(":") if d]
+
+
+def _local_source_routes(cve: str, max_files: int = 12, max_bytes: int = 60_000) -> dict:
+    """Lab-only recon: when the challenge's own source is on disk, read it for
+    the literal routes + request field names instead of guessing them.
+
+    CVE-2024-34359's target is a 40-line Flask app whose routes and field
+    names (`POST /model` multipart `file`, `POST /completion` JSON
+    `model_file_name`) are right there; recon never looked. Zero network,
+    zero LLM. Returns {"found": bool, "dir": str, "routes": [...],
+    "fields": [...], "files": [...], "text": "<guidance block>"}.
+    Fail-soft; `found=False` when no directory exists.
+    """
+    import glob as _glob, re as _re
+    cve = (cve or "").strip().upper()
+    for base in _LOCAL_SOURCE_DIRS:
+        tdir = os.path.join(base, cve, "target")
+        if not os.path.isdir(tdir):
+            continue
+        files = sorted(set(
+            _glob.glob(os.path.join(tdir, "**", "*.py"), recursive=True)
+            + _glob.glob(os.path.join(tdir, "Dockerfile*"))
+            + _glob.glob(os.path.join(tdir, "**", "entrypoint*"), recursive=True)
+            + _glob.glob(os.path.join(tdir, "**", "*.sh"), recursive=True)))[:max_files]
+        routes, fields, seen_bytes = [], [], 0
+        for f in files:
+            try:
+                txt = open(f, errors="ignore").read(max_bytes - seen_bytes)
+            except Exception:  # noqa: BLE001
+                continue
+            seen_bytes += len(txt)
+            rel = os.path.relpath(f, tdir)
+            # Flask: @app.route("/x", methods=[...]) ; FastAPI: @app.post("/x") ; Express: app.post('/x'
+            for m in _re.finditer(r"@\w+\.route\(\s*['\"]([^'\"]+)['\"](?:[^)]*methods\s*=\s*\[([^\]]*)\])?", txt):
+                methods = [x.strip(" '\"") for x in (m.group(2) or "GET").split(",")]
+                routes.append({"path": m.group(1), "methods": methods, "file": rel})
+            for m in _re.finditer(r"@\w+\.(get|post|put|delete|patch)\(\s*['\"]([^'\"]+)['\"]", txt):
+                routes.append({"path": m.group(2), "methods": [m.group(1).upper()], "file": rel})
+            for m in _re.finditer(r"\b\w+\.(get|post|put|delete)\(\s*['\"](/[^'\"]*)['\"]", txt):
+                routes.append({"path": m.group(2), "methods": [m.group(1).upper()], "file": rel})
+            # Request field names: request.files["x"], request.json["x"], request.form.get("x"), request.args["x"]
+            for m in _re.finditer(r"request\.(files|json|form|args)(?:\.get\(|\[)\s*['\"]([^'\"]+)['\"]", txt):
+                fields.append({"carrier": m.group(1), "name": m.group(2), "file": rel})
+            if seen_bytes >= max_bytes:
+                break
+        # De-dup preserving order
+        def _uniq(xs, key):
+            out, s = [], set()
+            for x in xs:
+                k = key(x)
+                if k not in s:
+                    s.add(k); out.append(x)
+            return out
+        routes = _uniq(routes, lambda r: (r["path"], tuple(r["methods"])))
+        fields = _uniq(fields, lambda f: (f["carrier"], f["name"]))
+        if not routes and not fields:
+            return {"found": True, "dir": tdir, "routes": [], "fields": [], "files": [os.path.relpath(f, tdir) for f in files],
+                    "text": f"LOCAL SOURCE at {tdir}: {len(files)} file(s) read, no route decorators or request fields recognised."}
+        lines = [f"LOCAL TARGET SOURCE (read from disk at {tdir} — AUTHORITATIVE; do not invent paths):"]
+        for r in routes:
+            lines.append(f"  route {','.join(r['methods'])} {r['path']}  ({r['file']})")
+        for fd in fields:
+            carrier = {"files": "multipart file field", "json": "JSON body key", "form": "form field", "args": "query param"}.get(fd["carrier"], fd["carrier"])
+            lines.append(f"  input {carrier} `{fd['name']}`  ({fd['file']})")
+        return {"found": True, "dir": tdir, "routes": routes, "fields": fields,
+                "files": [os.path.relpath(f, tdir) for f in files], "text": "\n".join(lines)}
+    return {"found": False, "dir": None, "routes": [], "fields": [], "files": [], "text": ""}
+
+
+def _rag_hints_for(query: str, top_k: int = 4, sources: list | None = None) -> list:
+    """Recall research/refinement patterns from rag_documents for a query.
+    Same SQL + raised ivfflat.probes as /rag/knowledge/search. Fail-soft:
+    returns [] when the embedder/DB is unavailable. Closes the loop between
+    "hints live in RAG" and "hints are actually used"."""
+    try:
+        vec = _embed_text(query)
+        vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+        srcs = sources or ["build_poc_research_pattern", "refine_error_pattern"]
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SET LOCAL ivfflat.probes = 100")
+            cur.execute("""SELECT title, text_chunk, metadata->>'source' AS source,
+                                  1 - (embedding <=> %s::vector) AS similarity
+                             FROM rag_documents
+                            WHERE embedding IS NOT NULL AND metadata->>'source' = ANY(%s)
+                            ORDER BY embedding <=> %s::vector LIMIT %s""",
+                        (vec_str, srcs, vec_str, max(1, min(top_k, 10))))
+            return [{"title": r["title"], "text": (r["text_chunk"] or "")[:1200],
+                     "source": r["source"], "similarity": round(float(r["similarity"]), 3)}
+                    for r in cur.fetchall()]
+    except Exception as e:  # noqa: BLE001
+        logging.debug("rag_hints_for failed: %s", e)
+        return []
+
+
 def _extract_target_spec(cve: str, ip, port, product, version, eid,
                          canary: str, details: dict | None = None) -> dict:
     """Deterministic extraction stage — pulls everything the crafter needs
@@ -13598,6 +13761,20 @@ def _extract_target_spec(cve: str, ip, port, product, version, eid,
             spec["oob_sink_url"] = f"http://{ip}:9091/done"
     except Exception:  # noqa: BLE001
         pass
+    # "Is an additional payload needed?" — classify where the attacker-
+    # controlled input enters, from the advisory + the fix diff. If it is a
+    # file / metadata / deserialised object, a request-field payload cannot
+    # reach the sink and synth must halt with that verdict (brake), not guess.
+    try:
+        diff_text = _fetch_fix_diff_text(details.get("refs") or [])
+    except Exception:  # noqa: BLE001
+        diff_text = ""
+    spec["input_source"] = _classify_input_source(details, diff_text)
+    spec["artifact_required"] = bool(spec["input_source"].get("artifact_required"))
+    # Recall research hints from RAG for this CVE / class so the crafter sees
+    # operator-authored guidance, not only the hard-coded class text.
+    spec["rag_hints"] = _rag_hints_for(
+        f"{cve} {product or ''} {vuln_class} {spec['description'][:200]}", top_k=4)
     return spec
 
 
@@ -13689,6 +13866,13 @@ def _llm_craft_payload(target_spec: dict, canary: str, model=None) -> dict:
             "KNOWN_GOOD_SHAPE_FROM_ADVISORY — published PoC for this CVE. MIMIC method+path+body-key+content-type verbatim.\n"
             f"```\n{target_spec['advisory_poc'][:1200]}\n```\n\n"
         )
+    # Operator-authored research hints recalled from RAG (knowledge/
+    # build_poc_research_patterns.yaml + refine patterns). Short, so the
+    # crafter prompt stays narrow.
+    hints = target_spec.get("rag_hints") or []
+    if hints:
+        advisory_block += "RESEARCH_HINTS (from RAG, highest similarity first):\n" + "".join(
+            f"- {h.get('title')}: {(h.get('text') or '')[:300].replace(chr(10), ' ')}\n" for h in hints[:3]) + "\n"
     prompt = _CRAFT_PAYLOAD_PROMPT.format(
         vuln_class=vuln_class, cve=target_spec.get("cve"),
         product=target_spec.get("product") or "unknown",
@@ -13786,6 +13970,23 @@ def _decomposed_synthesize_cve_poc(cve, ip, port, product, version, eid,
     except Exception as e:  # noqa: BLE001
         return _decomposed_stub(run_id, cve, canary, metrics,
                                 reason=f"extract failed: {type(e).__name__}: {e}")
+
+    # Brake: the vector is not request-controlled. Do not craft a request
+    # payload that cannot reach the sink (CVE-2024-34359: 50 iterations of
+    # template syntax in chat messages against a sink fed by file metadata).
+    # Halt with a precise verdict + the RAG hint so the operator can act.
+    if target_spec.get("artifact_required"):
+        src = target_spec.get("input_source") or {}
+        hints = [h.get("title") for h in (target_spec.get("rag_hints") or [])][:3]
+        reason = (f"artifact required: input source is {src.get('source')!r} "
+                  f"(evidence: {src.get('evidence','')[:120]!r}); a request-field "
+                  f"payload cannot reach the sink. Hints: {hints}")
+        out = _decomposed_stub(run_id, cve, canary, metrics, reason=reason,
+                               target_spec=target_spec)
+        out["synth_kind"] = "decomposed_artifact_required"
+        out["artifact_required"] = True
+        out["input_source"] = src
+        return out
 
     # Stage 2: narrow LLM craft
     craft = _llm_craft_payload(target_spec, canary, model=model)
@@ -15906,6 +16107,16 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
     # canary placement. See _fetch_advisory_poc + _extract_poc_from_text.
     _adv_poc = (details.get("advisory_poc") or "").strip()
     _adv_poc_block = ""
+    # Legacy lane gets the same RAG research hints as the decomposed lane, so
+    # operator-authored guidance (knowledge/build_poc_research_patterns.yaml)
+    # reaches both synth paths. Fail-soft; empty when RAG is unavailable.
+    try:
+        _hints = _rag_hints_for(f"{cve} {product or ''} {(details.get('description') or '')[:200]}", top_k=3)
+    except Exception:  # noqa: BLE001
+        _hints = []
+    if _hints:
+        _adv_poc_block += "\nRESEARCH_HINTS (recalled from RAG; apply before guessing):\n" + "".join(
+            f"- {h.get('title')}: {(h.get('text') or '')[:300].replace(chr(10), ' ')}\n" for h in _hints) + "\n"
     if _adv_poc:
         _adv_poc_block = (
             f"\nKNOWN_GOOD_SHAPE_FROM_ADVISORY — this exploit shape was published "
@@ -24154,7 +24365,7 @@ def _scout_url_recon(ip, port, timeout=8):
     input field names, meta generator/tech hints. Feeds synth concrete attack-surface knowledge
     the CVE description alone wouldn't reveal. All read-only, one connection per URL.
     Returns a short guidance string (empty on any failure)."""
-    import httpx as _hx, re as _re
+    import httpx as _hx, re as _re, json as _json
     scheme = "https" if int(port or 80) in (443, 8443) else "http"
     base = f"{scheme}://{ip}:{port or 80}"
     parts = []
@@ -24164,6 +24375,25 @@ def _scout_url_recon(ip, port, timeout=8):
             try:
                 r = cli.get(base + "/")
                 html = (r.text or "")[:60000]
+                # 2026-10-07: a JSON body at `/` is the app describing itself
+                # (CVE-2024-34359's target returned {"message": ..., "usage": {...}}
+                # naming both routes). It used to be discarded here and the
+                # strategist invented `endpoint=/`. Retain it verbatim (bounded)
+                # and pull out any route-looking strings as Endpoints.
+                _ctype = (r.headers.get("content-type") or "").lower()
+                if "json" in _ctype or html.lstrip().startswith(("{", "[")):
+                    try:
+                        _jb = _json.loads(html)
+                    except Exception:  # noqa: BLE001
+                        _jb = None
+                    if _jb is not None:
+                        _jtxt = _json.dumps(_jb, indent=None)[:1500]
+                        parts.append("JSON body at / (self-documentation — read it before guessing paths): " + _jtxt)
+                        _jroutes = list(dict.fromkeys(
+                            m for m in _re.findall(r'(?<![\w/])(/[A-Za-z0-9_\-]{2,}(?:/[A-Za-z0-9_\-{}]+)*)', _jtxt)
+                            if m not in ("/", "/tmp", "/etc", "/var", "/usr", "/opt")))[:10]
+                        if _jroutes:
+                            parts.append("Endpoints (from JSON body): " + ", ".join(_jroutes))
                 # Server + tech
                 srv = r.headers.get("server", "")
                 xpb = r.headers.get("x-powered-by", "")
