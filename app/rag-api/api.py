@@ -13010,6 +13010,223 @@ class ResolveExploitBody(BaseModel):
 _POC_LOG_DIR = os.environ.get("POC_LOG_DIR", "/app/poc_logs")
 
 
+# ============================================================================
+# Build-PoC — decomposed-pipeline shadow mode (B rollout, phase 1)
+# ============================================================================
+#
+# Env flag: BUILD_POC_DECOMPOSED
+#   "off" (default) — only the legacy single-prompt synth runs. Zero behaviour
+#                     change; safe default.
+#   "shadow"       — legacy runs AND the decomposed pipeline runs in parallel.
+#                    Legacy result is used for the real verification (new
+#                    pipeline is observed-only). Both outputs are recorded to
+#                    build_poc_shadow_runs so divergence can be analysed.
+#   "on"           — new decomposed pipeline is authoritative; legacy is NOT
+#                    run. (Not enabled until divergence rate under some
+#                    threshold.)
+#
+# Added 2026-10-06 — operator ask: "lets go with B, during the initial rollout
+# lets run the curl and the python code to compare the results."
+
+_BUILD_POC_DECOMPOSED_MODE = (os.environ.get("BUILD_POC_DECOMPOSED") or "off").strip().lower()
+
+
+def _ensure_shadow_table():
+    """Idempotent CREATE TABLE for build_poc_shadow_runs. Called lazily on first
+    shadow record to avoid startup overhead when the flag is off."""
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS build_poc_shadow_runs (
+                    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                    run_id text NOT NULL,
+                    iteration integer NOT NULL DEFAULT 0,
+                    phase text NOT NULL,
+                    cve text,
+                    target_ip text,
+                    target_port integer,
+                    legacy_result jsonb,
+                    new_result jsonb,
+                    divergence jsonb,
+                    created_at timestamptz NOT NULL DEFAULT now()
+                );
+                CREATE INDEX IF NOT EXISTS build_poc_shadow_runs_run_id_idx
+                    ON build_poc_shadow_runs (run_id, iteration);
+                CREATE INDEX IF NOT EXISTS build_poc_shadow_runs_created_at_idx
+                    ON build_poc_shadow_runs (created_at DESC);
+            """)
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("ensure_shadow_table failed (ok on first-ever call): %s", e)
+
+
+def _poc_shadow_divergence(legacy: dict, new: dict) -> dict:
+    """Compute a structured divergence between the legacy and new synth results.
+
+    Returns:
+      {"identical": bool,
+       "same_command": bool, "same_assertion": bool, "same_synth_kind": bool,
+       "legacy_only_fields": [...], "new_only_fields": [...],
+       "notes": [...]}
+
+    Pure function — fail-soft. Called in the shadow write path; never raises.
+    """
+    try:
+        a = legacy or {}
+        b = new or {}
+        d = {
+            "same_command": (a.get("command") or "") == (b.get("command") or ""),
+            "same_assertion": (a.get("assertion") or {}) == (b.get("assertion") or {}),
+            "same_synth_kind": (a.get("synth_kind") or "") == (b.get("synth_kind") or ""),
+            "legacy_only_fields": sorted(set(a) - set(b)),
+            "new_only_fields": sorted(set(b) - set(a)),
+            "notes": [],
+        }
+        d["identical"] = d["same_command"] and d["same_assertion"] and d["same_synth_kind"]
+        if not d["same_command"]:
+            d["notes"].append(f"command len legacy={len(a.get('command') or '')} new={len(b.get('command') or '')}")
+        if not d["same_synth_kind"]:
+            d["notes"].append(f"synth_kind legacy={a.get('synth_kind')!r} new={b.get('synth_kind')!r}")
+        return d
+    except Exception as e:  # noqa: BLE001
+        return {"identical": False, "notes": [f"divergence calc failed: {e}"]}
+
+
+def _poc_shadow_record(run_id: str, iteration: int, phase: str,
+                       cve: str, ip: str, port, legacy: dict, new: dict) -> None:
+    """Record one shadow comparison. Fail-soft (debug-logs on error — never
+    blocks the main run)."""
+    try:
+        _ensure_shadow_table()
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO build_poc_shadow_runs
+                   (run_id, iteration, phase, cve, target_ip, target_port,
+                    legacy_result, new_result, divergence)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (run_id, iteration, phase, cve, str(ip), port,
+                 Json(legacy or {}), Json(new or {}),
+                 Json(_poc_shadow_divergence(legacy or {}, new or {}))))
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("poc_shadow_record failed: %s", e)
+
+
+def _decomposed_synthesize_cve_poc(cve, ip, port, product, version, eid,
+                                   run_id=None, guidance_extra="", model=None):
+    """SKELETON — Phase 1 of the B rollout.
+
+    Returns the same dict shape as `_synthesize_cve_poc`:
+      {command, assertion, rationale, synth_kind, run_id, canary,
+       origin_family, llm_model, metrics,
+       llm_error_reason, llm_error_model}
+
+    Phase 1 deliberately does NOT call the legacy synth — the whole point of
+    the shadow mode is to compare two INDEPENDENT paths. In Phase 1 this
+    function:
+      1. Deterministically extracts a `target_spec` (method/endpoint/port
+         resolved from recon + derived_cve_specs) using the same inputs the
+         LLM would see
+      2. Returns a stub `command` plus the extracted spec attached under
+         `target_spec` so divergence analytics can see "decomposed extracted
+         THESE recon facts; legacy's command referenced DIFFERENT facts"
+
+    Phase 2 (next commit) fills in `_curl_to_request` + `_execute_http_chain`
+    so the shadow lane can re-run the legacy curl command via httpx and
+    record a structured response for comparison.
+
+    Phase 3 replaces this scaffold with the real decomposed pipeline:
+    `_extract_target_spec` → `_llm_craft_payload` → `_assemble_curl` →
+    (per-iter) `_llm_diagnose_failure`.
+    """
+    cve = (cve or "").strip().upper()
+    port = port or 80
+    import time as _t
+    run_id = run_id or f"{cve}_{ip}_{int(_t.time())}_decomposed"
+    tgt = f"http://{ip}:{port}"
+
+    # Phase 1 deterministic extraction — mirrors what the LLM has to work out
+    # from the giant single prompt today. Each piece is a key input into the
+    # Phase 3 crafter templates.
+    target_spec = {
+        "ip": str(ip),
+        "port": int(port),
+        "scheme": "https" if int(port) in (443, 8443) else "http",
+        "cve": cve,
+        "product": product or "",
+        "version": version or "",
+    }
+
+    # Try to attach the recon-known live paths + the derived_cve_specs vector
+    # if either is available. Fail-soft on either lookup.
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT spec, verify_method FROM derived_cve_specs WHERE cve=%s",
+                        (cve,))
+            row = cur.fetchone()
+            if row:
+                target_spec["derived_spec_summary"] = str(row.get("spec") or "")[:400]
+                target_spec["derived_verify_method"] = row.get("verify_method")
+    except Exception:  # noqa: BLE001
+        pass
+
+    canary = _poc_canary()
+    # Stub command — Phase 2 will produce a real one via the Python exec lane.
+    return {
+        "command": f"# decomposed_phase1_scaffold — no command synthesised yet. target_spec: {target_spec}",
+        "assertion": {"expect_regex": canary, "canary": canary, "cve_anchored": True,
+                      "_phase1_stub": True},
+        "rationale": "Phase 1 scaffold — extraction stage only, no payload crafting yet.",
+        "synth_kind": "decomposed_phase1_scaffold",
+        "run_id": run_id,
+        "canary": canary,
+        "origin_family": ("", ""),
+        "llm_model": None,
+        "metrics": _new_poc_metrics(),
+        "llm_error_reason": None,
+        "llm_error_model": None,
+        "target_spec": target_spec,  # new field — carries the deterministic extraction
+    }
+
+
+def _synthesize_cve_poc_with_shadow(cve, ip, port, product, version, eid,
+                                    run_id=None, guidance_extra="", model=None):
+    """Shadow wrapper around `_synthesize_cve_poc`.
+
+    Always calls the legacy synth and returns its result unchanged — the real
+    verification + storage still runs on the legacy output. When
+    `BUILD_POC_DECOMPOSED` is "shadow" or "on", ALSO calls the decomposed
+    pipeline, computes a structured divergence, and records both results to
+    `build_poc_shadow_runs` for later analysis.
+
+    When mode is "on" (post-Phase-4 flip), the decomposed path's result
+    becomes authoritative. Phase 1 keeps "on" behaviour identical to "shadow"
+    — the scaffold stub isn't ready to be authoritative. See
+    `BUILD_POC_DECOMPOSED` doc at the top of this section.
+    """
+    legacy = _synthesize_cve_poc(cve, ip, port, product, version, eid,
+                                 run_id=run_id, guidance_extra=guidance_extra, model=model)
+    mode = _BUILD_POC_DECOMPOSED_MODE
+    if mode in ("shadow", "on"):
+        try:
+            new = _decomposed_synthesize_cve_poc(
+                cve, ip, port, product, version, eid,
+                run_id=run_id, guidance_extra=guidance_extra, model=model)
+        except Exception as e:  # noqa: BLE001
+            new = {"command": "", "assertion": {},
+                   "synth_kind": "decomposed_error",
+                   "error": f"{type(e).__name__}: {e}"}
+        try:
+            _poc_shadow_record(
+                run_id=(legacy or {}).get("run_id") or run_id or "unknown",
+                iteration=0, phase="synthesize",
+                cve=cve, ip=str(ip), port=port,
+                legacy=legacy, new=new)
+        except Exception:  # noqa: BLE001
+            pass
+    return legacy
+
+
 def _poc_run_file(run_id):
     import os as _os
     try:
@@ -23902,6 +24119,47 @@ def _poc_precheck_model(model: str) -> dict:
     return {"ok": True, "model": res.get("model") or model}
 
 
+@app.get("/build-poc/shadow-runs", tags=["Assets"])
+def build_poc_shadow_runs(limit: int = Query(50, ge=1, le=500),
+                          only_divergent: bool = Query(False),
+                          cve: Optional[str] = Query(None),
+                          _: bool = Depends(auth)):
+    """Inspect recorded shadow-mode comparisons (B-rollout observability).
+
+    Phase 1 ships the plumbing + skeleton; each row captures the legacy synth
+    result side-by-side with the decomposed pipeline's output + a structured
+    divergence. See `BUILD_POC_DECOMPOSED` + `_poc_shadow_record`. Added
+    2026-10-06.
+    """
+    try:
+        _ensure_shadow_table()
+        clauses = []
+        params = []
+        if cve:
+            clauses.append("cve = %s"); params.append(cve.upper())
+        if only_divergent:
+            clauses.append("(divergence->>'identical')::boolean = false")
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(f"""
+                SELECT id::text, run_id, iteration, phase, cve, target_ip, target_port,
+                       legacy_result, new_result, divergence, created_at
+                  FROM build_poc_shadow_runs {where}
+                 ORDER BY created_at DESC
+                 LIMIT %s""", params + [limit])
+            rows = [dict(r) for r in cur.fetchall()]
+            cur.execute(f"""
+                SELECT count(*)::int total,
+                       sum(CASE WHEN (divergence->>'identical')::boolean THEN 1 ELSE 0 END)::int identical_count,
+                       sum(CASE WHEN (divergence->>'same_command')::boolean THEN 1 ELSE 0 END)::int same_command_count
+                  FROM build_poc_shadow_runs {where}""", params)
+            stats = dict(cur.fetchone() or {})
+        return {"ok": True, "mode": _BUILD_POC_DECOMPOSED_MODE,
+                "runs": rows, "stats": stats}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"shadow-run listing failed: {type(e).__name__}: {e}")
+
+
 @app.post("/software/build-poc", tags=["Assets"])
 def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     """PoC-builder: research -> synthesize -> run-and-refine. Invoking this authorizes
@@ -28072,7 +28330,7 @@ def _resolve_and_queue_exploit(cve, ip, port, product, version, eid, dedupe=True
                         "verified": core.get("verified"),
                         "exploit_store_id": core.get("exploit_store_id")}
             return None
-        return _synthesize_cve_poc(cve, ip, port, product, version, eid)
+        return _synthesize_cve_poc_with_shadow(cve, ip, port, product, version, eid)
 
     resolution = resolve_exploit_for_cve(cve, _msf, _edb, _synth)
     method = resolution["method"]
