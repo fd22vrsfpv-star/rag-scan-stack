@@ -58,10 +58,16 @@ def test_can_execute_detector_accepts_pure_curl_chain():
     && / ; as the allowed set."""
     body = _func_src("_can_execute_in_python")
     assert body, "_can_execute_in_python missing"
-    for tok in ('"curl"', '"sleep"', '"&&"', '";"'):
-        assert tok in body, (
-            f"allowed_bins must include {tok} for pure curl chains to pass"
-        )
+    # 2026-10-07 redesign: `&&` / `;` are the SEGMENT SPLITTER, not allowed
+    # tokens; only each segment's leading command word is validated. The old
+    # token-walk (every token had to be in allowed_bins) rejected every curl
+    # flag and never executed a single command. The dynamic tests below are
+    # the real guard; this keeps the design pinned.
+    assert '"curl"' in body and '"sleep"' in body, "allowed leading words must include curl + sleep"
+    assert re.search(r"_re\.split\(r\"\\s\*\(\?:&&\|;\)\\s\*\"", body), (
+        "detector must split segments on && / ; before validating leading words"
+    )
+    assert "tokens[0]" in body, "detector must validate only each segment's leading word"
 
 
 # ── Curl parser ────────────────────────────────────────────────────────────
@@ -156,3 +162,80 @@ def test_dispatch_fallback_records_skip_reason():
         "etc.), a dispatch_skipped shadow row must be written so operators "
         "see HOW OFTEN the fallback fires"
     )
+
+
+# ── DYNAMIC guards (added 2026-10-07) ─────────────────────────────────────
+#
+# The structural tests above passed while the detector rejected EVERY real
+# command (every curl flag was an "unsupported token"). These exec the real
+# helpers against the exact command shapes the overnight batch produced and
+# assert the decision, not the source text. CLAUDE.md: ast.parse passing is
+# NOT verification.
+
+
+def _load_lane_helpers() -> dict:
+    src = API.read_text()
+    tree = _ast.parse(src)
+    ns: dict = {}
+    for name in ("_strip_sink_tail", "_strip_shell_redirects", "_can_execute_in_python",
+                 "_curl_to_request"):
+        node = next(n for n in _ast.walk(tree)
+                    if isinstance(n, _ast.FunctionDef) and n.name == name)
+        exec(_ast.get_source_segment(src, node), ns)
+    return ns
+
+
+REAL_LLM_TAIL = ("curl -X POST http://172.18.0.35:9090/api/proxy -d 'http://localhost:8000/POCz93a306fdd0' "
+                 "2>/dev/null; sleep 1; curl -s http://172.18.0.35:9091/done | grep -q 'POCz93a306fdd0' "
+                 "&& echo 'SINK-VERIFIED: POCz93a306fdd0'")
+REAL_AUGMENT_TAIL = ("( curl -s -k 'http://172.18.0.36:9090/apply/index.php?url=http://localhost:8000/POCzabc123' ) "
+                     ">/dev/null 2>&1; \n# sink-verification tail (auto-added for blind/OOB class):\n"
+                     "sleep 1; _DONE=$(curl -s 'http://172.18.0.36:9091/done' 2>/dev/null); "
+                     "echo \"$_DONE\" | grep -qE '\"attack_success\":true' && echo \"SINK-VERIFIED: POCzabc123 ($_DONE)\"")
+REAL_ASSEMBLER_TAIL = ("curl -s -S -i -k --max-time 30 -X POST -H 'Content-Type: application/json' "
+                       "--data-raw '{\"url\":\"http://localhost:8000/POCzdef456\"}' http://172.18.0.35:9090/api/proxy "
+                       "; sleep 1 ; _DONE=$(curl -s http://172.18.0.35:9091/done) ; echo \"$_DONE\" | "
+                       "grep -qE 'attack_success' && echo 'SINK-VERIFIED: POCzdef456 '\"$_DONE\"")
+
+
+def _lane_decision(ns, cmd):
+    head, sink, canary = ns["_strip_sink_tail"](cmd)
+    head = ns["_strip_shell_redirects"](head)
+    ok, why = ns["_can_execute_in_python"](head)
+    return ok, why, sink, canary, head
+
+
+def test_dynamic_real_llm_tail_is_accepted():
+    ns = _load_lane_helpers()
+    ok, why, sink, canary, head = _lane_decision(ns, REAL_LLM_TAIL)
+    assert sink == "http://172.18.0.35:9091/done" and canary == "POCz93a306fdd0"
+    assert ok, f"real LLM-shaped command must be executable after tail strip: {why} | head={head!r}"
+    req = ns["_curl_to_request"](head)
+    assert req["method"] == "POST" and req["url"].endswith("/api/proxy")
+
+
+def test_dynamic_real_augmenter_tail_is_accepted():
+    ns = _load_lane_helpers()
+    ok, why, sink, canary, head = _lane_decision(ns, REAL_AUGMENT_TAIL)
+    assert sink and canary == "POCzabc123"
+    assert ok, f"augmenter-wrapped `( curl ... )` head must be executable: {why} | head={head!r}"
+
+
+def test_dynamic_real_assembler_tail_is_accepted():
+    ns = _load_lane_helpers()
+    ok, why, sink, canary, head = _lane_decision(ns, REAL_ASSEMBLER_TAIL)
+    assert sink and canary == "POCzdef456"
+    assert ok, f"Phase-3 assembler output must be executable: {why} | head={head!r}"
+    req = ns["_curl_to_request"](head)
+    assert req["headers"].get("Content-Type") == "application/json"
+    assert req["body"] and "POCzdef456" in req["body"]
+
+
+def test_dynamic_non_curl_and_pipes_still_rejected():
+    ns = _load_lane_helpers()
+    for bad in ("nmap -p 9090 172.18.0.35",
+                "curl -s http://t/ | grep foo",
+                "python3 -c 'print(1)' && curl -s http://t/",
+                "curl -s http://t/ $(cat /tmp/x)"):
+        ok, why, *_ = _lane_decision(ns, bad)
+        assert not ok, f"must reject {bad!r} (got accepted: {why})"

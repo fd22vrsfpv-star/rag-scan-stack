@@ -13156,26 +13156,36 @@ def _can_execute_in_python(command: str) -> tuple:
             i += 1
     if _re.search(r"\b(nmap|nc|wget|python3?|bash|sh|awk|grep|sed|hashcat|sqlmap|ncat|socat)\b", command):
         return (False, "non-curl tool in command")
-    # Split on && / ;; / ; (but not inside quotes — crude approximation; good enough
-    # for the common `curl ... && sleep N && curl ...` pattern).
+    # Split into segments on && / ; and validate ONLY each segment's leading
+    # command word. The rest of a `curl` segment is curl's own flags + URL and
+    # is parsed later by _curl_to_request — validating those tokens here was
+    # the 2026-10-07 bug: every `-X` / `-s` was rejected as "unsupported
+    # token", so the Python lane never ran a single command.
     import shlex as _shlex
-    try:
-        tokens = _shlex.split(command)
-    except Exception as e:  # noqa: BLE001
-        return (False, f"shlex split failed: {e}")
-    # Walk tokens, finding each `curl` command. Any token that isn't curl / && /
-    # ; / sleep (literal `sleep N`) disqualifies.
-    allowed_bins = {"curl", "sleep", "&&", ";", "echo", "true", "false"}
-    i = 0
-    while i < len(tokens):
-        t = tokens[i]
-        if t in allowed_bins:
-            # `sleep 1` consumes the next token as a number.
-            if t == "sleep" and i + 1 < len(tokens) and tokens[i+1].isdigit():
-                i += 2; continue
-            i += 1
+    allowed_bins = {"curl", "sleep", "echo", "true", "false"}
+    segments = [s.strip() for s in _re.split(r"\s*(?:&&|;)\s*", command.strip()) if s.strip()]
+    if not segments:
+        return (False, "no command segments")
+    saw_curl = False
+    for seg in segments:
+        # Unwrap a subshell `( ... )` — _augment_with_sink_verification wraps
+        # the exploit head in one.
+        seg = _re.sub(r"^\(\s*(.*?)\s*\)\s*$", r"\1", seg, flags=_re.S).strip()
+        if not seg or seg.startswith("#"):
+            continue  # blank / comment line from the augmenter
+        try:
+            tokens = _shlex.split(seg)
+        except Exception as e:  # noqa: BLE001
+            return (False, f"shlex split failed: {e}")
+        if not tokens:
             continue
-        return (False, f"unsupported token: {t!r}")
+        head = tokens[0]
+        if head not in allowed_bins:
+            return (False, f"unsupported command: {head!r}")
+        if head == "curl":
+            saw_curl = True
+    if not saw_curl:
+        return (False, "no curl segment")
     return (True, "pure curl chain")
 
 
@@ -13357,6 +13367,49 @@ def _execute_http_chain(commands: list, chain_timeout: int = 180) -> dict:
             "exit_code": exit_code, "steps": steps}
 
 
+def _strip_sink_tail(command: str) -> tuple:
+    """Split off the OOB sink-verification tail so the HTTP head can run in
+    the Python lane. Returns (head_command, sink_url|None, canary|None).
+
+    Fix 2026-10-07: every one of the overnight batch's 55 commands was
+    rejected by `_can_execute_in_python` ("shell pipe (|) present" /
+    "command substitution present") — all from the sink-poll tail the
+    pipeline itself appends for OOB classes:
+        ; sleep 1; curl -s http://T:9091/done | grep -q CANARY && echo SINK-VERIFIED: CANARY
+        ; sleep 1; _DONE=$(curl -s 'URL'); echo "$_DONE" | grep -qE ... && echo "SINK-VERIFIED: ..."
+    The Python lane polls the sink itself after the head runs, so the tail
+    is reconstructed in-process rather than parsed.
+    """
+    import re as _re
+    if not command:
+        return command, None, None
+    m = _re.search(r"curl\s+-s\s+['\"]?(https?://[^\s'\"|;)]+/done)['\"]?", command)
+    if not m:
+        return command, None, None
+    sink_url = m.group(1)
+    cm = _re.search(r"SINK-VERIFIED:\s*['\"]?\s*(POCz[0-9a-f]+)", command)
+    canary = cm.group(1) if cm else None
+    # Cut at the separator that begins the tail: the `sleep` / `_DONE=` / the
+    # sink curl itself, whichever comes first before the matched curl.
+    start = m.start()
+    cut = start
+    for pat in (r";\s*sleep\s+\d+\s*;?", r"&&\s*sleep\s+\d+", r";\s*_DONE=", r"&&\s*_DONE="):
+        mm = None
+        for cand in _re.finditer(pat, command[:start + 1]):
+            mm = cand
+        if mm and mm.start() < cut:
+            cut = mm.start()
+    head = command[:cut].rstrip(" ;&")
+    return head, sink_url, canary
+
+
+def _strip_shell_redirects(command: str) -> str:
+    """Drop `2>/dev/null`, `>/dev/null 2>&1`, `>/dev/null`, `2>&1` — harmless
+    for the Python lane and otherwise tokenised as unsupported shlex tokens."""
+    import re as _re
+    return _re.sub(r"\s*(?:2>&1|[12]?>\s*/dev/null(?:\s+2>&1)?)", " ", command or "")
+
+
 def _execute_curl_chain_in_python(command: str, chain_timeout: int = 180) -> dict:
     """High-level helper: given a shell command, if it's a pure curl chain
     (per `_can_execute_in_python`), parse each `curl ...` segment and run via
@@ -13364,12 +13417,20 @@ def _execute_curl_chain_in_python(command: str, chain_timeout: int = 180) -> dic
 
     `result` has the shape returned by `_execute_http_chain`. When
     can_execute is False, caller should fall back to shell dispatch.
+
+    The OOB sink-verification tail is stripped first and re-done in Python
+    after the head chain runs (see `_strip_sink_tail`); shell redirections
+    are dropped (see `_strip_shell_redirects`).
     """
-    can, reason = _can_execute_in_python(command)
+    head, sink_url, canary = _strip_sink_tail(command)
+    head = _strip_shell_redirects(head)
+    can, reason = _can_execute_in_python(head)
     if not can:
-        return {"can_execute": False, "reason": reason}
+        return {"can_execute": False, "reason": reason,
+                "stripped_sink": bool(sink_url)}
     # Split chain on `&&` / `;` — crude, but we already filtered pipes/subs upstream.
     import re as _re
+    command = head
     segments = _re.split(r"\s*(?:&&|;)\s*", command.strip())
     parsed = []
     for seg in segments:
@@ -13390,7 +13451,30 @@ def _execute_curl_chain_in_python(command: str, chain_timeout: int = 180) -> dic
         result = _execute_http_chain(parsed, chain_timeout=chain_timeout)
     except Exception as e:  # noqa: BLE001
         return {"can_execute": False, "reason": f"httpx chain execute raised: {e}"}
-    return {"can_execute": True, "reason": "ok", "result": result}
+    # Re-do the stripped sink-verification tail in-process: poll the sink,
+    # emit the same SINK-VERIFIED marker the shell tail would, so the
+    # Python-lane output is verdict-comparable with the shell lane.
+    if sink_url:
+        try:
+            import httpx as _hx, time as _t
+            _t.sleep(1)
+            sr = _hx.get(sink_url, timeout=10, verify=False)
+            sbody = sr.text or ""
+            result.setdefault("steps", []).append({
+                "url": sink_url, "method": "GET", "status": sr.status_code,
+                "headers": dict(sr.headers), "body_preview": sbody[:1500],
+                "elapsed_ms": int(sr.elapsed.total_seconds() * 1000) if sr.elapsed else 0,
+                "cookies": {}, "sink_poll": True})
+            hit = (canary and canary in sbody) or ("attack_success" in sbody and '"success"' in sbody)
+            if hit:
+                result["output"] = (result.get("output") or "") + f"\nSINK-VERIFIED: {canary or ''} {sbody[:300]}"
+                result["sink_hit"] = True
+            else:
+                result["sink_hit"] = False
+        except Exception as e:  # noqa: BLE001
+            result["sink_error"] = f"{type(e).__name__}: {e}"
+    return {"can_execute": True, "reason": "ok", "result": result,
+            "stripped_sink": bool(sink_url), "canary": canary}
 
 
 # ─── Phase 3 of B rollout: decomposed synth pipeline ─────────────────────
@@ -14016,7 +14100,25 @@ def _fetch_cve_details(cve):
             cur.execute("SELECT results FROM software_research_cache WHERE LOWER(product)=LOWER(%s) AND source='nvd_cve'", (cve,))
             r = cur.fetchone()
             if r and r[0]:
-                return r[0]
+                cached = r[0]
+                # Backfill: rows cached before the advisory-PoC extractor
+                # shipped (2026-10-06) have no `advisory_poc` key, and this
+                # early return skipped the extractor forever — the overnight
+                # batch injected KNOWN_GOOD_SHAPE_FROM_ADVISORY zero times
+                # even though the refs held GHSA pages. Compute once, persist.
+                if isinstance(cached, dict) and "advisory_poc" not in cached:
+                    try:
+                        cached["advisory_poc"] = _fetch_advisory_poc(cve, cached.get("refs") or [])
+                    except Exception:  # noqa: BLE001
+                        cached["advisory_poc"] = ""
+                    try:
+                        cur.execute("""UPDATE software_research_cache SET results=%s, updated_at=now()
+                                       WHERE LOWER(product)=LOWER(%s) AND source='nvd_cve'""",
+                                    (Json(cached), cve))
+                        conn.commit()
+                    except Exception:  # noqa: BLE001
+                        pass
+                return cached
     except Exception:  # noqa: BLE001
         pass
     import requests as _rq
@@ -24614,6 +24716,18 @@ def _prerun_payload_probe(ip, port, command: str, timeout: int = 5) -> dict:
     if status == 404:
         return {"ok": False, "method": method, "url": url, "status": 404,
                 "reason": f"endpoint 404 on {method} {url} — exploit will all_404",
+                "body_preview": body_preview, "allow_header": allow_header}
+    # 405 on the exploit's OWN method is deterministic — the path exists but
+    # this verb is refused. Fix 2026-10-07: CVE-2024-34359 burned 50
+    # iterations, every probe returned 405 on the same path, and the refine
+    # loop kept varying the payload because 405 was treated as "exists,
+    # proceed". Hard-fail so PRERUN_PROBE_FAIL + the Allow header reach the
+    # refine prompt and force a method/path change.
+    if status == 405:
+        return {"ok": False, "method": method, "url": url, "status": 405,
+                "reason": (f"405 Method Not Allowed: {method} is refused on {url}"
+                           + (f" (server Allow: {allow_header})" if allow_header else "")
+                           + " — CHANGE THE METHOD OR THE PATH; do not re-send this verb here"),
                 "body_preview": body_preview, "allow_header": allow_header}
     # Soft warning: method isn't in the server's Allow set — exploit will
     # likely 405 if the server honours its own advertisement.
