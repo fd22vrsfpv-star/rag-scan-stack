@@ -13470,7 +13470,14 @@ def _execute_curl_chain_in_python(command: str, chain_timeout: int = 180) -> dic
                 result["output"] = (result.get("output") or "") + f"\nSINK-VERIFIED: {canary or ''} {sbody[:300]}"
                 result["sink_hit"] = True
             else:
+                # Mirror the shell tail's `grep -q CANARY && echo` semantics:
+                # a sink miss makes the whole chain exit 1. Without this the
+                # first round-2 dispatch row read shell_ec=1 / py_ec=0 for
+                # the same miss, which would poison Phase-4 agreement scoring.
                 result["sink_hit"] = False
+                if not result.get("exit_code"):
+                    result["exit_code"] = 1
+                result["ok"] = False
         except Exception as e:  # noqa: BLE001
             result["sink_error"] = f"{type(e).__name__}: {e}"
     return {"can_execute": True, "reason": "ok", "result": result,
@@ -14073,18 +14080,87 @@ def _fetch_advisory_poc(cve: str, refs: list, per_url_bytes: int = 12000, max_fe
         if "nvd.nist.gov" in u: w += 1
         return w
 
+    ua = {"User-Agent": "poc-shape-extract/1.0 (+security research)"}
+    # GitHub token raises the unauthenticated 60/hr API limit; optional.
+    pat = os.environ.get("GITHUB_PAT") or ""
+    if not pat:
+        try:
+            with get_db() as conn, conn.cursor() as cur:
+                cur.execute("SELECT value FROM app_settings WHERE key IN ('github_pat','github_token') LIMIT 1")
+                rr = cur.fetchone(); pat = (rr[0] if rr else "") or ""
+        except Exception:  # noqa: BLE001
+            pass
+    api_hdrs = {**ua, "Accept": "application/vnd.github+json"}
+    if pat:
+        api_hdrs["Authorization"] = f"Bearer {pat}"
+
+    # PASS 1 (2026-10-07 fix): the GitHub advisories API returns the advisory
+    # `description` as RAW MARKDOWN with ``` fences — the rendered HTML page
+    # is ~200 KB of nav before the content and uses <pre>, so the fence regex
+    # never matched and per_url_bytes truncated before the PoC. For
+    # GHSA-mxhq-xw3g-rphc (CVE-2024-32964) the first fence is the literal
+    # `POST /api/proxy HTTP/2 ...` request. Fetch the API first.
+    ghsa_ids = []
+    for u in refs:
+        for gid in _re.findall(r"GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}", u or "", _re.I):
+            if gid.upper() not in [g.upper() for g in ghsa_ids]:
+                ghsa_ids.append(gid)
+    for gid in ghsa_ids[:max_fetches]:
+        try:
+            r = _rq.get(f"https://api.github.com/advisories/{gid}", timeout=12, headers=api_hdrs)
+            if r.status_code != 200:
+                continue
+            desc = (r.json() or {}).get("description") or ""
+        except Exception:  # noqa: BLE001
+            continue
+        snippet = _extract_poc_from_text(desc)
+        if snippet:
+            return f"[source: https://api.github.com/advisories/{gid}]\n{snippet}"
+
+    # PASS 1b: GitHub ISSUES carry PoCs for projects without a GHSA
+    # (CVE-2024-36675's only ref is lylme_spage/issues/92). Same API shape:
+    # /repos/{owner}/{repo}/issues/{n} -> markdown `body`. React-rendered
+    # issue pages give pass 2 nothing, so this is the only way to read them.
+    for u in refs:
+        m = _re.search(r"github\.com/([^/\s]+)/([^/\s#?]+)/issues/(\d+)", u or "")
+        if not m:
+            continue
+        owner, repo, num = m.group(1), m.group(2), m.group(3)
+        try:
+            r = _rq.get(f"https://api.github.com/repos/{owner}/{repo}/issues/{num}",
+                        timeout=12, headers=api_hdrs)
+            if r.status_code != 200:
+                continue
+            body_md = (r.json() or {}).get("body") or ""
+        except Exception:  # noqa: BLE001
+            continue
+        snippet = _extract_poc_from_text(body_md)
+        if snippet:
+            return f"[source: https://github.com/{owner}/{repo}/issues/{num}]\n{snippet}"
+
+    # PASS 2: rendered pages (vendor advisories, nuclei templates, gists).
+    # Convert HTML <pre>/<code> blocks into ``` fences so the same extractor
+    # applies, and read enough bytes to get past page chrome.
+    def _html_to_fenced(html: str) -> str:
+        import html as _html
+        blocks = _re.findall(r"<pre[^>]*>(?:\s*<code[^>]*>)?([\s\S]*?)(?:</code>\s*)?</pre>", html, _re.I)
+        if not blocks:
+            return html
+        return "\n\n".join("```\n" + _html.unescape(_re.sub(r"<[^>]+>", "", b)).strip() + "\n```" for b in blocks)
+
     candidates = sorted(set(refs), key=_rank, reverse=True)[:max_fetches]
     for url in candidates:
         if not url or _rank(url) == 0:
             continue
         try:
-            r = _rq.get(url, timeout=10, allow_redirects=True,
-                        headers={"User-Agent": "poc-shape-extract/1.0 (+security research)"})
+            r = _rq.get(url, timeout=10, allow_redirects=True, headers=ua)
             if r.status_code != 200:
                 continue
-            body = (r.text or "")[:per_url_bytes]
+            body = (r.text or "")[:max(per_url_bytes, 400_000)]
         except Exception:  # noqa: BLE001
             continue
+        if "<pre" in body.lower():
+            body = _html_to_fenced(body)
         snippet = _extract_poc_from_text(body)
         if snippet:
             # Prefix the source URL so the operator can audit where the shape came from.
@@ -14106,11 +14182,19 @@ def _fetch_cve_details(cve):
                 # early return skipped the extractor forever — the overnight
                 # batch injected KNOWN_GOOD_SHAPE_FROM_ADVISORY zero times
                 # even though the refs held GHSA pages. Compute once, persist.
-                if isinstance(cached, dict) and "advisory_poc" not in cached:
+                # Retry when EMPTY too (not just missing): the first backfill
+                # ran against rendered HTML and stored "" for every CVE.
+                # Debounced to one attempt per 6h so a CVE with genuinely no
+                # published PoC doesn't cost 3 GETs on every synth.
+                import time as _tm
+                _checked = float((cached or {}).get("_advisory_poc_checked") or 0)
+                if (isinstance(cached, dict) and not cached.get("advisory_poc")
+                        and _tm.time() - _checked > 6 * 3600):
                     try:
                         cached["advisory_poc"] = _fetch_advisory_poc(cve, cached.get("refs") or [])
                     except Exception:  # noqa: BLE001
                         cached["advisory_poc"] = ""
+                    cached["_advisory_poc_checked"] = _tm.time()
                     try:
                         cur.execute("""UPDATE software_research_cache SET results=%s, updated_at=now()
                                        WHERE LOWER(product)=LOWER(%s) AND source='nvd_cve'""",
