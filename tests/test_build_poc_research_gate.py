@@ -779,3 +779,29 @@ def test_read_back_verifier_requires_canary_or_a_real_regex_and_never_a_3xx_alon
     assert '"method": "assertion_trivial"' in body
     seed = _func_src("_assemble_from_cve_spec")
     assert 'a["expect_regex"] = canary' in seed, "a seeded trivial regex must be replaced by the canary anchor"
+
+
+# ── round-11: second pass is a second chance, not a second budget ─────────
+
+def test_widen_plan_tries_default_creds_first_without_a_session():
+    ns = _load_deep()
+    assert ns["_deep_recon_plan"]([], has_session=False)[0] == "default_creds"
+    assert ns["_deep_recon_plan"]([], has_session=True)[0] == "auth_crawl"
+
+
+def test_second_pass_iterations_are_capped():
+    assert '_BUILD_POC_SECOND_PASS_ITERS = int(os.environ.get("BUILD_POC_SECOND_PASS_ITERS") or "10")' in API.read_text()
+    node = _func_src("node_deep_recon", GRAPH)
+    assert '"max_iters": min(' in node and "_BUILD_POC_SECOND_PASS_ITERS" in node
+
+
+def test_credential_unsourced_is_traced_once_per_distinct_command():
+    body = _func_src("_run_refine_poc")
+    assert '_seen_cu = metrics.setdefault("_credential_unsourced_seen", [])' in body and "raise StopIteration" in body
+
+
+def test_read_back_verifier_has_its_regex_import():
+    """Round 11: derivation failed with "name '_re' is not defined" — the 3xx-only
+    check referenced _re in a function that only imported time."""
+    body = _func_src("_live_verify_recipe")
+    assert "import time as _t, re as _re" in body
