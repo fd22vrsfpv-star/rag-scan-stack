@@ -13535,6 +13535,16 @@ def _vuln_class_from_cve(cve: str, details: dict) -> str:
     return "unknown"
 
 
+_ARTIFACT_FORMAT_HINTS = [
+    ("GGUF model file", r"\bgguf\b|llama[-_ ]?cpp|chat_template"),
+    ("Python pickle", r"\bpickle\b|RestrictedUnpickler|\.pkl\b|torch\.load"),
+    ("YAML document", r"\byaml\b"),
+    ("Java serialized object", r"readObject\(|ObjectInputStream|ysoserial"),
+    ("PHP serialized object", r"unserialize\("),
+    ("archive (zip/tar)", r"\bzip(?:file)?\b|\btar(?:file)?\b|zip ?slip"),
+    ("XML/SVG document", r"\bsvg\b|\bxxe\b|\bxml\b"),
+]
+
 _INPUT_SOURCE_SIGNATURES = [
     # (source, regex over advisory description + fix diff text)
     ("template_in_file", r"SandboxedEnvironment|ImmutableSandboxedEnvironment|chat_template|template.*(?:metadata|from (?:the )?(?:model|file))"),
@@ -13569,8 +13579,19 @@ def _classify_input_source(details: dict | None, fix_diff_text: str = "") -> dic
         for origin, text, conf in parts:
             m = _re.search(pat, text, _re.I | _re.S)
             if m:
-                return {"source": source,
-                        "artifact_required": source in ("template_in_file", "deserialized_object", "uploaded_file"),
+                # `uploaded_file` only needs an EXTERNAL artifact when the
+                # target parses a specific format (GGUF/pickle/zip/XML...).
+                # A webshell or arbitrary bytes in a multipart field IS the
+                # request body — CVE-2024-36858 (writeFileSync), CVE-2024-2624
+                # and CVE-2024-5084 were mislabelled artifact_required on the
+                # 2026-10-07 40-challenge sweep.
+                alltext = " ".join(t for _, t, _ in parts)
+                fmt = next((name for name, fpat in _ARTIFACT_FORMAT_HINTS
+                            if _re.search(fpat, alltext, _re.I)), None)
+                needs_artifact = (source in ("template_in_file", "deserialized_object")
+                                  or (source == "uploaded_file" and fmt is not None))
+                return {"source": source, "artifact_required": needs_artifact,
+                        "format_hint": fmt,
                         "evidence": text[max(0, m.start() - 60): m.end() + 60].replace("\n", " ")[:200],
                         "evidence_from": origin, "confidence": conf}
     return {"source": "request", "artifact_required": False, "evidence": "",
@@ -13681,15 +13702,6 @@ def _local_source_routes(cve: str, max_files: int = 12, max_bytes: int = 60_000)
 
 _BUILD_POC_ARTIFACT_HALT = (os.environ.get("BUILD_POC_ARTIFACT_HALT") or "on").strip().lower()
 
-_ARTIFACT_FORMAT_HINTS = [
-    ("GGUF model file", r"\bgguf\b|llama[-_ ]?cpp|chat_template"),
-    ("Python pickle", r"\bpickle\b|RestrictedUnpickler|\.pkl\b|torch\.load"),
-    ("YAML document", r"\byaml\b"),
-    ("Java serialized object", r"readObject\(|ObjectInputStream|ysoserial"),
-    ("PHP serialized object", r"unserialize\("),
-    ("archive (zip/tar)", r"\bzip(?:file)?\b|\btar(?:file)?\b|zip ?slip"),
-    ("XML/SVG document", r"\bsvg\b|\bxxe\b|\bxml\b"),
-]
 
 _ARTIFACT_LOCATION_BY_SOURCE = {
     "template_in_file": "the template string the target renders out of the file's metadata (the fix diff names the field)",
@@ -14140,7 +14152,8 @@ def _decomposed_synthesize_cve_poc(cve, ip, port, product, version, eid,
     # payload that cannot reach the sink (CVE-2024-34359: 50 iterations of
     # template syntax in chat messages against a sink fed by file metadata).
     # Halt with a precise verdict + the RAG hint so the operator can act.
-    if target_spec.get("artifact_required"):
+    if (target_spec.get("artifact_required")
+            and float((target_spec.get("input_source") or {}).get("confidence") or 0) >= 0.7):
         src = target_spec.get("input_source") or {}
         hints = [h.get("title") for h in (target_spec.get("rag_hints") or [])][:3]
         reason = (f"artifact required: input source is {src.get('source')!r} "
