@@ -395,7 +395,7 @@ def litellm_completion_for(backend: str,
     # Single-prompt → wrap as one user message. For multi-turn, use
     # `litellm_chat_completion_for()` which takes messages directly.
     kwargs["messages"] = [{"role": "user", "content": prompt}]
-    resp = litellm.completion(model=lmodel, **kwargs)
+    resp = _litellm_completion_with_azure_shape_retry(litellm, backend, model, lmodel, kwargs)
     return _extract_text_and_usage(resp)
 
 
@@ -495,8 +495,90 @@ def litellm_chat_completion_for(backend: str,
         return None
     # Chat takes `messages` instead of a wrapped single-user prompt.
     kwargs["messages"] = messages
-    resp = litellm.completion(model=lmodel, **kwargs)
+    resp = _litellm_completion_with_azure_shape_retry(litellm, backend, model, lmodel, kwargs)
     return _extract_text_and_usage(resp)
+
+
+def _litellm_completion_with_azure_shape_retry(litellm_mod, backend: str,
+                                               model: str, lmodel: str,
+                                               kwargs: Dict[str, Any]):
+    """Call `litellm.completion(model=lmodel, **kwargs)` with a bounded
+    retry for Azure Foundry resources that host OpenAI-compat deployments.
+
+    Azure's `.services.ai.azure.com` hostname is used for BOTH:
+      (A) Foundry Models-as-a-Service (DeepSeek, Mistral, Phi, Llama,
+          Anthropic) served by Microsoft — LiteLLM reaches these via
+          `azure_ai/[<prefix>/]<model>`.
+      (B) The operator's own OpenAI-compat deployment hosted on that
+          resource — reachable at `<endpoint>/openai/v1/chat/completions`
+          with the model name in the request body (not the URL path).
+
+    The hostname alone doesn't tell them apart. We default to (A) in
+    `_build_litellm_kwargs()`, then on a NotFoundError here retry
+    as (B) — `openai/<model>` with `api_base=<endpoint>/openai/v1`.
+    If both fail the second exception propagates with context so the
+    operator sees "both shapes 404'd" rather than one or the other.
+
+    Memoises the successful shape per (endpoint, model) so subsequent
+    calls skip the first attempt. Classic Azure OpenAI endpoints
+    (…/.openai.azure.com) + Foundry Anthropic (claude-* deployment names)
+    never enter the retry — their shapes are unambiguous.
+    """
+    is_azure = (backend or "").lower() == "azure"
+    is_foundry_openai = (is_azure and lmodel.startswith("azure_ai/")
+                         and not lmodel.startswith("azure_ai/anthropic/"))
+    endpoint = kwargs.get("api_base") or ""
+    cache_key = (endpoint, model)
+    pinned = _AZURE_SHAPE_CACHE.get(cache_key) if is_foundry_openai else None
+    if pinned == "openai_compat":
+        return _call_litellm_openai_compat(litellm_mod, model, kwargs)
+    try:
+        return litellm_mod.completion(model=lmodel, **kwargs)
+    except Exception as e:  # noqa: BLE001
+        # Narrow retry: only for Azure Foundry OpenAI-compat 404 on the
+        # azure_ai shape. Anything else raises as-is so a real error
+        # (bad credentials, provider down) doesn't get retried blindly.
+        if not is_foundry_openai:
+            raise
+        msg = str(e).lower()
+        if "404" not in msg and "not found" not in msg and "notfound" not in msg:
+            raise
+        logging.info("litellm_router: azure_ai/ 404 for %r on %s — retrying with openai-compat shape",
+                     model, endpoint)
+        try:
+            resp = _call_litellm_openai_compat(litellm_mod, model, kwargs)
+            _AZURE_SHAPE_CACHE[cache_key] = "openai_compat"
+            logging.info("litellm_router: pinned (%s, %s) to openai_compat shape", endpoint, model)
+            return resp
+        except Exception as e2:  # noqa: BLE001
+            # Surface BOTH failures so the operator sees what each shape
+            # returned — the hand-rolled fallback that catches this
+            # exception will still save the call, but the pin tells them
+            # neither LiteLLM shape handles this provider yet.
+            raise RuntimeError(
+                f"both LiteLLM shapes failed for {model} on {endpoint}: "
+                f"azure_ai/ said {e}; openai-compat said {e2}") from e2
+
+
+def _call_litellm_openai_compat(litellm_mod, model: str,
+                                base_kwargs: Dict[str, Any]):
+    """Second-chance shape: route an Azure Foundry OpenAI-compat deployment
+    through LiteLLM's `openai/` provider. The Foundry resource serves
+    `/openai/v1/chat/completions` with the model name in the request body,
+    which is exactly what LiteLLM's openai provider sends when `api_base`
+    is pointed at that path.
+    """
+    kw = dict(base_kwargs)
+    # api_base: swap the azure path for the openai-compat path.
+    api_base = kw.get("api_base", "").rstrip("/")
+    if not api_base.endswith("/openai/v1"):
+        kw["api_base"] = api_base.rstrip("/") + "/openai/v1"
+    # api_version is an Azure-only param; LiteLLM's openai provider rejects it.
+    kw.pop("api_version", None)
+    return litellm_mod.completion(model=f"openai/{model}", **kw)
+
+
+_AZURE_SHAPE_CACHE: Dict[tuple, str] = {}
 
 
 def _extract_text_and_usage(resp) -> tuple:
