@@ -1082,6 +1082,89 @@ async def put_llm_providers(body: LlmProvidersBody):
             "note": "takes effect within 30s (resolver cache TTL)"}
 
 
+def _diagnose_generate_failure(*, err_text: str, model: str,
+                               ptype: str, deployment_names: list) -> str:
+    """Attach an operator-actionable hint to a generate-step failure.
+
+    The probe surfaces the real dispatcher error (good: that's what agents
+    see), but a raw `DeploymentNotFound` or `not_found_error` is often
+    one of a handful of operator-config patterns we've seen. Each pattern
+    gets a one-line "do THIS to fix it" nudge appended to the error so
+    the operator doesn't have to guess.
+
+    Patterns covered:
+      (1) Case-mismatch: `default_model` has a case-insensitive match in
+          the deployments list on this resource. Classic Azure portal
+          typo (`deepseek4-pro` vs `DeepSeek-V4-Pro`).
+      (2) No deployments: the resource authenticates but is empty — the
+          endpoint points at the wrong resource.
+      (3) Fuzzy name match: `default_model` substring-matches one of the
+          deployments (`gpt5-mini` vs `gpt-5-mini`). Probably the
+          operator meant the one that exists.
+      (4) Anthropic model-not-found: Azure routed to Anthropic but
+          Anthropic itself rejected the model id — Microsoft's Foundry
+          deployment is misbound in the Azure portal, not fixable
+          client-side.
+      (5) Nothing matched: generic nudge pointing to Settings.
+
+    Return value includes a leading space when non-empty so it appends
+    cleanly to the error message.
+    """
+    err_lower = err_text.lower()
+    model = (model or "").strip()
+    names = [n for n in (deployment_names or []) if n]
+
+    # (4) Anthropic says "not_found" with no "deployment" prefix → the
+    # request REACHED Anthropic and Anthropic itself rejects the model.
+    # Microsoft/Foundry misbinding — fix on Azure side.
+    if ("not_found_error" in err_lower
+            and "deployment" not in err_lower
+            and model.lower().startswith("claude-")):
+        return (" — Microsoft Foundry forwarded the request to Anthropic, "
+                "which rejected the model id. The Azure deployment is "
+                "misbound. Fix: Azure Portal → AI Foundry → the project → "
+                "Deployments → delete and re-create from the Model Catalog "
+                "so Azure maps the deployment to a real Anthropic model id.")
+
+    # (1) Case-insensitive exact match in deployments list.
+    if "deploymentnotfound" in err_lower and names:
+        lower_match = next((n for n in names if n.lower() == model.lower()
+                            and n != model), None)
+        if lower_match:
+            return (f" — case mismatch? Change default_model to "
+                    f"{lower_match!r} (the exact deployment name on "
+                    f"this resource).")
+
+        # (3) Fuzzy name match: substring either direction, or trim non-alnum.
+        import re
+        def _norm(s): return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+        mn = _norm(model)
+        for n in names:
+            nn = _norm(n)
+            if mn and nn and (mn in nn or nn in mn):
+                return (f" — did you mean {n!r}? Change default_model to "
+                        f"match (deployments on this resource: "
+                        f"{', '.join(names[:6])}"
+                        f"{'…' if len(names) > 6 else ''}).")
+
+    # (2) No deployments at all — endpoint points at the wrong resource.
+    if "deploymentnotfound" in err_lower and ptype == "azure" and not names:
+        return (" — this resource has no deployments. Either remove the "
+                "provider or re-point its endpoint at a resource that has "
+                f"a {model!r} deployment (check your other configured "
+                "providers for the right URL).")
+
+    # (5) DeploymentNotFound with deployments present but no match:
+    # explicitly list what IS there.
+    if "deploymentnotfound" in err_lower and names:
+        return (f" — default_model {model!r} isn't in the deployments on "
+                f"this resource. Change it to one of: "
+                f"{', '.join(names[:8])}"
+                f"{'…' if len(names) > 8 else ''}.")
+
+    return ""
+
+
 @router.post("/api/settings/llm/providers/{provider_id}/test")
 async def test_llm_provider(provider_id: str):
     """Connectivity check for ONE named provider, step by step.
@@ -1144,6 +1227,10 @@ async def test_llm_provider(provider_id: str):
     add("endpoint", True,
         f"root {root}" + ("" if root == ep.rstrip("/") else f"  (normalised from {ep})"))
 
+    # Deployments list, hoisted to this scope so the generate step can
+    # cross-reference the operator's default_model against it (catches
+    # case-mismatches: `deepseek4-pro` vs the real `DeepSeek-V4-Pro`).
+    deployment_names: list[str] = []
     async with httpx.AsyncClient(timeout=45, verify=False) as c:
         if ptype in ("azure", "openai"):
             hdr = ({"api-key": key} if ptype == "azure"
@@ -1153,12 +1240,12 @@ async def test_llm_provider(provider_id: str):
                                 params={"api-version": "2023-03-15-preview"},
                                 headers=hdr)
                 if r.status_code == 200:
-                    names = [d.get("id") for d in (r.json().get("data") or [])
-                             if isinstance(d, dict)
-                             and (d.get("status") or "succeeded") == "succeeded"]
+                    deployment_names = [d.get("id") for d in (r.json().get("data") or [])
+                                        if isinstance(d, dict)
+                                        and (d.get("status") or "succeeded") == "succeeded"]
                     add("auth", True, "key accepted")
-                    add("deployments", bool(names),
-                        (", ".join(names) if names else
+                    add("deployments", bool(deployment_names),
+                        (", ".join(deployment_names) if deployment_names else
                          "NONE — this resource authenticates but serves no "
                          "models; the model you want is probably on a "
                          "different resource"))
@@ -1227,8 +1314,11 @@ async def test_llm_provider(provider_id: str):
                             err = err.get("message") or err.get("code") or json.dumps(err)[:200]
                     except Exception:
                         err = r.text[:200]
+                    hint = _diagnose_generate_failure(
+                        err_text=str(err), model=model, ptype=ptype,
+                        deployment_names=deployment_names)
                     add("generate", False,
-                        f"HTTP {r.status_code} via llm_query for {alias!r}: {err}")
+                        f"HTTP {r.status_code} via llm_query for {alias!r}: {err}{hint}")
             except Exception as e:
                 add("generate", False, f"{str(e) or type(e).__name__}")
 
