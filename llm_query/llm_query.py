@@ -1203,8 +1203,17 @@ def _generate_routed(route: Dict[str, Any], prompt: str,
     longer will not help -- a DIFFERENT model is the only thing that will. The
     response says which one answered, because silently substituting a model the
     operator did not choose would otherwise be invisible.
+
+    Per-task reasoning_effort — if the resolved route carries one (set in
+    `get_route()` via `llm.reasoning_effort.<task>`) AND the caller didn't
+    override it in `options`, inject it so `_build_litellm_kwargs` picks it
+    up for reasoning deployments (gpt-5*, o1*, o3*, o4*). Non-reasoning
+    deployments ignore it (gated at _build_litellm_kwargs by `_is_reasoning_model`).
     """
     primary = (route.get("backend"), route.get("model"))
+    options = dict(options or {})
+    if "reasoning_effort" not in options and route.get("reasoning_effort"):
+        options["reasoning_effort"] = route["reasoning_effort"]
     try:
         text, usage = _generate_text(primary[0], primary[1], prompt, options,
                                      route.get("endpoint"), route.get("api_key"))

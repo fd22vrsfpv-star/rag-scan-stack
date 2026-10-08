@@ -57,6 +57,13 @@ _FIELDS = {
     "vllm_model":        ("vllm_model",       "VLLM_MODEL",        ""),
     "ollama_url":        ("ollama_url",       "OLLAMA_URL",        "http://ollama:11434"),
     "ollama_model":      ("ollama_model",     "OLLAMA_MODEL",      "qwen2.5:32b"),
+    # Reasoning-model budget control: `minimal | low | medium | high`. Only
+    # applied by the dispatcher when the model name matches a reasoning
+    # deployment pattern (gpt-5*, o1*, o3*, o4*). Empty = unset (LiteLLM uses
+    # the deployment's `default_reasoning_effort`, which Azure defaults to
+    # medium). Setting this lower on gpt-5-mini cuts cost + latency since
+    # reasoning tokens count against the budget and bill at output rate.
+    "reasoning_effort":  ("reasoning_effort", "LLM_REASONING_EFFORT", ""),
 }
 
 
@@ -277,7 +284,42 @@ def get_route(task, settings=None):
     return {"task": task, "backend": backend, "model": model,
             "provider": prov["id"], "endpoint": prov["endpoint"],
             "api_key": prov["api_key"], "api_version": prov["api_version"],
-            "source": source, "raw": raw, "fallback": fallback}
+            "source": source, "raw": raw, "fallback": fallback,
+            "reasoning_effort": get_reasoning_effort(task, s)}
+
+
+_REASONING_EFFORT_VALUES = ("minimal", "low", "medium", "high")
+
+
+def get_reasoning_effort(task, settings=None):
+    """Resolve the reasoning-effort setting for a task → `minimal | low |
+    medium | high | ""` (empty = unset, let the model use its deployment
+    default — Azure defaults to `medium`).
+
+    Priority, highest wins:
+      1. `llm.reasoning_effort.<task>`   (task-specific override)
+      2. `llm.reasoning_effort.default`  (fallback for tasks without one)
+      3. `llm.reasoning_effort`          (legacy single global, pre-per-task)
+
+    Only applied by the dispatcher when the model name matches a reasoning
+    deployment pattern (gpt-5*, o1*, o3*, o4*) — gating is done at the
+    dispatcher, not here; this just resolves the value.
+
+    Normalises to lowercase; an unknown value (operator typo) is silently
+    dropped so a dispatch call never 400s on a bad effort string.
+    """
+    s = settings or get_llm_settings()
+    efforts = (s.get("reasoning_efforts") or {}) if isinstance(s, dict) else {}
+    task = (task or "").strip()
+    raw = ""
+    if task and efforts.get(task):
+        raw = efforts[task]
+    elif efforts.get("default"):
+        raw = efforts["default"]
+    else:
+        raw = (s.get("reasoning_effort") or "") if isinstance(s, dict) else ""
+    val = (raw or "").strip().lower()
+    return val if val in _REASONING_EFFORT_VALUES else ""
 
 
 def _resolve_one(raw, s):
@@ -394,6 +436,18 @@ def get_llm_settings(force_refresh=False):
         fallbacks["default"] = os.environ["LLM_ROUTE_FALLBACK"]
     merged["routes"] = routes
     merged["fallbacks"] = fallbacks
+    # Per-task reasoning_effort — same shape as routes but under a different
+    # key prefix. `llm.reasoning_effort.<task>` → `{task: effort}` dict.
+    efforts = {}
+    for k, v in db.items():
+        if k.startswith("reasoning_effort.") and v:
+            efforts[k[len("reasoning_effort."):]] = v
+    for task in LLM_TASK_NAMES + ("default",):
+        if task not in efforts:
+            ev = os.environ.get(f"LLM_REASONING_EFFORT_{task.upper()}")
+            if ev:
+                efforts[task] = ev
+    merged["reasoning_efforts"] = efforts
     merged["providers"] = db.get("providers") or os.environ.get("LLM_PROVIDERS") or ""
     merged["agent_models"] = {
         k[len("agentmodel."):]: v for k, v in db.items()

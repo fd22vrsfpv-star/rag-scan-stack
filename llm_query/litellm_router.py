@@ -351,6 +351,24 @@ LITELLM_ROUTER_ENABLED = os.environ.get("LITELLM_ROUTER_ENABLED", "true").lower(
 _AZURE_API_VERSION_DEFAULT = "2024-10-21"
 
 
+_REASONING_MODEL_PATTERNS = ("gpt-5", "gpt5", "o1", "o3", "o4")
+
+
+def _is_reasoning_model(model: str) -> bool:
+    """True for deployments that burn hidden reasoning tokens before output
+    and support the `reasoning_effort` kwarg (minimal | low | medium | high).
+
+    Matches by deployment-name prefix after normalising case + stripping
+    anything non-alphanumeric to catch typo variants (`gpt_5_mini`,
+    `GPT-5-mini`, …). The operator-visible knob gets routed through
+    `_build_litellm_kwargs()` only when this returns True; sending
+    `reasoning_effort` to a non-reasoning model is a 400 at the provider.
+    """
+    import re
+    norm = re.sub(r"[^a-z0-9]", "", (model or "").lower())
+    return any(norm.startswith(p.replace("-", "")) for p in _REASONING_MODEL_PATTERNS)
+
+
 def _azure_endpoint_is_foundry(endpoint: str) -> bool:
     """True for a Microsoft Azure Foundry endpoint (Azure AI Services) —
     same signal `_azure_is_foundry` uses in the hand-rolled dispatcher.
@@ -431,6 +449,20 @@ def _build_litellm_kwargs(backend: str,
         kwargs["temperature"] = temp
     if top_p is not None:
         kwargs["top_p"] = top_p
+    # Reasoning-effort knob (gpt-5*, o1*, o3*, o4* only). Priority:
+    #   per-call options.reasoning_effort > global llm.reasoning_effort setting.
+    # LiteLLM accepts it as a top-level kwarg and routes it correctly for
+    # Azure Foundry / OpenAI direct / Anthropic (which has its own reasoning
+    # knob). Non-reasoning models reject it with 400; gate on model name.
+    if _is_reasoning_model(model):
+        effort = (options or {}).get("reasoning_effort")
+        if effort is None and get_llm_settings is not None:
+            try:
+                effort = (get_llm_settings() or {}).get("reasoning_effort") or None
+            except Exception:  # noqa: BLE001
+                effort = None
+        if effort:
+            kwargs["reasoning_effort"] = str(effort).lower()
     b = (backend or "").lower()
     if b == "azure":
         # Mirrors entry_for_provider()'s three-case Azure handling:
