@@ -1185,7 +1185,42 @@ async def test_llm_provider(provider_id: str):
             add("generate", False, "no default model set — nothing to test")
         else:
             try:
-                if ptype in ("azure", "openai"):
+                # Foundry Anthropic deploys (claude-* deployment names on
+                # *.services.ai.azure.com) answer on `<root>/anthropic/v1/messages`
+                # with the Anthropic Messages API shape — NOT
+                # `/openai/v1/chat/completions` which returns
+                # "api_not_supported" for Anthropic deployments. Operator
+                # saw this fail live on the `sonnet-4-5` provider; the
+                # llm_query hand-rolled dispatcher's _is_anthropic_on_foundry
+                # already handled it, so this is probe-side only.
+                is_foundry_anthropic = (
+                    ptype == "azure"
+                    and (model or "").lower().startswith("claude-")
+                    and ".services.ai.azure.com" in (root or "").lower())
+                if is_foundry_anthropic:
+                    hdr = {"x-api-key": key,
+                           "anthropic-version": "2023-06-01",
+                           "Content-Type": "application/json"}
+                    body = {"model": model, "max_tokens": 16,
+                            "messages": [{"role": "user", "content": "Reply with only: OK"}]}
+                    r = await c.post(f"{root}/anthropic/v1/messages",
+                                     headers=hdr, json=body)
+                    if r.status_code == 200:
+                        # Anthropic Messages API returns {"content":[{"type":"text","text":"…"}]}
+                        d = r.json()
+                        parts = d.get("content") or []
+                        txt = next((p.get("text", "") for p in parts
+                                    if p.get("type") == "text"), "") or ""
+                        add("generate", True, f"{model} answered {txt.strip()[:40]!r}")
+                    else:
+                        err_detail = ""
+                        try:
+                            err_detail = r.json().get("error", {}).get("message", "") or r.text[:120]
+                        except Exception:
+                            err_detail = (r.text or "")[:120]
+                        add("generate", False,
+                            f"HTTP {r.status_code} on Foundry Anthropic path for {model!r}: {err_detail}")
+                elif ptype in ("azure", "openai"):
                     hdr = ({"api-key": key, "Content-Type": "application/json"}
                            if ptype == "azure"
                            else {"Authorization": f"Bearer {key}",
