@@ -292,6 +292,7 @@ const SERVICE_TABS = [
   { id: 'database', label: 'Database' },
   { id: 'health', label: 'Health' },
   { id: 'gpu', label: 'GPU' },
+  { id: 'cost', label: 'Cost' },
   { id: 'optional', label: 'Optional Tools' },
 ] as const
 type ServiceTab = typeof SERVICE_TABS[number]['id']
@@ -480,6 +481,23 @@ export default function Services() {
       )}
 
       {/* ── Optional Tools Tab ───────────────────────────────── */}
+      {activeTab === 'cost' && (
+        <div className="space-y-4">
+          <div className="rounded-lg border border-primary/20 bg-primary/5 p-3 text-xs text-muted-foreground">
+            Per-call LLM cost + token usage, aggregated by caller over the last 7 days.
+            Cost figures come from LiteLLM's built-in price catalog (Azure OpenAI,
+            Foundry Anthropic, OpenAI direct, Anthropic native, Bedrock, Vertex, Groq,
+            Together, Ollama = $0). A "—" means the call went through a path that
+            doesn't price yet (hand-rolled fallback, or a model LiteLLM's catalog
+            doesn't know). Click a caller row to filter the recent-calls list.
+          </div>
+          {/* LlmMetricsPanel reused — on the dedicated Cost tab it auto-opens
+              so there's no extra click. On the Health tab it still ships
+              collapsed-by-default (long-standing behaviour there). */}
+          <LlmMetricsPanel defaultOpen />
+        </div>
+      )}
+
       {activeTab === 'optional' && (
         <div className="space-y-6">
           <div>
@@ -1933,8 +1951,8 @@ function ServiceRowWithLogs({ svc, status, healthInfo, isUnhealthy, isOptional, 
 }
 
 
-function LlmMetricsPanel() {
-  const [show, setShow] = useState(false)
+function LlmMetricsPanel({ defaultOpen = false }: { defaultOpen?: boolean } = {}) {
+  const [show, setShow] = useState(defaultOpen)
   const [summary, setSummary] = useState<any>(null)
   const [recent, setRecent] = useState<any[]>([])
   const [loading, setLoading] = useState(false)
