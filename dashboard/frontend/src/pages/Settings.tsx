@@ -3131,19 +3131,21 @@ function BurpApiConfig() {
         </span>
       </div>
       <p className="text-[10px] text-muted-foreground mb-3">
-        Connect to Burp Suite Professional for headless scanning. Set <code className="font-mono bg-muted px-1 rounded">BURP_API_URL</code> and <code className="font-mono bg-muted px-1 rounded">BURP_API_KEY</code> in your environment.
+        Connect to Burp Suite Professional for headless scanning. This panel is read-only — the three
+        variables live in <code className="font-mono bg-muted px-1 rounded">.env</code> at the stack root
+        and are picked up when the dashboard container is recreated.
       </p>
       <div className="space-y-2 text-xs text-muted-foreground">
         <div className="bg-muted/30 border border-border rounded p-3 space-y-1.5">
-          <p className="font-medium text-foreground">Setup Instructions:</p>
+          <p className="font-medium text-foreground">Setup:</p>
           <ol className="list-decimal list-inside space-y-1">
-            <li>Enable Burp REST API: <code className="font-mono bg-muted px-1 rounded text-[10px]">Settings &gt; Suite &gt; REST API &gt; Enable</code></li>
-            <li>Note the API port (default 1337) and optionally set an API key</li>
-            <li>Set environment variables on the dashboard container:
-              <pre className="mt-1 bg-muted rounded p-2 text-[10px] font-mono">BURP_API_URL=http://host.docker.internal:1337{'\n'}BURP_API_KEY=your-api-key-here{'\n'}BURP_PROXY_URL=http://host.docker.internal:8080</pre>
+            <li>In Burp: <code className="font-mono bg-muted px-1 rounded text-[10px]">Settings &gt; Suite &gt; REST API &gt; Enable</code>, note the port (default 1337), generate an API key.</li>
+            <li>Open the port on the Burp host's firewall if Burp is on another machine.</li>
+            <li>Edit <code className="font-mono bg-muted px-1 rounded text-[10px]">.env</code> at the repo root — add or update:
+              <pre className="mt-1 bg-muted rounded p-2 text-[10px] font-mono">BURP_API_URL=http://192.168.1.183:1337   # LAN host example{'\n'}# or:  BURP_API_URL=http://host.docker.internal:1337   # Burp on this box{'\n'}BURP_API_KEY=your-api-key-here{'\n'}BURP_PROXY_URL=http://192.168.1.183:8080   # only if routing tools through Burp proxy</pre>
             </li>
-            <li>Restart the dashboard container</li>
-            <li>Use the <strong>Burp Suite</strong> scan type in the Scan Launcher, or enable <strong>"Route through Burp"</strong> toggle on any web scan</li>
+            <li>Recreate the dashboard: <code className="font-mono bg-muted px-1 rounded text-[10px]">docker compose up -d --force-recreate pentest-dashboard</code>. This panel will flip to <span className="text-green-400">Connected</span>.</li>
+            <li>Use the <strong>Burp Suite</strong> scan type in the Scan Launcher, or enable <strong>"Route through Burp"</strong> on any web scan.</li>
           </ol>
         </div>
         {connected && status?.url && (

@@ -2512,6 +2512,12 @@ services:
       DB_NAME: ${POSTGRES_DB:-scans}
       DB_USER: ${POSTGRES_USER:-app}
       DB_PASSWORD: ${POSTGRES_PASSWORD:-app}
+      # Burp Suite Pro REST API. BFF reads these via dashboard/bff/config.py.
+      # Dashboard's Settings → General → "Burp Suite REST API" panel is
+      # read-only; set the values in .env (and recreate this container).
+      BURP_API_URL: ${BURP_API_URL:-}
+      BURP_API_KEY: ${BURP_API_KEY:-}
+      BURP_PROXY_URL: ${BURP_PROXY_URL:-}
     depends_on:
       rag-api:
         condition: service_started
