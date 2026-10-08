@@ -1184,81 +1184,51 @@ async def test_llm_provider(provider_id: str):
         if not model:
             add("generate", False, "no default model set — nothing to test")
         else:
+            # DELEGATE to llm_query's /api/generate rather than hand-rolling
+            # a per-provider HTTP call here. The dispatcher already knows
+            # every provider's shape (LiteLLM-first → azure_ai/anthropic/<m>
+            # for Foundry Anthropic, azure_ai/<m> → openai/<m> retry for
+            # Foundry OpenAI-compat, hand-rolled fallback for anything
+            # LiteLLM doesn't yet handle, api_version translation, etc.).
+            # If llm_query returns 200, the provider works end-to-end FOR
+            # REAL TRAFFIC — not just a probe that mimics a shape nobody
+            # actually uses. If it fails, the operator sees exactly what
+            # a real agent call would see.
             try:
-                # Foundry Anthropic deploys (claude-* deployment names on
-                # *.services.ai.azure.com) answer on `<root>/anthropic/v1/messages`
-                # with the Anthropic Messages API shape — NOT
-                # `/openai/v1/chat/completions` which returns
-                # "api_not_supported" for Anthropic deployments. Operator
-                # saw this fail live on the `sonnet-4-5` provider; the
-                # llm_query hand-rolled dispatcher's _is_anthropic_on_foundry
-                # already handled it, so this is probe-side only.
-                is_foundry_anthropic = (
-                    ptype == "azure"
-                    and (model or "").lower().startswith("claude-")
-                    and ".services.ai.azure.com" in (root or "").lower())
-                if is_foundry_anthropic:
-                    hdr = {"x-api-key": key,
-                           "anthropic-version": "2023-06-01",
-                           "Content-Type": "application/json"}
-                    body = {"model": model, "max_tokens": 16,
-                            "messages": [{"role": "user", "content": "Reply with only: OK"}]}
-                    r = await c.post(f"{root}/anthropic/v1/messages",
-                                     headers=hdr, json=body)
-                    if r.status_code == 200:
-                        # Anthropic Messages API returns {"content":[{"type":"text","text":"…"}]}
-                        d = r.json()
-                        parts = d.get("content") or []
-                        txt = next((p.get("text", "") for p in parts
-                                    if p.get("type") == "text"), "") or ""
-                        add("generate", True, f"{model} answered {txt.strip()[:40]!r}")
-                    else:
-                        err_detail = ""
-                        try:
-                            err_detail = r.json().get("error", {}).get("message", "") or r.text[:120]
-                        except Exception:
-                            err_detail = (r.text or "")[:120]
-                        add("generate", False,
-                            f"HTTP {r.status_code} on Foundry Anthropic path for {model!r}: {err_detail}")
-                elif ptype in ("azure", "openai"):
-                    hdr = ({"api-key": key, "Content-Type": "application/json"}
-                           if ptype == "azure"
-                           else {"Authorization": f"Bearer {key}",
-                                 "Content-Type": "application/json"})
-                    body = {"model": model,
-                            "messages": [{"role": "user", "content": "Reply with only: OK"}],
-                            "max_tokens": 16}
-                    r = await c.post(f"{root}/openai/v1/chat/completions",
-                                     headers=hdr, json=body)
-                    # Same swap llm_query performs: the gpt-5 / o-series
-                    # families reject max_tokens.
-                    if r.status_code == 400 and "max_completion_tokens" in (r.text or ""):
-                        body.pop("max_tokens")
-                        body["max_completion_tokens"] = 2000
-                        r = await c.post(f"{root}/openai/v1/chat/completions",
-                                         headers=hdr, json=body)
-                    if r.status_code == 200:
-                        txt = r.json()["choices"][0]["message"]["content"]
-                        add("generate", True, f"{model} answered {txt.strip()[:40]!r}")
-                    else:
-                        code = ""
-                        try:
-                            code = r.json().get("error", {}).get("code", "")
-                        except Exception:
-                            pass
-                        add("generate", False,
-                            f"HTTP {r.status_code} {code} for model {model!r}"
-                            + (" — that model is not deployed on THIS resource"
-                               if str(code) == "DeploymentNotFound" else ""))
+                alias = f"{provider_id}:{model}"
+                llm_query_url = LLM_QUERY_URL
+                # Minimal body — no options. The probe is "can this provider
+                # dispatch an answer at all?"; keeping options out avoids
+                # parameter-support bugs in the dispatch path (e.g. the
+                # hand-rolled Foundry Anthropic path rejecting `temperature`
+                # or gpt-5-mini rejecting it in reasoning mode).
+                probe_body = {
+                    "model": alias,
+                    "prompt": "Reply with only: OK",
+                    "stream": False,
+                }
+                r = await c.post(f"{llm_query_url}/api/generate",
+                                 json=probe_body, timeout=60)
+                if r.status_code == 200:
+                    d = r.json()
+                    txt = (d.get("response") or "").strip()
+                    backend_used = d.get("backend") or "?"
+                    provider_used = d.get("provider") or "?"
+                    failed_over = d.get("failed_over")
+                    detail = f"{model} answered {txt[:40]!r} via {provider_used}/{backend_used}"
+                    if failed_over:
+                        detail += " (failed over from primary)"
+                    add("generate", True, detail)
                 else:
-                    r = await c.post(f"{root}/api/generate",
-                                     json={"model": model, "prompt": "Reply with only: OK",
-                                           "stream": False})
-                    if r.status_code == 200:
-                        add("generate", True,
-                            f"{model} answered {str(r.json().get('response',''))[:40]!r}")
-                    else:
-                        add("generate", False, f"HTTP {r.status_code}: {r.text[:120]}")
+                    err = ""
+                    try:
+                        err = (r.json().get("detail") or r.json().get("error") or "")
+                        if isinstance(err, dict):
+                            err = err.get("message") or err.get("code") or json.dumps(err)[:200]
+                    except Exception:
+                        err = r.text[:200]
+                    add("generate", False,
+                        f"HTTP {r.status_code} via llm_query for {alias!r}: {err}")
             except Exception as e:
                 add("generate", False, f"{str(e) or type(e).__name__}")
 

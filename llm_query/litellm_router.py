@@ -166,8 +166,14 @@ def entry_for_provider(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if ptype == "azure":
         # Three cases:
         #   (a) Foundry Anthropic (`claude-*` on *.services.ai.azure.com):
-        #       `azure_ai/anthropic/<deployment>` — Anthropic Messages API
-        #       passthrough.
+        #       model=`azure_ai/anthropic/<deployment>` AND
+        #       api_base=`<root>/anthropic` (not just <root>). The
+        #       `/anthropic` suffix is REQUIRED — LiteLLM 1.104's
+        #       `azure_ai/anthropic/` provider resolves the model as
+        #       the last segment and appends `/v1/messages` to the
+        #       api_base. Without the suffix Azure gets a request for
+        #       deployment literally named "anthropic/<model>" and
+        #       returns DeploymentNotFound.
         #   (b) Foundry OpenAI (anything else on *.services.ai.azure.com):
         #       `azure_ai/<deployment>` — OpenAI-compat chat completions.
         #       This is where gpt-5-mini / o1-mini / o3-mini live, and
@@ -181,6 +187,10 @@ def entry_for_provider(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             api_base = _strip_foundry_project_suffix(ep)
             if model.lower().startswith("claude-"):
                 params["model"] = f"azure_ai/anthropic/{model}"
+                # /anthropic suffix is REQUIRED for Foundry Anthropic
+                # — see docstring above.
+                if not api_base.rstrip("/").endswith("/anthropic"):
+                    api_base = api_base.rstrip("/") + "/anthropic"
             else:
                 params["model"] = f"azure_ai/{model}"
         else:
@@ -425,6 +435,8 @@ def _build_litellm_kwargs(backend: str,
     if b == "azure":
         # Mirrors entry_for_provider()'s three-case Azure handling:
         # (a) Foundry Anthropic → azure_ai/anthropic/<model>
+        #     + api_base = <root>/anthropic (REQUIRED suffix — see
+        #     entry_for_provider docstring)
         # (b) Foundry OpenAI    → azure_ai/<model>   (gpt-5 / o1 / o3 land here)
         # (c) Classic Azure OAI → azure/<model>
         is_foundry = _azure_endpoint_is_foundry(endpoint or "")
@@ -432,6 +444,8 @@ def _build_litellm_kwargs(backend: str,
             api_base = _strip_foundry_project_suffix(endpoint or "")
             if (model or "").lower().startswith("claude-"):
                 lmodel = f"azure_ai/anthropic/{model}"
+                if not api_base.rstrip("/").endswith("/anthropic"):
+                    api_base = api_base.rstrip("/") + "/anthropic"
             else:
                 lmodel = f"azure_ai/{model}"
         else:
