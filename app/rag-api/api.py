@@ -28211,6 +28211,422 @@ def download_exploit(exploit_id: str, fmt: str = "python", authorized: bool = De
                     headers={"Content-Disposition": f'attachment; filename="{fn}"'})
 
 
+# ─── Export helpers (shared by /export/har and /export/review.md) ──────────
+def _exploit_filename_base(row: dict) -> str:
+    """Operator-friendly base filename: `<cve>_<host>_<port>_<kind>` when the
+    row has them, falling back to the exploit name. Matches /download's
+    convention so the HAR / review.md sit next to the .py / .http files when
+    operators save them to a case folder."""
+    import re as _re
+    def _clean(s):
+        return _re.sub(r"[^A-Za-z0-9_.-]+", "_", str(s or "")).strip("_") or ""
+    parts = []
+    if row.get("cve"):         parts.append(_clean(row["cve"]))
+    if row.get("target_host"): parts.append(_clean(row["target_host"]))
+    if row.get("target_port"): parts.append(str(row["target_port"]))
+    if row.get("kind"):        parts.append(_clean(row["kind"]))
+    return "_".join(p for p in parts if p) or _clean(row.get("name")) or "exploit"
+
+
+def _http_text_to_har_entry(http_text: str, started_iso: str,
+                            source_label: str, target_host: str | None,
+                            target_port: int | None) -> dict | None:
+    """Parse a raw HTTP request (what `exploit_store.http_request` + each
+    version stores) into a single HAR 1.2 entry. Request-only: no response
+    body is persisted on the row, so `response` is a stub with status=0 and
+    the operator fills it from Burp after Repeater replays. The entry
+    carries a `comment` naming its source (e.g. `v3 (model:ollama/…)` or
+    `main`) so the operator can tell which version produced it."""
+    if not http_text or not http_text.strip():
+        return None
+    lines = http_text.splitlines()
+    if not lines:
+        return None
+    # Request line: METHOD /path HTTP/1.1
+    rl = lines[0].strip()
+    rl_parts = rl.split(None, 2)
+    method = rl_parts[0].upper() if rl_parts else "GET"
+    raw_path = rl_parts[1] if len(rl_parts) >= 2 else "/"
+    http_version = rl_parts[2] if len(rl_parts) >= 3 else "HTTP/1.1"
+    # Headers until a blank line.
+    headers: list[dict] = []
+    body_start = len(lines)
+    host_header = None
+    content_type = ""
+    for i, raw in enumerate(lines[1:], start=1):
+        if raw.strip() == "":
+            body_start = i + 1
+            break
+        if ":" in raw:
+            k, _, v = raw.partition(":")
+            name, value = k.strip(), v.strip()
+            headers.append({"name": name, "value": value})
+            lname = name.lower()
+            if lname == "host":
+                host_header = value
+            elif lname == "content-type":
+                content_type = value
+    body = "\n".join(lines[body_start:]).strip()
+    # URL: prefer Host header, fall back to the row's target. Assume http
+    # unless Host carries ":443" or the port is 443/8443. HAR does not
+    # require the URL to resolve — operators replay through Burp with
+    # upstream choice.
+    def _mk_url(path: str) -> str:
+        if path.lower().startswith(("http://", "https://")):
+            return path
+        host = host_header or (target_host or "")
+        port = target_port
+        is_tls = (port in (443, 8443)) or (host.endswith(":443"))
+        scheme = "https" if is_tls else "http"
+        if host and (":" not in host) and port and port not in (80, 443):
+            host = f"{host}:{port}"
+        if not path.startswith("/"):
+            path = "/" + path
+        return f"{scheme}://{host}{path}" if host else path
+    url = _mk_url(raw_path)
+    # Query string split for HAR (purely informational — Burp regenerates
+    # from the URL on import anyway).
+    query_string: list[dict] = []
+    if "?" in raw_path:
+        from urllib.parse import parse_qsl
+        qs = raw_path.split("?", 1)[1]
+        for k, v in parse_qsl(qs, keep_blank_values=True):
+            query_string.append({"name": k, "value": v})
+    post_data = None
+    if body and method not in ("GET", "HEAD"):
+        post_data = {"mimeType": content_type or "application/octet-stream", "text": body}
+    return {
+        "startedDateTime": started_iso,
+        "time": 0,
+        "request": {
+            "method": method,
+            "url": url,
+            "httpVersion": http_version,
+            "cookies": [],
+            "headers": headers,
+            "queryString": query_string,
+            "postData": post_data,
+            "headersSize": -1,
+            "bodySize": len(body.encode("utf-8")) if body else 0,
+        },
+        "response": {
+            "status": 0, "statusText": "", "httpVersion": http_version,
+            "cookies": [], "headers": [],
+            "content": {"size": 0, "mimeType": "", "text": ""},
+            "redirectURL": "", "headersSize": -1, "bodySize": -1,
+        },
+        "cache": {},
+        "timings": {"send": 0, "wait": 0, "receive": 0},
+        "comment": source_label,
+    }
+
+
+@app.get("/exploit-store/{exploit_id}/export/har", tags=["Exploit Store"])
+def export_exploit_har(exploit_id: str, authorized: bool = Depends(auth)):
+    """HAR 1.2 bundle of every HTTP request this exploit has produced across
+    its versions — current `http_request` + every `exploit_versions` row's
+    stored request. One HAR = one file to drag into Burp's Dashboard → New
+    scan from HAR, or into any HAR viewer. Responses are stubbed (status=0):
+    the stored data is request-only. The operator replays through Repeater
+    to populate real responses. Each entry carries a comment naming its
+    source (`main`, `v<N>`, optional `label` from the version row) so the
+    operator can tell which attempt produced which request."""
+    import datetime as _dt
+    _ensure_exploit_store()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM exploit_store WHERE id = %s", (exploit_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "exploit not found")
+        # Versions carry their own http_request snapshots. The table is
+        # `exploit_store_versions` (same table the /versions endpoints read
+        # via _snapshot_exploit_version); _ensure_exploit_store() above
+        # creates both tables.
+        cur.execute("SELECT version, label, http_request, created_at, llm_model "
+                    "FROM exploit_store_versions WHERE exploit_id = %s ORDER BY version ASC",
+                    (exploit_id,))
+        versions = cur.fetchall() or []
+    row_d = dict(row)
+    target_host = row_d.get("target_host")
+    target_port = row_d.get("target_port")
+    entries: list[dict] = []
+    # The current / most-recent request is first (operators look at the
+    # latest attempt first; HAR has no notion of ordering beyond startedDateTime).
+    current_ts = (row_d.get("updated_at") or row_d.get("built_at") or
+                  _dt.datetime.utcnow()).isoformat() + ("" if "T" in str(row_d.get("updated_at") or "") else "Z")
+    e = _http_text_to_har_entry(row_d.get("http_request") or "", str(current_ts),
+                                f"main (current) — {row_d.get('name') or exploit_id}",
+                                target_host, target_port)
+    if e:
+        entries.append(e)
+    for v in versions:
+        vd = dict(v)
+        ts = (vd.get("created_at") or _dt.datetime.utcnow()).isoformat()
+        label_bits = [f"v{vd.get('version')}"]
+        if vd.get("label"):     label_bits.append(str(vd["label"]))
+        if vd.get("llm_model"): label_bits.append(str(vd["llm_model"]))
+        e = _http_text_to_har_entry(vd.get("http_request") or "", str(ts),
+                                    " / ".join(label_bits), target_host, target_port)
+        if e:
+            entries.append(e)
+    har = {
+        "log": {
+            "version": "1.2",
+            "creator": {"name": "rag-scan-stack / exploit-store", "version": "1.0"},
+            "comment": (f"Exploit {exploit_id} — {row_d.get('name') or ''} "
+                        f"({row_d.get('cve') or 'no-cve'}) on "
+                        f"{target_host or '?'}:{target_port or '?'}. "
+                        f"Request-only — replay through Burp Repeater to fill responses."),
+            "entries": entries,
+        }
+    }
+    base = _exploit_filename_base(row_d)
+    return Response(content=json.dumps(har, default=str, indent=2),
+                    media_type="application/json",
+                    headers={"Content-Disposition": f'attachment; filename="{base}.har"'})
+
+
+@app.get("/exploit-store/{exploit_id}/export/review.md", tags=["Exploit Store"])
+def export_exploit_review_md(exploit_id: str, authorized: bool = Depends(auth)):
+    """Operator-review markdown — recon findings, derived intel, agent
+    decisions. One file that answers 'what did the pipeline see, what did
+    it derive, where did it stop?' so the operator can diff against reality
+    and figure out what isn't working. Sections:
+      1. Metadata (name, CVE, target, verified, build metrics)
+      2. Reference-PoC Research breakdown (metadata.research)
+      3. Derived CVE spec + confirmed facts (from derived_cve_specs +
+         confirmed_facts via the same path /derivation-intel reads)
+      4. Captured credentials + footholds
+      5. Key trace phases (cve_spec_derivation, challenge_building_blocks,
+         readiness_gate, poc_captured_credentials, …)
+      6. Manual research queries (metadata.manual_research_queries log)
+    Reuses `get_derivation_intel`'s data assembly directly so the file
+    stays in sync with the UI's Derivation Intel panel."""
+    import datetime as _dt
+    intel = get_derivation_intel(exploit_id, authorized=authorized)
+    _ensure_exploit_store()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM exploit_store WHERE id = %s", (exploit_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "exploit not found")
+    r = dict(row)
+    md = r.get("metadata") or {}
+    out: list[str] = []
+    out.append(f"# Exploit review — {r.get('name') or exploit_id}")
+    out.append("")
+    header_bits = []
+    if r.get("cve"):           header_bits.append(f"**CVE:** `{r['cve']}`")
+    if r.get("target_host"):   header_bits.append(f"**Target:** `{r['target_host']}:{r.get('target_port') or '?'}`")
+    if r.get("verified") is not None:
+        header_bits.append("**Verified:** " + ("✓" if r.get("verified") else "✗ (needs tweaking)"))
+    if r.get("kind"):          header_bits.append(f"**Kind:** `{r['kind']}`")
+    if r.get("llm_model"):     header_bits.append(f"**LLM:** `{r['llm_model']}`")
+    if r.get("built_at"):      header_bits.append(f"**Built:** {r['built_at']}")
+    if header_bits:
+        out.append(" · ".join(header_bits))
+        out.append("")
+    metrics = (md.get("metrics") or {}) if isinstance(md, dict) else {}
+    if metrics:
+        out.append("### Build metrics")
+        out.append("")
+        for k in ("build_seconds", "llm_seconds", "llm_calls", "run_seconds",
+                  "target_runs", "total_tokens", "prompt_tokens",
+                  "completion_tokens", "iterations"):
+            if k in metrics:
+                out.append(f"- `{k}` = {metrics[k]}")
+        out.append("")
+    research = (md.get("research") or {}) if isinstance(md, dict) else {}
+    if research:
+        out.append("## Reference-PoC research")
+        out.append("")
+        if research.get("summary"):
+            out.append(research["summary"])
+            out.append("")
+        for k in ("http_method", "target_endpoint", "success_signal"):
+            if research.get(k):
+                out.append(f"- **{k}:** `{research[k]}`")
+        if research.get("preconditions"):
+            out.append(f"- **preconditions:** {'; '.join(research['preconditions'])}")
+        if research.get("params"):
+            out.append(f"- **params:** `{', '.join(research['params'])}`")
+        if research.get("payload"):
+            out.append("")
+            out.append("```")
+            out.append(str(research["payload"]))
+            out.append("```")
+        if research.get("seed_command"):
+            out.append("")
+            out.append("```sh")
+            out.append(str(research["seed_command"]))
+            out.append("```")
+        out.append("")
+    spec = intel.get("derived_spec") or {}
+    if spec:
+        out.append("## Derived CVE spec")
+        out.append("")
+        for k in ("vuln_class", "status", "verified", "verify_method",
+                  "source", "attempts", "last_failure"):
+            if spec.get(k) not in (None, "", []):
+                out.append(f"- **{k}:** {spec[k]}")
+        if spec.get("refine_hints"):
+            out.append(f"- **refine_hints:** {spec['refine_hints']}")
+        out.append("")
+    facts = intel.get("confirmed_facts") or []
+    if facts:
+        out.append(f"## Confirmed facts ({len(facts)})")
+        out.append("")
+        out.append("| claim_type | claim_key | status | confidence | method |")
+        out.append("|---|---|---|---|---|")
+        for f in facts[:50]:
+            out.append(f"| `{f.get('claim_type') or ''}` | `{f.get('claim_key') or ''}` "
+                       f"| {f.get('status') or ''} | {f.get('confidence') or ''} "
+                       f"| {f.get('method') or ''} |")
+        out.append("")
+    creds = intel.get("captured_credentials") or []
+    if creds:
+        out.append(f"## Captured credentials ({len(creds)})")
+        out.append("")
+        out.append("| username | type | auth | severity | captured_at |")
+        out.append("|---|---|---|---|---|")
+        for c in creds[:25]:
+            out.append(f"| `{c.get('username') or ''}` | {c.get('secret_type') or ''} "
+                       f"| {c.get('auth_type') or ''} | {c.get('severity') or ''} "
+                       f"| {c.get('created_at') or ''} |")
+        out.append("")
+    foots = intel.get("footholds") or []
+    if foots:
+        out.append(f"## Footholds ({len(foots)})")
+        out.append("")
+        for f in foots[:10]:
+            out.append(f"- **{f.get('kind') or ''}** / transport `{f.get('transport') or ''}` "
+                       f"/ status `{f.get('status') or ''}` / score {f.get('score') or ''} "
+                       f"— whoami=`{f.get('whoami') or ''}`")
+        out.append("")
+    if intel.get("sqlmap_command"):
+        out.append("## sqlmap hand-off")
+        out.append("")
+        out.append("```sh")
+        out.append(str(intel["sqlmap_command"]))
+        out.append("```")
+        out.append("")
+    trace = intel.get("key_trace") or []
+    if trace:
+        out.append(f"## Agent decisions — key trace phases ({len(trace)})")
+        out.append("")
+        for t in trace:
+            out.append(f"### `{t.get('phase')}` (iter {t.get('iteration') or '?'}, {t.get('ts') or ''})")
+            resp = (t.get("response") or "").strip()
+            if resp:
+                out.append("")
+                out.append("```")
+                out.append(resp[:600])
+                out.append("```")
+            extra = t.get("extra") or {}
+            if extra:
+                out.append("")
+                out.append(f"**extra:** `{json.dumps(extra, default=str)[:600]}`")
+            out.append("")
+    manual = (md.get("manual_research_queries") or []) if isinstance(md, dict) else []
+    if manual:
+        out.append(f"## Manual research queries ({len(manual)})")
+        out.append("")
+        for q in manual[-25:]:
+            out.append(f"### `{q.get('query')}` — {q.get('created_at') or ''}")
+            if q.get("note"):
+                out.append("")
+                out.append(f"> {q['note']}")
+            hits = q.get("results") or []
+            if hits:
+                out.append("")
+                for h in hits[:5]:
+                    out.append(f"- **{h.get('title') or '?'}** (sim={h.get('similarity')}) "
+                               f"— {(h.get('text') or '')[:160]}…")
+            out.append("")
+    if not metrics and not research and not spec and not facts and not creds and not foots and not trace and not manual:
+        out.append("_No derivation evidence stored for this exploit yet._")
+    base = _exploit_filename_base(r)
+    body = "\n".join(out).rstrip() + "\n"
+    return Response(content=body, media_type="text/markdown",
+                    headers={"Content-Disposition": f'attachment; filename="{base}-review.md"'})
+
+
+class ManualResearchSearchBody(BaseModel):
+    """Operator-driven research augmentation. The term is any text the
+    operator wants to add to this exploit's research knowledge — a
+    bypass they heard about, a related CVE, a specific endpoint they
+    want to look up. The server runs the SAME semantic search as
+    /rag/knowledge/search, persists `{query, note, results, created_at}`
+    in `metadata.manual_research_queries`, and returns the hits for
+    immediate display."""
+    query: str
+    note: Optional[str] = None
+    top_k: Optional[int] = 6
+
+
+@app.post("/exploit-store/{exploit_id}/research/manual-search", tags=["Exploit Store"])
+def exploit_manual_research_search(exploit_id: str, body: ManualResearchSearchBody,
+                                   authorized: bool = Depends(auth)):
+    """Operator-added research knowledge. Runs the operator's query through
+    the rag_documents knowledge search (same probes-raised retrieval
+    `/rag/knowledge/search` uses) and appends `{query, note, results,
+    created_at}` to `metadata.manual_research_queries`. Returns the hits so
+    the UI can show them inline; the review.md export surfaces the whole
+    history for the operator later."""
+    import datetime as _dt
+    q = (body.query or "").strip()
+    if not q:
+        raise HTTPException(400, "query is required")
+    _ensure_exploit_store()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT id, metadata FROM exploit_store WHERE id = %s", (exploit_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "exploit not found")
+    # Reuse the same retrieval path /rag/knowledge/search uses. Wrap in a
+    # try/except so a flaky embedder or missing table doesn't 500 the whole
+    # endpoint — we still persist the query (operator intent is captured).
+    hits: list[dict] = []
+    search_err: str | None = None
+    try:
+        search = rag_knowledge_search(
+            KnowledgeSearchBody(query=q, top_k=int(body.top_k or 6)),
+            _=True)
+        hits = search.get("results") or []
+    except HTTPException as e:
+        search_err = f"knowledge search failed: {e.detail}"
+    except Exception as e:  # noqa: BLE001
+        search_err = f"knowledge search failed: {e}"
+    entry = {
+        "query": q,
+        "note": body.note or None,
+        "results": hits,
+        "search_error": search_err,
+        "created_at": _dt.datetime.utcnow().isoformat() + "Z",
+    }
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """UPDATE exploit_store
+                  SET metadata = jsonb_set(
+                        COALESCE(metadata,'{}'::jsonb),
+                        '{manual_research_queries}',
+                        COALESCE(metadata->'manual_research_queries','[]'::jsonb)
+                            || %s::jsonb,
+                        true),
+                      updated_at = now()
+                WHERE id = %s""",
+            (json.dumps([entry], default=str), exploit_id))
+        conn.commit()
+    try:
+        emit_webhook("exploit_manual_research_search", "exploit_store",
+                     {"id": exploit_id, "query": q, "hits": len(hits),
+                      "search_error": bool(search_err)})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "query": q, "hits": hits, "search_error": search_err,
+            "entry": entry}
+
+
 @app.post("/exploit-store/{exploit_id}/push", tags=["Exploit Store"])
 def push_exploit_to_node(exploit_id: str, body: ExploitPushBody, authorized: bool = Depends(auth)):
     """Push the Python PoC to an SSH remote node so it can be run there. Requires the node
