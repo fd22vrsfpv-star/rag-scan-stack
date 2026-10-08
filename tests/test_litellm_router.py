@@ -481,6 +481,109 @@ def test_litellm_chat_completion_for_unknown_backend_returns_none():
                                           None) is None
 
 
+def test_azure_shape_retry_falls_through_on_azure_ai_404(monkeypatch):
+    """`_litellm_completion_with_azure_shape_retry` catches a 404 on the
+    `azure_ai/` path and retries as `openai/<model>` with the
+    `/openai/v1` api_base — the shape Foundry OpenAI-compat deployments
+    (DeepSeek, Mistral, Phi, Llama) actually answer on. Verifies both the
+    retry fires AND the pin lands so subsequent calls skip the first
+    attempt."""
+    lr._AZURE_SHAPE_CACHE.clear()
+    calls = []
+    class _R: choices=[type('C',(),{'message':type('M',(),{'content':'ok'})()})()]; usage=None
+    class FakeLitellm:
+        @staticmethod
+        def completion(**kw):
+            calls.append(kw["model"])
+            if kw["model"].startswith("azure_ai/"):
+                raise Exception("404 Resource not found")
+            return _R()
+    resp = lr._litellm_completion_with_azure_shape_retry(
+        FakeLitellm, "azure", "DeepSeek-V4-Flash", "azure_ai/DeepSeek-V4-Flash",
+        {"api_base": "https://rt3ai.services.ai.azure.com",
+         "api_key": "k", "api_version": "2024-10-21",
+         "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8})
+    assert calls == ["azure_ai/DeepSeek-V4-Flash", "openai/DeepSeek-V4-Flash"]
+    # Pin recorded — a second call should skip the azure_ai/ attempt.
+    assert lr._AZURE_SHAPE_CACHE[("https://rt3ai.services.ai.azure.com",
+                                  "DeepSeek-V4-Flash")] == "openai_compat"
+
+
+def test_azure_shape_retry_pin_short_circuits_subsequent_calls(monkeypatch):
+    """After the pin is set, the azure_ai/ attempt is skipped and the
+    openai-compat shape is used directly — one call, not two."""
+    lr._AZURE_SHAPE_CACHE[("https://rt3ai.services.ai.azure.com",
+                           "DeepSeek-V4-Flash")] = "openai_compat"
+    calls = []
+    class _R: choices=[type('C',(),{'message':type('M',(),{'content':'ok'})()})()]; usage=None
+    class FakeLitellm:
+        @staticmethod
+        def completion(**kw): calls.append(kw["model"]); return _R()
+    lr._litellm_completion_with_azure_shape_retry(
+        FakeLitellm, "azure", "DeepSeek-V4-Flash", "azure_ai/DeepSeek-V4-Flash",
+        {"api_base": "https://rt3ai.services.ai.azure.com",
+         "api_version": "2024-10-21",
+         "messages": [{"role": "user", "content": "hi"}]})
+    assert calls == ["openai/DeepSeek-V4-Flash"]
+    lr._AZURE_SHAPE_CACHE.clear()
+
+
+def test_azure_shape_retry_skips_anthropic_foundry(monkeypatch):
+    """Foundry Anthropic (`azure_ai/anthropic/<deployment>`) does NOT get
+    the openai-compat retry — those deployments really ARE Anthropic
+    Messages API and the retry would route them to the wrong shape."""
+    lr._AZURE_SHAPE_CACHE.clear()
+    class FakeLitellm:
+        @staticmethod
+        def completion(**kw):
+            raise Exception("404 something")
+    with pytest.raises(Exception) as exc_info:
+        lr._litellm_completion_with_azure_shape_retry(
+            FakeLitellm, "azure", "claude-sonnet-4-5",
+            "azure_ai/anthropic/claude-sonnet-4-5",
+            {"api_base": "https://rt3ai.services.ai.azure.com",
+             "messages": [{"role": "user", "content": "hi"}]})
+    # Original error propagates, not the retry wrapper's "both failed".
+    assert "404" in str(exc_info.value)
+
+
+def test_azure_shape_retry_only_fires_on_404(monkeypatch):
+    """A 429 or 500 on the azure_ai/ attempt is a real provider failure,
+    not a shape mismatch — raise it immediately, don't retry."""
+    lr._AZURE_SHAPE_CACHE.clear()
+    class FakeLitellm:
+        @staticmethod
+        def completion(**kw):
+            raise Exception("429 rate limited")
+    with pytest.raises(Exception) as exc_info:
+        lr._litellm_completion_with_azure_shape_retry(
+            FakeLitellm, "azure", "DeepSeek-V4-Flash",
+            "azure_ai/DeepSeek-V4-Flash",
+            {"api_base": "https://rt3ai.services.ai.azure.com",
+             "messages": [{"role": "user", "content": "hi"}]})
+    assert "429" in str(exc_info.value)
+
+
+def test_call_litellm_openai_compat_strips_api_version(monkeypatch):
+    """`_call_litellm_openai_compat` strips the `api_version` kwarg
+    (Azure-only — LiteLLM's openai provider rejects it) and appends
+    `/openai/v1` to the api_base if not already there."""
+    captured = {}
+    class _R: choices=[type('C',(),{'message':type('M',(),{'content':'ok'})()})()]; usage=None
+    class FakeLitellm:
+        @staticmethod
+        def completion(**kw): captured.update(kw); return _R()
+    lr._call_litellm_openai_compat(FakeLitellm, "DeepSeek-V4-Flash", {
+        "api_base": "https://rt3ai.services.ai.azure.com",
+        "api_key": "k", "api_version": "2024-10-21",
+        "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8,
+    })
+    assert captured["model"] == "openai/DeepSeek-V4-Flash"
+    assert captured["api_base"] == "https://rt3ai.services.ai.azure.com/openai/v1"
+    assert captured["api_key"] == "k"
+    assert "api_version" not in captured  # stripped
+
+
 def test_build_litellm_kwargs_is_shared(monkeypatch):
     """`_build_litellm_kwargs()` is the single source of truth for the
     backend→kwargs mapping. Both wrappers delegate to it, so a change in
