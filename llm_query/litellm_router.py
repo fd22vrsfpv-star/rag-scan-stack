@@ -164,19 +164,33 @@ def entry_for_provider(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     params: Dict[str, Any] = {}
     alias = f"{pid}:{model}"
     if ptype == "azure":
-        # Foundry Anthropic deployments carry `claude-*` as their deployment
-        # name — the signal LiteLLM uses to pick the azure_ai/anthropic path
-        # over azure/openai. Same empirical rule the Foundry adapter uses
-        # today (see _is_anthropic_on_foundry in llm_query.py).
-        if model.lower().startswith("claude-"):
-            params["model"] = f"azure_ai/anthropic/{model}"
+        # Three cases:
+        #   (a) Foundry Anthropic (`claude-*` on *.services.ai.azure.com):
+        #       `azure_ai/anthropic/<deployment>` — Anthropic Messages API
+        #       passthrough.
+        #   (b) Foundry OpenAI (anything else on *.services.ai.azure.com):
+        #       `azure_ai/<deployment>` — OpenAI-compat chat completions.
+        #       This is where gpt-5-mini / o1-mini / o3-mini live, and
+        #       `azure/<deployment>` would hit the classic Azure OpenAI
+        #       REST path which Foundry rejects.
+        #   (c) Classic Azure OpenAI (…/.openai.azure.com):
+        #       `azure/<deployment>` — the historical path.
+        ep = (p.get("endpoint") or "")
+        is_foundry = _azure_endpoint_is_foundry(ep)
+        if is_foundry:
+            api_base = _strip_foundry_project_suffix(ep)
+            if model.lower().startswith("claude-"):
+                params["model"] = f"azure_ai/anthropic/{model}"
+            else:
+                params["model"] = f"azure_ai/{model}"
         else:
+            api_base = ep
             params["model"] = f"azure/{model}"
-        if p.get("endpoint"):
-            params["api_base"] = p["endpoint"]
+        if api_base:
+            params["api_base"] = api_base
         if p.get("api_key"):
             params["api_key"] = p["api_key"]
-        params["api_version"] = p.get("api_version") or "2024-05-01-preview"
+        params["api_version"] = p.get("api_version") or _AZURE_API_VERSION_DEFAULT
     elif ptype == "ollama":
         params["model"] = f"ollama/{model}"
         if p.get("endpoint"):
@@ -318,7 +332,39 @@ LITELLM_ROUTER_ENABLED = os.environ.get("LITELLM_ROUTER_ENABLED", "true").lower(
 # dispatcher's semantics 1:1 — explicit (backend, model) wins.
 
 
-_AZURE_API_VERSION_DEFAULT = "2024-05-01-preview"
+# api_version default picks a release that supports gpt-5 / o1 / o3
+# reasoning deployments (which rejected older versions with
+# "API version not supported"). The hand-rolled dispatcher pins
+# 2024-08-01-preview via AZURE_API_VERSION; 2024-10-21 is the first
+# GA version that supports max_completion_tokens + reasoning deploys.
+# A provider-row api_version wins when set.
+_AZURE_API_VERSION_DEFAULT = "2024-10-21"
+
+
+def _azure_endpoint_is_foundry(endpoint: str) -> bool:
+    """True for a Microsoft Azure Foundry endpoint (Azure AI Services) —
+    same signal `_azure_is_foundry` uses in the hand-rolled dispatcher.
+    Foundry serves ALL deployments (OpenAI + Anthropic + others) through
+    the OpenAI-compat `/openai/v1/chat/completions` path, which LiteLLM
+    reaches via the `azure_ai/<deployment>` prefix. The classic Azure
+    OpenAI resource endpoint (…/.openai.azure.com) uses the `azure/`
+    prefix instead."""
+    b = (endpoint or "").lower()
+    return (".services.ai.azure.com" in b or "/openai/v1" in b
+            or b.rstrip("/").endswith("/openai"))
+
+
+def _strip_foundry_project_suffix(endpoint: str) -> str:
+    """Foundry PROJECT endpoints look like
+    `https://<resource>.services.ai.azure.com/api/projects/<name>`.
+    LiteLLM wants the RESOURCE root as `api_base`, so strip the
+    `/api/projects/<name>` suffix — same thing `_azure_foundry_root`
+    does for the hand-rolled dispatch. Idempotent: a resource-root
+    endpoint comes back unchanged."""
+    import re
+    b = (endpoint or "").rstrip("/")
+    b = re.sub(r"/api/projects/[^/]+/?$", "", b, flags=re.I)
+    return b.rstrip("/")
 
 
 def litellm_completion_for(backend: str,
@@ -354,12 +400,22 @@ def litellm_completion_for(backend: str,
         kwargs["top_p"] = top_p
     b = (backend or "").lower()
     if b == "azure":
-        if (model or "").lower().startswith("claude-"):
-            lmodel = f"azure_ai/anthropic/{model}"
+        # Mirrors entry_for_provider()'s three-case Azure handling:
+        # (a) Foundry Anthropic → azure_ai/anthropic/<model>
+        # (b) Foundry OpenAI    → azure_ai/<model>   (gpt-5 / o1 / o3 land here)
+        # (c) Classic Azure OAI → azure/<model>
+        is_foundry = _azure_endpoint_is_foundry(endpoint or "")
+        if is_foundry:
+            api_base = _strip_foundry_project_suffix(endpoint or "")
+            if (model or "").lower().startswith("claude-"):
+                lmodel = f"azure_ai/anthropic/{model}"
+            else:
+                lmodel = f"azure_ai/{model}"
         else:
+            api_base = endpoint or ""
             lmodel = f"azure/{model}"
-        if endpoint:
-            kwargs["api_base"] = endpoint
+        if api_base:
+            kwargs["api_base"] = api_base
         if api_key:
             kwargs["api_key"] = api_key
         kwargs["api_version"] = api_version or _AZURE_API_VERSION_DEFAULT

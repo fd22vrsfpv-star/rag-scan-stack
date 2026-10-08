@@ -55,31 +55,62 @@ except Exception as e:  # pragma: no cover
 
 # --- Per-provider agreement tests -----------------------------------------
 
-def test_azure_openai_entry_shape():
-    """Azure OpenAI deployment → `azure/<deployment>` + api_base + api_key
-    + api_version. Alias is `<provider_id>:<default_model>`."""
+def test_azure_classic_openai_entry_shape():
+    """CLASSIC Azure OpenAI endpoint (…/.openai.azure.com) → `azure/<deployment>`.
+    This is the historical shape pre-Foundry; Foundry OpenAI deploys use a
+    different prefix (see test_azure_foundry_openai_entry_shape)."""
     entry = lr.entry_for_provider({
-        "id": "azure-main",
+        "id": "azure-classic",
         "type": "azure",
         "endpoint": "https://my-aoai.openai.azure.com",
         "api_key": "sk-abc123",
         "api_version": "2024-08-01-preview",
-        "default_model": "gpt-5-mini",
+        "default_model": "gpt-4o",
         "enabled": True,
     })
     assert entry is not None
-    assert entry["model_name"] == "azure-main:gpt-5-mini"
+    assert entry["model_name"] == "azure-classic:gpt-4o"
     p = entry["litellm_params"]
-    assert p["model"] == "azure/gpt-5-mini"
+    assert p["model"] == "azure/gpt-4o"
     assert p["api_base"] == "https://my-aoai.openai.azure.com"
     assert p["api_key"] == "sk-abc123"
     assert p["api_version"] == "2024-08-01-preview"
 
 
+def test_azure_foundry_openai_entry_shape():
+    """Foundry OpenAI deployment (gpt-5-mini / gpt-4o / o1 / o3) on
+    *.services.ai.azure.com → `azure_ai/<deployment>`. This is the
+    OpenAI-compat path through Foundry; `azure/<deployment>` would
+    hit the classic REST shape which Foundry rejects. Caught after the
+    first focused-10 CVE run: 1.56.4 sent `max_tokens` and 1.104.2
+    (even after that bug was fixed upstream) was sent to `azure/` by
+    the router, 400ing on "API version not supported" at the wrong
+    endpoint shape."""
+    entry = lr.entry_for_provider({
+        "id": "azure-gpt5",
+        "type": "azure",
+        "endpoint": "https://rt3ai2-resource.services.ai.azure.com/api/projects/rt3ai2",
+        "api_key": "sk-xyz",
+        "api_version": "",
+        "default_model": "gpt-5-mini",
+        "enabled": True,
+    })
+    assert entry is not None
+    assert entry["model_name"] == "azure-gpt5:gpt-5-mini"
+    p = entry["litellm_params"]
+    assert p["model"] == "azure_ai/gpt-5-mini"
+    # /api/projects/<name> suffix stripped — LiteLLM wants the resource root
+    # as api_base, same as the hand-rolled dispatcher's _azure_foundry_root.
+    assert p["api_base"] == "https://rt3ai2-resource.services.ai.azure.com"
+    assert p["api_key"] == "sk-xyz"
+    # Blank api_version → default. The default itself is covered by
+    # test_azure_api_version_defaults_when_blank.
+
+
 def test_azure_foundry_anthropic_entry_shape():
-    """Deployment name starting with `claude-` → `azure_ai/anthropic/<deployment>`.
-    This is the Foundry Anthropic path the hand-rolled adapter discovered
-    empirically — same rule drives the LiteLLM translation."""
+    """Deployment name starting with `claude-` on *.services.ai.azure.com
+    → `azure_ai/anthropic/<deployment>`. The deployment-name prefix is
+    the empirical signal the hand-rolled Foundry Anthropic adapter uses."""
     entry = lr.entry_for_provider({
         "id": "sonnet-4-5",
         "type": "azure",
@@ -98,16 +129,18 @@ def test_azure_foundry_anthropic_entry_shape():
 
 
 def test_azure_api_version_defaults_when_blank():
-    """A provider row with no api_version falls back to `2024-05-01-preview`
+    """A provider row with no api_version falls back to `_AZURE_API_VERSION_DEFAULT`
     — LiteLLM REQUIRES api_version for Azure, so a blank one is a 400 at
-    first call. The default picks the version the Foundry adapter uses."""
+    first call. The default is 2024-10-21 (bumped from 2024-05-01-preview
+    after Foundry rejected the older version on gpt-5 deployments)."""
     entry = lr.entry_for_provider({
         "id": "azure-x", "type": "azure",
         "endpoint": "https://x.openai.azure.com", "api_key": "k",
         "api_version": "", "default_model": "gpt-4o",
         "enabled": True,
     })
-    assert entry["litellm_params"]["api_version"] == "2024-05-01-preview"
+    assert entry["litellm_params"]["api_version"] == lr._AZURE_API_VERSION_DEFAULT
+    assert lr._AZURE_API_VERSION_DEFAULT == "2024-10-21"
 
 
 def test_ollama_entry_shape():
@@ -304,11 +337,10 @@ def test_litellm_router_enabled_default_is_on_from_pr2():
             importlib.reload(lr)
 
 
-def test_litellm_completion_for_builds_azure_openai_call(monkeypatch):
-    """litellm_completion_for() translates (backend='azure', model='gpt-4o',
-    endpoint, api_key) into litellm.completion(model='azure/gpt-4o', api_base,
-    api_key, api_version). Patches litellm.completion to capture kwargs so
-    the test runs without a real endpoint."""
+def test_litellm_completion_for_builds_azure_classic_openai_call(monkeypatch):
+    """CLASSIC Azure OpenAI (…/.openai.azure.com) → `azure/<deployment>`.
+    api_base, api_key, api_version plumbed through. Patches litellm.completion
+    to capture kwargs so the test runs without a real endpoint."""
     import litellm
     captured = {}
     class _FakeMsg: content = "ok"
@@ -332,6 +364,27 @@ def test_litellm_completion_for_builds_azure_openai_call(monkeypatch):
     assert captured["temperature"] == 0.3
 
 
+def test_litellm_completion_for_builds_azure_foundry_openai_call(monkeypatch):
+    """Foundry OpenAI (gpt-5-mini / o1 / o3 on *.services.ai.azure.com) →
+    `azure_ai/<deployment>`. Caught in the first focused-10 run — the
+    router was sending `azure/gpt-5-mini` which 400'd on "API version
+    not supported" because the hand-rolled dispatcher's `_azure_is_foundry`
+    rule wasn't applied here. Also strips the `/api/projects/<name>`
+    suffix from api_base — LiteLLM wants the resource root."""
+    import litellm
+    captured = {}
+    class _R:
+        choices = [type("C", (), {"message": type("M", (), {"content": "ok"})()})()]
+        usage = None
+    monkeypatch.setattr(litellm, "completion", lambda **kw: (captured.update(kw), _R())[1])
+    lr.litellm_completion_for("azure", "gpt-5-mini", "hi", None,
+                              endpoint="https://rt3ai2-resource.services.ai.azure.com/api/projects/rt3ai2",
+                              api_key="sk-xyz")
+    assert captured["model"] == "azure_ai/gpt-5-mini"
+    assert captured["api_base"] == "https://rt3ai2-resource.services.ai.azure.com"
+    assert captured["api_version"] == lr._AZURE_API_VERSION_DEFAULT
+
+
 def test_litellm_completion_for_builds_azure_foundry_anthropic_call(monkeypatch):
     """Deployment starting with `claude-` → `azure_ai/anthropic/<deployment>`.
     Same empirical rule the alias factory uses, enforced on the completion
@@ -343,8 +396,14 @@ def test_litellm_completion_for_builds_azure_foundry_anthropic_call(monkeypatch)
         choices = [type("C", (), {"message": type("M", (), {"content": "ok"})()})()]
         usage = None
     monkeypatch.setattr(litellm, "completion", lambda **kw: (captured.update(kw), _R())[1])
+    # Realistic Foundry endpoint — the foundry-detection rule keys off
+    # *.services.ai.azure.com (same rule the hand-rolled _azure_is_foundry
+    # uses). An endpoint that doesn't match that pattern would be treated
+    # as a CLASSIC Azure OpenAI resource, which is correct — Foundry
+    # Anthropic deploys only live on Foundry endpoints.
     lr.litellm_completion_for("azure", "claude-sonnet-4-5", "hi", None,
-                              endpoint="https://foundry.example", api_key="k")
+                              endpoint="https://my-foundry.services.ai.azure.com",
+                              api_key="k")
     assert captured["model"] == "azure_ai/anthropic/claude-sonnet-4-5"
 
 
