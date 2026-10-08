@@ -912,10 +912,47 @@ def _generate_text(backend: str, model: str, prompt: str,
     Separate from generate() so a route can send a request to a backend other
     than the globally-selected one -- that is what makes "news on a local
     ollama while the agents stay on Azure" possible.
+
+    PR 2 of the LiteLLM migration (Docs/plans/LITELLM_MIGRATION.md): when the
+    `LITELLM_ROUTER_ENABLED` kill switch is on (default) AND the router can
+    be built, try the LiteLLM path first and fall back to the hand-rolled
+    dispatch on any error. The LiteLLM path returns the SAME (text, usage)
+    tuple shape so downstream telemetry doesn't branch. A warning log line
+    is emitted on fallback so an operator seeing their LiteLLM path fail
+    gets a signal, not silence.
     """
     backend = (backend or "").lower()
     temp = (options or {}).get("temperature")
     top_p = (options or {}).get("top_p")
+
+    # ─── LiteLLM path (PR 2) ─────────────────────────────────────────────
+    try:
+        from litellm_router import (
+            LITELLM_ROUTER_ENABLED, router_available, litellm_completion_for,
+        )
+        _can_route = LITELLM_ROUTER_ENABLED and router_available()
+    except Exception as e:  # noqa: BLE001
+        _can_route = False
+        logging.debug("llm_query: litellm_router import failed (%s) — hand-rolled dispatch only", e)
+    if _can_route:
+        try:
+            result = litellm_completion_for(backend, model, prompt, options,
+                                            endpoint=endpoint, api_key=api_key,
+                                            max_tokens=MAX_COMPLETION_TOKENS)
+            if result is not None:
+                # Path telemetry — one line per served call so an operator can
+                # grep the logs to confirm LiteLLM served (vs hand-rolled
+                # fallback) for a given backend+model. Lightweight — the
+                # per-call overhead is negligible compared to the model call.
+                logging.info("llm_query: path=litellm backend=%s model=%s", backend, model)
+                return result
+        except Exception as e:  # noqa: BLE001
+            # Fall through to the hand-rolled path. The exception message
+            # is kept at WARNING so the operator sees exactly which call
+            # LiteLLM couldn't serve — critical during PR 2 bake-in.
+            logging.warning("llm_query: LiteLLM path failed on backend=%s model=%s (%s) — "
+                            "falling back to hand-rolled dispatch", backend, model, e)
+    logging.info("llm_query: path=hand_rolled backend=%s model=%s", backend, model)
 
     if backend == "azure":
         # Azure Foundry serves Anthropic Claude models through a
