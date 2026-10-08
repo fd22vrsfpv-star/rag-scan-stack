@@ -14,7 +14,10 @@
 #
 # Env knobs:
 #   SOCKS_NAME       (default: socks-cve)
-#   SOCKS_PORT       (default: 1080)      — bound to 127.0.0.1 only
+#   SOCKS_PORT       (default: 1080)
+#   SOCKS_BIND       (default: 127.0.0.1) — set to 0.0.0.0 if a Burp running on
+#                     Windows (WSL2 NAT mode) needs to reach this; WSL's own
+#                     localhost-forwarding then makes Windows 127.0.0.1 resolve
 #   SOCKS_IMAGE      (default: serjs/go-socks5-proxy)
 #   SOCKS_BASE_NET   (default: agents_net) — always kept attached
 #   SOCKS_NET_PATTERN (default: ^cve-.*_target_network$) — which nets to reconcile
@@ -28,6 +31,7 @@ set -euo pipefail
 
 SOCKS_NAME="${SOCKS_NAME:-socks-cve}"
 SOCKS_PORT="${SOCKS_PORT:-1080}"
+SOCKS_BIND="${SOCKS_BIND:-127.0.0.1}"
 SOCKS_IMAGE="${SOCKS_IMAGE:-serjs/go-socks5-proxy}"
 BASE_NET="${SOCKS_BASE_NET:-agents_net}"
 PATTERN="${SOCKS_NET_PATTERN:-^cve-.*_target_network$}"
@@ -70,12 +74,14 @@ ensure_running() {
             echo "base network '$BASE_NET' does not exist — set SOCKS_BASE_NET to a live net" >&2
             exit 3
         fi
-        # REQUIRE_AUTH=false: open SOCKS, safe because we bind to 127.0.0.1 only.
+        # REQUIRE_AUTH=false: open SOCKS. SOCKS_BIND defaults to 127.0.0.1
+        # (loopback-only); set it to 0.0.0.0 when a Burp on Windows (WSL2 NAT
+        # mode) needs to reach it via WSL's own localhost-forwarding.
         docker run -d --name "$SOCKS_NAME" --restart=unless-stopped \
-            --network "$BASE_NET" -p "127.0.0.1:${SOCKS_PORT}:1080" \
+            --network "$BASE_NET" -p "${SOCKS_BIND}:${SOCKS_PORT}:1080" \
             -e REQUIRE_AUTH=false \
             "$SOCKS_IMAGE" >/dev/null
-        echo "started $SOCKS_NAME on 127.0.0.1:${SOCKS_PORT} (base: $BASE_NET)"
+        echo "started $SOCKS_NAME on ${SOCKS_BIND}:${SOCKS_PORT} (base: $BASE_NET)"
     elif ! docker ps --format '{{.Names}}' | grep -qx "$SOCKS_NAME"; then
         docker start "$SOCKS_NAME" >/dev/null
         echo "restarted $SOCKS_NAME"
@@ -107,21 +113,25 @@ reconcile() {
             echo "  - $n"
         fi
     done
+    local published
+    published=$(docker inspect "$SOCKS_NAME" --format '{{range $p,$b := .NetworkSettings.Ports}}{{range $b}}{{.HostIp}}:{{.HostPort}} {{end}}{{end}}' 2>/dev/null | head -c 128)
     echo "attachments:"
     current_attachments | sed 's/^/  /'
-    echo "listen: socks5://127.0.0.1:${SOCKS_PORT}"
+    echo "listen: socks5://${published:-${SOCKS_BIND}:${SOCKS_PORT}}"
 }
 
 status() {
     have_docker
     if docker inspect "$SOCKS_NAME" >/dev/null 2>&1; then
         echo "$SOCKS_NAME: $(docker inspect "$SOCKS_NAME" --format '{{.State.Status}}')"
-        echo "listen: socks5://127.0.0.1:${SOCKS_PORT}"
+        local published
+        published=$(docker inspect "$SOCKS_NAME" --format '{{range $p,$b := .NetworkSettings.Ports}}{{range $b}}{{.HostIp}}:{{.HostPort}} {{end}}{{end}}' 2>/dev/null | head -c 128)
+        echo "listen: socks5://${published:-${SOCKS_BIND}:${SOCKS_PORT}}"
         echo "attachments:"
         current_attachments | sed 's/^/  /'
     else
         echo "$SOCKS_NAME: not present"
-        echo "listen: socks5://127.0.0.1:${SOCKS_PORT} (not running)"
+        echo "listen: socks5://${SOCKS_BIND}:${SOCKS_PORT} (not running)"
     fi
     echo "live CVE target networks:"
     live_cve_nets | sed 's/^/  /' || true
