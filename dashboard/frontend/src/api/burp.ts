@@ -34,6 +34,38 @@ export function useBurpStatus() {
   })
 }
 
+/** Download the RAG Scan Bridge Jython extension (`RagScanBridge.py`) that
+ *  the operator loads into Burp Pro (Settings → Extensions → Add → Python).
+ *  Streams through the BFF; the file lives in the rag-api image. */
+export async function downloadBurpBridgeExtension() {
+  const resp = await fetch('/api/burp/extension')
+  if (!resp.ok) throw new Error(`Burp extension download failed: ${resp.status}`)
+  const blob = await resp.blob()
+  const cd = resp.headers.get('content-disposition') || ''
+  const m = cd.match(/filename="?([^"]+)"?/)
+  const fname = m ? m[1] : 'RagScanBridge.py'
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url; a.download = fname
+  document.body.appendChild(a); a.click(); a.remove()
+  URL.revokeObjectURL(url)
+}
+
+/** README markdown for the Burp bridge extension — install steps + feature
+ *  list. The UI renders it inline next to the download button. */
+export function useBurpBridgeReadme(enabled = true) {
+  return useQuery({
+    queryKey: ['burp-bridge-readme'],
+    enabled,
+    queryFn: async () => {
+      const resp = await fetch('/api/burp/extension/readme')
+      if (!resp.ok) throw new Error(`readme fetch failed: ${resp.status}`)
+      return resp.text()
+    },
+    staleTime: 10 * 60 * 1000,  // README is immutable per build
+  })
+}
+
 export function useStartBurpScan() {
   return useMutation({
     mutationFn: (params: {

@@ -10565,6 +10565,38 @@ def _build_burp_item_xml(row: dict) -> ET.Element:
     return item
 
 
+@app.get("/burp-extension/download", tags=["Export"])
+def download_burp_bridge_extension(authorized: bool = Depends(auth)):
+    """Serve the RAG Scan Bridge Jython extension (`RagScanBridge.py`) as a
+    download. Operator loads it into Burp Pro: Settings → Extensions →
+    Extension Settings → Python Environment → point at Jython 2.7.x JAR,
+    then Extensions → Add → Python → select this file. Shipped inside the
+    rag-api image at `/app/burp-extension/` (COPY from the repo's
+    `burp-extension/` dir at build time).
+
+    See `/burp-extension/readme` for installation + feature docs."""
+    path = "/app/burp-extension/RagScanBridge.py"
+    if not os.path.exists(path):
+        raise HTTPException(500, "Burp bridge extension not present in image — rebuild rag-api")
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    return Response(content=content, media_type="text/x-python",
+                    headers={"Content-Disposition": 'attachment; filename="RagScanBridge.py"'})
+
+
+@app.get("/burp-extension/readme", tags=["Export"])
+def download_burp_bridge_readme(authorized: bool = Depends(auth)):
+    """Serve the Burp bridge README (`burp-extension/README.md`) as
+    markdown. The UI renders this inline next to the download button so
+    the operator sees the install steps without leaving the page."""
+    path = "/app/burp-extension/README.md"
+    if not os.path.exists(path):
+        raise HTTPException(500, "Burp bridge README not present in image — rebuild rag-api")
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    return Response(content=content, media_type="text/markdown; charset=utf-8")
+
+
 @app.get("/export/burp", tags=["Export"])
 def export_burp_sitemap(
     severity: Optional[List[str]] = Query(None, description="Filter by severity (critical, high, medium, low, info)"),

@@ -15,6 +15,13 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 # Copy application code AFTER deps — code changes don't re-trigger pip install
 COPY app/rag-api/ /app/
 
+# Burp Suite bridge extension — the Jython .py the operator loads into Burp
+# Pro (Settings → Tool Options → "Download Burp bridge extension" / Exploit
+# Workbench → Tools → "Burp bridge .py"). Shipped here because the rag-api
+# build context is the repo root; the pentest-dashboard build context is
+# ./dashboard and can't see this directory.
+COPY burp-extension/ /app/burp-extension/
+
 # Bake a BUILD-TIME version stamp into the image so it reflects the code the
 # image actually contains, independent of the CREATE-TIME `BUILD_VERSION` env
 # (docker-compose environment block). A container that was NOT recreated after a

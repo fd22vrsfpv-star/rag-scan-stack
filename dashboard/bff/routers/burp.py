@@ -30,6 +30,41 @@ def _burp_headers() -> dict:
     return {"Content-Type": "application/json"}
 
 
+@router.get("/api/burp/extension")
+async def burp_bridge_extension():
+    """Stream the RAG Scan Bridge Jython extension (`RagScanBridge.py`) back
+    through nginx so the operator can download it from the dashboard
+    without needing shell access to the server. The file lives in the
+    rag-api image at `/app/burp-extension/`."""
+    from fastapi import Response
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=15) as c:
+        resp = await c.get(f"{s.rag_api_url}/burp-extension/download",
+                           headers={"x-api-key": s.api_key})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return Response(content=resp.content,
+                        media_type=resp.headers.get("content-type", "text/x-python"),
+                        headers={"Content-Disposition":
+                                 resp.headers.get("content-disposition",
+                                                  'attachment; filename="RagScanBridge.py"')})
+
+
+@router.get("/api/burp/extension/readme")
+async def burp_bridge_readme():
+    """Markdown README for the Burp bridge extension, served inline so the
+    UI can render the install steps next to the download button."""
+    from fastapi import Response
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=10) as c:
+        resp = await c.get(f"{s.rag_api_url}/burp-extension/readme",
+                           headers={"x-api-key": s.api_key})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text)
+        return Response(content=resp.content,
+                        media_type=resp.headers.get("content-type", "text/markdown; charset=utf-8"))
+
+
 @router.get("/api/burp/status")
 async def burp_status():
     try:

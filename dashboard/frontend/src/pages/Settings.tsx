@@ -4,7 +4,7 @@ import InfoTip from '@/components/InfoTip'
 import KaliAllowlistPanel from '@/components/settings/KaliAllowlistPanel'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useScopeNames } from '@/api/scope'
-import { useBurpStatus } from '@/api/burp'
+import { useBurpStatus, downloadBurpBridgeExtension, useBurpBridgeReadme } from '@/api/burp'
 import { useZapAddons, useInstallAddon, useUninstallAddon } from '@/api/zapAddons'
 import type { ZapAddon } from '@/api/zapAddons'
 import { useApiKeys, useUpsertApiKey, useDeleteApiKey } from '@/api/apiKeys'
@@ -2222,6 +2222,12 @@ function ToolOptionsTab() {
       {/* Profile selector */}
       <ProfileSelector />
 
+      {/* Burp bridge extension download — the Jython .py the operator loads
+          into Burp Pro so the dashboard can push/pull findings to/from Burp
+          Repeater + Scanner. Lives in the rag-api image (COPY from the
+          repo's burp-extension/ dir). */}
+      <BurpBridgeDownloadPanel />
+
       {/* Tool Updates */}
       <ToolUpdates />
 
@@ -3110,6 +3116,73 @@ function ToolUpdates() {
           </div>
         ))}
       </div>
+    </div>
+  )
+}
+
+
+/* ─── Burp Bridge Extension download panel ────────────────────────────── */
+// Serves `burp-extension/RagScanBridge.py` + its README from the rag-api
+// image. The operator downloads the .py file and loads it into Burp Pro
+// as a Jython extension (Extensions → Add → Python). Also surfaced on
+// the Exploit Workbench Tools tab for a selected PoC.
+function BurpBridgeDownloadPanel() {
+  const [showReadme, setShowReadme] = useState(false)
+  const [downloading, setDownloading] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const { data: readme, isLoading: readmeLoading, error: readmeErr } = useBurpBridgeReadme(showReadme)
+  const doDownload = async () => {
+    setErr(null); setDownloading(true)
+    try { await downloadBurpBridgeExtension() }
+    catch (e) { setErr((e as Error).message) }
+    finally { setDownloading(false) }
+  }
+  return (
+    <div className="border border-orange-500/30 rounded-lg bg-orange-500/5 p-3 space-y-2">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <div>
+          <h3 className="text-sm font-semibold inline-flex items-center gap-1.5">
+            <Download className="w-4 h-4" /> Burp Suite Bridge Extension
+          </h3>
+          <p className="text-[11px] text-muted-foreground mt-0.5">
+            Bidirectional finding sync between RAG Scan Stack and Burp Suite
+            Professional. Load the Jython file into Burp — adds a <span className="font-mono">RAG Scan Bridge</span> tab for preview-count, filter-by-scope, push findings to Repeater.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={doDownload}
+            disabled={downloading}
+            className="h-8 px-3 rounded bg-orange-600 hover:bg-orange-500 text-white text-xs inline-flex items-center gap-1 disabled:opacity-50">
+            {downloading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
+            RagScanBridge.py
+          </button>
+          <button
+            onClick={() => setShowReadme(v => !v)}
+            className="h-8 px-3 rounded border border-border hover:bg-accent text-xs inline-flex items-center gap-1">
+            {showReadme ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+            Install steps
+          </button>
+        </div>
+      </div>
+      {err && <div className="text-[11px] text-red-400">{err}</div>}
+      {showReadme && (
+        <div className="border border-border rounded bg-background/50 p-2 max-h-[50vh] overflow-y-auto">
+          {readmeLoading ? (
+            <div className="text-[11px] text-muted-foreground inline-flex items-center gap-1">
+              <Loader2 className="w-3 h-3 animate-spin" /> Loading README…
+            </div>
+          ) : readmeErr ? (
+            <div className="text-[11px] text-red-400">{String(readmeErr)}</div>
+          ) : (
+            // README is markdown; render as preformatted text (dependency-free,
+            // avoids pulling a markdown lib into the Settings bundle just for
+            // this one surface). Operator reads install steps + feature list
+            // inline; the full repo copy is `burp-extension/README.md`.
+            <pre className="text-[11px] whitespace-pre-wrap font-mono leading-relaxed">{readme || ''}</pre>
+          )}
+        </div>
+      )}
     </div>
   )
 }
