@@ -837,6 +837,57 @@ def routes():
             "routes": out}
 
 
+@router.get("/litellm-status")
+def litellm_status():
+    """Live state of the LiteLLM migration (PR 4/4 — Docs/plans/LITELLM_MIGRATION.md).
+
+    Returns which path `_generate_text()` would take right now, the kill-switch
+    value, the list of model aliases the router has registered, and whether
+    `litellm.completion()` is importable. The operator-facing smoke-test script
+    (`scripts/litellm-smoke.sh`) reads this to decide which providers to probe.
+
+    Never exposes api keys. Safe for the dashboard to poll.
+    """
+    try:
+        from litellm_router import (
+            LITELLM_ROUTER_ENABLED, router_available, get_router,
+        )
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"litellm_router unimportable: {e}",
+                "kill_switch_enabled": False, "router_available": False,
+                "path_in_use": "hand_rolled"}
+    aliases: list = []
+    try:
+        router = get_router()
+        if router is not None:
+            aliases = [m.get("model_name") for m in (router.model_list or [])]
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"get_router() failed: {e}",
+                "kill_switch_enabled": LITELLM_ROUTER_ENABLED,
+                "router_available": False, "path_in_use": "hand_rolled"}
+    try:
+        import litellm  # noqa: F401
+        litellm_importable = True
+    except Exception:  # noqa: BLE001
+        litellm_importable = False
+    avail = router_available()
+    path = ("litellm" if (LITELLM_ROUTER_ENABLED and avail and litellm_importable)
+            else "hand_rolled")
+    return {
+        "ok": True,
+        "kill_switch_enabled": LITELLM_ROUTER_ENABLED,
+        "router_available": avail,
+        "litellm_importable": litellm_importable,
+        "path_in_use": path,
+        "aliases": aliases,
+        "alias_count": len(aliases),
+        "note": ("path_in_use is what _generate_text() would use next. "
+                 "Set LITELLM_ROUTER_ENABLED=false in the llm_query env to "
+                 "force hand_rolled. Per-call path is also logged as "
+                 "'llm_query: path=litellm|hand_rolled backend=X model=Y'."),
+    }
+
+
 def _resolve_caller_provider_model(caller: str):
     """If `caller` is "provider:model" with a KNOWN provider prefix, resolve it to
     a full route (that provider's backend/endpoint/api_key + the bare model), the
