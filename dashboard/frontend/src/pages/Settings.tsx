@@ -4266,6 +4266,29 @@ function buildOptions(provs: AvailModels[]): ModelOption[] {
 
 /** A model picker that never traps the operator: the dropdown lists what we
  *  found, and "Custom…" switches to free text for anything we did not. */
+// Reasoning-effort dropdown for the per-task routing table. Classic chat
+// models silently ignore the value — the dispatcher only sends it when the
+// effective model is a reasoning deployment (gpt-5*, o1*, o3*, o4*).
+// Placeholder shows "inherit" (or the default effort if one is set) when
+// the operator leaves the row blank.
+function ReasoningEffortSelect({ value, onChange, placeholder }: {
+  value: string
+  onChange: (v: string) => void
+  placeholder?: string
+}) {
+  return (
+    <select value={value || ''} onChange={e => onChange(e.target.value)}
+      className="h-8 px-1.5 rounded border border-border bg-background text-xs">
+      <option value="">{placeholder || 'inherit'}</option>
+      <option value="minimal">minimal</option>
+      <option value="low">low</option>
+      <option value="medium">medium</option>
+      <option value="high">high</option>
+    </select>
+  )
+}
+
+
 function ModelSelect({ value, onChange, opts, placeholder }: {
   value: string
   onChange: (v: string) => void
@@ -4321,6 +4344,12 @@ type RouteEntry = {
   effective: string
   effective_fallback: string
   inherited: boolean
+  // Reasoning effort for this task — only applied when the effective model
+  // is a reasoning deployment (gpt-5*, o1*, o3*, o4*). Blank = inherit the
+  // default; `effective_reasoning_effort` is what the dispatcher would use
+  // right now.
+  reasoning_effort?: string
+  effective_reasoning_effort?: string
 }
 
 function TaskRoutingSection() {
@@ -4330,6 +4359,12 @@ function TaskRoutingSection() {
   const [dfltFb, setDfltFb] = useState('')
   const [routes, setRoutes] = useState<Record<string, string>>({})
   const [fallbacks, setFallbacks] = useState<Record<string, string>>({})
+  // Per-task reasoning_effort. Blank = inherit. One of ""|"minimal"|"low"|"medium"|"high".
+  // Only applied by the dispatcher when the effective model is a reasoning
+  // deployment (gpt-5*, o1*, o3*, o4*); a classic chat model silently
+  // ignores it.
+  const [efforts, setEfforts] = useState<Record<string, string>>({})
+  const [effortDefault, setEffortDefault] = useState('')
   const [opts, setOpts] = useState<ModelOption[]>([])
   const [avail, setAvail] = useState<AvailModels[]>([])
   const [saving, setSaving] = useState(false)
@@ -4339,8 +4374,10 @@ function TaskRoutingSection() {
     try {
       const r = await apiFetch<{
         tasks: RouteEntry[]; default: string; fallback: string; global_model: string
+        reasoning_effort_default?: string; reasoning_effort_global?: string
       }>('/settings/llm/routes')
       setTasks(r.tasks)
+      setEffortDefault(r.reasoning_effort_default || r.reasoning_effort_global || '')
       // Dropdown options come from a separate probe so a slow provider cannot
       // delay the routes table itself.
       try {
@@ -4356,6 +4393,7 @@ function TaskRoutingSection() {
       setGlobalModel(r.global_model || '')
       setRoutes(Object.fromEntries(r.tasks.map(t => [t.task, t.model || ''])))
       setFallbacks(Object.fromEntries(r.tasks.map(t => [t.task, t.fallback || ''])))
+      setEfforts(Object.fromEntries(r.tasks.map(t => [t.task, (t as RouteEntry).reasoning_effort || ''])))
       setMsg(null)
     } catch (e) {
       setMsg({ kind: 'err', text: `Load failed: ${String(e)}` })
@@ -4372,6 +4410,8 @@ function TaskRoutingSection() {
           method: 'PUT',
           body: JSON.stringify({
             routes, fallbacks, default: dflt, default_fallback: dfltFb,
+            reasoning_efforts: efforts,
+            reasoning_effort_default: effortDefault,
           }),
         },
       )
@@ -4429,7 +4469,7 @@ function TaskRoutingSection() {
         )}
       </div>
 
-      <div className="grid gap-2 sm:grid-cols-2 max-w-3xl">
+      <div className="grid gap-2 sm:grid-cols-3 max-w-4xl">
         <div className="text-xs">
           <div className="text-muted-foreground mb-1">Default for all tasks</div>
           <ModelSelect value={dflt} onChange={setDflt} opts={opts}
@@ -4440,6 +4480,12 @@ function TaskRoutingSection() {
           <ModelSelect value={dfltFb} onChange={setDfltFb} opts={opts}
             placeholder="none" />
         </div>
+        <div className="text-xs">
+          <div className="text-muted-foreground mb-1" title="Only applied to reasoning deployments (gpt-5*, o1*, o3*, o4*). Classic chat models ignore it.">
+            Default reasoning effort
+          </div>
+          <ReasoningEffortSelect value={effortDefault} onChange={setEffortDefault} />
+        </div>
       </div>
 
       <div className="overflow-x-auto border border-border rounded">
@@ -4449,6 +4495,7 @@ function TaskRoutingSection() {
               <th className="px-3 py-2 text-left">Task</th>
               <th className="px-3 py-2 text-left">Model</th>
               <th className="px-3 py-2 text-left">Fallback on rate limit</th>
+              <th className="px-3 py-2 text-left" title="Only applied when the effective model is a reasoning deployment (gpt-5*, o1*, o3*, o4*).">Reasoning</th>
               <th className="px-3 py-2 text-left">Effective</th>
             </tr>
           </thead>
@@ -4475,12 +4522,24 @@ function TaskRoutingSection() {
                     placeholder="inherit"
                   />
                 </td>
+                <td className="px-3 py-2">
+                  <ReasoningEffortSelect
+                    value={efforts[t.task] ?? ''}
+                    onChange={v => setEfforts({ ...efforts, [t.task]: v })}
+                    placeholder={effortDefault || 'inherit'}
+                  />
+                </td>
                 <td className="px-3 py-2 text-xs">
                   <span className="font-mono">{t.effective || '—'}</span>
                   {t.inherited && <span className="ml-1 text-muted-foreground">(inherited)</span>}
                   {t.effective_fallback && (
                     <div className="text-[11px] text-muted-foreground">
                       → {t.effective_fallback}
+                    </div>
+                  )}
+                  {t.effective_reasoning_effort && (
+                    <div className="text-[11px] text-muted-foreground" title="Only applied if the model is a reasoning deployment.">
+                      effort: {t.effective_reasoning_effort}
                     </div>
                   )}
                 </td>

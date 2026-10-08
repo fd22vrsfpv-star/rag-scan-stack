@@ -1502,14 +1502,22 @@ async def get_llm_routes():
         global_fallback = await _read_config(c, s, "llm.route.default.fallback")
         global_model = await _read_config(c, s, "llm.azure_model")
         providers_raw = await _read_config(c, s, "llm.providers")
+        default_effort = await _read_config(c, s, "llm.reasoning_effort.default")
+        global_effort = await _read_config(c, s, "llm.reasoning_effort")
         for task, desc in LLM_ROUTE_TASKS:
             model = await _read_config(c, s, f"llm.route.{task}")
             fb = await _read_config(c, s, f"llm.route.{task}.fallback")
+            effort = await _read_config(c, s, f"llm.reasoning_effort.{task}")
             out.append({
                 "task": task,
                 "description": desc,
                 "model": model,
                 "fallback": fb,
+                # Reasoning effort for this task — only applied when the
+                # effective model is a reasoning deployment (gpt-5*, o1*,
+                # o3*, o4*). Blank = inherit default/global.
+                "reasoning_effort": effort,
+                "effective_reasoning_effort": effort or default_effort or global_effort or "",
                 # What actually runs today, so a blank row is not ambiguous.
                 "effective": model or global_default or global_model or "",
                 "effective_fallback": fb or global_fallback or "",
@@ -1517,6 +1525,8 @@ async def get_llm_routes():
             })
     return {"tasks": out, "default": global_default,
             "fallback": global_fallback, "global_model": global_model,
+            "reasoning_effort_default": default_effort,
+            "reasoning_effort_global": global_effort,
             # So the UI can offer "<provider>:<model>" without the operator
             # having to remember what is configured.
             "providers": _provider_choices(providers_raw)}
@@ -1532,6 +1542,10 @@ class LlmRouteBody(BaseModel):
     fallbacks: Optional[Dict[str, str]] = None
     default: Optional[str] = None
     default_fallback: Optional[str] = None
+    # Per-task reasoning effort (minimal|low|medium|high|""). Same partial-
+    # update semantics as routes. `default` sets the global fallback effort.
+    reasoning_efforts: Optional[Dict[str, str]] = None
+    reasoning_effort_default: Optional[str] = None
 
 
 @router.put("/api/settings/llm/routes")
@@ -1540,19 +1554,36 @@ async def put_llm_routes(body: LlmRouteBody):
     silently stored — a typo'd task would create a key nothing ever reads."""
     s = get_settings()
     known = {t for t, _ in LLM_ROUTE_TASKS}
-    bad = sorted((set(body.routes or {}) | set(body.fallbacks or {})) - known)
+    bad = sorted((set(body.routes or {}) | set(body.fallbacks or {})
+                  | set(body.reasoning_efforts or {})) - known)
     if bad:
         raise HTTPException(400, f"unknown task(s): {', '.join(bad)}")
+
+    # Reasoning effort values are a closed set; silently drop unknowns so a
+    # typo in the UI doesn't become a stored value that nothing reads.
+    allowed_efforts = {"", "minimal", "low", "medium", "high"}
 
     writes = {}
     for task, val in (body.routes or {}).items():
         writes[f"llm.route.{task}"] = (val or "").strip()
     for task, val in (body.fallbacks or {}).items():
         writes[f"llm.route.{task}.fallback"] = (val or "").strip()
+    for task, val in (body.reasoning_efforts or {}).items():
+        v = (val or "").strip().lower()
+        if v not in allowed_efforts:
+            raise HTTPException(400, f"reasoning_effort for {task!r} must be one of "
+                                     f"minimal|low|medium|high (got {val!r})")
+        writes[f"llm.reasoning_effort.{task}"] = v
     if body.default is not None:
         writes["llm.route.default"] = body.default.strip()
     if body.default_fallback is not None:
         writes["llm.route.default.fallback"] = body.default_fallback.strip()
+    if body.reasoning_effort_default is not None:
+        v = body.reasoning_effort_default.strip().lower()
+        if v not in allowed_efforts:
+            raise HTTPException(400, f"reasoning_effort_default must be one of "
+                                     f"minimal|low|medium|high (got {body.reasoning_effort_default!r})")
+        writes["llm.reasoning_effort.default"] = v
 
     saved, failed = [], {}
     async with httpx.AsyncClient(timeout=15) as c:
