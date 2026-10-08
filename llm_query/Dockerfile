@@ -7,15 +7,17 @@
 
    # Install necessary dependencies.
    #
-   # `litellm` is added for the LiteLLM migration (Docs/plans/LITELLM_MIGRATION.md).
-   # PR 1 ships the router FACTORY in parallel to the hand-rolled dispatch; the
-   # swap of `_generate_text` to `router.completion` lands in PR 2. Pinned to the
-   # 1.56.x line referenced in the plan — the version-pin matters because LiteLLM
-   # has rapid releases and the azure_ai/anthropic provider shape stabilised in
-   # that window. Bump deliberately.
+   # `litellm` powers the LiteLLM migration (Docs/plans/LITELLM_MIGRATION.md).
+   # Pinned to the 1.104 minor (~=1.104.0 → >=1.104.0, <1.105); bumped from
+   # 1.56.4 after the first focused-10 CVE-Bench run surfaced that 1.56.x
+   # sends `max_tokens` to Azure `gpt-5-mini` which 400s with
+   # "Use 'max_completion_tokens' instead" — the newer LiteLLM lines added
+   # the automatic param translation for gpt-5 / o1 / o3 reasoning deploys.
+   # Keep the pin narrow (minor-level) because LiteLLM ships breaking
+   # changes between minors on their release cadence — bump deliberately.
    RUN pip install requests fastapi uvicorn pydantic psycopg2-binary autogen \
        anthropic azure-identity \
-       'litellm==1.56.4'
+       'litellm~=1.104.0'
    RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl  wget iproute2 && \
     rm -rf /var/lib/apt/lists/*
