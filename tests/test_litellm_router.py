@@ -109,8 +109,11 @@ def test_azure_foundry_openai_entry_shape():
 
 def test_azure_foundry_anthropic_entry_shape():
     """Deployment name starting with `claude-` on *.services.ai.azure.com
-    → `azure_ai/anthropic/<deployment>`. The deployment-name prefix is
-    the empirical signal the hand-rolled Foundry Anthropic adapter uses."""
+    → `azure_ai/anthropic/<deployment>` AND api_base MUST have the
+    `/anthropic` suffix (LiteLLM 1.104 appends `/v1/messages` to
+    api_base; without the suffix Azure gets a request for a deployment
+    literally named `anthropic/<model>` and returns DeploymentNotFound —
+    this was the live `sonnet-4-5` failure that uncovered the bug)."""
     entry = lr.entry_for_provider({
         "id": "sonnet-4-5",
         "type": "azure",
@@ -124,8 +127,24 @@ def test_azure_foundry_anthropic_entry_shape():
     assert entry["model_name"] == "sonnet-4-5:claude-sonnet-4-5"
     p = entry["litellm_params"]
     assert p["model"] == "azure_ai/anthropic/claude-sonnet-4-5"
-    assert p["api_base"] == "https://my-foundry.services.ai.azure.com"
+    # /anthropic suffix REQUIRED — see docstring.
+    assert p["api_base"] == "https://my-foundry.services.ai.azure.com/anthropic"
     assert p["api_key"] == "sk-def456"
+
+
+def test_azure_foundry_anthropic_api_base_not_doubled():
+    """If the operator already included `/anthropic` in the endpoint
+    (some docs show it that way), we shouldn't append it again."""
+    entry = lr.entry_for_provider({
+        "id": "sonnet-4-5",
+        "type": "azure",
+        "endpoint": "https://my-foundry.services.ai.azure.com/anthropic",
+        "api_key": "k",
+        "default_model": "claude-sonnet-4-5",
+        "enabled": True,
+    })
+    assert entry["litellm_params"]["api_base"] == "https://my-foundry.services.ai.azure.com/anthropic"
+    # NOT /anthropic/anthropic.
 
 
 def test_azure_api_version_defaults_when_blank():
