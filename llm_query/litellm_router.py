@@ -388,12 +388,35 @@ def litellm_completion_for(backend: str,
     propagate-vs-fallback.
     """
     import litellm  # local import — the module is heavy, don't pay import cost unused
+    lmodel, kwargs = _build_litellm_kwargs(
+        backend, model, options, endpoint, api_key, max_tokens, api_version)
+    if lmodel is None:
+        return None
+    # Single-prompt → wrap as one user message. For multi-turn, use
+    # `litellm_chat_completion_for()` which takes messages directly.
+    kwargs["messages"] = [{"role": "user", "content": prompt}]
+    resp = litellm.completion(model=lmodel, **kwargs)
+    return _extract_text_and_usage(resp)
+
+
+def _build_litellm_kwargs(backend: str,
+                          model: str,
+                          options: Optional[Dict[str, Any]],
+                          endpoint: Optional[str],
+                          api_key: Optional[str],
+                          max_tokens: int,
+                          api_version: Optional[str]) -> tuple:
+    """Shared backend→(model_string, kwargs) picker used by both the
+    single-prompt and multi-turn LiteLLM wrappers. Returns
+    `(None, {})` for an unknown backend — the caller falls back to the
+    hand-rolled dispatch, same contract as `entry_for_provider`.
+
+    `kwargs` is returned WITHOUT `messages` so the caller can set its
+    own (single-prompt or multi-turn shape).
+    """
     temp = (options or {}).get("temperature")
     top_p = (options or {}).get("top_p")
-    kwargs: Dict[str, Any] = {
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens,
-    }
+    kwargs: Dict[str, Any] = {"max_tokens": max_tokens}
     if temp is not None:
         kwargs["temperature"] = temp
     if top_p is not None:
@@ -440,11 +463,48 @@ def litellm_completion_for(backend: str,
         if endpoint:
             kwargs["api_base"] = endpoint
     else:
+        return (None, {})
+    return (lmodel, kwargs)
+
+
+def litellm_chat_completion_for(backend: str,
+                                model: str,
+                                messages: list,
+                                options: Optional[Dict[str, Any]],
+                                endpoint: Optional[str] = None,
+                                api_key: Optional[str] = None,
+                                max_tokens: int = 8192,
+                                api_version: Optional[str] = None):
+    """Multi-turn chat variant of `litellm_completion_for`.
+
+    Takes the OpenAI-shape `messages` list directly (preserving system /
+    user / assistant turn boundaries, which the single-prompt path would
+    flatten). Same return contract: `(text, usage)` or `None` for an
+    unknown backend. Used by `chat()` endpoint's non-routed branches
+    after the LiteLLM cutover.
+
+    Shares the backend → model-string translation table with
+    `litellm_completion_for` so the two paths stay in sync. Any provider
+    shape change applied to one must land in the other — the shape
+    picker is extracted into `_build_litellm_kwargs()` below.
+    """
+    import litellm
+    lmodel, kwargs = _build_litellm_kwargs(
+        backend, model, options, endpoint, api_key, max_tokens, api_version)
+    if lmodel is None:
         return None
+    # Chat takes `messages` instead of a wrapped single-user prompt.
+    kwargs["messages"] = messages
     resp = litellm.completion(model=lmodel, **kwargs)
-    # LiteLLM returns a `litellm.ModelResponse` (OpenAI-compat shape); extract
-    # the text + usage in the same normalised form `_usage_from` emits so
-    # downstream telemetry keeps the same keys.
+    return _extract_text_and_usage(resp)
+
+
+def _extract_text_and_usage(resp) -> tuple:
+    """Pull `(text, usage_dict)` out of a `litellm.ModelResponse` in the
+    same normalised shape `_usage_from` emits. Factored out so the
+    single-prompt and multi-turn LiteLLM wrappers return identically-
+    shaped tuples.
+    """
     text = resp.choices[0].message.content if getattr(resp, "choices", None) else ""
     usage_out: Dict[str, Any] = {}
     u = getattr(resp, "usage", None)
