@@ -193,6 +193,19 @@ def _azure_foundry_root(base: str) -> str:
         '', b.rstrip('/'), flags=re.I).rstrip('/')
 
 
+# ───────────────────────────────────────────────────────────────────────────
+# DEPRECATED (LiteLLM migration) — hand-rolled per-provider adapters.
+#
+# These helpers are scheduled for removal in PR 4 of the migration. The
+# `_generate_text()` routed path already prefers LiteLLM (PR 2); the chat(),
+# embeddings(), stream, and non-routed generate() handlers still call them,
+# so they stay until PR 4 migrates those too and the live smoke tests pass.
+# See Docs/plans/LITELLM_MIGRATION.md + the "LLM dispatch" section in CLAUDE.md.
+# Each DEPRECATED function below carries a single-line marker so a grep for
+# "DEPRECATED (LiteLLM" turns up the full set.
+# ───────────────────────────────────────────────────────────────────────────
+
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
 def _azure_chat_url(model: Optional[str] = None,
                     endpoint: Optional[str] = None) -> str:
     """Build Azure chat completions URL based on endpoint pattern.
@@ -221,6 +234,7 @@ def _azure_embed_url(model: Optional[str] = None) -> str:
     return f"{base}/openai/deployments/{mdl}/embeddings?api-version={AZURE_API_VERSION}"
 
 
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
 def _azure_headers(api_key: Optional[str] = None) -> Dict[str, str]:
     """Auth for one Azure call. `api_key` lets a named provider instance use
     its OWN key instead of the global one -- required for two Azure resources
@@ -267,6 +281,7 @@ def _retry_after_seconds(resp):
     return None
 
 
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
 def _post_with_429_retry(url: str, payload: Dict[str, Any],
                          headers: Dict[str, str]):
     """POST, retrying ONLY on 429.
@@ -295,6 +310,7 @@ def _post_with_429_retry(url: str, payload: Dict[str, Any],
     return resp
 
 
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
 def _azure_json_post(url: str, payload: Dict[str, Any],
                      api_key: Optional[str] = None) -> Dict[str, Any]:
     """POST to Azure endpoint with API key auth."""
@@ -380,6 +396,7 @@ _FOUNDRY_ANTHROPIC_PREFIXES = ("claude-",)
 _FOUNDRY_ENTRA_SCOPE = "https://ai.azure.com/.default"
 
 
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
 def _is_anthropic_on_foundry(model: Optional[str]) -> bool:
     """True when model id looks like an Anthropic Claude deployment that
     should be served via Foundry's Anthropic passthrough rather than the
@@ -390,6 +407,7 @@ def _is_anthropic_on_foundry(model: Optional[str]) -> bool:
     return any(m.startswith(p) for p in _FOUNDRY_ANTHROPIC_PREFIXES)
 
 
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
 def _foundry_resource_root(endpoint: Optional[str]) -> str:
     """Strip /api/projects/<project> from a Foundry Project endpoint so
     the resulting URL is the resource root the Anthropic passthrough
@@ -404,6 +422,7 @@ def _foundry_resource_root(endpoint: Optional[str]) -> str:
 _foundry_anthropic_client_cache: Dict[str, Any] = {}
 
 
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
 def _foundry_anthropic_client(endpoint: Optional[str],
                               api_key: Optional[str] = None):
     """Build (and cache) an AnthropicFoundry client bound to the given
@@ -456,6 +475,7 @@ def _foundry_anthropic_client(endpoint: Optional[str],
     return client
 
 
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
 def _azure_anthropic_messages_post(
     endpoint: Optional[str], api_key: Optional[str],
     model: str, prompt: str, options: Optional[Dict[str, Any]]
@@ -514,12 +534,14 @@ def _azure_anthropic_messages_post(
 
 # ---------- OpenAI Helpers ----------
 
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
 def _openai_headers(api_key: Optional[str] = None) -> Dict[str, str]:
     """`api_key` lets a named provider instance use its own key."""
     return {"Authorization": f"Bearer {api_key or OPENAI_API_KEY}",
             "Content-Type": "application/json"}
 
 
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
 def _openai_chat_url(base: Optional[str] = None) -> str:
     return f"{(base or OPENAI_API_BASE).rstrip('/')}/v1/chat/completions"
 
@@ -528,6 +550,7 @@ def _openai_embed_url() -> str:
     return f"{OPENAI_API_BASE.rstrip('/')}/v1/embeddings"
 
 
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
 def _openai_json_post(url: str, payload: Dict[str, Any],
                       api_key: Optional[str] = None) -> Dict[str, Any]:
     """POST to OpenAI endpoint."""
@@ -547,6 +570,7 @@ def _openai_json_post(url: str, payload: Dict[str, Any],
 
 # ---------- Anthropic Helpers ----------
 
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
 def _anthropic_headers() -> Dict[str, str]:
     return {
         "x-api-key": ANTHROPIC_API_KEY,
@@ -555,6 +579,7 @@ def _anthropic_headers() -> Dict[str, str]:
     }
 
 
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
 def _anthropic_json_post(payload: Dict[str, Any]) -> Dict[str, Any]:
     """POST to Anthropic messages endpoint."""
     try:
@@ -570,6 +595,7 @@ def _anthropic_json_post(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=502, detail=f"Anthropic endpoint unreachable: {e}")
 
 
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
 def _anthropic_extract_text(data: Dict) -> str:
     """Extract text content from Anthropic response."""
     for block in data.get("content", []):
