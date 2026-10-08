@@ -291,8 +291,115 @@ def router_available() -> bool:
         return False
 
 
-# Opt-in kill switch so the operator can disable the LiteLLM path WITHOUT
-# a rebuild if PR 2's swap turns up a provider shape LiteLLM gets wrong.
-# When PR 2 lands, `_generate_text` consults this before taking the router
-# path — defaulting to `enabled` once we've completed PR 4's smoke tests.
-LITELLM_ROUTER_ENABLED = os.environ.get("LITELLM_ROUTER_ENABLED", "false").lower() in ("1", "true", "yes")
+# Kill switch — operator-facing toggle so the LiteLLM path can be disabled
+# WITHOUT a rebuild if a provider shape LiteLLM gets wrong turns up in
+# production. `_generate_text` reads this before taking the router path.
+#
+# Default DIFFERS by PR:
+#   PR 1 — default OFF (nothing wired in yet)
+#   PR 2 — default ON (the swap is in; hand-rolled is the fallback path)
+#   PR 3 — default ON, env override still honoured
+#   PR 4 — default ON, env override removed once smoke tests pass
+LITELLM_ROUTER_ENABLED = os.environ.get("LITELLM_ROUTER_ENABLED", "true").lower() in ("1", "true", "yes")
+
+
+# ---------------------------------------------------------------------------
+# One-shot completion (PR 2 wiring)
+# ---------------------------------------------------------------------------
+# `_generate_text` in llm_query.py receives explicit (backend, model, endpoint,
+# api_key) per call — not an alias. This helper translates that shape into a
+# `litellm.completion(...)` call with the right provider prefix + credentials
+# and returns the (text, usage) tuple matching `_usage_from()`'s contract.
+#
+# The Router from `build_router_from_settings` is still built (used for
+# `router_available()` + fallback-alias registration) but PR 2's dispatch
+# goes through `litellm.completion` directly, because the caller already
+# knows which provider instance it wants. That matches the hand-rolled
+# dispatcher's semantics 1:1 — explicit (backend, model) wins.
+
+
+_AZURE_API_VERSION_DEFAULT = "2024-05-01-preview"
+
+
+def litellm_completion_for(backend: str,
+                           model: str,
+                           prompt: str,
+                           options: Optional[Dict[str, Any]],
+                           endpoint: Optional[str] = None,
+                           api_key: Optional[str] = None,
+                           max_tokens: int = 8192,
+                           api_version: Optional[str] = None):
+    """Dispatch one prompt through LiteLLM.
+
+    Returns `(text, usage)` where `usage` is the same
+    `{prompt_tokens, completion_tokens, total_tokens}` shape
+    `_usage_from()` emits — so `_generate_text` can swap in this call
+    without any downstream reshape.
+
+    Returns `None` for an unknown backend (caller falls back to the
+    hand-rolled dispatch — same contract as `entry_for_provider`).
+    Raises on provider errors so the caller can decide between
+    propagate-vs-fallback.
+    """
+    import litellm  # local import — the module is heavy, don't pay import cost unused
+    temp = (options or {}).get("temperature")
+    top_p = (options or {}).get("top_p")
+    kwargs: Dict[str, Any] = {
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+    }
+    if temp is not None:
+        kwargs["temperature"] = temp
+    if top_p is not None:
+        kwargs["top_p"] = top_p
+    b = (backend or "").lower()
+    if b == "azure":
+        if (model or "").lower().startswith("claude-"):
+            lmodel = f"azure_ai/anthropic/{model}"
+        else:
+            lmodel = f"azure/{model}"
+        if endpoint:
+            kwargs["api_base"] = endpoint
+        if api_key:
+            kwargs["api_key"] = api_key
+        kwargs["api_version"] = api_version or _AZURE_API_VERSION_DEFAULT
+    elif b == "openai":
+        lmodel = f"openai/{model}"
+        if endpoint:
+            kwargs["api_base"] = endpoint
+        if api_key:
+            kwargs["api_key"] = api_key
+    elif b == "anthropic":
+        lmodel = f"anthropic/{model}"
+        if api_key:
+            kwargs["api_key"] = api_key
+    elif b == "ollama":
+        lmodel = f"ollama/{model}"
+        if endpoint:
+            kwargs["api_base"] = endpoint
+    elif b == "vllm":
+        # vLLM speaks OpenAI chat completions. Same translation as the
+        # hand-rolled vllm branch (base + /v1/chat/completions).
+        lmodel = f"openai/{model}"
+        if endpoint:
+            kwargs["api_base"] = endpoint
+    else:
+        return None
+    resp = litellm.completion(model=lmodel, **kwargs)
+    # LiteLLM returns a `litellm.ModelResponse` (OpenAI-compat shape); extract
+    # the text + usage in the same normalised form `_usage_from` emits so
+    # downstream telemetry keeps the same keys.
+    text = resp.choices[0].message.content if getattr(resp, "choices", None) else ""
+    usage_out: Dict[str, int] = {}
+    u = getattr(resp, "usage", None)
+    if u is not None:
+        pt = getattr(u, "prompt_tokens", None)
+        ct = getattr(u, "completion_tokens", None)
+        tt = getattr(u, "total_tokens", None)
+        if pt is not None:
+            usage_out["prompt_tokens"] = int(pt)
+        if ct is not None:
+            usage_out["completion_tokens"] = int(ct)
+        if tt is not None:
+            usage_out["total_tokens"] = int(tt)
+    return text, usage_out

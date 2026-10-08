@@ -283,11 +283,88 @@ def test_router_available_flag_type():
     assert isinstance(lr.router_available(), bool)
 
 
-def test_litellm_router_enabled_default_is_off():
-    """Opt-in kill switch defaults OFF through PRs 1-3; PR 4 flips the
-    default once end-to-end smoke tests pass. Pinning the default here
-    so a stray env-var change in a future PR fails the test visibly."""
-    # Re-read the env the module read at import time; the default is 'false'.
+def test_litellm_router_enabled_default_is_on_from_pr2():
+    """Kill switch defaults ON from PR 2 onwards. PR 1 shipped default-OFF
+    because nothing was wired in; PR 2 wires LiteLLM into `_generate_text`
+    with a hand-rolled fallback on error, so default-ON is safe: a bad
+    LiteLLM response falls back and logs the failure. The env var
+    `LITELLM_ROUTER_ENABLED=false` still disables the path for operators
+    who want to force hand-rolled dispatch during an incident."""
+    # Re-read without the env var to assert the default. os.environ.pop
+    # removes a per-session override (e.g. a dev who exports =false).
     import importlib
-    importlib.reload(lr)
-    assert lr.LITELLM_ROUTER_ENABLED is False
+    import os as _os
+    _prev = _os.environ.pop("LITELLM_ROUTER_ENABLED", None)
+    try:
+        importlib.reload(lr)
+        assert lr.LITELLM_ROUTER_ENABLED is True
+    finally:
+        if _prev is not None:
+            _os.environ["LITELLM_ROUTER_ENABLED"] = _prev
+            importlib.reload(lr)
+
+
+def test_litellm_completion_for_builds_azure_openai_call(monkeypatch):
+    """litellm_completion_for() translates (backend='azure', model='gpt-4o',
+    endpoint, api_key) into litellm.completion(model='azure/gpt-4o', api_base,
+    api_key, api_version). Patches litellm.completion to capture kwargs so
+    the test runs without a real endpoint."""
+    import litellm
+    captured = {}
+    class _FakeMsg: content = "ok"
+    class _FakeChoice: message = _FakeMsg()
+    class _FakeUsage: prompt_tokens, completion_tokens, total_tokens = 11, 22, 33
+    class _FakeResp: choices = [_FakeChoice()]; usage = _FakeUsage()
+    def _fake(**kw):
+        captured.update(kw); return _FakeResp()
+    monkeypatch.setattr(litellm, "completion", _fake)
+    text, usage = lr.litellm_completion_for(
+        "azure", "gpt-4o", "hello", options={"temperature": 0.3},
+        endpoint="https://x.openai.azure.com", api_key="sk-k",
+        max_tokens=256, api_version="2024-08-01-preview")
+    assert text == "ok"
+    assert usage == {"prompt_tokens": 11, "completion_tokens": 22, "total_tokens": 33}
+    assert captured["model"] == "azure/gpt-4o"
+    assert captured["api_base"] == "https://x.openai.azure.com"
+    assert captured["api_key"] == "sk-k"
+    assert captured["api_version"] == "2024-08-01-preview"
+    assert captured["max_tokens"] == 256
+    assert captured["temperature"] == 0.3
+
+
+def test_litellm_completion_for_builds_azure_foundry_anthropic_call(monkeypatch):
+    """Deployment starting with `claude-` → `azure_ai/anthropic/<deployment>`.
+    Same empirical rule the alias factory uses, enforced on the completion
+    call too so the kill-switch-ON path routes to Foundry Anthropic exactly
+    like the hand-rolled adapter does today."""
+    import litellm
+    captured = {}
+    class _R:
+        choices = [type("C", (), {"message": type("M", (), {"content": "ok"})()})()]
+        usage = None
+    monkeypatch.setattr(litellm, "completion", lambda **kw: (captured.update(kw), _R())[1])
+    lr.litellm_completion_for("azure", "claude-sonnet-4-5", "hi", None,
+                              endpoint="https://foundry.example", api_key="k")
+    assert captured["model"] == "azure_ai/anthropic/claude-sonnet-4-5"
+
+
+def test_litellm_completion_for_ollama_no_api_key(monkeypatch):
+    """Ollama path doesn't send api_key (local LAN). api_base is passed."""
+    import litellm
+    captured = {}
+    class _R:
+        choices = [type("C", (), {"message": type("M", (), {"content": "ok"})()})()]
+        usage = None
+    monkeypatch.setattr(litellm, "completion", lambda **kw: (captured.update(kw), _R())[1])
+    lr.litellm_completion_for("ollama", "qwen2.5:14b", "hi", None,
+                              endpoint="http://ollama:11434", api_key=None)
+    assert captured["model"] == "ollama/qwen2.5:14b"
+    assert captured["api_base"] == "http://ollama:11434"
+    assert "api_key" not in captured
+
+
+def test_litellm_completion_for_unknown_backend_returns_none():
+    """Unknown backend → None; the caller falls back to the hand-rolled
+    dispatch instead of raising. Operator-added `bedrock` or `vertex`
+    should not take the dispatch down."""
+    assert lr.litellm_completion_for("bedrock", "claude-x", "hi", None) is None
