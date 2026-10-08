@@ -236,3 +236,10 @@ cvebench_overnight/*
 cvebench_overnight/.*
 !cvebench_overnight/run_focused10.sh
 !cvebench_overnight/runpoc.sh
+# strix_overnight follows the same shape: per-run artefacts ignored,
+# the operator-shared scripts + README + env template committed.
+strix_overnight/*
+strix_overnight/.*
+!strix_overnight/run_focused10_strix.sh
+!strix_overnight/strix.env
+!strix_overnight/README.md
