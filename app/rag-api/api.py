@@ -15914,22 +15914,45 @@ def _ollama_tags():
 def _is_local_model(model):
     """True iff `model` names a tag loaded in local ollama.
 
-    Ollama tags carry an implicit ":latest" suffix: `llama3` is listed as
-    `llama3:latest`. Prior exact-match let `llama3:latest` through but rejected
-    the bare `llama3` operators actually type — then `_llm_for_model` fell to
-    `llm_generate` which 404'd on llm_query, and the build-poc pre-check
-    rejected a model that is actually usable. See 2026-10-06 CHANGES_MADE.
+    Handles three input shapes operators + the LiteLLM router use:
+      - bare tag:            `qwen3-coder:30b`
+      - with :latest suffix: `llama3:latest`
+      - with provider alias prefix: `ollama:qwen3-coder:30b`  (LiteLLM
+        router's alias format `<provider_id>:<model>`)
+
+    Previously the alias-prefix form fell through to `llm_generate` and
+    POSTed to llm_query with a model string ollama's REST API didn't
+    understand — the call hung on a cold 30 GB model load and the
+    rag-api side ReadTimeout'd at 120 s. See 2026-10-08 symptom:
+    `cve_poc_synth model=ollama:qwen3-coder:30b latency=120094ms`.
+    Stripping the `<provider_id>:` prefix before the tag check routes
+    the call through the fast direct-ollama path (same code path that
+    serves the bare-tag calls which never fail).
     """
     if not model:
         return False
+    # Strip a `<provider_id>:` prefix if the suffix is itself an ollama tag.
+    # The split is `('ollama', 'qwen3-coder:30b')` for the alias form; the
+    # bare-tag form `qwen3-coder:30b` is not split because `qwen3-coder` is
+    # not a known provider id. Belt-and-braces: if the stripped suffix matches
+    # a tag, use it; otherwise fall back to the raw string.
+    raw = model
     tags = _ollama_tags()
-    if model in tags:
+    def _match(m):
+        if m in tags:
+            return True
+        if ":" not in m and f"{m}:latest" in tags:
+            return True
+        if m.endswith(":latest") and m[: -len(":latest")] in tags:
+            return True
+        return False
+    if _match(raw):
         return True
-    # Try with/without the implicit :latest suffix either way around.
-    if ":" not in model and f"{model}:latest" in tags:
-        return True
-    if model.endswith(":latest") and model[: -len(":latest")] in tags:
-        return True
+    # Try as `<prefix>:<rest>` where <rest> is an ollama tag.
+    if ":" in raw:
+        _, rest = raw.split(":", 1)
+        if _match(rest):
+            return True
     return False
 
 
@@ -15948,12 +15971,20 @@ def _llm_for_model(prompt, model=None, caller="llm", num_predict=1024, temperatu
     if _is_local_model(model):
         import httpx as _hx, time as _t
         t0 = _t.time()
-        res = {"response": "", "model": model, "ok": False,
+        # Ollama's REST API expects the bare tag (`qwen3-coder:30b`) — the
+        # LiteLLM router's `<provider_id>:<tag>` alias form has to be
+        # stripped first, else the model-not-found path hangs on load.
+        ollama_model = model
+        if ":" in ollama_model and ollama_model not in _ollama_tags():
+            _, _rest = ollama_model.split(":", 1)
+            if _rest in _ollama_tags() or f"{_rest}:latest" in _ollama_tags():
+                ollama_model = _rest
+        res = {"response": "", "model": ollama_model, "ok": False,
                "eval_count": 0, "prompt_tokens": 0, "total_tokens": 0,
                "latency_ms": 0.0, "cost_usd": 0.0}
         try:
             r = _hx.post(f"{_OLLAMA_DIRECT_URL.rstrip('/')}/api/generate",
-                         json={"model": model, "prompt": prompt, "stream": False,
+                         json={"model": ollama_model, "prompt": prompt, "stream": False,
                                "options": {"num_predict": num_predict, "temperature": temperature}},
                          timeout=600)
             d = r.json() if r.status_code < 400 else {}
