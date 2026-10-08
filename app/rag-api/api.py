@@ -15936,10 +15936,21 @@ def _is_local_model(model):
 def _llm_for_model(prompt, model=None, caller="llm", num_predict=1024, temperature=0.2):
     """Dispatch one prompt to a specific model. A LOCAL ollama model (in /api/tags) is called
     directly on the ollama service; any other model (or None) goes through the cloud/routed
-    llm_generate. Returns the llm_generate result shape so metrics accumulation is identical."""
+    llm_generate. Returns the llm_generate result shape so metrics accumulation is identical.
+
+    Both branches now persist to `llm_request_metrics` so the LLM Performance panel +
+    the LiteLLM-cost dashboard see every call. The local-ollama branch used to go
+    direct via httpx and skip the persist entirely, which left most of the build-poc
+    pipeline invisible on the stats panel. Ollama is $0 in LiteLLM's catalog, so the
+    direct branch pins `cost_usd=0.0` (not NULL) — makes the "priced calls" counter
+    reflect reality instead of showing 2/71.
+    """
     if _is_local_model(model):
         import httpx as _hx, time as _t
         t0 = _t.time()
+        res = {"response": "", "model": model, "ok": False,
+               "eval_count": 0, "prompt_tokens": 0, "total_tokens": 0,
+               "latency_ms": 0.0, "cost_usd": 0.0}
         try:
             r = _hx.post(f"{_OLLAMA_DIRECT_URL.rstrip('/')}/api/generate",
                          json={"model": model, "prompt": prompt, "stream": False,
@@ -15947,13 +15958,34 @@ def _llm_for_model(prompt, model=None, caller="llm", num_predict=1024, temperatu
                          timeout=600)
             d = r.json() if r.status_code < 400 else {}
             pt = int(d.get("prompt_eval_count") or 0); ct = int(d.get("eval_count") or 0)
-            return {"response": d.get("response", ""), "model": model, "ok": True,
-                    "eval_count": ct, "prompt_tokens": pt, "total_tokens": pt + ct,
-                    "latency_ms": round((_t.time() - t0) * 1000, 1)}
+            eval_dur = int(d.get("eval_duration") or 0)
+            tps = round(ct / (eval_dur / 1e9), 1) if eval_dur else 0
+            res.update({"response": d.get("response", ""), "ok": True,
+                        "eval_count": ct, "prompt_tokens": pt, "total_tokens": pt + ct,
+                        "tokens_per_sec": tps,
+                        "latency_ms": round((_t.time() - t0) * 1000, 1)})
         except Exception as e:  # noqa: BLE001
-            return {"response": "", "model": model, "ok": False, "error": str(e),
-                    "eval_count": 0, "prompt_tokens": 0, "total_tokens": 0,
-                    "latency_ms": round((_t.time() - t0) * 1000, 1)}
+            res["error"] = str(e)
+            res["latency_ms"] = round((_t.time() - t0) * 1000, 1)
+        # Persist to llm_request_metrics — same shape llm_generate writes.
+        # Fire-and-forget: a logging failure must not take the caller down.
+        try:
+            with get_db(autocommit=True) as conn, conn.cursor() as cur:
+                cur.execute("""INSERT INTO llm_request_metrics
+                    (caller, model_name, prompt_tokens, completion_tokens, total_tokens,
+                     tokens_per_sec, latency_ms, is_error, error_message,
+                     request_params, cost_usd)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (caller, model, res.get("prompt_tokens", 0), res["eval_count"],
+                     res.get("total_tokens", 0), res.get("tokens_per_sec", 0),
+                     res["latency_ms"], not res["ok"], res.get("error"),
+                     Json({"num_predict": num_predict, "temperature": temperature,
+                           "prompt_len": len(prompt),
+                           "prompt": prompt[:8000], "response": res["response"][:8000]}),
+                     res.get("cost_usd")))
+        except Exception:  # noqa: BLE001
+            pass
+        return res
     return llm_generate(prompt, caller=caller, model=model, num_predict=num_predict)
 
 
