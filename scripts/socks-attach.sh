@@ -41,22 +41,27 @@ have_docker() {
     command -v docker >/dev/null 2>&1 || { echo "docker not found" >&2; exit 2; }
 }
 
-# Networks matching PATTERN that still have at least one non-SOCKS container
+# Networks matching PATTERN that still have at least one non-SOCKS container.
+# `return 0` at the end: an EOF `read` and a pattern-less `grep` both return 1,
+# and under `set -o pipefail` that would abort the caller for no good reason.
 live_cve_nets() {
     local n count
-    docker network ls --format '{{.Name}}' | grep -E "$PATTERN" 2>/dev/null | while read -r n; do
+    { docker network ls --format '{{.Name}}' 2>/dev/null | grep -E "$PATTERN" || true; } \
+    | while read -r n; do
         [ -z "$n" ] && continue
         count=$(docker network inspect "$n" \
             --format '{{range $k,$v := .Containers}}{{$v.Name}}{{"\n"}}{{end}}' 2>/dev/null \
             | grep -v -F -x "$SOCKS_NAME" | grep -c . || true)
         [ "${count:-0}" -gt 0 ] && echo "$n"
     done
+    return 0
 }
 
 current_attachments() {
-    docker inspect "$SOCKS_NAME" \
+    { docker inspect "$SOCKS_NAME" \
         --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' 2>/dev/null \
-        | grep -v '^$' || true
+        || true; } | grep -v '^$' || true
+    return 0
 }
 
 ensure_running() {
@@ -65,8 +70,10 @@ ensure_running() {
             echo "base network '$BASE_NET' does not exist — set SOCKS_BASE_NET to a live net" >&2
             exit 3
         fi
+        # REQUIRE_AUTH=false: open SOCKS, safe because we bind to 127.0.0.1 only.
         docker run -d --name "$SOCKS_NAME" --restart=unless-stopped \
             --network "$BASE_NET" -p "127.0.0.1:${SOCKS_PORT}:1080" \
+            -e REQUIRE_AUTH=false \
             "$SOCKS_IMAGE" >/dev/null
         echo "started $SOCKS_NAME on 127.0.0.1:${SOCKS_PORT} (base: $BASE_NET)"
     elif ! docker ps --format '{{.Names}}' | grep -qx "$SOCKS_NAME"; then
@@ -90,9 +97,11 @@ reconcile() {
             echo "  + $n"
         fi
     done
-    # Disconnect stale (only within PATTERN — never BASE_NET or other unrelated nets)
-    comm -13 <(printf '%s\n' "$want_all") <(printf '%s\n' "$have") \
-        | grep -E "$PATTERN" | while read -r n; do
+    # Disconnect stale (only within PATTERN — never BASE_NET or other unrelated nets).
+    # grep returns 1 when there's nothing stale: expected and not an error, so
+    # swallow it inside the compound to keep `set -e` + `pipefail` happy.
+    { comm -13 <(printf '%s\n' "$want_all") <(printf '%s\n' "$have") \
+        | { grep -E "$PATTERN" || true; } ; } | while read -r n; do
         [ -z "$n" ] && continue
         if docker network disconnect "$n" "$SOCKS_NAME" 2>/dev/null; then
             echo "  - $n"
