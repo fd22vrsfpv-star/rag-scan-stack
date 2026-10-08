@@ -427,3 +427,75 @@ def test_litellm_completion_for_unknown_backend_returns_none():
     dispatch instead of raising. Operator-added `bedrock` or `vertex`
     should not take the dispatch down."""
     assert lr.litellm_completion_for("bedrock", "claude-x", "hi", None) is None
+
+
+def test_litellm_chat_completion_for_preserves_messages(monkeypatch):
+    """Chat variant takes `messages` directly and preserves turn roles
+    (the single-prompt wrapper would flatten them into one user turn).
+    This is what makes `chat()`'s non-routed cutover safe — multi-turn
+    semantics survive."""
+    import litellm
+    captured = {}
+    class _R:
+        choices = [type("C", (), {"message": type("M", (), {"content": "ok"})()})()]
+        usage = None
+    monkeypatch.setattr(litellm, "completion", lambda **kw: (captured.update(kw), _R())[1])
+    msgs = [{"role": "system", "content": "you are a tool"},
+            {"role": "user", "content": "what time is it"},
+            {"role": "assistant", "content": "noon"},
+            {"role": "user", "content": "and now"}]
+    text, _ = lr.litellm_chat_completion_for(
+        "ollama", "qwen2.5:14b", msgs, options=None,
+        endpoint="http://ollama:11434")
+    assert text == "ok"
+    assert captured["model"] == "ollama/qwen2.5:14b"
+    # The messages array is passed through unchanged — no flattening,
+    # no system-message extraction, no role-tag prefixing.
+    assert captured["messages"] == msgs
+
+
+def test_litellm_chat_completion_for_builds_azure_foundry_call(monkeypatch):
+    """Chat on Foundry OpenAI still hits `azure_ai/<deployment>` with the
+    stripped api_base — same translation table as the completion wrapper.
+    Catches the easy mistake of forgetting to add a branch to one but not
+    the other."""
+    import litellm
+    captured = {}
+    class _R:
+        choices = [type("C", (), {"message": type("M", (), {"content": "ok"})()})()]
+        usage = None
+    monkeypatch.setattr(litellm, "completion", lambda **kw: (captured.update(kw), _R())[1])
+    lr.litellm_chat_completion_for(
+        "azure", "gpt-5-mini",
+        [{"role": "user", "content": "hi"}], None,
+        endpoint="https://rt3ai2-resource.services.ai.azure.com/api/projects/rt3ai2",
+        api_key="k")
+    assert captured["model"] == "azure_ai/gpt-5-mini"
+    assert captured["api_base"] == "https://rt3ai2-resource.services.ai.azure.com"
+
+
+def test_litellm_chat_completion_for_unknown_backend_returns_none():
+    """Same fallback contract as the single-prompt wrapper."""
+    assert lr.litellm_chat_completion_for("bedrock", "claude-x",
+                                          [{"role": "user", "content": "hi"}],
+                                          None) is None
+
+
+def test_build_litellm_kwargs_is_shared(monkeypatch):
+    """`_build_litellm_kwargs()` is the single source of truth for the
+    backend→kwargs mapping. Both wrappers delegate to it, so a change in
+    one lands in both. This test pins the shape: Foundry OpenAI with
+    custom api_version → azure_ai/<deployment> + stripped api_base +
+    the given api_version."""
+    lmodel, kwargs = lr._build_litellm_kwargs(
+        "azure", "gpt-5-mini", {"temperature": 0.2},
+        "https://foundry.services.ai.azure.com/api/projects/p",
+        "k", 1024, "2025-01-01-preview")
+    assert lmodel == "azure_ai/gpt-5-mini"
+    assert kwargs["api_base"] == "https://foundry.services.ai.azure.com"
+    assert kwargs["api_version"] == "2025-01-01-preview"
+    assert kwargs["temperature"] == 0.2
+    assert kwargs["max_tokens"] == 1024
+    # `messages` is intentionally NOT set — the caller plugs in its own
+    # (single-prompt or multi-turn shape).
+    assert "messages" not in kwargs
