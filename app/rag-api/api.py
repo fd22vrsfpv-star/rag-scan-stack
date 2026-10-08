@@ -15671,6 +15671,53 @@ def _fetch_advisory_poc(cve: str, refs: list, per_url_bytes: int = 12000, max_fe
     return ""
 
 
+_BUILD_POC_WEB_SEARCH = (os.environ.get("BUILD_POC_WEB_SEARCH") or "on").strip().lower() != "off"
+
+
+def _web_search_poc_refs(cve: str, existing_refs: list, max_urls: int = 4) -> list:
+    """DDG for `<CVE> PoC` and `<CVE> exploit`, keep only high-signal PoC refs
+    (GHSA, GitHub issues/commits/gists, exploit-db, nuclei templates, vendor
+    advisories), drop ones already in `existing_refs`. Round 12 showed the
+    "stuck" case: NVD + the linked GHSA/issue carried no fenced PoC, so the
+    gather miner mined nothing and the loop halted. A one-shot search opens
+    the door to PoCs that live elsewhere (gists, Chinese blog posts linking a
+    GHSA PoC, nuclei templates). Fail-soft to `[]`.
+    """
+    if not _BUILD_POC_WEB_SEARCH or not cve:
+        return []
+    cve_u = cve.strip().upper()
+    seen = {(u or "").strip().rstrip("/").lower() for u in (existing_refs or [])}
+
+    def _is_poc_ref(u: str) -> bool:
+        lu = (u or "").lower()
+        if any(d in lu for d in (
+                "github.com/advisories/", "/security/advisories/",
+                "gist.github.com", "exploit-db.com", "packetstormsecurity.com",
+                "nuclei-templates", "huntr.dev", "huntr.com")):
+            return True
+        if "github.com/" in lu and ("/issues/" in lu or "/commit/" in lu or "/blob/" in lu):
+            return True
+        if lu.endswith((".yaml", ".yml", ".py")):
+            return True
+        return False
+
+    out: list = []
+    for q in (f"{cve_u} proof of concept", f"{cve_u} exploit poc github"):
+        try:
+            hits = ddg_search(q, max_results=15, timeout=8.0)
+        except Exception:  # noqa: BLE001
+            hits = []
+        for h in hits:
+            u = (h.get("url") or "").strip()
+            k = u.rstrip("/").lower()
+            if not u or k in seen or not _is_poc_ref(u):
+                continue
+            seen.add(k); out.append(u)
+            if len(out) >= max_urls:
+                return out
+    return out
+
+
 def _fetch_cve_details(cve):
     """NVD lookup by cveId (cached in software_research_cache). {cve, description, refs, cvss}."""
     cve = (cve or "").strip().upper()
@@ -15698,6 +15745,21 @@ def _fetch_cve_details(cve):
                     except Exception:  # noqa: BLE001
                         cached["advisory_poc"] = ""
                     cached["_advisory_poc_checked"] = _tm.time()
+                    # Web-search fallback: if NVD+GHSA yielded nothing, DDG for
+                    # the CVE once per 6h, merge new high-signal refs, retry.
+                    _ws_checked = float((cached or {}).get("_web_search_checked") or 0)
+                    if (not cached.get("advisory_poc") and _BUILD_POC_WEB_SEARCH
+                            and _tm.time() - _ws_checked > 6 * 3600):
+                        try:
+                            extra_refs = _web_search_poc_refs(cve, cached.get("refs") or [])
+                            if extra_refs:
+                                cached["refs"] = (cached.get("refs") or []) + extra_refs
+                                cached["advisory_poc"] = _fetch_advisory_poc(cve, cached["refs"])
+                                logging.info("build_poc.web_search cve=%s added_refs=%d poc_found=%s",
+                                             cve, len(extra_refs), bool(cached["advisory_poc"]))
+                        except Exception as _wse:  # noqa: BLE001
+                            logging.debug("web_search fallback failed for %s: %s", cve, _wse)
+                        cached["_web_search_checked"] = _tm.time()
                     try:
                         cur.execute("""UPDATE software_research_cache SET results=%s, updated_at=now()
                                        WHERE LOWER(product)=LOWER(%s) AND source='nvd_cve'""",
@@ -15747,6 +15809,23 @@ def _fetch_cve_details(cve):
     except Exception as _ape:  # noqa: BLE001
         details["advisory_poc"] = ""
         logging.debug("advisory_poc extraction failed for %s: %s", cve, _ape)
+    # Web-search fallback (first fetch): if NVD + GHSA yielded no fenced PoC
+    # snippet, do one bounded DDG search for the CVE, merge any new refs, and
+    # retry the extractor. See `_web_search_poc_refs`. Cached on `details` so
+    # the row's 6h debounce guards it on later calls.
+    import time as _tm
+    details["_advisory_poc_checked"] = _tm.time()
+    if not details.get("advisory_poc") and _BUILD_POC_WEB_SEARCH:
+        try:
+            extra_refs = _web_search_poc_refs(cve, details.get("refs") or [])
+            if extra_refs:
+                details["refs"] = (details.get("refs") or []) + extra_refs
+                details["advisory_poc"] = _fetch_advisory_poc(cve, details["refs"])
+                logging.info("build_poc.web_search cve=%s added_refs=%d poc_found=%s",
+                             cve, len(extra_refs), bool(details["advisory_poc"]))
+        except Exception as _wse:  # noqa: BLE001
+            logging.debug("web_search fallback failed for %s: %s", cve, _wse)
+        details["_web_search_checked"] = _tm.time()
     try:
         with get_db() as conn, conn.cursor() as cur:
             cur.execute("""INSERT INTO software_research_cache (product,version,source,results,cve_ids)
