@@ -1,0 +1,293 @@
+"""PR 1 of the LiteLLM migration — agreement tests for the Router factory.
+
+Pins that `litellm_router.entry_for_provider()` turns each provider
+shape from `common.llm_settings.get_providers()` into exactly the
+`model_list` entry LiteLLM's `Router` expects. These are PURE
+translation tests — no network calls, no LiteLLM Router construction
+(which pulls provider SDKs at import time), no agent paths exercised.
+
+What this test proves BEFORE PR 2's dispatch swap:
+    - Azure OpenAI deployments map to `azure/<deployment>`
+    - Azure Foundry Anthropic deployments map to `azure_ai/anthropic/<deployment>`
+      (empirical rule: deployment name starts with `claude-`)
+    - Ollama providers map to `ollama/<model>` + api_base
+    - Anthropic native providers map to `anthropic/<model>` + api_key
+    - OpenAI providers map to `openai/<model>` + api_base + api_key
+    - vLLM providers map to `openai/<model>` + api_base (vLLM speaks OpenAI
+      chat completions)
+    - A provider with no `default_model` is skipped (returns None)
+    - An unknown provider type is skipped (returns None, warning logged)
+    - The alias is `<provider_id>:<default_model>` so caller-override
+      with that same string resolves 1:1
+
+If any of these drifts, the test flags it BEFORE PR 2 wires the router
+into `_generate_text` — because once that swap happens, a translation
+bug reaches live traffic as a 404 or wrong-provider dispatch.
+
+Runs standalone (`pytest tests/test_litellm_router.py`); skips cleanly
+when `litellm_router` isn't on the path (e.g. the test is invoked
+outside the llm_query image). The llm_query service's bind mount for
+`common/` + the Dockerfile's COPY of `litellm_router.py` are the two
+things this test ultimately asserts the shape of.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import pytest
+
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# litellm_router lives in the repo at ../llm_query/ and in the image at /app/.
+# Try both so the test runs identically from the host checkout and inside the
+# llm_query container (the only place litellm itself is installed).
+for _cand in (os.path.join(os.path.dirname(_HERE), "llm_query"), "/app"):
+    if os.path.isfile(os.path.join(_cand, "litellm_router.py")) and _cand not in sys.path:
+        sys.path.insert(0, _cand)
+
+try:
+    import litellm_router as lr
+except Exception as e:  # pragma: no cover
+    pytest.skip(f"litellm_router unimportable (looked in ../llm_query and /app): {e}",
+                allow_module_level=True)
+
+
+# --- Per-provider agreement tests -----------------------------------------
+
+def test_azure_openai_entry_shape():
+    """Azure OpenAI deployment → `azure/<deployment>` + api_base + api_key
+    + api_version. Alias is `<provider_id>:<default_model>`."""
+    entry = lr.entry_for_provider({
+        "id": "azure-main",
+        "type": "azure",
+        "endpoint": "https://my-aoai.openai.azure.com",
+        "api_key": "sk-abc123",
+        "api_version": "2024-08-01-preview",
+        "default_model": "gpt-5-mini",
+        "enabled": True,
+    })
+    assert entry is not None
+    assert entry["model_name"] == "azure-main:gpt-5-mini"
+    p = entry["litellm_params"]
+    assert p["model"] == "azure/gpt-5-mini"
+    assert p["api_base"] == "https://my-aoai.openai.azure.com"
+    assert p["api_key"] == "sk-abc123"
+    assert p["api_version"] == "2024-08-01-preview"
+
+
+def test_azure_foundry_anthropic_entry_shape():
+    """Deployment name starting with `claude-` → `azure_ai/anthropic/<deployment>`.
+    This is the Foundry Anthropic path the hand-rolled adapter discovered
+    empirically — same rule drives the LiteLLM translation."""
+    entry = lr.entry_for_provider({
+        "id": "sonnet-4-5",
+        "type": "azure",
+        "endpoint": "https://my-foundry.services.ai.azure.com",
+        "api_key": "sk-def456",
+        "api_version": "2024-05-01-preview",
+        "default_model": "claude-sonnet-4-5",
+        "enabled": True,
+    })
+    assert entry is not None
+    assert entry["model_name"] == "sonnet-4-5:claude-sonnet-4-5"
+    p = entry["litellm_params"]
+    assert p["model"] == "azure_ai/anthropic/claude-sonnet-4-5"
+    assert p["api_base"] == "https://my-foundry.services.ai.azure.com"
+    assert p["api_key"] == "sk-def456"
+
+
+def test_azure_api_version_defaults_when_blank():
+    """A provider row with no api_version falls back to `2024-05-01-preview`
+    — LiteLLM REQUIRES api_version for Azure, so a blank one is a 400 at
+    first call. The default picks the version the Foundry adapter uses."""
+    entry = lr.entry_for_provider({
+        "id": "azure-x", "type": "azure",
+        "endpoint": "https://x.openai.azure.com", "api_key": "k",
+        "api_version": "", "default_model": "gpt-4o",
+        "enabled": True,
+    })
+    assert entry["litellm_params"]["api_version"] == "2024-05-01-preview"
+
+
+def test_ollama_entry_shape():
+    """Ollama → `ollama/<model>` + api_base. No api_key (local, trust the LAN)."""
+    entry = lr.entry_for_provider({
+        "id": "ollama", "type": "ollama",
+        "endpoint": "http://ollama:11434",
+        "api_key": "",
+        "default_model": "qwen2.5:14b",
+        "enabled": True,
+    })
+    assert entry is not None
+    assert entry["model_name"] == "ollama:qwen2.5:14b"
+    p = entry["litellm_params"]
+    assert p["model"] == "ollama/qwen2.5:14b"
+    assert p["api_base"] == "http://ollama:11434"
+    assert "api_key" not in p
+
+
+def test_anthropic_native_entry_shape():
+    """Anthropic native (console api_key, not Foundry) → `anthropic/<model>` + api_key."""
+    entry = lr.entry_for_provider({
+        "id": "anthropic", "type": "anthropic",
+        "endpoint": "https://api.anthropic.com",
+        "api_key": "sk-ant-xxx",
+        "default_model": "claude-sonnet-4-20250514",
+        "enabled": True,
+    })
+    assert entry is not None
+    assert entry["model_name"] == "anthropic:claude-sonnet-4-20250514"
+    p = entry["litellm_params"]
+    assert p["model"] == "anthropic/claude-sonnet-4-20250514"
+    assert p["api_key"] == "sk-ant-xxx"
+
+
+def test_openai_direct_entry_shape():
+    """Direct OpenAI → `openai/<model>` + api_base + api_key."""
+    entry = lr.entry_for_provider({
+        "id": "openai", "type": "openai",
+        "endpoint": "https://api.openai.com",
+        "api_key": "sk-xxx",
+        "default_model": "gpt-4o",
+        "enabled": True,
+    })
+    assert entry is not None
+    assert entry["model_name"] == "openai:gpt-4o"
+    p = entry["litellm_params"]
+    assert p["model"] == "openai/gpt-4o"
+    assert p["api_base"] == "https://api.openai.com"
+    assert p["api_key"] == "sk-xxx"
+
+
+def test_vllm_entry_shape():
+    """vLLM speaks OpenAI chat-completions — LiteLLM routes it as
+    `openai/<model>` with an api_base pointed at the vLLM server."""
+    entry = lr.entry_for_provider({
+        "id": "vllm", "type": "vllm",
+        "endpoint": "http://vllm:8000",
+        "api_key": "",
+        "default_model": "mistralai/Mistral-7B-Instruct-v0.3",
+        "enabled": True,
+    })
+    assert entry is not None
+    assert entry["litellm_params"]["model"] == "openai/mistralai/Mistral-7B-Instruct-v0.3"
+    assert entry["litellm_params"]["api_base"] == "http://vllm:8000"
+
+
+# --- Negative cases --------------------------------------------------------
+
+def test_provider_without_default_model_is_skipped():
+    """No default_model → no alias we can register. Skipped (not raised);
+    PR 2 adds a wildcard path for one-shot explicit `prov_id:model` calls
+    that aren't in the alias table."""
+    assert lr.entry_for_provider({
+        "id": "ollama", "type": "ollama",
+        "endpoint": "http://ollama:11434",
+        "default_model": "",
+        "enabled": True,
+    }) is None
+
+
+def test_unknown_provider_type_is_skipped_not_raised(caplog):
+    """An unknown type logs a WARNING and returns None — operator-added
+    'bedrock' or 'vertex' should not take the router build down; the
+    hand-rolled dispatcher continues to serve those while we add
+    first-class support."""
+    import logging as _logging
+    caplog.set_level(_logging.WARNING)
+    assert lr.entry_for_provider({
+        "id": "bedrock-x", "type": "bedrock",
+        "default_model": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+        "enabled": True,
+    }) is None
+    assert any("unknown provider type" in r.message for r in caplog.records)
+
+
+def test_missing_id_or_type_is_skipped():
+    """Guards: an empty id or type shouldn't produce a half-valid entry
+    LiteLLM will refuse at Router construction time."""
+    assert lr.entry_for_provider({"id": "", "type": "openai", "default_model": "gpt-4o"}) is None
+    assert lr.entry_for_provider({"id": "x", "type": "", "default_model": "gpt-4o"}) is None
+
+
+# --- Model-list assembly ---------------------------------------------------
+
+def test_build_model_list_filters_disabled_providers(monkeypatch):
+    """`enabled: False` providers never reach LiteLLM. The settings resolver
+    hides them from the DB-loaded list already, but a stray dict passed in
+    directly must still be filtered — belt-and-braces, since the operator-
+    facing toggle in Settings → LLM reads 'enabled' as the authoritative
+    switch."""
+    sample = [
+        {"id": "a", "type": "openai", "endpoint": "https://x", "api_key": "k",
+         "default_model": "gpt-4o", "enabled": True},
+        {"id": "b", "type": "openai", "endpoint": "https://y", "api_key": "k",
+         "default_model": "gpt-4o-mini", "enabled": False},
+    ]
+    monkeypatch.setattr(lr, "get_providers", lambda _s: sample)
+    out = lr._build_model_list({})
+    assert [e["model_name"] for e in out] == ["a:gpt-4o"]
+
+
+def test_build_model_list_empty_when_no_providers(monkeypatch):
+    """No providers → empty list → build_router_from_settings returns None.
+    PR 2 reads that None as 'fall back to hand-rolled dispatch'."""
+    monkeypatch.setattr(lr, "get_providers", lambda _s: [])
+    assert lr._build_model_list({}) == []
+
+
+# --- Fallbacks -------------------------------------------------------------
+
+def test_build_fallbacks_registers_task_fallbacks(monkeypatch):
+    """`fallbacks[<task>]` → `fallbacks=[{prim_alias: [backup_alias]}]`.
+    The alias strings match the ones `_build_model_list` emits, so the
+    Router correctly resolves the fallback target."""
+    def fake_route(task, _s):
+        if task == "extract":
+            return {"task": "extract", "provider": "ollama", "model": "qwen2.5:14b",
+                    "fallback": {"provider": "openai", "model": "gpt-4o-mini"}}
+        return None
+    monkeypatch.setattr(lr, "get_route", fake_route)
+    monkeypatch.setattr(lr, "LLM_TASK_NAMES", ("extract", "recon"))
+    out = lr._build_fallbacks({})
+    assert out == [{"ollama:qwen2.5:14b": ["openai:gpt-4o-mini"]}]
+
+
+def test_build_fallbacks_dedupe_self_fallback(monkeypatch):
+    """A fallback pointing at the same provider+model as the primary buys
+    nothing but a second 429. Skipped. (The hand-rolled resolver already
+    does this; the router agreement test pins the behaviour.)"""
+    def fake_route(task, _s):
+        return {"task": task, "provider": "ollama", "model": "qwen2.5:14b",
+                "fallback": {"provider": "ollama", "model": "qwen2.5:14b"}}
+    monkeypatch.setattr(lr, "get_route", fake_route)
+    monkeypatch.setattr(lr, "LLM_TASK_NAMES", ("recon",))
+    assert lr._build_fallbacks({}) == []
+
+
+# --- Public API guards ----------------------------------------------------
+
+def test_build_router_returns_none_without_providers(monkeypatch):
+    """build_router_from_settings() returns None when no providers are
+    configured. PR 2's dispatch gate reads this and keeps the hand-rolled
+    path serving everything."""
+    monkeypatch.setattr(lr, "get_providers", lambda _s: [])
+    assert lr.build_router_from_settings({}) is None
+
+
+def test_router_available_flag_type():
+    """Smoke: router_available() returns a bool, never raises on a
+    missing dependency / unimportable settings — PR 2 will branch on
+    its return value, so a crash here would take every dispatch out."""
+    assert isinstance(lr.router_available(), bool)
+
+
+def test_litellm_router_enabled_default_is_off():
+    """Opt-in kill switch defaults OFF through PRs 1-3; PR 4 flips the
+    default once end-to-end smoke tests pass. Pinning the default here
+    so a stray env-var change in a future PR fails the test visibly."""
+    # Re-read the env the module read at import time; the default is 'false'.
+    import importlib
+    importlib.reload(lr)
+    assert lr.LITELLM_ROUTER_ENABLED is False
