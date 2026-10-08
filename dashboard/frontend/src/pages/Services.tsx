@@ -1971,6 +1971,17 @@ function LlmMetricsPanel() {
       <div className="flex items-center justify-between">
         <h4 className="text-xs font-semibold flex items-center gap-1.5"><Cpu className="h-3.5 w-3.5" /> LLM Performance Metrics (7 days)</h4>
         <div className="flex items-center gap-2">
+          {/* Total spend across all callers (LiteLLM-priced calls only — the
+              hand-rolled fallback path doesn't populate cost_usd). The
+              fraction of priced calls is shown so the operator can tell
+              whether the headline total covers everything or just part. */}
+          {summary?.totals?.cost_usd != null && (
+            <span className="text-[11px] font-mono bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 px-2 py-0.5 rounded"
+              title={`Covers ${summary.totals.priced_calls} of ${summary.totals.total_calls} calls. Hand-rolled dispatch doesn't compute cost yet.`}>
+              ${Number(summary.totals.cost_usd).toFixed(4)}
+              <span className="text-emerald-500/60 ml-1">({summary.totals.priced_calls}/{summary.totals.total_calls})</span>
+            </span>
+          )}
           <button onClick={load} disabled={loading} className="text-[10px] text-primary hover:underline">
             {loading ? 'Loading...' : 'Refresh'}
           </button>
@@ -1993,6 +2004,7 @@ function LlmMetricsPanel() {
                 <th className="px-2 py-1.5 font-medium text-right">Avg Latency</th>
                 <th className="px-2 py-1.5 font-medium text-right">Avg tok/s</th>
                 <th className="px-2 py-1.5 font-medium text-right">Total Tokens</th>
+                <th className="px-2 py-1.5 font-medium text-right">Cost (USD)</th>
               </tr>
             </thead>
             <tbody>
@@ -2006,6 +2018,10 @@ function LlmMetricsPanel() {
                   <td className="px-2 py-1 text-right font-mono">{c.avg_latency_ms ? `${(c.avg_latency_ms / 1000).toFixed(1)}s` : '—'}</td>
                   <td className="px-2 py-1 text-right font-mono text-primary">{c.avg_tok_per_sec ?? '—'}</td>
                   <td className="px-2 py-1 text-right font-mono">{c.total_tokens_used?.toLocaleString() ?? '—'}</td>
+                  <td className="px-2 py-1 text-right font-mono text-emerald-300"
+                      title={c.priced_calls && c.priced_calls < c.total_calls ? `${c.priced_calls}/${c.total_calls} calls priced (rest went hand-rolled)` : undefined}>
+                    {c.total_cost_usd != null ? `$${Number(c.total_cost_usd).toFixed(4)}` : '—'}
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -2029,6 +2045,7 @@ function LlmMetricsPanel() {
                   <th className="px-1.5 py-1 text-right">Tokens</th>
                   <th className="px-1.5 py-1 text-right">tok/s</th>
                   <th className="px-1.5 py-1 text-right">Latency</th>
+                  <th className="px-1.5 py-1 text-right">Cost</th>
                   <th className="px-1.5 py-1">Status</th>
                 </tr>
               </thead>
@@ -2041,6 +2058,10 @@ function LlmMetricsPanel() {
                     <td className="px-1.5 py-0.5 text-right">{r.total_tokens ?? '—'}</td>
                     <td className="px-1.5 py-0.5 text-right text-primary font-mono">{r.tokens_per_sec ?? '—'}</td>
                     <td className="px-1.5 py-0.5 text-right font-mono">{r.latency_ms ? `${(r.latency_ms / 1000).toFixed(1)}s` : '—'}</td>
+                    <td className="px-1.5 py-0.5 text-right font-mono text-emerald-300"
+                        title={r.cost_usd == null ? 'hand-rolled dispatch — no cost computed' : undefined}>
+                      {r.cost_usd != null ? `$${Number(r.cost_usd).toFixed(5)}` : '—'}
+                    </td>
                     <td className="px-1.5 py-0.5">{r.is_error ? <span className="text-red-400">{r.error_message?.slice(0, 40) || 'error'}</span> : <span className="text-green-400">ok</span>}</td>
                   </tr>
                 ))}

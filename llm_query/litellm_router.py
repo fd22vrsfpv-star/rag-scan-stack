@@ -446,7 +446,7 @@ def litellm_completion_for(backend: str,
     # the text + usage in the same normalised form `_usage_from` emits so
     # downstream telemetry keeps the same keys.
     text = resp.choices[0].message.content if getattr(resp, "choices", None) else ""
-    usage_out: Dict[str, int] = {}
+    usage_out: Dict[str, Any] = {}
     u = getattr(resp, "usage", None)
     if u is not None:
         pt = getattr(u, "prompt_tokens", None)
@@ -458,4 +458,30 @@ def litellm_completion_for(backend: str,
             usage_out["completion_tokens"] = int(ct)
         if tt is not None:
             usage_out["total_tokens"] = int(tt)
+    # Cost — LiteLLM 1.57+ attaches a USD amount to `response._hidden_params`
+    # (`response_cost`), computed from its built-in price catalog. Grab it
+    # here so the per-call insert into `llm_request_metrics` has a real
+    # dollar figure to persist. The catalog covers every provider LiteLLM
+    # knows (Azure OpenAI, Foundry Anthropic, OpenAI direct, Anthropic
+    # native, Bedrock, Vertex, Groq, Together, Ollama = 0.0). An unknown
+    # model falls through to `None` → the schema stores NULL, which the
+    # UI renders as "—".
+    try:
+        hp = getattr(resp, "_hidden_params", None) or {}
+        cost = hp.get("response_cost") if isinstance(hp, dict) else None
+        if cost is None:
+            # Fallback for older LiteLLM lines or custom models not in the
+            # price catalog: compute from cost_calculator if importable.
+            try:
+                from litellm import completion_cost
+                cost = completion_cost(completion_response=resp)
+            except Exception:  # noqa: BLE001
+                cost = None
+        if cost is not None:
+            # Round at 6 decimal places — the price catalog's smallest unit
+            # is ~$0.000001/token for cheap models; 6 d.p. preserves it
+            # without noise.
+            usage_out["cost_usd"] = round(float(cost), 6)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("litellm_router: cost extraction failed (%s)", e)
     return text, usage_out
