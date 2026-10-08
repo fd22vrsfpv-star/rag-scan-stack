@@ -2574,6 +2574,28 @@ CREATE TRIGGER trg_app_settings_updated
   BEFORE UPDATE ON public.app_settings
   FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
 
+-- Default per-task LLM routing for the exploit synthesis + judge path.
+-- Added 2026-10-08 as the "bump 2 to a higher level" change on PR #374:
+-- route the gather-fallback, the PoC synth, and the end-of-loop judge
+-- all to deepseek4-pro with reasoning_effort=high. The hand-rolled
+-- defaults (qwen3-coder:30b) ran all 10 iterations on CVE-2024-32511
+-- without cracking it — more iterations isn't the answer, better
+-- reasoning is. These rows seed the routing table on a fresh install;
+-- an operator can override from Settings → LLM Tuning without touching
+-- SQL. Idempotent: ON CONFLICT keeps existing operator overrides.
+-- category MUST be 'config' — `common/llm_settings.py::_read_db_llm()` filters
+-- its SELECT on `category = 'config'` and silently drops rows under any other
+-- category (caught post-apply when the live settings showed azure-main
+-- defaults even after these rows were in the table).
+INSERT INTO public.app_settings (key, value, category) VALUES
+  ('llm.route.exploit.synth',             'deepseek4-pro', 'config'),
+  ('llm.route.exploit.gather_fallback',   'deepseek4-pro', 'config'),
+  ('llm.route.exploit.judge',             'deepseek4-pro', 'config'),
+  ('llm.reasoning_effort.exploit.synth',           'high', 'config'),
+  ('llm.reasoning_effort.exploit.gather_fallback', 'high', 'config'),
+  ('llm.reasoning_effort.exploit.judge',           'high', 'config')
+ON CONFLICT (key) DO NOTHING;
+
 -- ============================================================================
 -- TIER 7: Engagements & Workflow (pentest lifecycle)
 -- ============================================================================

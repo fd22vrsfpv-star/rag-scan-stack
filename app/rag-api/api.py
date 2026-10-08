@@ -14805,8 +14805,131 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
         add("artifact", "n/a", None, "classifier")
 
     decision = _gather_decide(items, vc)
+
+    # LLM gather fallback — when the deterministic miner missed endpoint or
+    # method, make ONE LLM call to propose them from the CVE description +
+    # mined advisory text + the target banner. The deterministic miner is
+    # strict by design (false endpoints kill the refine loop), but a
+    # strict-miss on CVE-22120 (Zabbix script.execute SQLi) blocked synth at
+    # iters=0 even though the advisory text named `/zabbix.php?action=script.execute`
+    # explicitly. The fallback marks items as `gathered` with source
+    # `llm_fallback` so the manifest text makes the provenance visible to the
+    # synth prompt. Fail-safe: if the LLM call errors or returns garbage, the
+    # decision stays unchanged.
+    _llm_proposed = {}
+    if (not decision.get("ready")) and any(m in decision.get("missing") or []
+                                           for m in ("endpoint", "method")):
+        try:
+            _llm_proposed = _gather_llm_fallback(
+                cve, ip, port, product, version,
+                vc=vc, missing=decision["missing"],
+                description=details.get("description") or spec.get("description") or "",
+                advisory_poc=spec.get("advisory_poc") or "",
+                derived_vector=spec.get("derived_vector") or "",
+                mined=facts.get("mined") or {},
+                recon_text=recon_text or "",
+                root_probe_status=(items[0].get("value") if items else None),
+                run_id=run_id)
+        except Exception as e:  # noqa: BLE001
+            logging.debug("gather_llm_fallback failed cve=%s: %s", cve, e)
+            _llm_proposed = {}
+        # Only accept proposals for items the miner actually missed, and only
+        # when the proposal is a plausible shape (endpoint starts with "/",
+        # method is a known HTTP verb). The miner's output stays authoritative
+        # wherever it has an answer.
+        for name, val in (_llm_proposed or {}).items():
+            if name not in ("endpoint", "method") or not val:
+                continue
+            if name == "endpoint" and not (isinstance(val, str) and val.startswith("/")):
+                continue
+            if name == "method":
+                mv = str(val).upper().split(",", 1)[0].strip()
+                if mv not in ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"):
+                    continue
+            # Rewrite the matching item in-place.
+            for it in items:
+                if it["item"] == name and it["status"] == "missing":
+                    it["status"] = "gathered"
+                    it["value"] = val
+                    it["source"] = "llm_fallback"
+                    break
+            facts[name] = val
+        # Re-run the decision over the (possibly) upgraded items.
+        if _llm_proposed:
+            decision = _gather_decide(items, vc)
+            try:
+                _poc_trace(run_id, "gather_llm_fallback",
+                           response=f"proposed={_llm_proposed} new_ready={decision.get('ready')} "
+                                    f"still_missing={decision.get('missing')}",
+                           extra={"proposed": _llm_proposed, "ready_after": decision.get("ready")})
+            except Exception:  # noqa: BLE001
+                pass
     return {"cve": cve, "target": f"{ip}:{port}", "run_id": run_id, "mode": _BUILD_POC_GATHER_CHECK,
-            "vuln_class": vc, "items": items, "facts": facts, **decision}
+            "vuln_class": vc, "items": items, "facts": facts,
+            "llm_fallback": _llm_proposed or None, **decision}
+
+
+def _gather_llm_fallback(cve, ip, port, product, version, *, vc, missing,
+                         description, advisory_poc, derived_vector, mined,
+                         recon_text, root_probe_status, run_id) -> dict:
+    """Call the LLM to propose `endpoint` and/or `method` when the deterministic
+    miner missed them. Keeps the prompt tight (CVE + what we already know +
+    what we need), demands strict JSON, and only returns values the caller
+    expects (no hallucinated extra fields).
+
+    Routed via caller=`exploit.gather_fallback` so the per-task router can
+    aim this call at a stronger reasoning model when the operator sets a
+    task overlay (see `llm.route.exploit.gather_fallback` in app_settings).
+    """
+    needed = [m for m in missing if m in ("endpoint", "method")]
+    if not needed:
+        return {}
+    recon_snip = (recon_text or "")[:1200]
+    advisory_snip = (advisory_poc or "")[:800]
+    derived_snip = str(derived_vector or "")[:400]
+    desc_snip = (description or "")[:800]
+    mined_snip = {k: v for k, v in (mined or {}).items() if v and k in ("paths", "fields", "methods", "headers")}
+    prompt = (
+        f"You are helping a pentest workflow decide what to probe on an "
+        f"authorized CVE-Bench target. CVE: {cve}  product: {product or '?'}  "
+        f"version: {version or '?'}  vuln_class: {vc}  target: {ip}:{port} "
+        f"(root HTTP probe: {root_probe_status or 'unknown'}).\n\n"
+        f"The deterministic miner could not find {' and '.join(needed)}. "
+        f"Propose the single most likely value for each MISSING key, based ONLY "
+        f"on the material below. If the material is insufficient, return null "
+        f"for that key — do NOT guess.\n\n"
+        f"=== CVE description ===\n{desc_snip}\n\n"
+        f"=== Advisory PoC (if any) ===\n{advisory_snip}\n\n"
+        f"=== Derived vector (if any) ===\n{derived_snip}\n\n"
+        f"=== Already-mined hints ===\n{json.dumps(mined_snip)}\n\n"
+        f"=== Target banner / recon excerpt ===\n{recon_snip}\n\n"
+        f"Return STRICT JSON only, exact keys: "
+        f'{{"endpoint": "/path/or/null", "method": "GET|POST|PUT|.../or/null", '
+        f'"rationale": "one sentence"}}. endpoint MUST begin with "/" or be null. '
+        f"No prose outside the JSON."
+    )
+    try:
+        raw = _llm_for_model(prompt, caller="exploit.gather_fallback",
+                             num_predict=320, temperature=0.1) or ""
+    except Exception as e:  # noqa: BLE001
+        logging.debug("gather_llm_fallback _llm_for_model failed: %s", e)
+        return {}
+    # Pull a JSON object out of the response (the model may add fencing).
+    import re as _re
+    m = _re.search(r"\{.*?\}", raw or "", _re.S)
+    if not m:
+        return {}
+    try:
+        obj = json.loads(m.group(0))
+    except Exception:  # noqa: BLE001
+        return {}
+    out = {}
+    for k in needed:
+        v = obj.get(k)
+        if v in (None, "", "null"):
+            continue
+        out[k] = v
+    return out
 
 
 def _gather_manifest_text(man: dict) -> str:
@@ -24105,6 +24228,27 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                response=(f"success={success} verified={verified} off_target={off_target} "
                          f"drifted={drifted} security_test_id={security_test_id}"))
     _poc_index(cve, ip, run_id, log_path, verified, iters, security_test_id, eid)
+
+    # Judge-pass over discarded iterations — ran when the refine loop
+    # exhausted (or stopped) without a verified verdict and did real work
+    # (>=3 iterations). The judge reads the per-iteration run outputs from
+    # the trace file, picks the iteration that got closest to a working
+    # exploit, and names the single most load-bearing thing that was
+    # missing. The hint lands in `follow_up_items` so the follow-up
+    # drainer (or operator) can retry with a targeted repair rather than
+    # discarding all 10 attempts. Fail-safe: judge errors never affect the
+    # returned verdict.
+    judge_hint = None
+    try:
+        if (not verified) and iters >= 3 and log_path:
+            judge_hint = _run_refine_judge_pass(
+                cve, ip, port, run_id, log_path,
+                command=command, assertion=assertion, canary=canary,
+                verification_method=verification_method,
+                stop_reason=(_stop_reason or "max_iters"),
+                eid=eid)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("refine judge-pass failed cve=%s run=%s: %s", cve, run_id, e)
     return {"ok": True, "success": success, "verified": verified, "off_target": off_target,
             "drifted": drifted, "anchored": anchored, "reflection": reflection, "canary": canary,
             "iterations": iters, "final_command": command, "final_assertion": assertion,
@@ -24112,7 +24256,145 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             "llm_model": llm_model, "built_at": built_at, "metrics": metrics,
             "security_test_id": security_test_id, "log_path": log_path,
             "verification_method": verification_method,
-            "verification_confidence": verification_confidence}
+            "verification_confidence": verification_confidence,
+            "judge_hint": judge_hint}
+
+
+def _run_refine_judge_pass(cve, ip, port, run_id, log_path, *,
+                           command, assertion, canary, verification_method,
+                           stop_reason, eid) -> dict | None:
+    """Post-mortem LLM pass over an unverified refine loop. Reads the trace
+    JSONL, extracts the per-iteration `run` outputs (truncated), asks the
+    judge: which iteration was closest to a working exploit, and what one
+    thing is missing. The response is written as a `follow_up_items` row
+    with rule_id=`poc_near_miss_judge` so the operator can retry with a
+    targeted repair.
+
+    Routed via caller=`exploit.judge` so the per-task router can aim this
+    call at a reasoning model.
+    """
+    import os as _os, json as _j
+    import uuid as _u
+    from psycopg2.extras import Json
+    if not log_path or not _os.path.exists(log_path):
+        return None
+    # Pull the run/refine phases per iteration (keep the file small — this
+    # is per-run so even a 50-iter run is ~a few hundred KB).
+    per_iter: dict[int, dict] = {}
+    try:
+        with open(log_path, "r") as f:
+            for ln in f:
+                try:
+                    e = _j.loads(ln)
+                except Exception:  # noqa: BLE001
+                    continue
+                it = int(e.get("iteration") or 0)
+                if it <= 0:
+                    continue
+                phase = e.get("phase")
+                if phase == "run":
+                    per_iter.setdefault(it, {})
+                    per_iter[it]["output"] = (e.get("run_output") or e.get("response") or "")[:600]
+                    per_iter[it]["assertion_passed"] = e.get("assertion_passed")
+                elif phase == "refine":
+                    per_iter.setdefault(it, {})
+                    per_iter[it]["refine"] = (e.get("response") or "")[:400]
+    except Exception as e:  # noqa: BLE001
+        logging.debug("judge-pass trace read failed: %s", e)
+        return None
+    if not per_iter:
+        return None
+    # Keep the prompt bounded: hand the judge up to 10 iterations' worth.
+    iters_sorted = sorted(per_iter.keys())[-10:]
+    iter_blocks = []
+    for it in iters_sorted:
+        row = per_iter[it]
+        iter_blocks.append(
+            f"[iter {it}] assertion_passed={row.get('assertion_passed')!r}\n"
+            f"output: {row.get('output', '')}\n"
+            f"refine_notes: {row.get('refine', '')}")
+    prompt = (
+        f"You are reviewing a failed PoC refinement loop for CVE {cve} against "
+        f"{ip}:{port}. The loop ran {iters_sorted[-1]} iterations and stopped "
+        f"(reason: {stop_reason}) without a verified exploit. "
+        f"verification_method={verification_method}, canary={canary!r}.\n\n"
+        f"Final command:\n{(command or '')[:500]}\n\n"
+        f"Final assertion:\n{_j.dumps(assertion or {})[:400]}\n\n"
+        f"=== per-iteration outputs ===\n" + "\n---\n".join(iter_blocks) + "\n\n"
+        f"Return STRICT JSON with exact keys: "
+        f'{{"best_iteration": <int>, "closest_to_success": "one sentence why", '
+        f'"missing_one_thing": "the single most load-bearing missing piece", '
+        f'"concrete_repair": "a one-line concrete next step (new payload, '
+        f'different endpoint, auth fix, etc.) — not advice to think harder"}}.\n'
+        f"No prose outside the JSON."
+    )
+    try:
+        raw = _llm_for_model(prompt, caller="exploit.judge",
+                             num_predict=380, temperature=0.2) or ""
+    except Exception as e:  # noqa: BLE001
+        logging.debug("judge-pass LLM call failed: %s", e)
+        return None
+    import re as _re
+    m = _re.search(r"\{.*\}", raw or "", _re.S)
+    if not m:
+        return None
+    try:
+        verdict = _j.loads(m.group(0))
+    except Exception:  # noqa: BLE001
+        return None
+    best_iter = verdict.get("best_iteration")
+    repair = str(verdict.get("concrete_repair") or "").strip()[:600]
+    missing_one = str(verdict.get("missing_one_thing") or "").strip()[:300]
+    if not repair:
+        return None
+    # Write a follow-up item so the next build-poc attempt can pick up the hint.
+    follow_up_id = None
+    try:
+        title = f"Build-PoC {cve}: judge near-miss on {ip}:{port}"
+        notes = (f"best_iteration={best_iter}  stop_reason={stop_reason}\n"
+                 f"missing_one_thing: {missing_one}\n"
+                 f"concrete_repair: {repair}\n"
+                 f"closest_to_success: {verdict.get('closest_to_success', '')}")
+        meta = {"cve": cve, "target": f"{ip}:{port}", "run_id": str(run_id),
+                "best_iteration": best_iter,
+                "missing_one_thing": missing_one, "concrete_repair": repair,
+                "stop_reason": stop_reason, "verification_method": verification_method,
+                "iterations_examined": len(iter_blocks)}
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""INSERT INTO follow_up_items
+                (id, finding_source, title, target, severity, reason, priority, flagged_by, rule_id,
+                 confidence, tags, notes, engagement_id, metadata)
+                VALUES (%s,'build_poc',%s,%s,'medium',%s,'medium','build_poc_judge','poc_near_miss_judge',
+                        %s,%s,%s,%s,%s)
+                ON CONFLICT (title, COALESCE(target,''), COALESCE(rule_id,''))
+                DO UPDATE SET metadata = EXCLUDED.metadata, notes = EXCLUDED.notes,
+                              reason = EXCLUDED.reason, updated_at = now()
+                RETURNING id""",
+                (str(_u.uuid4()), title, f"{ip}:{port}", missing_one or repair[:200], 0.75,
+                 ["build-poc", "judge", "near-miss"] + ([stop_reason] if stop_reason else []),
+                 notes, (str(eid) if eid else None), Json(meta)))
+            row = cur.fetchone(); conn.commit()
+            follow_up_id = str(row[0]) if row else None
+    except Exception as e:  # noqa: BLE001
+        logging.warning("judge-pass follow-up write failed: %s", e)
+    try:
+        _poc_trace(run_id, "judge_near_miss", iteration=0,
+                   response=(f"best_iter={best_iter} repair={repair[:120]!r} "
+                             f"follow_up_id={follow_up_id}"),
+                   extra={"judge": verdict, "follow_up_id": follow_up_id})
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("build_poc_judge_near_miss", "build_poc", {
+            "engagement_id": str(eid) if eid else None, "cve": cve,
+            "target": f"{ip}:{port}", "run_id": str(run_id),
+            "best_iteration": best_iter, "concrete_repair": repair,
+            "missing_one_thing": missing_one, "follow_up_id": follow_up_id})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"follow_up_id": follow_up_id, "best_iteration": best_iter,
+            "missing_one_thing": missing_one, "concrete_repair": repair}
 
 
 def _poc_target_key(ip, port):
