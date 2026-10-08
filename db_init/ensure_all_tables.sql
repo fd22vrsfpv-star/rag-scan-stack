@@ -1076,6 +1076,11 @@ CREATE TABLE IF NOT EXISTS public.llm_request_metrics (
 ALTER TABLE public.llm_request_metrics ALTER COLUMN session_id DROP NOT NULL;
 ALTER TABLE public.llm_request_metrics ADD COLUMN IF NOT EXISTS caller text;
 ALTER TABLE public.llm_request_metrics ADD COLUMN IF NOT EXISTS tokens_per_sec numeric;
+-- cost_usd: dollar amount per call, computed by LiteLLM's built-in price
+-- catalog on the LiteLLM dispatch path (nullable because hand-rolled calls
+-- + models LiteLLM doesn't price yet come through as NULL — the summary
+-- SUMs over NOT NULL rows and the UI renders NULL as "—").
+ALTER TABLE public.llm_request_metrics ADD COLUMN IF NOT EXISTS cost_usd numeric(10,6);
 CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_session_id ON public.llm_request_metrics(session_id);
 CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_model_name ON public.llm_request_metrics(model_name);
 CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_agent_name ON public.llm_request_metrics(agent_name);

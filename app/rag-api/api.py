@@ -293,10 +293,21 @@ def llm_generate(prompt: str, caller: str, model: str = None, think: bool = Fals
             eval_dur = data.get("eval_duration", 0)
             result["tokens_per_sec"] = round(result["eval_count"] / (eval_dur / 1e9), 1) if eval_dur else 0
             result["prompt_tokens"] = data.get("prompt_eval_count", 0)
+            # Cost — llm_query's LiteLLM path puts `cost_usd` into `usage`
+            # (from LiteLLM's built-in price catalog); the hand-rolled path
+            # omits it. NULL on hand-rolled is intentional — the UI shows
+            # "—" and the summary sums over NOT NULL rows.
+            _usage = data.get("usage") or {}
+            if isinstance(_usage, dict) and _usage.get("cost_usd") is not None:
+                try:
+                    result["cost_usd"] = float(_usage["cost_usd"])
+                except Exception:  # noqa: BLE001
+                    pass
             result["ok"] = True
             result["model"] = model
-            logger.info("[llm:%s] %s: %d tokens, %.1f tok/s, %dms",
-                        caller, model, result["eval_count"], result["tokens_per_sec"], latency_ms)
+            logger.info("[llm:%s] %s: %d tokens, %.1f tok/s, %dms, $%s",
+                        caller, model, result["eval_count"], result["tokens_per_sec"],
+                        latency_ms, result.get("cost_usd", "—"))
         else:
             result["error"] = f"HTTP {resp.status_code}"
             logger.warning("[llm:%s] HTTP %s from Ollama", caller, resp.status_code)
@@ -309,15 +320,21 @@ def llm_generate(prompt: str, caller: str, model: str = None, think: bool = Fals
     # Log to database (fire-and-forget)
     try:
         with get_db(autocommit=True) as conn, conn.cursor() as cur:
+            # cost_usd is a nullable NUMERIC(10,6) column added for the LiteLLM
+            # migration — the LiteLLM dispatch path returns `usage.cost_usd`
+            # from LiteLLM's built-in price catalog; a NULL here means the
+            # call went through a path that doesn't compute cost (hand-rolled
+            # fallback, or a model LiteLLM's catalog doesn't price yet).
             cur.execute("""INSERT INTO llm_request_metrics
                 (caller, model_name, prompt_tokens, completion_tokens, total_tokens, tokens_per_sec,
-                 latency_ms, is_error, error_message, request_params)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                 latency_ms, is_error, error_message, request_params, cost_usd)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (caller, model or task, result.get("prompt_tokens", 0), result["eval_count"],
                  result.get("prompt_tokens", 0) + result["eval_count"], result["tokens_per_sec"],
                  result["latency_ms"], not result["ok"], result.get("error"),
                  Json({"temperature": temperature, "num_predict": num_predict, "prompt_len": len(prompt),
-                       "prompt": prompt[:8000], "response": result["response"][:8000]})))
+                       "prompt": prompt[:8000], "response": result["response"][:8000]}),
+                 result.get("cost_usd")))
     except Exception:
         pass
 
@@ -952,9 +969,13 @@ def ensure_phase0_schema():
             is_error            boolean NOT NULL DEFAULT false,
             error_message       text,
             request_params      jsonb DEFAULT '{}'::jsonb,
+            cost_usd            numeric(10,6),
             created_at          timestamptz NOT NULL DEFAULT now()
         )
         """,
+        # Nullable idempotent ALTERs for installs that pre-date the cost_usd
+        # column (the runtime CREATE above only fires on a FRESH table).
+        "ALTER TABLE llm_request_metrics ADD COLUMN IF NOT EXISTS cost_usd numeric(10,6)",
         "CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_session_id ON llm_request_metrics(session_id)",
         "CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_model_name ON llm_request_metrics(model_name)",
         "CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_agent_name ON llm_request_metrics(agent_name)",
