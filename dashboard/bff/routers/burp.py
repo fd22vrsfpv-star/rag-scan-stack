@@ -10,18 +10,24 @@ router = APIRouter()
 
 
 def _burp_url() -> str:
+    """Base URL for Burp Pro's REST API, WITH the API key mounted into the
+    path. Burp expects the key as a path segment (`/<key>/v0.1/scan`), NOT
+    as an Authorization header — bearer auth returns 401. Every caller
+    composes URLs as `f"{_burp_url()}/v0.1/..."`, so including the key here
+    keeps the call sites identical and leaves the key out of logs."""
     s = get_settings()
     if not s.burp_api_url:
         raise HTTPException(503, "Burp API URL not configured. Set BURP_API_URL in environment.")
-    return s.burp_api_url.rstrip("/")
+    url = s.burp_api_url.rstrip("/")
+    if s.burp_api_key:
+        url = f"{url}/{s.burp_api_key}"
+    return url
 
 
 def _burp_headers() -> dict:
-    s = get_settings()
-    h = {"Content-Type": "application/json"}
-    if s.burp_api_key:
-        h["Authorization"] = f"Bearer {s.burp_api_key}"
-    return h
+    # Burp's REST API doesn't use Authorization headers (see _burp_url).
+    # Keep this helper so handlers can add per-request headers in future.
+    return {"Content-Type": "application/json"}
 
 
 @router.get("/api/burp/status")
@@ -32,11 +38,15 @@ async def burp_status():
         return {"connected": False, "error": "BURP_API_URL not configured"}
     try:
         async with httpx.AsyncClient(timeout=5) as c:
-            resp = await c.get(f"{base}/v0.1/scan", headers=_burp_headers())
-            return {"connected": True, "url": base, "status_code": resp.status_code,
-                    "scans": resp.json() if resp.status_code == 200 else None}
+            # /v0.1/ returns 200 on a valid key; /v0.1/scan requires a task id
+            # (GET without one is 400 "Malformed URL") so it isn't a status probe.
+            resp = await c.get(f"{base}/v0.1/", headers=_burp_headers())
+            # Don't leak the key: report the URL without the path segment.
+            safe_url = (get_settings().burp_api_url or "").rstrip("/")
+            return {"connected": True, "url": safe_url, "status_code": resp.status_code,
+                    "scans": None}
     except Exception as e:
-        return {"connected": False, "url": base, "error": str(e)}
+        return {"connected": False, "url": (get_settings().burp_api_url or ""), "error": str(e)}
 
 
 @router.post("/api/burp/scan")
