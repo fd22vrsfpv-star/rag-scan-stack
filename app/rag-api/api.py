@@ -25465,6 +25465,12 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             if reflection:
                 verified = False
     off_target = bool(success and not verified)
+    # 2026-10-09: an assertion that passed on a DRIFTED endpoint is not a
+    # success — CVE-2024-5314 reported `stop=success verified=False` on the
+    # batch summary line. Name the real stop reason once, here, so the attempts
+    # row, derived_cve_specs and the return value all say the same thing.
+    if not _stop_reason:
+        _stop_reason = "off_target" if off_target else ("success" if success else None)
     security_test_id = None
     log_path = _poc_run_file(run_id)
     metrics["iterations"] = iters

@@ -77,6 +77,10 @@ def test_refine_loop_records_its_outcome_on_derived_specs():
     assert src and '_touch_derived_spec_outcome(cve, verified, (_stop_reason or "max_iters"))' in src
     helper = _func_src("_touch_derived_spec_outcome")
     assert helper and "UPDATE derived_cve_specs" in helper and "INSERT" not in helper
+    # 2026-10-09: an assertion that passed on a drifted endpoint stops as
+    # `off_target`, never `success` (CVE-2024-5314 read `stop=success verified=False`)
+    assert '_stop_reason = "off_target" if off_target else ("success" if success else None)' in src
+    assert src.index("off_target = bool(success and not verified)") < src.index('_touch_derived_spec_outcome(cve, verified')
 
 
 def test_build_wall_clock_is_unlimited_unless_explicit():
