@@ -1564,6 +1564,37 @@ CREATE TABLE IF NOT EXISTS public.exploit_store_versions (
     created_at    timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS ix_exploit_versions_parent ON public.exploit_store_versions(exploit_id, version DESC);
+
+-- One row per build-PoC ATTEMPT (2026-10-09). exploit_store only gets a row when
+-- a command was built; 20 of 33 CVE-Bench attempts halted at the gather gate
+-- and left nothing queryable. Keyed (engagement_id, cve, ip, run_id) — the
+-- first build-poc table that does not rely on IP alone (CVE-Bench reuses one
+-- IP for every target). Holds the gather manifest, the run's own recon, the
+-- trace summary and the end-of-attempt failure analysis that review.md and
+-- the UI attempt summary render. Mirrored by api._ensure_build_poc_attempts_table().
+CREATE TABLE IF NOT EXISTS public.build_poc_attempts (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id uuid,
+    cve text NOT NULL,
+    ip text NOT NULL,
+    port integer,
+    run_id text NOT NULL UNIQUE,
+    exploit_store_id uuid,
+    verified boolean NOT NULL DEFAULT false,
+    stage_reached text,
+    stop_reason text,
+    missing text[] NOT NULL DEFAULT '{}',
+    gather_manifest jsonb,
+    live_recon jsonb,
+    summary jsonb,
+    failure_analysis jsonb,
+    poc_log_path text,
+    llm_model text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_bpa_cve_ip ON public.build_poc_attempts(cve, ip, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_bpa_eng ON public.build_poc_attempts(engagement_id);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_exploit_versions_num ON public.exploit_store_versions(exploit_id, version);
 
 CREATE TABLE IF NOT EXISTS public.security_test_runs (

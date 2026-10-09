@@ -15367,6 +15367,21 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
     else:
         add("auth", "n/a", "not required by advisory/preconditions", "analysis")
 
+    # 7b. WordPress nonces — per-user, so only worth harvesting with a session.
+    # Five WP runs resolved /wp-admin/admin-ajax.php and then fought the nonce
+    # (2026-10-09). Recorded as facts + a guidance block; never a gate item.
+    _is_wp = ("wordpress" in (str(product or "") + " " + (recon_text or "")[:20000]).lower()
+              or any("/wp-" in str(p) for p in (live.get("crawl_urls") or []) + (live.get("zap_paths") or []))
+              or any(str(fm.get("path") or "") == "/wp-login.php" for fm in (live.get("form_fields") or [])))
+    if _is_wp and cookie:
+        try:
+            _pre = _fetch_preconditions(ip, port, timeout=timeout, cookie_header=cookie)
+            if _pre.get("tokens") or _pre.get("by_object"):
+                facts["wp_nonces"] = {"tokens": _pre.get("tokens") or [],
+                                      "by_object": _pre.get("by_object") or {}}
+        except Exception as e:  # noqa: BLE001
+            logging.debug("gather: wp nonce harvest failed: %s", e)
+
     # 8. OOB sink
     sink = spec.get("oob_sink_url")
     if vc in _GATHER_OOB_CLASSES:
@@ -15685,6 +15700,17 @@ def _gather_manifest_text(man: dict) -> str:
         zp = lr.get("zap_paths") or []
         if zp:
             lines.append(f"  zap paths ({len(zp)}): " + ", ".join(zp[:10]) + (" …" if len(zp) > 10 else ""))
+
+    wpn = facts.get("wp_nonces") or {}
+    if wpn.get("tokens") or wpn.get("by_object"):
+        lines.append("")
+        lines.append("KNOWN WP NONCES (harvested WITH the session; per-user — use as the matching POST field, "
+                     "e.g. `security=`/`nonce=`/`_wpnonce=` for the plugin's admin-ajax action):")
+        for obj, val in list((wpn.get("by_object") or {}).items())[:8]:
+            lines.append(f"  {obj}.nonce = {val}")
+        for t in (wpn.get("tokens") or [])[:10]:
+            if "." not in t.split("=", 1)[0]:
+                lines.append(f"  {t}")
 
     # Scan-side telemetry already captured on this target. Carried into the
     # synth prompt via guidance_extra so synth builds against what we already
@@ -19766,37 +19792,60 @@ def _poc_needs_precondition(output):
     return any(s in low for s in _POC_PRECOND_SIGNALS)
 
 
-def _fetch_preconditions(ip, port, timeout=8):
+def _fetch_preconditions(ip, port, timeout=8, cookie_header=None, paths=None):
     """Best-effort: fetch likely exploit preconditions (CSRF nonce / token / session
     cookie) from the target so the refine step can bake them into the PoC. Returns
-    {tokens, cookies, base}."""
+    {tokens, cookies, base, by_object}.
+
+    With `cookie_header` (an authenticated session) the pages are fetched AS that
+    user and the WP admin pages are included: WordPress nonces are per-user, so
+    an anonymous `_wpnonce` is useless for an authenticated admin-ajax action
+    (five CVE-Bench WP runs fought the nonce for up to 15 iterations,
+    2026-10-09). `by_object` maps a `wp_localize_script` object name to its
+    nonce (`{"htmega_ajax": "240c8d3aa3"}`) so synth can pick the one the
+    plugin's `action=` expects. All pages are read when a cookie is given; the
+    anonymous scan keeps its first-hit short-circuit."""
     import httpx as _hx, re as _re
     Q = "[" + chr(34) + chr(39) + "]"          # matches a " or a '
     NQ = "[^" + chr(34) + chr(39) + "]"        # any non-quote char
     pat_input = r"name=" + Q + "(" + NQ + r"*(?:nonce|token|csrf|xsrf)" + NQ + r"*)" + Q + r"[^>]*value=" + Q + "(" + NQ + r"+)" + Q
-    pat_json = Q + r"(?:nonce|_wpnonce|csrf[_-]?token|authenticity_token)" + Q + r"\s*:\s*" + Q + "(" + NQ + r"+)" + Q
+    pat_json = Q + r"(?:nonce|_wpnonce|_ajax_nonce|ajax_nonce|security|csrf[_-]?token|authenticity_token)" + Q + r"\s*:\s*" + Q + "(" + NQ + r"+)" + Q
     pat_meta = r"<meta[^>]+name=" + Q + r"(?:csrf-token|_csrf)" + Q + r"[^>]+content=" + Q + "(" + NQ + r"+)" + Q
+    # `var pluginObj = {"ajax_url":"…","nonce":"abcdef0123"}` — the object name
+    # is the clue to which admin-ajax action the nonce belongs to.
+    pat_localize = r"var\s+(\w+)\s*=\s*\{[^}]{0,2000}?" + Q + r"(?:nonce|_wpnonce|_ajax_nonce|ajax_nonce|security)" + Q + r"\s*:\s*" + Q + r"([A-Za-z0-9]{6,40})" + Q
+    pat_wpnonce_url = r"_wpnonce=([a-f0-9]{8,12})"
     scheme = "https" if int(port or 80) in (443, 8443) else "http"
     base = f"{scheme}://{ip}:{port or 80}"
-    tokens, cookies = set(), set()
-    for pth in ("/", "/wp-login.php", "/wp-admin/", "/login", "/admin", "/index.php"):
+    tokens, cookies, by_object = set(), set(), {}
+    hdrs = {"Cookie": cookie_header} if cookie_header else {}
+    page_list = list(paths) if paths else ["/", "/wp-login.php", "/wp-admin/", "/login", "/admin", "/index.php"]
+    if cookie_header and not paths:
+        page_list += ["/wp-admin/profile.php", "/wp-admin/index.php", "/wp-admin/admin.php", "/wp-admin/users.php"]
+    for pth in page_list:
         try:
-            r = _hx.get(base + pth, timeout=timeout, verify=False, follow_redirects=True)
+            r = _hx.get(base + pth, timeout=timeout, verify=False, follow_redirects=True, headers=hdrs)
         except Exception:  # noqa: BLE001
             continue
-        body = (r.text or "")[:80000]
+        body = (r.text or "")[:200000]
         for m in _re.finditer(pat_input, body, _re.I):
             tokens.add(f"{m.group(1)}={m.group(2)}")
         for m in _re.finditer(pat_json, body, _re.I):
             tokens.add(f"nonce={m.group(1)}")
         for m in _re.finditer(pat_meta, body, _re.I):
             tokens.add(f"csrf-token={m.group(1)}")
+        for m in _re.finditer(pat_localize, body, _re.I | _re.S):
+            by_object.setdefault(m.group(1), m.group(2))
+            tokens.add(f"{m.group(1)}.nonce={m.group(2)}")
+        for m in _re.finditer(pat_wpnonce_url, body):
+            tokens.add(f"_wpnonce={m.group(1)}")
         sc = r.headers.get("set-cookie")
         if sc:
             cookies.add(sc.split(";")[0])
-        if tokens or cookies:
+        if (tokens or cookies) and not cookie_header:
             break
-    return {"tokens": sorted(tokens)[:8], "cookies": sorted(cookies)[:5], "base": base}
+    return {"tokens": sorted(tokens)[:24], "cookies": sorted(cookies)[:5], "base": base,
+            "by_object": dict(list(by_object.items())[:16])}
 
 
 _LOGIN_PATH_CANDIDATES = ("/wp-login.php", "/login", "/user/login", "/admin/login",
@@ -27531,6 +27580,119 @@ def _ensure_poc_hints_table():
         cur.execute("""CREATE INDEX IF NOT EXISTS ix_poc_hints_cve
                        ON public.poc_hints(cve, active)""")
         conn.commit()
+
+
+def _ensure_build_poc_attempts_table():
+    # Mirrors db_init/ensure_all_tables.sql — keep both in sync.
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS public.build_poc_attempts (
+            id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+            engagement_id uuid,
+            cve text NOT NULL,
+            ip text NOT NULL,
+            port integer,
+            run_id text NOT NULL UNIQUE,
+            exploit_store_id uuid,
+            verified boolean NOT NULL DEFAULT false,
+            stage_reached text,
+            stop_reason text,
+            missing text[] NOT NULL DEFAULT '{}',
+            gather_manifest jsonb,
+            live_recon jsonb,
+            summary jsonb,
+            failure_analysis jsonb,
+            poc_log_path text,
+            llm_model text,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            updated_at timestamptz NOT NULL DEFAULT now())""")
+        cur.execute("""CREATE INDEX IF NOT EXISTS ix_bpa_cve_ip
+                       ON public.build_poc_attempts(cve, ip, created_at DESC)""")
+        cur.execute("""CREATE INDEX IF NOT EXISTS ix_bpa_eng
+                       ON public.build_poc_attempts(engagement_id)""")
+        conn.commit()
+
+
+_ATTEMPT_REDACT_KEYS = ("cookie_header", "cookies", "password", "_auto_cookie", "api_key", "secret")
+
+
+def _redact_attempt_blob(obj, depth=0):
+    """Drop session cookies / passwords before an attempt row or webhook payload
+    is written (the trace already carries them; the DB row must not)."""
+    if depth > 8:
+        return obj
+    if isinstance(obj, dict):
+        return {k: ("[redacted]" if str(k).lower() in _ATTEMPT_REDACT_KEYS else _redact_attempt_blob(v, depth + 1))
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redact_attempt_blob(v, depth + 1) for v in obj[:200]]
+    return obj
+
+
+def _record_build_poc_attempt(*, run_id, cve, ip, port, eid=None, exploit_store_id=None,
+                              verified=False, stage_reached=None, stop_reason=None, missing=None,
+                              gather_manifest=None, live_recon=None, summary=None,
+                              failure_analysis=None, poc_log_path=None, llm_model=None):
+    """Upsert the per-run attempt row. Returns the row id or None (fail-soft)."""
+    from psycopg2.extras import Json
+    try:
+        _ensure_build_poc_attempts_table()
+        missing_list = [str(m) for m in (missing or [])]
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""INSERT INTO build_poc_attempts
+                (run_id, engagement_id, cve, ip, port, exploit_store_id, verified, stage_reached,
+                 stop_reason, missing, gather_manifest, live_recon, summary, failure_analysis,
+                 poc_log_path, llm_model)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (run_id) DO UPDATE SET
+                    exploit_store_id = COALESCE(EXCLUDED.exploit_store_id, build_poc_attempts.exploit_store_id),
+                    verified = EXCLUDED.verified,
+                    stage_reached = COALESCE(EXCLUDED.stage_reached, build_poc_attempts.stage_reached),
+                    stop_reason = COALESCE(EXCLUDED.stop_reason, build_poc_attempts.stop_reason),
+                    missing = EXCLUDED.missing,
+                    gather_manifest = COALESCE(EXCLUDED.gather_manifest, build_poc_attempts.gather_manifest),
+                    live_recon = COALESCE(EXCLUDED.live_recon, build_poc_attempts.live_recon),
+                    summary = COALESCE(EXCLUDED.summary, build_poc_attempts.summary),
+                    failure_analysis = COALESCE(EXCLUDED.failure_analysis, build_poc_attempts.failure_analysis),
+                    poc_log_path = COALESCE(EXCLUDED.poc_log_path, build_poc_attempts.poc_log_path),
+                    llm_model = COALESCE(EXCLUDED.llm_model, build_poc_attempts.llm_model),
+                    updated_at = now()
+                RETURNING id""",
+                (str(run_id), (str(eid) if eid else None), str(cve), str(ip),
+                 (int(port) if port is not None else None),
+                 (str(exploit_store_id) if exploit_store_id else None), bool(verified),
+                 stage_reached, stop_reason, missing_list,
+                 (Json(_redact_attempt_blob(gather_manifest)) if gather_manifest is not None else None),
+                 (Json(_redact_attempt_blob(live_recon)) if live_recon is not None else None),
+                 (Json(_redact_attempt_blob(summary)) if summary is not None else None),
+                 (Json(_redact_attempt_blob(failure_analysis)) if failure_analysis is not None else None),
+                 poc_log_path, llm_model))
+            row = cur.fetchone()
+            conn.commit()
+            return str(row[0]) if row else None
+    except Exception as e:  # noqa: BLE001
+        logging.warning("build_poc_attempts upsert failed run=%s: %s", run_id, e)
+        return None
+
+
+def _read_trace_file(log_path, limit=5000):
+    """All JSONL entries of one run's trace, by path (blocked runs never get a
+    store id, so the store-id reader cannot serve them)."""
+    import json as _j
+    out = []
+    try:
+        if not log_path or not os.path.exists(log_path):
+            return out
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    out.append(_j.loads(line))
+                except Exception:  # noqa: BLE001
+                    continue
+                if len(out) >= limit:
+                    break
+    except Exception as e:  # noqa: BLE001
+        logging.debug("_read_trace_file failed %s: %s", log_path, e)
+    return out
 
 
 def _load_hints_for(cve, ip=None, port=None):
