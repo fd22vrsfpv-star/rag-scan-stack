@@ -313,27 +313,25 @@ that commit in a reviewed PR; otherwise delete the branch.
 
 ### Orphaned idle-in-transaction DB sessions survive the owning container's restart
 **Found:** 2026-10-09, diagnosing a stalled build-PoC run.
-**Evidence:** `pg_stat_activity` on the live DB showed 28 non-idle/long sessions:
-one `idle in transaction` backend (pid 3431892, `RELEASE SAVEPOINT any_scope`,
-idle 5 h) blocking nine `INSERT INTO follow_up_items …` statements for up to
-2.2 h (`wait_event_type='Lock'`, `pg_blocking_pids` → 3431892), plus ~15 more
-idle-in-transaction sessions at `osint_agent` savepoints (`host_aliases`,
-`any_scope`, `followup_insert`, `already_flagged_check`) from two client IPs.
-The statements belong to `app/rag-api/osint_agent.py` (`scan_new_findings`, a
-FastAPI background task on every ingest, raw `psycopg2.connect` — no timeouts),
-yet the blocker outlived two `docker compose restart rag-api` cycles, so the
-backend is kept alive on the DB side after the local socket died (the SSH
-tunnel `rag-db-tunnel` is the only path to the DB). Server settings:
-`idle_in_transaction_session_timeout=0`, `lock_timeout=0`, `statement_timeout=0`.
-Only the rag-api pool sets a per-connection idle cap (2 min).
-**Where:** `app/rag-api/osint_agent.py::_get_conn` (now sets a 5-min idle cap +
-15 s lock wait), `app/rag-api/api.py::_get_pool` (idle cap 2 min, lock_timeout
-15 s since 2026-10-09), the remote Postgres server config, `ssh-tunnel/`.
-**Done when:** the server has a database-level default
-(`ALTER DATABASE scans SET idle_in_transaction_session_timeout = '10min'` and a
-`lock_timeout`) so a leaked transaction cannot outlive its client regardless of
-code path, the tunnel carries TCP keepalives (`ServerAliveInterval` /
-`tcp_keepalives_idle` on the server) so a dead local socket ends the backend
-within minutes, and a re-check of `pg_stat_activity` after a service restart
-shows no session older than that cap.
+**Evidence:** `pg_stat_activity` showed one `idle in transaction` backend (5 h,
+`osint_agent` savepoints) blocking nine `follow_up_items` INSERTs for up to
+2.2 h, plus ~15 more idle-in-transaction backends at the same savepoints — a new
+one roughly every 20 min since 04:00 — all from this host's tunnel address and
+all surviving two `docker compose restart rag-api` cycles. 29 remote backends vs
+7 live tunnel-local connections: the DB side kept backends whose local socket
+was gone. Server defaults were `idle_in_transaction_session_timeout=0`,
+`lock_timeout=0`.
+**Update 2026-10-09 (operator approved):** `ALTER DATABASE scans SET
+idle_in_transaction_session_timeout='10min'` and `SET lock_timeout='60s'`
+applied and persisted (`pg_db_role_setting`); 26 orphaned backends + the stale
+waiter chain terminated — `lock_waiters=0 idle_in_tx=0`. Client-side guards:
+`osint_agent._get_conn()` (5 min / 15 s), rag-api pool (`lock_timeout=15s`),
+the attempts upsert + failure-analysis follow-up (`SET LOCAL lock_timeout='5s'`).
+**Where:** `ssh-tunnel/` (`rag-db-tunnel`), the remote Postgres server config,
+`app/rag-api/osint_agent.py`, `app/rag-api/api.py::_get_pool`.
+**Done when:** the tunnel carries TCP keepalives (`ServerAliveInterval` on the
+ssh side and/or `tcp_keepalives_idle` on the server) so a dead local socket ends
+its backend within minutes rather than at the 10-min cap, and a
+`pg_stat_activity` check after a rag-api restart shows no backend older than
+that cap.
 **Enforced by:** not enforced
