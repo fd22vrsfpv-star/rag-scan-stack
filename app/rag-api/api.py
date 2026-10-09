@@ -18990,7 +18990,7 @@ def _load_refine_patterns(force=False):
     return rows
 
 
-def _match_refine_patterns(output, assertion, canary, command):
+def _match_refine_patterns(output, assertion, canary, command, context=None):
     """Return the guidance blocks whose structured triggers match the current
     iter's state. Operators extend coverage by editing
     knowledge/refine_error_patterns.yaml (or by promoting a learned pattern
@@ -19014,11 +19014,34 @@ def _match_refine_patterns(output, assertion, canary, command):
     a = assertion if isinstance(assertion, dict) else {}
     cmd = command or ""
     cmd_lc = cmd.lower()
+    # 2026-10-09 — context from the loop: `iteration` (1-based) and the
+    # iteration's normalised `error_signature` (api._error_signature). Two more
+    # trigger keys read them:
+    #   min_iteration:    int — do not fire before this iteration (the first
+    #                     failure is expected; a "reflection risk" lecture on
+    #                     iteration 1 was 1,531 injections for 9 passes)
+    #   error_signature:  str | [str] — fire when the iteration's signature
+    #                     equals one of these (how error-memory-learned
+    #                     patterns match: the signature is already normalised)
+    # and one budget key, applied by the loop, not here:
+    #   max_per_build:    int — injections allowed per build (default
+    #                     REFINE_PATTERN_MAX_INJECT=2); past it the loop says
+    #                     "already applied N× without effect" instead.
+    ctx = context if isinstance(context, dict) else {}
+    cur_it = int(ctx.get("iteration") or 0)
+    cur_sig = str(ctx.get("error_signature") or "")
     matched = []
     for row in _load_refine_patterns():
         trig = row.get("triggers") or {}
         if not isinstance(trig, dict):
             continue
+        if trig.get("min_iteration") and cur_it and cur_it < int(trig["min_iteration"]):
+            continue
+        want_sig = trig.get("error_signature")
+        if want_sig:
+            sigs = [want_sig] if isinstance(want_sig, str) else list(want_sig or [])
+            if not cur_sig or cur_sig not in sigs:
+                continue
         # output_contains — any substring match wins
         subs = trig.get("output_contains")
         if subs:
@@ -19063,7 +19086,8 @@ def _match_refine_patterns(output, assertion, canary, command):
                          "guidance": row.get("guidance") or "",
                          "pending": bool(row.get("pending")),
                          "trial_count": row.get("trial_count") or 0,
-                         "success_count": row.get("success_count") or 0})
+                         "success_count": row.get("success_count") or 0,
+                         "max_per_build": trig.get("max_per_build")})
     return matched
 
 
@@ -19240,9 +19264,64 @@ def _mine_refine_pattern_candidates(limit=200, min_hits=3):
                     break  # one signal per iter
         except Exception as e:  # noqa: BLE001
             logging.debug("mine skipping %s: %s", f, e)
+    # ── 2026-10-09: second source — the cross-run error memory ──────────────
+    # build_poc_error_memory already holds exactly the (error, what the next
+    # command changed, did it resolve) tuple this miner was written to dig out
+    # of traces — and it is populated by EVERY build, not only the converged
+    # ones. A normalised signature that ≥ min_hits DISTINCT runs got past, with
+    # a dominant change_summary, becomes a pending learned pattern whose trigger
+    # is `error_signature` (exact match on the normalised signature; see
+    # _match_refine_patterns). Still gated: operator approves.
+    em_candidates = {}
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""SELECT signature, status_tier, cve, run_id, change_summary, next_command, verified
+                             FROM build_poc_error_memory
+                            WHERE resolved AND next_command IS NOT NULL
+                              AND change_summary IS NOT NULL
+                              AND change_summary NOT IN ('identical command', 'no next command')
+                            ORDER BY created_at DESC LIMIT 5000""")
+            for r in cur.fetchall():
+                em_candidates.setdefault(r["signature"], []).append(dict(r))
+    except Exception as e:  # noqa: BLE001
+        logging.debug("mine: error-memory source unavailable: %s", e)
     # Promote any signal seen >= min_hits times
     promoted = []
     with get_db() as conn, conn.cursor() as cur:
+        for sig, hits in em_candidates.items():
+            distinct_runs = {h["run_id"] for h in hits}
+            if len(distinct_runs) < min_hits:
+                continue
+            import hashlib as _hl
+            pid = "learned_em_" + _hl.sha1(sig.encode("utf-8", "replace")).hexdigest()[:10]
+            cur.execute("SELECT 1 FROM public.refine_error_patterns WHERE id = %s", (pid,))
+            if cur.fetchone():
+                continue
+            from collections import Counter as _Ctr
+            changes = _Ctr(str(h.get("change_summary")) for h in hits)
+            dominant, dom_n = changes.most_common(1)[0]
+            tier = (hits[0].get("status_tier") or "").strip()
+            n_ver = sum(1 for h in hits if h.get("verified"))
+            example = next((h.get("next_command") for h in hits
+                            if h.get("change_summary") == dominant and h.get("next_command")), None)
+            title = f"Learned (error memory): {tier or 'error'} — {dominant[:48]}"
+            guidance = (
+                f"LEARNED FROM THE CROSS-RUN ERROR MEMORY: {len(distinct_runs)} builds "
+                f"({n_ver} verified) hit this same error and got past it.\n"
+                f"Error signature: {sig}\n"
+                f"What the next command changed in {dom_n}/{len(hits)} of them: {dominant}\n"
+                + (f"Example command that got past it (adapt host/path/param to THIS target):\n  {str(example)[:300]}\n" if example else "")
+                + "Other changes seen: " + "; ".join(c for c, _ in changes.most_common(4)[1:]) + "\n"
+                  "Apply the dominant change first; do not repeat the shape that produced the error."
+            )
+            triggers = {"error_signature": sig, "max_per_build": 2}
+            cur.execute("""
+                INSERT INTO public.refine_error_patterns
+                    (id, title, guidance, triggers, source)
+                VALUES (%s, %s, %s, %s::jsonb, 'learned')
+                ON CONFLICT (id) DO NOTHING
+            """, (pid, title, guidance, json.dumps(triggers)))
+            promoted.append({"id": pid, "signal": sig, "hits": len(distinct_runs), "source": "error_memory"})
         for sig, hits in candidates.items():
             if len(hits) < min_hits:
                 continue
@@ -24573,6 +24652,13 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
     _err_rows = []
     _similar_lookups = 0
     _similar_seen_sigs = set()
+    # Per-build injection budget for refine-pattern skills (2026-10-09): the
+    # same guidance re-injected 27× in one build (method_not_allowed_405) and
+    # 11×/build (canary_reflection_risk) measured 0 and 9 next-iteration passes
+    # over 1,718 injections. After REFINE_PATTERN_MAX_INJECT (default 2) — or
+    # the pattern's own triggers.max_per_build — the loop says so instead.
+    _REFINE_PATTERN_MAX_INJECT = int(os.environ.get("REFINE_PATTERN_MAX_INJECT", "2") or "2")
+    _pattern_inject_counts = {}
     _known_cred_values = []
     try:
         _si = (metrics or {}).get("_session_cookie_header") if isinstance(metrics, dict) else None
@@ -25106,18 +25192,47 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         # approve path to promote proven-helpful learned patterns.
         _pending_tried_this_iter = []
         try:
-            matched = _match_refine_patterns(output, assertion, canary, command)
+            matched = _match_refine_patterns(
+                output, assertion, canary, command,
+                context={"iteration": it,
+                         "error_signature": (_err_rows[-1]["signature"] if _err_rows else "")})
             if matched:
                 blocks = []
+                _suppressed, _exhausted = [], []
                 for p in matched[:4]:  # cap at 4 so prompt doesn't balloon
-                    tag = p.get("title", p.get("id"))
+                    pid = p.get("id")
+                    budget = p.get("max_per_build")
+                    try:
+                        budget = int(budget) if budget is not None else _REFINE_PATTERN_MAX_INJECT
+                    except (TypeError, ValueError):
+                        budget = _REFINE_PATTERN_MAX_INJECT
+                    n_prev = _pattern_inject_counts.get(pid, 0)
+                    if n_prev >= budget:
+                        # Budget spent: this guidance was already applied and
+                        # did not move the build. Say so ONCE, then stay silent.
+                        if n_prev == budget:
+                            _exhausted.append(pid)
+                            blocks.append(
+                                f"\n[{p.get('title', pid)} — ALREADY APPLIED {n_prev}× WITHOUT EFFECT]\n"
+                                f"The guidance above this build already followed {n_prev} times did not change "
+                                f"the outcome. Do NOT apply it again — change something else (endpoint, "
+                                f"method, parameter, proof model).")
+                            _pattern_inject_counts[pid] = n_prev + 1
+                        else:
+                            _suppressed.append(pid)
+                        continue
+                    _pattern_inject_counts[pid] = n_prev + 1
+                    tag = p.get("title", pid)
                     if p.get("pending"):
                         tag = f"PENDING-TRIAL · {tag}"  # transparency
-                        _pending_tried_this_iter.append(p.get("id"))
+                        _pending_tried_this_iter.append(pid)
                     blocks.append(f"\n[{tag}]\n{p['guidance'].strip()}")
                 rag_pattern_notes = "".join(blocks)
                 _poc_trace(run_id, "refine_patterns_matched", iteration=it,
-                           extra={"ids": [p.get("id") for p in matched],
+                           extra={"ids": [p.get("id") for p in matched
+                                          if p.get("id") not in _suppressed and p.get("id") not in _exhausted],
+                                  "matched": [p.get("id") for p in matched],
+                                  "suppressed": _suppressed, "exhausted": _exhausted,
                                   "pending": [p.get("id") for p in matched if p.get("pending")]})
                 # Record ONE trial per injected pending pattern. The success
                 # credit comes next iter (if assertion_passed).

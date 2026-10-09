@@ -18,7 +18,13 @@ An open-source **workflow collector for authorized penetration testing and red t
 > Separately, the build **wall clock is unlimited unless you set it** (presets
 > no longer imply 30 min / 2 h; the dashboard proxy no longer cuts builds at
 > 5 min), and the wall clock, per-command run timeout and deep-recon budget are
-> operator settings under **Settings → Scan timeouts**.
+> operator settings under **Settings → Scan timeouts**. The refine-pattern
+> **skills** were measured over all 473 builds (one fired 1,531× for 9 passes,
+> another 27×/build for 0): each now has a per-build injection budget — past
+> it the loop says *"already applied N× without effect, change something
+> else"* — the noisy triggers wait for iteration 3, and the pattern miner now
+> learns pending skills from the error memory (same error resolved in ≥3
+> builds → a `learned_em_*` pattern for you to approve).
 >
 > **New (2026-10-09) — Build-PoC reads its own recon, logs in with what it found, and explains every failed attempt.**
 > On CVE-Bench, 20 of 33 PoC attempts used to stop at the readiness gate while

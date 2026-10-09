@@ -106,6 +106,12 @@ patterns:
       canary_in_request: true
       canary_in_output: false
       prev_assertion_lacks: ["min_seconds"]  # skip for timing-based proofs
+      # 2026-10-09: measured over 473 builds this fired 1,531 times (134 builds,
+      # ~11 per build) for 9 next-iteration passes — it matched nearly every
+      # failing non-timing request. The first failures are expected; say it
+      # once, late, and only once per build.
+      min_iteration: 3
+      max_per_build: 1
     guidance: |
       REFLECTION RISK — your canary appears in the REQUEST but NOT the response.
       That proves nothing new: either the server is reflecting your input
@@ -179,6 +185,10 @@ patterns:
         - "405 Method Not Allowed"
         - "method not allowed"
         - "method not supported"
+      # 2026-10-09: re-injected ~27× per build (187 injections / 7 builds) for
+      # 0 next-iteration passes. Twice is enough; after that the loop says
+      # "already applied without effect" and asks for a different change.
+      max_per_build: 2
     guidance: |
       METHOD MISMATCH — the server returned 405.
       TRY PUT instead of POST, PATCH instead of PUT, or check the OpenAPI
