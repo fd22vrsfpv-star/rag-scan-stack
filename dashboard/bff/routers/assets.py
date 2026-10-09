@@ -340,10 +340,17 @@ async def revoke_poc(ip: str, port: int = None):
 @router.post("/api/software/build-poc")
 async def build_poc(request: Request):
     """Run the CVE PoC-builder (research -> synthesize -> run-and-refine). Long-running
-    (NVD + LLM + live runs), so a generous timeout. Invoking it authorizes the loop."""
+    (NVD + LLM + live runs). Invoking it authorizes the loop.
+
+    2026-10-09: no read timeout. The build's wall clock is unlimited by default
+    (rag-api caps it only on an explicit `wall_timeout_sec`), so a 300 s proxy
+    timeout here cut off every dashboard-initiated build that took longer than
+    five minutes while rag-api kept running it — the verified CVE-2024-36412 run
+    took 2009 s. Connect timeout stays short so a down rag-api still fails fast.
+    """
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(timeout=300) as c:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0)) as c:
         resp = await c.post(f"{s.rag_api_url}/software/build-poc", json=body,
                             headers={"x-api-key": s.api_key, **engagement_headers()})
         if resp.status_code >= 400:

@@ -25621,19 +25621,20 @@ class BuildPocBody(BaseModel):
     # per-knob tuning and makes a run reproducible by name.
     # These apply PER SITE (per build-poc call) — a batch runner that
     # loops N CVEs gets the preset budget N times, once per target.
-    #   "quick" — 30-min wall budget, 5 iterations, fanout 1, no deep
-    #             flags. Baseline for comparison / spot-checks.
-    #   "deep"  — 2h wall budget, 15 iterations, fanout 5, ALL three
-    #             deep flags on. The thorough pass.
-    #   None    — operator-tuned (respects individual flags above, no
-    #             wall cap).
+    #   "quick" — 5 iterations, fanout 1, no deep flags. Baseline for
+    #             comparison / spot-checks.
+    #   "deep"  — 15 iterations, fanout 5, ALL three deep flags on. The
+    #             thorough pass.
+    #   None    — operator-tuned (respects individual flags above).
     # When set, the preset OVERRIDES the matching individual fields.
+    # No preset implies a wall clock (2026-10-09) — see wall_timeout_sec.
     test_mode: Optional[str] = None
 
     # Hard wall-clock cap for THIS build-poc call (seconds, per site).
-    # None = no limit; "quick" preset sets 1800, "deep" sets 7200. The
-    # derive loop checks this between passes and exits early with
-    # source='wall_timeout' when the budget is spent.
+    # UNLIMITED by default: None / 0 / negative = no cap, and no preset sets
+    # one — only an explicit positive value caps the build. The derive loop
+    # checks it between passes and exits early with source='wall_timeout'
+    # when the budget is spent.
     wall_timeout_sec: Optional[int] = None
 
 
@@ -28914,17 +28915,20 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     eff_dcs = bool(body.enable_default_cred_sweep)
     eff_wlf = bool(body.enable_wordlist_fuzz)
     eff_kps = bool(body.enable_known_poc_seed)
-    eff_wall = body.wall_timeout_sec
+    # 2026-10-09: the wall clock is UNLIMITED unless the operator sets it
+    # explicitly. Presets bound iterations / fanout / deep flags only — they
+    # no longer imply 1800 s / 7200 s, which cut off builds whose synth +
+    # refine legitimately take longer (the verified 36412 run took 2009 s).
+    # 0 / None / negative all mean "no cap".
+    eff_wall = body.wall_timeout_sec if (body.wall_timeout_sec or 0) > 0 else None
     if preset == "quick":
         eff_fanout = 1
         eff_max_iters = min(eff_max_iters, 5)
         eff_dcs = eff_wlf = eff_kps = False
-        eff_wall = eff_wall or 1800
     elif preset == "deep":
         eff_fanout = max(eff_fanout, 5)
         eff_max_iters = max(eff_max_iters, 15)
         eff_dcs = eff_wlf = eff_kps = True
-        eff_wall = eff_wall or 7200
     elif preset and preset not in ("custom", "none"):
         raise HTTPException(400,
             f"test_mode must be one of: quick, deep, custom "
