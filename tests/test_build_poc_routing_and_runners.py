@@ -72,7 +72,9 @@ def test_scope_add_route_really_does_not_exist():
 
 def test_refine_loop_records_its_outcome_on_derived_specs():
     src = _func_src("_run_refine_poc")
-    assert src and "_touch_derived_spec_outcome(cve, verified, stop_reason)" in src
+    # the local in _run_refine_poc is `_stop_reason` — a bare `stop_reason` was a
+    # NameError on the last line of every completed build (2026-10-09)
+    assert src and '_touch_derived_spec_outcome(cve, verified, (_stop_reason or "max_iters"))' in src
     helper = _func_src("_touch_derived_spec_outcome")
     assert helper and "UPDATE derived_cve_specs" in helper and "INSERT" not in helper
 

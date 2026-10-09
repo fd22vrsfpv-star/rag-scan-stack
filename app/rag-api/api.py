@@ -25308,7 +25308,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                response=(f"success={success} verified={verified} off_target={off_target} "
                          f"drifted={drifted} security_test_id={security_test_id}"))
     _poc_index(cve, ip, run_id, log_path, verified, iters, security_test_id, eid)
-    _touch_derived_spec_outcome(cve, verified, stop_reason)
+    _touch_derived_spec_outcome(cve, verified, (_stop_reason or "max_iters"))
 
     # Judge-pass over discarded iterations — ran when the refine loop
     # exhausted (or stopped) without a verified verdict and did real work
@@ -30525,13 +30525,77 @@ def export_exploit_review_md(exploit_id: str, authorized: bool = Depends(auth)):
                     headers={"Content-Disposition": f'attachment; filename="{base}-review.md"'})
 
 
+_REVIEW_URL_RE = None
+
+
+def _review_source_links(md: dict, intel: dict, target_host=None, cap=60) -> list:
+    """[(found_via, url)] — deduplicated, first occurrence wins, in the order
+    the pipeline encountered them: research_sources (NVD refs, exploitdb, msf),
+    the derived spec, manual research hits, operator hints, then every trace
+    phase. Target/private/local addresses are dropped so the table is only
+    pages a human can open. PURE apart from `re`."""
+    import re as _re
+    global _REVIEW_URL_RE
+    if _REVIEW_URL_RE is None:
+        _REVIEW_URL_RE = _re.compile(r"https?://[^\s\"'<>)\]\\`|,;]+")
+    priv = _re.compile(r"^https?://(?:localhost|127\.|10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|0\.0\.0\.0|target[:/]|\[::1\])", _re.I)
+    host = str(target_host or "").strip()
+    seen, rows = set(), []
+
+    def _add(via, url):
+        u = str(url or "").strip().rstrip(".,;:)")
+        if not u.startswith(("http://", "https://")) or priv.match(u):
+            return
+        if host and host in u:
+            return
+        if u in seen or len(rows) >= cap:
+            return
+        seen.add(u); rows.append((via, u))
+
+    def _scan(via, text):
+        for m in _REVIEW_URL_RE.findall(str(text or "")):
+            _add(via, m)
+
+    md = md if isinstance(md, dict) else {}
+    rs = md.get("research_sources") or {}
+    if isinstance(rs, dict):
+        for u in (rs.get("nvd_refs") or []):
+            _add("NVD reference", u)
+        for u in (rs.get("exploitdb") or []):
+            _add("Exploit-DB", u if str(u).startswith("http") else f"https://www.exploit-db.com/exploits/{u}")
+        for m in (rs.get("msf") or []):
+            _add("Metasploit module", f"https://www.rapid7.com/db/modules/{str(m).lstrip('/')}" if not str(m).startswith("http") else m)
+        for u in (rs.get("web_refs") or rs.get("search_refs") or []):
+            _add("web search", u)
+    for key in ("research", "research_sources"):
+        _scan(f"metadata.{key}", md.get(key))
+    spec = (intel or {}).get("derived_spec") or {}
+    if isinstance(spec, dict):
+        _scan("derived CVE spec", spec.get("spec"))
+        _scan("derived CVE spec", spec.get("verify_evidence"))
+    for q in (md.get("manual_research_queries") or [])[-25:]:
+        for h in (q.get("results") or [])[:10] if isinstance(q, dict) else []:
+            if isinstance(h, dict):
+                _add(f"manual research: {str(q.get('query') or '')[:40]}", h.get("url") or h.get("source") or "")
+                _scan(f"manual research: {str(q.get('query') or '')[:40]}", h.get("text"))
+    for t in (intel or {}).get("full_trace") or (intel or {}).get("key_trace") or []:
+        ph = str(t.get("phase") or "")
+        if ph in ("run", "refine", "synthesize", "result"):
+            continue           # commands against the target, not research pages
+        _scan(f"trace: {ph}", t.get("response"))
+        ex = t.get("extra") or {}
+        if ex:
+            _scan(f"trace: {ph}", json.dumps(ex, default=str)[:20000])
+    return rows
+
+
 def _render_review_md(r: dict, intel: dict, failure_analysis=None, live_recon=None) -> str:
     """The review.md body, shared by the exploit-store export and the
     build-poc attempt export (which has no store row). `r` is a row-like dict:
     name/cve/target_host/target_port/verified/kind/llm_model/built_at/metadata."""
     md = r.get("metadata") or {}
     out: list[str] = []
-    out.append(f"# Exploit review — {r.get('name') or exploit_id}")
+    out.append(f"# Exploit review — {r.get('name') or r.get('id') or r.get('cve') or 'exploit'}")
     out.append("")
     header_bits = []
     if r.get("cve"):           header_bits.append(f"**CVE:** `{r['cve']}`")
@@ -30667,6 +30731,19 @@ def _render_review_md(r: dict, intel: dict, failure_analysis=None, live_recon=No
             out.append("```sh")
             out.append(str(research["seed_command"]))
             out.append("```")
+        out.append("")
+
+    # ─── Sources: every web page the research touched, with where it came from ──
+    # (operator ask 2026-10-09: the research markdown must link to the pages
+    # things were found on). Target / private addresses are excluded.
+    _src_rows = _review_source_links(md, intel, target_host=r.get("target_host"))
+    if _src_rows:
+        out.append(f"### Sources ({len(_src_rows)})")
+        out.append("")
+        out.append("| found via | link |")
+        out.append("|---|---|")
+        for via, url in _src_rows:
+            out.append(f"| {via} | <{url}> |")
         out.append("")
     spec = intel.get("derived_spec") or {}
     if spec:
