@@ -83,6 +83,7 @@ class BuildPocState(TypedDict, total=False):
     plan_verdicts: Dict[str, str]
     id_pool: Dict[str, Any]           # ids seen in recon/enumeration, for templated paths
     guidance: str
+    guidance_base: str                # pre-gather guidance; pass 2 composes from this, not from pass 1's output
     built: Optional[Dict[str, Any]]
 
     # Refine loop state
@@ -132,7 +133,7 @@ def initial_state(cve: str, ip: str, port: int, product=None, version=None, eid=
         "detected_frameworks": [], "waf_family": None, "waf_characterization": {},
         "auth": auth or {}, "auth_guidance": "", "session_info": None,
         "hint_guidance": "", "hint_parts": [], "research_out": None,
-        "recon_guidance": "", "strategy": "", "plan_verdicts": {}, "guidance": "",
+        "recon_guidance": "", "strategy": "", "plan_verdicts": {}, "guidance": "", "guidance_base": "",
         "built": None,
         "command": "", "assertion": {}, "canary": None, "origin_family": None,
         "llm_model": None, "output": "",
@@ -692,7 +693,7 @@ def node_arjun_recon(state: BuildPocState) -> Dict[str, Any]:
 def node_auth_establish(state: BuildPocState) -> Dict[str, Any]:
     """Establish an authenticated session when the operator supplied creds OR when
     auto_login already captured a cookie. Matches the monolith exactly."""
-    from api import _establish_session_for_build
+    from api import _establish_session_for_build, _poc_trace
     auth = state.get("auth") or {}
     auth_guidance = ""
     session_info = None
@@ -700,14 +701,29 @@ def node_auth_establish(state: BuildPocState) -> Dict[str, Any]:
         try:
             session_info = _establish_session_for_build(
                 state["ip"], state["port"], auth, state.get("eid"),
-                product=state.get("product"))
+                product=state.get("product"), segments=state.get("segments") or [])
             ch = (session_info or {}).get("cookie_header")
             if ch:
                 auth_guidance = (f"AUTH: an authenticated session exists — send this cookie in "
                                  f"EVERY exploit request: Cookie: {ch}. (user "
                                  f"{session_info.get('username')}). ")
+            _poc_trace(state["run_id"], "recon:auth_establish",
+                       response=f"method={(session_info or {}).get('method')} ok={bool(ch)} "
+                                f"user={(session_info or {}).get('username')} "
+                                f"note={str((session_info or {}).get('note') or '')[:300]}",
+                       extra={"auth_ok": bool(ch), "auth_method": (session_info or {}).get("method"),
+                              "login_url": (session_info or {}).get("login_url")})
+            if not ch:
+                # A failed attempt used to be returned as a session_info with
+                # cookie_header="" — downstream "session exists" checks were
+                # fooled. Keep it None; the trace above records the attempt.
+                session_info = None
         except Exception as e:  # noqa: BLE001
             logging.debug("build auth step failed: %s", e)
+            _poc_trace(state["run_id"], "recon:auth_establish",
+                       response=f"error {type(e).__name__}: {str(e)[:300]}",
+                       extra={"auth_ok": False, "auth_method": "error"})
+            session_info = None
     if auth and auth.get("_auto_cookie") and not auth_guidance:
         auth_guidance = (f"AUTH (auto-login from mined creds): send this cookie in EVERY "
                          f"exploit request: Cookie: {auth['_auto_cookie']}. "
@@ -1113,8 +1129,12 @@ def node_gather_check(state: BuildPocState) -> Dict[str, Any]:
                 for g, v in dr["solutions"].items() if g in (man.get("missing") or [])]
     rec = _record_gather_manifest(man, state["cve"], state["ip"], state["port"],
                                   eid=state.get("eid"), run_id=state["run_id"])
-    guidance = (_gather_manifest_text(man) + "\n" + (state.get("guidance") or "")).strip()
-    upd: Dict[str, Any] = {"guidance": guidance, "gather_manifest": {**man, "follow_up_id": rec.get("follow_up_id")},
+    # Pass 2 (after deep_recon) must not prepend a second manifest onto pass 1's
+    # output: compose from the pre-gather guidance captured on pass 1.
+    base = state.get("guidance_base") if state.get("guidance_base") else (state.get("guidance") or "")
+    guidance = (_gather_manifest_text(man) + "\n" + base).strip()
+    upd: Dict[str, Any] = {"guidance": guidance, "guidance_base": base,
+                           "gather_manifest": {**man, "follow_up_id": rec.get("follow_up_id")},
                            "recon_metrics": {**state.get("recon_metrics", {}),
                                              "gather_check": {"ready": man.get("ready"),
                                                               "missing": man.get("missing"),
@@ -1529,6 +1549,31 @@ def _route_post_zap(state: BuildPocState) -> str:
 
 
 # ── graph builder ──────────────────────────────────────────────────────────────
+def _traced(name: str, fn):
+    """Wrap a node so an exception inside it leaves a `node_error:<name>` trace
+    row (with traceback) before propagating. CVE-2024-22120 (2026-10-08) died
+    between `operator_hint` and the next node with nothing in the JSONL."""
+    def _run(state):
+        try:
+            return fn(state)
+        except Exception as e:  # noqa: BLE001
+            import traceback as _tb
+            try:
+                from api import _poc_trace
+                _poc_trace(state.get("run_id"), f"node_error:{name}",
+                           response=f"{type(e).__name__}: {str(e)[:400]}\n{_tb.format_exc()[-3500:]}",
+                           extra={"node": name, "error_type": type(e).__name__})
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+    _run.__name__ = getattr(fn, "__name__", name)
+    return _run
+
+
+def _add_node(g, name: str, fn):
+    g.add_node(name, _traced(name, fn))
+
+
 def build_graph():
     """Assemble the full StateGraph. Structure:
        START -> [recon block if recon_first]
@@ -1540,41 +1585,41 @@ def build_graph():
     g = StateGraph(BuildPocState)
 
     # Recon block (all conditional on recon_first)
-    g.add_node("port_sweep", node_port_sweep)
-    g.add_node("waf_detect", node_waf_detect)
-    g.add_node("waf_characterize", node_waf_characterize)
-    g.add_node("basic_recon", node_basic_recon)
-    g.add_node("product_identification", node_product_identification)
-    g.add_node("product_cve_enumeration", node_product_cve_enumeration)
-    g.add_node("response_mine", node_response_mine)
-    g.add_node("auto_login", node_auto_login)
-    g.add_node("framework_deep_enum", node_framework_deep_enum)
-    g.add_node("zap_recon", node_zap_recon)
-    g.add_node("openapi_recon", node_openapi_recon)
-    g.add_node("discovered_knowledge_recon", node_discovered_knowledge_recon)
-    g.add_node("playwright_recon", node_playwright_recon)
-    g.add_node("arjun_recon", node_arjun_recon)
+    _add_node(g, "port_sweep", node_port_sweep)
+    _add_node(g, "waf_detect", node_waf_detect)
+    _add_node(g, "waf_characterize", node_waf_characterize)
+    _add_node(g, "basic_recon", node_basic_recon)
+    _add_node(g, "product_identification", node_product_identification)
+    _add_node(g, "product_cve_enumeration", node_product_cve_enumeration)
+    _add_node(g, "response_mine", node_response_mine)
+    _add_node(g, "auto_login", node_auto_login)
+    _add_node(g, "framework_deep_enum", node_framework_deep_enum)
+    _add_node(g, "zap_recon", node_zap_recon)
+    _add_node(g, "openapi_recon", node_openapi_recon)
+    _add_node(g, "discovered_knowledge_recon", node_discovered_knowledge_recon)
+    _add_node(g, "playwright_recon", node_playwright_recon)
+    _add_node(g, "arjun_recon", node_arjun_recon)
 
     # Auth / hints / research
-    g.add_node("auth_establish", node_auth_establish)
-    g.add_node("load_hints", node_load_hints)
-    g.add_node("research", node_research)
-    g.add_node("access_enumeration", node_access_enumeration)
-    g.add_node("precondition_enumeration", node_precondition_enumeration)
-    g.add_node("readiness_gate", node_readiness_gate)
+    _add_node(g, "auth_establish", node_auth_establish)
+    _add_node(g, "load_hints", node_load_hints)
+    _add_node(g, "research", node_research)
+    _add_node(g, "access_enumeration", node_access_enumeration)
+    _add_node(g, "precondition_enumeration", node_precondition_enumeration)
+    _add_node(g, "readiness_gate", node_readiness_gate)
 
     # Guidance assembly + strategy
-    g.add_node("assemble_guidance", node_assemble_guidance)
-    g.add_node("strategist", node_strategist)
-    g.add_node("plan_verify", node_plan_verify)
+    _add_node(g, "assemble_guidance", node_assemble_guidance)
+    _add_node(g, "strategist", node_strategist)
+    _add_node(g, "plan_verify", node_plan_verify)
 
     # Synth + execution + save
-    g.add_node("gather_check", node_gather_check)
-    g.add_node("deep_recon", node_deep_recon)
-    g.add_node("synth", node_synth)
-    g.add_node("run_refine", node_run_refine)
-    g.add_node("save_store", node_save_store)
-    g.add_node("tool_handoff", node_tool_handoff)
+    _add_node(g, "gather_check", node_gather_check)
+    _add_node(g, "deep_recon", node_deep_recon)
+    _add_node(g, "synth", node_synth)
+    _add_node(g, "run_refine", node_run_refine)
+    _add_node(g, "save_store", node_save_store)
+    _add_node(g, "tool_handoff", node_tool_handoff)
 
     # Edges — the spine
     g.add_conditional_edges(START, _route_after_start,
@@ -1591,7 +1636,7 @@ def build_graph():
     # Pass-through hub after WAF so both branches converge
     def _post_waf_passthrough(state):  # no-op node
         return {}
-    g.add_node("_post_waf_hub", _post_waf_passthrough)
+    _add_node(g, "_post_waf_hub", _post_waf_passthrough)
     g.add_conditional_edges("_post_waf_hub", _route_post_waf,
                              {"basic_recon": "basic_recon",
                               "post_mine": "_post_mine_hub"})
@@ -1610,7 +1655,7 @@ def build_graph():
     g.add_edge("framework_deep_enum", "_post_mine_hub")
 
     # Pass-through hub after basic/mine/login/enum block converges
-    g.add_node("_post_mine_hub", _post_waf_passthrough)
+    _add_node(g, "_post_mine_hub", _post_waf_passthrough)
     g.add_conditional_edges("_post_mine_hub", _route_post_mine,
                              {"zap_recon": "zap_recon",
                               "arjun_recon": "openapi_recon",
@@ -1684,7 +1729,21 @@ def invoke_build_poc(state: BuildPocState) -> Dict[str, Any]:
     its endpoint caller: {command, assertion, canary, success, verified,
     off_target, reflection, iterations, exploit_store_id, ...}."""
     graph = build_graph()
-    final = graph.invoke(state)
+    try:
+        final = graph.invoke(state)
+    except Exception as e:  # noqa: BLE001
+        # A crash between nodes used to leave no `result` and no index row
+        # (CVE-2024-22120, 2026-10-08). Record it, then propagate.
+        try:
+            from api import _poc_trace, _poc_index, _poc_run_file
+            _poc_trace(state.get("run_id"), "result",
+                       response=f"crash: {type(e).__name__}: {str(e)[:400]}",
+                       extra={"verified": False, "crash": True, "error_type": type(e).__name__})
+            _poc_index(state.get("cve"), state.get("ip"), state.get("run_id"),
+                       _poc_run_file(state.get("run_id")), False, 0, None, state.get("eid"))
+        except Exception:  # noqa: BLE001
+            pass
+        raise
     result = final.get("result") or {}
     session_info = final.get("session_info")
     built = final.get("built") or {}
