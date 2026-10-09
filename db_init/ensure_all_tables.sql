@@ -2588,9 +2588,9 @@ CREATE TRIGGER trg_app_settings_updated
 -- category (caught post-apply when the live settings showed azure-main
 -- defaults even after these rows were in the table).
 INSERT INTO public.app_settings (key, value, category) VALUES
-  ('llm.route.exploit.synth',             'deepseek4-pro', 'config'),
-  ('llm.route.exploit.gather_fallback',   'deepseek4-pro', 'config'),
-  ('llm.route.exploit.judge',             'deepseek4-pro', 'config'),
+  ('llm.route.exploit.synth',             'azure-main:DeepSeek-V4-Pro', 'config'),
+  ('llm.route.exploit.gather_fallback',   'azure-main:DeepSeek-V4-Pro', 'config'),
+  ('llm.route.exploit.judge',             'azure-main:DeepSeek-V4-Pro', 'config'),
   ('llm.reasoning_effort.exploit.synth',           'high', 'config'),
   ('llm.reasoning_effort.exploit.gather_fallback', 'high', 'config'),
   ('llm.reasoning_effort.exploit.judge',           'high', 'config')
