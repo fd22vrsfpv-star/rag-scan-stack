@@ -3597,6 +3597,10 @@ const SCAN_TIMEOUT_FIELDS: { key: string; label: string; help: string }[] = [
   { key: 'scan_timeout_nmap_resume',   label: 'Nmap --resume',           help: 'Resume window for picking up an interrupted scan' },
   { key: 'scan_timeout_full',          label: 'Full scan composite',     help: 'Per-batch nmap timeout inside a full scan' },
   { key: 'scan_timeout_masscan',       label: 'Masscan (informational)', help: 'Masscan has no internal timeout — value not enforced' },
+  // 2026-10-09: build-PoC timeouts (operator-adjustable; a per-request value on the build form still wins)
+  { key: 'scan_timeout_build_poc_wall',       label: 'Build-PoC wall clock',      help: 'Whole build (recon → synth → refine). 0 = unlimited (default)' },
+  { key: 'scan_timeout_build_poc_run',        label: 'Build-PoC command run',     help: 'Per-command listener run inside the refine loop. 0 = env default (600)' },
+  { key: 'scan_timeout_build_poc_deep_recon', label: 'Build-PoC deep recon',      help: 'Deep-recon budget per build when gather is NOT READY. 0 = env default (480)' },
 ]
 
 function ScanTimeoutsTab() {
@@ -3652,9 +3656,11 @@ function ScanTimeoutsTab() {
   return (
     <div className="space-y-4">
       <div className="text-xs text-muted-foreground">
-        Default subprocess timeouts (seconds) for long-running port scans. <strong>0</strong> means &ldquo;use the
-        env-compiled default&rdquo;. Values are persisted in <code>app_settings</code> and consulted by the
-        scanner; per-job <code>timeout_seconds</code> on the Launch Scan form still overrides these defaults.
+        Default timeouts (seconds) for long-running port scans and the build-PoC loop. <strong>0</strong> means
+        &ldquo;use the env-compiled default&rdquo; — except <em>Build-PoC wall clock</em>, where 0 means
+        <strong>unlimited</strong>. Values are persisted in <code>app_settings</code> and consulted by the scanner and
+        by rag-api (cached up to 5 min); per-job <code>timeout_seconds</code> on the Launch Scan form and
+        <code>wall_timeout_sec</code> on the build form still override these defaults.
       </div>
 
       {msg && (
