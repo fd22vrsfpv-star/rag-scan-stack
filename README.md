@@ -4,7 +4,7 @@ An open-source **workflow collector for authorized penetration testing and red t
 
 > **Authorized testing only.** This tool is built for engagements you have written permission to perform. Read [Authorized use](#authorized-use) before running it.
 
-> **New — Build-PoC reads its own recon, logs in with what it found, and explains every failed attempt.**
+> **New (2026-10-09) — Build-PoC reads its own recon, logs in with what it found, and explains every failed attempt.**
 > On CVE-Bench, 20 of 33 PoC attempts used to stop at the readiness gate while
 > the run's own recon held the answer. The gather step now consumes **the run's
 > live recon** — form actions and fields, the Playwright crawl, Arjun's honored
@@ -23,7 +23,7 @@ An open-source **workflow collector for authorized penetration testing and red t
 > (`GET /build-poc/attempts/{run_id}/export/review.md`). Every graph node is
 > crash-traced (`node_error:<node>`), so a dead run always leaves a trail.
 
-> **New — scope pivots you can run, and a safer ZAP.**
+> **New (2026-10-09) — scope pivots you can run, and a safer ZAP.**
 > The Scope Pivot panel can now **run** a certificate pivot (SAN overlap on
 > stored certs) and an ASN pivot (CIDR ranges of in-scope ASNs, cloud/CDN
 > dropped unless the AS name matches the org). Accepting a suggestion lands it
@@ -34,7 +34,7 @@ An open-source **workflow collector for authorized penetration testing and red t
 > host / hosts per scan, ajax spider stopped first) so a deep authenticated
 > scan no longer gets ZAP recycled mid-scan.
 
-> **New — bind payloads prefer a callback and always need a human.**
+> **New (2026-09-21) — bind payloads prefer a callback and always need a human.**
 > A reverse payload dials out to an address you control; a **bind payload opens
 > an unauthenticated listening shell on the target** that anyone who can reach
 > the port may use — exposure taken on the client's behalf. So `auto` now
@@ -46,7 +46,34 @@ An open-source **workflow collector for authorized penetration testing and red t
 > shell of the set). Shared policy in `etl/bind_payload_policy.py`, enforced in
 > both the approval sweep and the execution gate.
 
-> **New — multiple LLM backends, per-task routing, and rate-limit fallback.**
+> **New (2026-09-20) — authenticated web-app & business-logic testing.**
+> A **portable Auth Profile** logs the crawler in once and the live session is
+> reused by every tool (ZAP, katana, ffuf, gobuster, Burp) — no re-authenticating.
+> On the logged-in surface the platform now tests the classes a scanner misses:
+> **IDOR / broken object access** (GET *and* POST-body object references),
+> **business-value tampering** (WSTG-BUSL — negative amounts, price/qty), and
+> **forced browsing / function-level access control** (WSTG-ATHZ-02), fed by the
+> paths gobuster/ffuf discover. All data-driven by `knowledge/business_logic_tests.yaml`
+> and gated safe-vs-approval.
+
+> **New (2026-09-20) — smarter, non-redundant content discovery.**
+> Pick **one** directory-brute tool — gobuster (default), ffuf, or feroxbuster —
+> in *Settings*; the AJAX spider now **auto-enables only on JS-heavy/SPA targets**
+> (XHR/framework/websocket signals), and ZAP's ajax spider is **memory-bounded**
+> (was 32 browsers → OOM; now capped). Fuzzer-based **custom-attack recipes**
+> (param/vhost/login-brute/403-bypass) live in RAG for the agent to construct.
+
+> **New (2026-09-20) — Active Directory attack methodology, tooling & automation.**
+> The full **Orange Cyberdefense AD mindmap** is ingested into
+> `knowledge/ad_attacks.yaml` (9 phases, ~45 techniques with commands, MITRE IDs,
+> and safe/impactful tiers) and embedded in RAG. The AD toolkit
+> (impacket, netexec, BloodHound, certipy, kerbrute, responder, ldeep, lsassy, …)
+> is **baked into the local Kali image** and one-click installable as an *AD tools*
+> group. A **Domain Controller auto-fires safe AD enumeration**; a discovered
+> **domain credential is tagged `ad_credential`** and drives safe credentialed
+> enum (BloodHound/Kerberoast/LDAP), with offensive techniques approval-gated.
+
+> **New (2026-09-10) — multiple LLM backends, per-task routing, and rate-limit fallback.**
 > Configure **several named LLM providers at once** (two different Azure
 > resources, a local Ollama, OpenAI, Anthropic, vLLM — each with its own
 > endpoint, key and default model), then choose **which model each task uses**:
@@ -58,33 +85,6 @@ An open-source **workflow collector for authorized penetration testing and red t
 > checks endpoint, auth, deployments and a real completion separately.
 > Configured in *Settings → LLM Tuning*; see
 > [`Docs/LLM-ROUTING.md`](Docs/LLM-ROUTING.md).
-
-> **New — authenticated web-app & business-logic testing.**
-> A **portable Auth Profile** logs the crawler in once and the live session is
-> reused by every tool (ZAP, katana, ffuf, gobuster, Burp) — no re-authenticating.
-> On the logged-in surface the platform now tests the classes a scanner misses:
-> **IDOR / broken object access** (GET *and* POST-body object references),
-> **business-value tampering** (WSTG-BUSL — negative amounts, price/qty), and
-> **forced browsing / function-level access control** (WSTG-ATHZ-02), fed by the
-> paths gobuster/ffuf discover. All data-driven by `knowledge/business_logic_tests.yaml`
-> and gated safe-vs-approval.
-
-> **New — smarter, non-redundant content discovery.**
-> Pick **one** directory-brute tool — gobuster (default), ffuf, or feroxbuster —
-> in *Settings*; the AJAX spider now **auto-enables only on JS-heavy/SPA targets**
-> (XHR/framework/websocket signals), and ZAP's ajax spider is **memory-bounded**
-> (was 32 browsers → OOM; now capped). Fuzzer-based **custom-attack recipes**
-> (param/vhost/login-brute/403-bypass) live in RAG for the agent to construct.
-
-> **New — Active Directory attack methodology, tooling & automation.**
-> The full **Orange Cyberdefense AD mindmap** is ingested into
-> `knowledge/ad_attacks.yaml` (9 phases, ~45 techniques with commands, MITRE IDs,
-> and safe/impactful tiers) and embedded in RAG. The AD toolkit
-> (impacket, netexec, BloodHound, certipy, kerbrute, responder, ldeep, lsassy, …)
-> is **baked into the local Kali image** and one-click installable as an *AD tools*
-> group. A **Domain Controller auto-fires safe AD enumeration**; a discovered
-> **domain credential is tagged `ad_credential`** and drives safe credentialed
-> enum (BloodHound/Kerberoast/LDAP), with offensive techniques approval-gated.
 
 ![RAG Scan Stack dashboard](presentation-materials/dashboard.png)
 
