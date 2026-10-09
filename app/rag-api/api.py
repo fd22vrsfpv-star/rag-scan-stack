@@ -14419,6 +14419,7 @@ def _deep_recon_for_gaps(cve, ip, port, product, eid, run_id, manifest: dict, *,
             break
         st0 = _t.time()
         note = ""
+        n_seg_before = len(out["segments"])
         try:
             if step == "default_creds":
                 # 1. product + common default pairs (bounded by default_cred_check.yaml;
@@ -14476,7 +14477,11 @@ def _deep_recon_for_gaps(cve, ip, port, product, eid, run_id, manifest: dict, *,
                     if txt:
                         out["segments"].append(txt)
                         all_text += "\n" + txt
-                    note = f"{sum(len(v or []) for v in (per_path or {}).values())} params on {len(per_path or {})} paths"
+                    # per_path values are the arjun text per path ("a, b"), not
+                    # lists — the old len() summed characters ("652 params").
+                    _n_params = sum(len([p for p in str(v or "").split(",") if p.strip()])
+                                    for v in (per_path or {}).values())
+                    note = f"{_n_params} params on {len(per_path or {})} paths"
             elif step == "verb_sweep":
                 targets = [x for x in ([(manifest or {}).get("facts", {}).get("endpoint")] + out["candidate_paths"]) if x][:8]
                 base = f"{'https' if int(port) in (443, 8443) else 'http'}://{ip}:{port}"
@@ -14502,8 +14507,10 @@ def _deep_recon_for_gaps(cve, ip, port, product, eid, run_id, manifest: dict, *,
             out["ran"].append(step)
         except Exception as e:  # noqa: BLE001
             note = f"error {type(e).__name__}: {str(e)[:120]}"
+        _seg_head = (out["segments"][-1][:1500]
+                     if len(out["segments"]) > n_seg_before else None)
         _poc_trace(run_id, f"deep_recon:{step}", response=note[:1200],
-                   extra={"seconds": round(_t.time() - st0, 2)})
+                   extra={"seconds": round(_t.time() - st0, 2), "segment_head": _seg_head})
     # ids from everything we crawled
     out["id_pool"].update({k: v for k, v in _collect_id_pool(all_text).items() if k not in out["id_pool"]})
     out["seconds"] = round(_t.time() - t0, 2)
@@ -16109,6 +16116,22 @@ def _poc_trace(run_id, phase, iteration=0, prompt=None, response=None,
             f.write(_j.dumps(entry) + "\n")
     except Exception as e:  # noqa: BLE001
         logging.debug("poc_trace write failed: %s", e)
+
+
+_POC_TRACE_STD_KEYS = frozenset(("ts", "epoch", "phase", "iteration", "prompt", "response",
+                                 "run_output", "assertion_passed", "llm_model"))
+
+
+def _trace_extra(entry: dict) -> dict:
+    # _poc_trace flattens `extra` into the record, so there is never an
+    # "extra" key to read back; every reader that did rec.get("extra") saw {}
+    # (2026-10-09: the review.md recon dossier and plan_verdicts in the
+    # auto-hint were always empty for that reason).
+    if not isinstance(entry, dict):
+        return {}
+    if isinstance(entry.get("extra"), dict):
+        return entry["extra"]
+    return {k: v for k, v in entry.items() if k not in _POC_TRACE_STD_KEYS}
 
 
 def _poc_index(cve, target_ip, run_id, log_path, success, iterations, security_test_id, eid):
@@ -19713,7 +19736,7 @@ def _login_field_variants(ip, port, username, password, login_url=None, timeout=
             "note": "no field variant logged in"}
 
 
-def _establish_session_for_build(ip, port, auth, eid=None, product=None):
+def _establish_session_for_build(ip, port, auth, eid=None, product=None, segments=None):
     """Get an authenticated session for the build. SUPPLIED creds -> log in directly.
     bruteforce=true and no password -> reuse default_cred_check to find a documented default
     credential, then log in with it. Returns {ok, cookie_header, username, method, note}."""
@@ -27210,7 +27233,7 @@ def _summarize_build_trace(entries):
     for e in entries:
         ph = str(e.get("phase") or "")
         resp = str(e.get("response") or "")
-        extra = e.get("extra") or {}
+        extra = _trace_extra(e)
         if ph == "recon:port_sweep":
             m = _re.search(r"Open ports on [\d.]+\s*\(\d+\):\s*(\[[^\]]+\])", resp)
             if m:
@@ -28941,7 +28964,7 @@ def get_derivation_intel(exploit_id: str, authorized: bool = Depends(auth)):
                     entry = {"phase": phase, "ts": rec.get("ts"),
                              "iteration": rec.get("iteration"),
                              "response": (rec.get("response") or "")[:4000],
-                             "extra": rec.get("extra") or {}}
+                             "extra": _trace_extra(rec)}
                     full_trace.append(entry)
                     # key_trace retains the whitelist shape for callers
                     # that render only a short list (UI panels); the full
