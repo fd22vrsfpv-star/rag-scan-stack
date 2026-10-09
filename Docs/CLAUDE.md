@@ -215,6 +215,40 @@ large change. Add the test in the same commit as the rule.
   after the engagement was cleared. Attribution is what makes engagement isolation,
   reporting, and cleanup work — for the data that belongs to one engagement.
 
+### Engagement + scope filters apply on READS (not just writes)
+- Attribution covers the WRITE path; this rule covers the READ path. Every
+  listing endpoint that returns engagement-attributable data MUST honor the
+  active engagement + the scope filter the operator is working in. Otherwise
+  the dashboard shows cross-engagement data under the current engagement
+  header and the operator thinks they're looking at scope.
+- The frontend's `apiFetch` attaches `X-Engagement-Id` on every call. Every
+  listing endpoint MUST read that header (via `_resolve_engagement_id()`)
+  and filter — the standard pattern is `WHERE engagement_id = %s OR
+  engagement_id IS NULL` (NULL rows are legacy/global, intentionally shown
+  in every engagement so pre-attribution data remains reachable).
+- An operator-explicit `?all_engagements=true` override is allowed (cross-
+  engagement audits need it); UI MUST label the active mode so the operator
+  cannot mistake "all engagements" for "this engagement".
+- Scope-aware views that list exploits / scans / findings tied to a target
+  host SHOULD support `?scope_only=true` to additionally restrict to
+  `scope_targets` entries for the current engagement. The default is
+  engagement-only (no scope restriction) so the operator can still see
+  out-of-scope collected data to review it; a scope filter is opt-in.
+- **Check after every change** that touches a listing endpoint OR a frontend
+  page that renders a list of exploits / scans / findings / credentials:
+  does it respect `X-Engagement-Id`, does it offer the scope toggle, does
+  it label the active mode? If the answer to any is no, fix it in the same
+  change.
+- *Enforced by:* `tests/test_engagement_attribution.py` already covers the
+  write path; the read-path audit is informal — add a per-endpoint test as
+  each one gets touched. Known-fixed: `/exploit-store`,
+  `/software/cves-without-poc`. The rest of the listing surface is a
+  ratchet to improve, not break.
+- *Why:* the Exploit Store listing used to show every exploit in the
+  database regardless of the operator's engagement — a global view
+  masquerading as per-engagement. An engagement-only listing is now the
+  default; the operator opts in to `all_engagements` explicitly.
+
 ### Authorization gates
 - Every code path that sends traffic to a host MUST pass the scope gate before
   dispatch. **Fail closed**: no configured scope means nothing runs, because the
@@ -232,6 +266,35 @@ large change. Add the test in the same commit as the rule.
 - *Why:* dispatch had no scope check at all, and 14 recommendations targeting
   third-party addresses were queued against this engagement — several already
   executed.
+
+### Blind-timing verdicts must be confirmed with a scaled payload
+- A latency-based verdict on a PoC (`method=latency` or `latency_anchored`,
+  from `assertion.min_seconds`) is NEVER accepted on a single run. A target
+  that takes 5s to respond on every request looks identical to a verified
+  blind SQLi `SLEEP(5)` when only one elapsed is observed.
+- The refine loop MUST re-run the command with a scaled payload (SLEEP(N)
+  → SLEEP(N+7) by default, `TIMING_CONFIRM_DELTA_SEC` configurable) and
+  verify the second run's elapsed scales with the payload (within a 2.5s
+  tolerance). If it scales, the verdict is upgraded to `latency_confirmed`
+  / `latency_confirmed_anchored`. If it does NOT scale, the first run was
+  a false positive — downgrade to `latency_unconfirmed` and let the loop
+  keep refining.
+- A command with no recognizable timing payload (no SLEEP / pg_sleep /
+  WAITFOR / BENCHMARK) cannot be confirmed → `latency_unconfirmable`,
+  advisory only.
+- The confirmation runs INLINE, deterministically, no LLM involved — can't
+  be subverted by model whims or by the operator forgetting to double-check.
+- *Enforced by:* `tests/test_timing_confirmation.py` (scaling for each
+  payload type, bail-out when nothing to scale, AST-grep that the refine
+  loop still calls `_timing_confirmation_rerun` and emits the three
+  downstream verdict methods).
+- *Why:* sqlmap's own confirmation is the standard; without it, a slow
+  target or a WAF with a fixed delay-response reads as "exploited" and
+  gets stored as a verified PoC. On CVE-2024-22120 (Zabbix script.execute
+  SQLi) the first run blocked for 5s because the server was handling the
+  CSRF+session establishment; the exploit itself didn't trigger. A second
+  run with `SLEEP(12)` would have blocked only 5s if the server wasn't
+  actually executing the payload — immediate downgrade.
 
 ### Scan volume
 - Any component that initiates OR triggers a scan MUST bound itself by
@@ -413,6 +476,61 @@ modules that violate the rules above today, each with a reason. They exist to
 make the debt visible while keeping the suite green, and they RATCHET — a new
 violation fails by name, and a resolved entry must be deleted (a separate test
 enforces that). Shrink these lists; do not grow them without a stated reason.
+
+### LLM dispatch — LiteLLM migration (in progress)
+
+`llm_query/` is **in the middle of a migration** from hand-rolled per-provider
+adapters to a `litellm.Router` + `litellm.completion()` dispatch. The plan,
+rationale, and PR-by-PR rollout live in `Docs/plans/LITELLM_MIGRATION.md`.
+
+**Current status (as of 2026-10-08):**
+
+- **PR 1 (merged):** `llm_query/litellm_router.py` factory builds a
+  `litellm.Router` from `common.llm_settings.get_providers()` in parallel to
+  the hand-rolled dispatch. 17 agreement tests pin the translation per
+  provider type (Azure OpenAI → `azure/<deployment>`, Azure Foundry Anthropic
+  → `azure_ai/anthropic/<deployment>`, Ollama → `ollama/<model>`, …). No
+  caller behaviour changed.
+- **PR 2 (merged):** `_generate_text()` tries LiteLLM first when the
+  `LITELLM_ROUTER_ENABLED` env var is on (default: on), falling back to the
+  hand-rolled branches on any LiteLLM error. Path telemetry logs
+  `llm_query: path=litellm|hand_rolled backend=X model=Y` for every served
+  call so the operator can tell which path answered. Live-verified on an
+  Ollama call through `/api/generate`.
+- **PR 3 (this change — docs only):** every hand-rolled helper the plan
+  calls out for eventual removal carries a `# DEPRECATED (LiteLLM migration)`
+  marker pointing to this section + the plan. No code deleted yet because
+  `chat()`, `embeddings()`, `stream`, and the non-routed branches in
+  `generate()` still use them. PR 4 is where those branches get migrated and
+  the helpers finally go.
+- **PR 4 (gated on a focused-10 CVE-Bench run):** extend LiteLLM to the
+  remaining four handlers, smoke-test every configured provider against its
+  real endpoint, delete the ~250 lines of hand-rolled helpers
+  (`_azure_json_post`, `_openai_json_post`, `_post_with_429_retry`, the
+  Foundry Anthropic adapter files, …), remove the kill-switch fallback.
+
+**Model-string shapes LiteLLM uses** (same shapes `entry_for_provider()` +
+`litellm_completion_for()` build from the DB provider config):
+
+| provider type           | LiteLLM `model` string              | kwargs            |
+|-------------------------|-------------------------------------|-------------------|
+| azure (OpenAI deploy)   | `azure/<deployment>`                | api_base, api_key, api_version |
+| azure + `claude-*`      | `azure_ai/anthropic/<deployment>`   | api_base, api_key, api_version |
+| anthropic (native)      | `anthropic/<model>`                 | api_key           |
+| openai (direct)         | `openai/<model>`                    | api_base, api_key |
+| ollama                  | `ollama/<model>`                    | api_base          |
+| vllm (OpenAI compat)    | `openai/<model>`                    | api_base          |
+
+**Operator rollback:** `LITELLM_ROUTER_ENABLED=false` in the `llm_query`
+container env (compose or `docker exec -e`) forces the hand-rolled dispatch
+until PR 4 lands and removes the fallback. The kill switch exists so a
+LiteLLM-side regression (model shape change, dep conflict, etc.) is
+recoverable without a rebuild.
+
+**Why this is deferred, not rushed:** the plan expects the migration to
+land only after a focused-10 CVE-Bench run on the current Foundry
+Anthropic adapter — that gives us a reference verdict to compare LiteLLM's
+dispatch against. Until that reference exists, PR 4's deletions stay out.
 
 ## Out-of-scope / constraints
 

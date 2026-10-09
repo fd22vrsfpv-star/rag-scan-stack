@@ -2,7 +2,8 @@ import { useState, useMemo, useEffect } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import PageHelp from '@/components/PageHelp'
 import InfoTip from '@/components/InfoTip'
-import { useInfiniteFindings, useUpdateFindingWorkflow, useFindingActivity, useAddFindingComment, useExploitMatches, useUpdateFindingTags, useTagSuggestions, useDeleteFindings, type FindingsFilter } from '@/api/findings'
+import { useInfiniteFindings, useUpdateFindingWorkflow, useFindingActivity, useAddFindingComment, useExploitMatches, useUpdateFindingTags, useTagSuggestions, useDeleteFindings, useAutoEvidence, type FindingsFilter, type AutoEvidenceItem } from '@/api/findings'
+import { useRunExploit, useBuildPoc } from '@/api/exploits'
 import { ScopeAssignModal } from '@/components/common/ScopeAssignModal'
 import { WebScanImportPanel } from '@/components/common/WebScanImportPanel'
 import { useFindingEvidence, useUploadEvidence, useLinkEvidence } from '@/api/evidence'
@@ -21,7 +22,7 @@ import { SourceBadge } from '@/components/common/SourceBadge'
 import { CustomerBadge } from '@/components/common/CustomerBadge'
 import { SEVERITY_LEVELS, PREDEFINED_TAGS, TAG_COLORS, TAG_COLOR_DEFAULT } from '@/lib/constants'
 import type { Finding, WorkflowStatus } from '@/lib/types'
-import { X, ThumbsUp, ThumbsDown, Check, ChevronRight, ChevronDown, Upload, MessageSquare, Swords, Tag, Crosshair, Zap, Loader2, Globe, Trash2, Flag } from 'lucide-react'
+import { X, ThumbsUp, ThumbsDown, Check, ChevronRight, ChevronDown, Upload, MessageSquare, Swords, Tag, Crosshair, Zap, Loader2, Globe, Trash2, Flag, Sparkles, Play } from 'lucide-react'
 import { useGeneratePocs, useQueuePoc, type WebPayload } from '@/api/exploits'
 import { cn, formatDate } from '@/lib/utils'
 
@@ -786,6 +787,7 @@ function FindingDetailPanel({
   const { data: activityData } = useFindingActivity(fSource, f.id)
   const { data: evidenceData } = useFindingEvidence(fSource, f.id)
   const { data: exploitData } = useExploitMatches(fSource, f.id)
+  const { data: autoEvidenceData } = useAutoEvidence(fSource, f.id)
   const { data: suggestionsData } = useTagSuggestions()
   const scopeNames = useScopeNames()
   const addToScope = useAddToScope()
@@ -904,15 +906,52 @@ function FindingDetailPanel({
   const [pocPayloads, setPocPayloads] = useState<WebPayload[]>([])
   const [selectedPayloads, setSelectedPayloads] = useState<Set<number>>(new Set())
   const [pocQueued, setPocQueued] = useState(false)
-  const [deepen, setDeepen] = useState<{ loading?: boolean; msg?: string; err?: boolean }>({})
+  // "Take action on this finding" — unified Deepen + Build-PoC surface.
+  // Both actions produce a stored exploit / queued probe that lands as an
+  // auto-evidence card in the panel above; sharing one notice area keeps the
+  // feedback consistent regardless of which engine the operator chose.
+  const [actionStatus, setActionStatus] = useState<{ loading?: 'deepen' | 'poc'; msg?: string; err?: boolean }>({})
+  const buildPoc = useBuildPoc()
   const handleDeepen = async () => {
-    setDeepen({ loading: true })
+    setActionStatus({ loading: 'deepen' })
     try {
       const r = await apiFetch<{ command?: string; why?: string }>(
         `/findings/${fSource}/${f.id}/deepen`, { method: 'POST', body: JSON.stringify({}) })
-      setDeepen({ msg: r?.command ? `Queued read-only probe: ${r.command}` : 'Deepen queued' })
+      setActionStatus({ msg: r?.command ? `Queued read-only probe: ${r.command}` : 'Deepen queued' })
     } catch (e: any) {
-      setDeepen({ msg: String(e?.message || e).slice(0, 160), err: true })
+      setActionStatus({ msg: String(e?.message || e).slice(0, 160), err: true })
+    }
+  }
+  // Pull the first CVE from the finding, if any. vulns.cve is a text[]; web
+  // findings may carry CVE ids via tags/refs (not materialized here, so we
+  // only enable Build PoC on CVE-tagged vuln findings for now).
+  const findingCve: string | undefined = Array.isArray(f.cve) ? f.cve[0]
+    : (typeof f.cve === 'string' ? (f.cve as string) : undefined)
+  // Build PoC: for a CVE-tagged finding, kick the full iterate loop (research
+  // → synthesize → run → refine). target_url pre-fills from the finding URL
+  // so synth aims at the right endpoint instead of guessing.
+  const canBuildPoc = Boolean(findingCve && (f.ip || f.url))
+  const handleBuildPoc = async () => {
+    if (!findingCve) return
+    setActionStatus({ loading: 'poc' })
+    try {
+      const payload: Record<string, unknown> = {
+        cve: findingCve,
+        recon_source: 'full',
+        max_iters: 5,
+        release: true,  // standing grant so the operator doesn't need a second click
+      }
+      if (f.url) payload.target_url = f.url
+      if (f.ip) payload.ip = f.ip
+      if (f.port) payload.port = f.port
+      const r = await buildPoc.mutateAsync(payload as any)
+      const verdict = r.verified ? 'VERIFIED' : 'FAILED — needs tweaking'
+      setActionStatus({
+        msg: `PoC build ${verdict} (iters=${r.iterations ?? '?'}, method=${r.verification_method ?? '?'}, store id=${r.exploit_store_id?.slice(0, 8) ?? '?'})`,
+        err: !r.verified,
+      })
+    } catch (e: any) {
+      setActionStatus({ msg: String(e?.message || e).slice(0, 200), err: true })
     }
   }
 
@@ -1220,26 +1259,60 @@ function FindingDetailPanel({
           </div>
         )}
 
-        {/* ── Deepen this finding (AI read-only probe) ── */}
-        {canGeneratePoc && (
+        {/* ── Take action on this finding — unified Deepen + Build PoC ──
+            Both engines overlap (same scope gate, same artifact store, same
+            auto-evidence surface above). Instead of two separate panels, the
+            operator sees ONE action bar and picks the depth they want:
+              - Deepen: ONE scoped probe queued to the pending-exploit lane
+              - Build PoC: full iterate loop (research/synth/refine ×5) that
+                lands in exploit_store directly, bypasses pending queue. */}
+        {(canGeneratePoc || canBuildPoc) && (
           <div className="border border-border rounded-md p-2.5 space-y-2">
             <h5 className="text-xs font-medium text-muted-foreground flex items-center gap-1">
-              <Zap className="h-3 w-3" /> Deepen
+              <Zap className="h-3 w-3" /> Take action on this finding
             </h5>
-            <p className="text-[10px] text-muted-foreground">
-              Synthesize ONE read-only probe that turns this finding into evidence and queue it
-              (scope-gated, pending approval). Useful for informational findings.
-            </p>
-            <button
-              onClick={handleDeepen}
-              disabled={deepen.loading}
-              className="px-3 py-1.5 text-xs rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 flex items-center gap-1"
-            >
-              {deepen.loading ? <Loader2 className="h-3 w-3 animate-spin" /> : <Zap className="h-3 w-3" />}
-              {deepen.loading ? 'Deepening…' : 'Deepen this finding'}
-            </button>
-            {deepen.msg && (
-              <p className={`text-[10px] ${deepen.err ? 'text-red-400' : 'text-green-400'} break-all`}>{deepen.msg}</p>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-[10px]">
+              {canGeneratePoc && (
+                <div className="border border-border rounded p-2 space-y-1.5">
+                  <div className="font-medium text-foreground inline-flex items-center gap-1">
+                    <Zap className="h-3 w-3" /> Deepen (quick probe)
+                  </div>
+                  <p className="text-muted-foreground">
+                    ONE scoped probe queued for approval. Fast — good for informational
+                    findings and GET-only confirmations.
+                  </p>
+                  <button
+                    onClick={handleDeepen}
+                    disabled={!!actionStatus.loading}
+                    className="w-full h-7 rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 inline-flex items-center justify-center gap-1 text-[11px]">
+                    {actionStatus.loading === 'deepen' ? <Loader2 className="h-3 w-3 animate-spin" /> : <Zap className="h-3 w-3" />}
+                    {actionStatus.loading === 'deepen' ? 'Deepening…' : 'Deepen'}
+                  </button>
+                </div>
+              )}
+              {canBuildPoc && (
+                <div className="border border-border rounded p-2 space-y-1.5">
+                  <div className="font-medium text-foreground inline-flex items-center gap-1">
+                    <Sparkles className="h-3 w-3" /> Build full PoC (iterate)
+                  </div>
+                  <p className="text-muted-foreground">
+                    Research → synthesize → run → refine ×5. Lands a verified or
+                    failed PoC in Exploit Store (5–10 min). CVE: <span className="font-mono text-amber-400">{findingCve}</span>
+                  </p>
+                  <button
+                    onClick={handleBuildPoc}
+                    disabled={!!actionStatus.loading}
+                    className="w-full h-7 rounded bg-purple-600 text-white hover:bg-purple-700 disabled:opacity-50 inline-flex items-center justify-center gap-1 text-[11px]">
+                    {actionStatus.loading === 'poc' ? <Loader2 className="h-3 w-3 animate-spin" /> : <Sparkles className="h-3 w-3" />}
+                    {actionStatus.loading === 'poc' ? 'Building…' : 'Build PoC'}
+                  </button>
+                </div>
+              )}
+            </div>
+            {actionStatus.msg && (
+              <p className={`text-[10px] ${actionStatus.err ? 'text-red-400' : 'text-green-400'} break-all pt-1 border-t border-border`}>
+                {actionStatus.msg}
+              </p>
             )}
           </div>
         )}
@@ -1303,11 +1376,30 @@ function FindingDetailPanel({
           </div>
         )}
 
+        {/* ── Auto-collected Evidence ── */}
+        {autoEvidenceData && autoEvidenceData.count > 0 && (
+          <div className="border-t border-border pt-3">
+            <h5 className="text-xs font-medium text-muted-foreground mb-2 flex items-center gap-1">
+              <Sparkles className="h-3 w-3" /> Already collected ({autoEvidenceData.count})
+              {autoEvidenceData.target_ip && (
+                <span className="text-[10px] text-muted-foreground font-normal">
+                  — target {autoEvidenceData.target_ip}
+                </span>
+              )}
+            </h5>
+            <div className="space-y-1.5">
+              {autoEvidenceData.items.map((it: AutoEvidenceItem, i: number) => (
+                <AutoEvidenceCard key={i} item={it} />
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* ── Evidence Gallery (B1) ── */}
         <div className="border-t border-border pt-3">
           <div className="flex items-center justify-between mb-2">
             <h5 className="text-xs font-medium text-muted-foreground flex items-center gap-1">
-              <Upload className="h-3 w-3" /> Evidence ({evidenceList.length})
+              <Upload className="h-3 w-3" /> Uploaded evidence ({evidenceList.length})
             </h5>
             <label className="px-2 py-0.5 text-[10px] rounded bg-primary/10 text-primary cursor-pointer hover:bg-primary/20">
               Add Evidence
@@ -1464,6 +1556,78 @@ function FindingDetailPanel({
           )}
         </div>
       </div>
+    </div>
+  )
+}
+
+
+// ─── Auto-evidence card ─────────────────────────────────────────────────
+// Renders one AutoEvidenceItem from /findings/{src}/{id}/auto-evidence —
+// uniform shape, kind-specific affordances. The stored_exploit kind gets a
+// Run button that fires /exploit-store/{id}/run and shows output inline so
+// the operator can prove the exploit still works without leaving the panel.
+function AutoEvidenceCard({ item }: { item: AutoEvidenceItem }) {
+  const [expanded, setExpanded] = useState(false)
+  const [runOutput, setRunOutput] = useState<string | null>(null)
+  const runExploit = useRunExploit()
+  const isExploit = item.kind === 'stored_exploit'
+  const kindBadge = {
+    finding_output: { label: 'scanner output', color: 'bg-blue-500/10 text-blue-300' },
+    finding_evidence: { label: 'finding evidence', color: 'bg-blue-500/10 text-blue-300' },
+    finding_description: { label: 'description', color: 'bg-blue-500/10 text-blue-300' },
+    stored_exploit: { label: item.verified ? 'verified exploit' : 'unverified exploit',
+                      color: item.verified ? 'bg-emerald-500/15 text-emerald-300' : 'bg-amber-500/15 text-amber-300' },
+    target_artifact: { label: 'scan artifact', color: 'bg-purple-500/10 text-purple-300' },
+  }[item.kind]
+  const run = async () => {
+    if (!isExploit) return
+    setRunOutput('running…')
+    try {
+      const r = await runExploit.mutateAsync(item.link.id)
+      setRunOutput(
+        `exit=${r.exit_code ?? '?'}  still_works=${r.still_works}  asserted=${r.asserted_verified}  (${r.seconds}s)\n` +
+        '─── output ───\n' + (r.output || '(empty)'),
+      )
+    } catch (e) {
+      setRunOutput(`ERROR: ${(e as Error).message}`)
+    }
+  }
+  return (
+    <div className="border border-border rounded p-2 bg-muted/20">
+      <div className="flex items-center justify-between gap-2 mb-1">
+        <div className="flex items-center gap-1.5 min-w-0">
+          <span className={cn('px-1.5 py-0.5 rounded text-[9px] font-medium', kindBadge.color)}>
+            {kindBadge.label}
+          </span>
+          <span className="text-xs font-medium truncate" title={item.title}>{item.title}</span>
+        </div>
+        <div className="flex items-center gap-1">
+          {isExploit && (
+            <button
+              onClick={run}
+              disabled={runExploit.isPending}
+              className="px-2 py-0.5 text-[10px] rounded bg-blue-600/80 hover:bg-blue-600 text-white disabled:opacity-40 inline-flex items-center gap-1"
+              title={`Run POST /exploit-store/${item.link.id}/run and show output`}>
+              {runExploit.isPending ? <Loader2 className="h-3 w-3 animate-spin" /> : <Play className="h-3 w-3" />}
+              Run
+            </button>
+          )}
+          <button onClick={() => setExpanded(e => !e)}
+            className="px-1.5 py-0.5 text-[10px] rounded border border-border hover:bg-muted">
+            {expanded ? 'hide' : 'show'}
+          </button>
+        </div>
+      </div>
+      {expanded && item.body && (
+        <pre className="text-[10px] bg-background/70 rounded p-2 overflow-x-auto max-h-48 whitespace-pre-wrap">
+          {item.body}
+        </pre>
+      )}
+      {runOutput !== null && (
+        <pre className="mt-1 text-[10px] bg-background/90 border border-blue-500/40 rounded p-2 overflow-x-auto max-h-64 whitespace-pre-wrap">
+          {runOutput}
+        </pre>
+      )}
     </div>
   )
 }

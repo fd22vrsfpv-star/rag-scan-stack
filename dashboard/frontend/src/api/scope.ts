@@ -286,3 +286,156 @@ export function useResolveScopeConflict() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['scope-conflicts'] }),
   })
 }
+
+// ─── OSINT scope-pivot (step 6 of the OSINT scope-expansion plan) ─────────
+// Separate query keys from the classifier-driven /scope/suggestions flow so
+// they coexist. The pivot pipeline writes rows with method IN ('typosquat',
+// 'cert_pivot', 'asn_pivot') and is reviewed through the review endpoint
+// below; the classifier's rule/similarity/llm rows stay with the existing
+// accept/reject endpoints.
+
+export interface PivotSuggestion {
+  id: string
+  target: string
+  suggested_scope: string
+  confidence: number
+  reasoning: string
+  method: 'typosquat' | 'cert_pivot' | 'asn_pivot' | 'rule' | 'similarity' | 'llm'
+  status: 'pending' | 'accepted' | 'rejected'
+  created_at: string
+  reviewed_at: string | null
+}
+
+export function usePivotSuggestions(params?: { status?: string; method?: string }) {
+  const query = new URLSearchParams()
+  if (params?.status) query.set('status', params.status)
+  if (params?.method) query.set('method', params.method)
+  query.set('limit', '500')
+  return useQuery({
+    queryKey: ['pivot-suggestions', params?.status || '', params?.method || ''],
+    queryFn: () => apiFetch<{ ok: boolean; suggestions: PivotSuggestion[]; total: number }>(
+      `/scope-pivot/suggestions?${query.toString()}`),
+    refetchInterval: 30_000,
+  })
+}
+
+export function useRunTyposquatPivot() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ engagementId, checkResolution, autoBlockAt }:
+                 { engagementId: string; checkResolution?: boolean; autoBlockAt?: number }) => {
+      const q = new URLSearchParams()
+      if (checkResolution !== undefined) q.set('check_resolution', String(checkResolution))
+      if (autoBlockAt !== undefined) q.set('auto_block_at', String(autoBlockAt))
+      return apiFetch<{
+        ok: boolean
+        engagement_id: string
+        summary: {
+          seeds: number
+          total_candidates: number
+          suggestions_written: number
+          denylist_added: number
+          errors: string[]
+        }
+      }>(`/scope-pivot/typosquat/${engagementId}?${q.toString()}`, { method: 'POST' })
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['pivot-suggestions'] })
+      qc.invalidateQueries({ queryKey: ['excluded-targets'] })
+      qc.invalidateQueries({ queryKey: ['scope-names'] })
+    },
+  })
+}
+
+export function useRunCertPivot() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ engagementId, limit }: { engagementId: string; limit?: number }) => {
+      const q = new URLSearchParams()
+      if (limit !== undefined) q.set('limit', String(limit))
+      return apiFetch<{
+        ok: boolean
+        engagement_id: string
+        summary: {
+          seeds: number
+          certs_examined: number
+          candidates: number
+          suggestions_written: number
+          errors: string[]
+        }
+      }>(`/scope-pivot/cert/${engagementId}?${q.toString()}`, { method: 'POST' })
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['pivot-suggestions'] })
+      qc.invalidateQueries({ queryKey: ['scope-names'] })
+    },
+  })
+}
+
+export function useRunAsnPivot() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ engagementId, limit }: { engagementId: string; limit?: number }) => {
+      const q = new URLSearchParams()
+      if (limit !== undefined) q.set('limit', String(limit))
+      return apiFetch<{
+        ok: boolean
+        engagement_id: string
+        summary: {
+          seeds: number
+          asns_matched: number
+          candidates: number
+          suggestions_written: number
+          errors: string[]
+        }
+      }>(`/scope-pivot/asn/${engagementId}?${q.toString()}`, { method: 'POST' })
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['pivot-suggestions'] })
+      qc.invalidateQueries({ queryKey: ['scope-names'] })
+    },
+  })
+}
+
+export function useReviewPivotSuggestion() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, action }: { id: string; action: 'accept' | 'reject' }) =>
+      apiFetch<{ ok: boolean; suggestion_id: string; new_status: string; action: string }>(
+        `/scope-pivot/suggestions/${id}/review`, {
+          method: 'POST', body: JSON.stringify({ action }),
+        }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['pivot-suggestions'] })
+      qc.invalidateQueries({ queryKey: ['excluded-targets'] })
+      qc.invalidateQueries({ queryKey: ['scope-names'] })
+    },
+  })
+}
+
+/**
+ * Bulk confirm/reject up to 500 pending suggestions in one call.
+ * The server runs them inside a single transaction, so the whole batch
+ * commits together or rolls back together.
+ */
+export function useBulkReviewPivotSuggestions() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ ids, action }: { ids: string[]; action: 'accept' | 'reject' }) =>
+      apiFetch<{
+        ok: boolean
+        action: string
+        requested: number
+        processed: number
+        new_status: string
+        results: Record<string, string>
+      }>(`/scope-pivot/suggestions/review-bulk`, {
+        method: 'POST', body: JSON.stringify({ ids, action }),
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['pivot-suggestions'] })
+      qc.invalidateQueries({ queryKey: ['excluded-targets'] })
+      qc.invalidateQueries({ queryKey: ['scope-names'] })
+    },
+  })
+}

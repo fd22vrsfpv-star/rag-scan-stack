@@ -864,4 +864,6 @@ async def export_logs():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8011, log_level="info", ssl_certfile=os.environ.get("SSL_CERTFILE"), ssl_keyfile=os.environ.get("SSL_KEYFILE"))
+    from common.tls_startup import require_tls_or_exit
+    _ssl_certfile, _ssl_keyfile = require_tls_or_exit("nuclei-runner")
+    uvicorn.run(app, host="0.0.0.0", port=8011, log_level="info", ssl_certfile=_ssl_certfile, ssl_keyfile=_ssl_keyfile)

@@ -160,3 +160,111 @@ async def list_excluded():
             headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
+
+
+# ─── OSINT scope-pivot (typosquats + cert / ASN pivots) ─────────────────────
+# The rag-api endpoints land at /scope-pivot/*; these are thin BFF proxies so
+# the dashboard's apiFetch -> /api/scope-pivot/* reaches them.
+
+@router.post("/api/scope-pivot/typosquat/{engagement_id}")
+async def run_typosquat_pivot(
+    engagement_id: str,
+    check_resolution: bool = Query(False),
+    auto_block_at: float = Query(0.85),
+):
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=120) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/scope-pivot/typosquat/{engagement_id}",
+            params={
+                "check_resolution": str(check_resolution).lower(),
+                "auto_block_at": auto_block_at,
+            },
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        return safe_json(resp)
+
+
+@router.post("/api/scope-pivot/cert/{engagement_id}")
+async def run_cert_pivot(
+    engagement_id: str,
+    limit: int = Query(500, le=1000),
+):
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=120) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/scope-pivot/cert/{engagement_id}",
+            params={"limit": limit},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        return safe_json(resp)
+
+
+@router.post("/api/scope-pivot/asn/{engagement_id}")
+async def run_asn_pivot(
+    engagement_id: str,
+    limit: int = Query(500, le=1000),
+):
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=120) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/scope-pivot/asn/{engagement_id}",
+            params={"limit": limit},
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        return safe_json(resp)
+
+
+@router.get("/api/scope-pivot/suggestions")
+async def list_pivot_suggestions(
+    status: Optional[str] = Query(None),
+    method: Optional[str] = Query(None),
+    limit: int = Query(200, le=1000),
+):
+    s = get_settings()
+    params = {"limit": limit}
+    if status: params["status"] = status
+    if method: params["method"] = method
+    async with httpx.AsyncClient(timeout=15) as c:
+        resp = await c.get(
+            f"{s.rag_api_url}/scope-pivot/suggestions",
+            params=params,
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        return safe_json(resp)
+
+
+class ReviewPivotBody(BaseModel):
+    action: str  # "accept" | "reject"
+
+
+@router.post("/api/scope-pivot/suggestions/{suggestion_id}/review")
+async def review_pivot_suggestion(suggestion_id: str, body: ReviewPivotBody):
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=30) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/scope-pivot/suggestions/{suggestion_id}/review",
+            json=body.model_dump(),
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        return safe_json(resp)
+
+
+class BulkReviewPivotBody(BaseModel):
+    ids: list[str]
+    action: str  # "accept" | "reject"
+
+
+@router.post("/api/scope-pivot/suggestions/review-bulk")
+async def review_pivot_suggestions_bulk(body: BulkReviewPivotBody):
+    """Bulk operator review — up to 500 ids per call, one rag-api round-trip
+    + one DB transaction, so the UI can confirm/reject a page of
+    suggestions without 500 serial requests."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=120) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/scope-pivot/suggestions/review-bulk",
+            json=body.model_dump(),
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        return safe_json(resp)

@@ -6,6 +6,7 @@ Scanners route traffic through these proxies to scan remote networks.
 """
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -4389,6 +4390,32 @@ class DOCreateRequest(BaseModel):
     do_token: Optional[str] = None
 
 
+def _do_error_response(resp, operation: str = "DigitalOcean call") -> HTTPException:
+    """Convert a DO API error response into an HTTPException with the real reason.
+
+    DO's error body is `{"id": "<code>", "message": "<human reason>"}`. Prior
+    code did `raise HTTPException(500, f"Failed to ...: {resp.text}")` — the UI
+    showed a bare 500 with a nested JSON string the user had to double-parse to
+    reach `message`. On 2026-10-06 the operator hit `s-1vcpu-1gb` not available
+    in `nyc1` and saw triple-wrapped JSON instead of "Size is not available in
+    this region." See 2026-10-06 CHANGES_MADE.
+    """
+    code = "unknown"
+    msg = (resp.text or "").strip() or f"HTTP {resp.status_code}"
+    try:
+        body = resp.json()
+        code = str(body.get("id") or body.get("code") or code)
+        msg = str(body.get("message") or body.get("detail") or msg)
+    except Exception:
+        pass
+    # Map DO's status to a useful outward status: validation → 400, auth → 401,
+    # not-found → 404, else keep DO's status so clients can distinguish.
+    status = resp.status_code
+    if status == 422:
+        status = 400
+    return HTTPException(status, f"DigitalOcean {operation} rejected: {code} — {msg}")
+
+
 def _get_do_token(override: Optional[str] = None) -> str:
     if override:
         return override
@@ -4409,9 +4436,56 @@ def _get_do_token(override: Optional[str] = None) -> str:
 
 
 @app.get("/cloud/do/options")
-async def do_options():
-    """Return available DO droplet sizes and regions."""
-    return {"sizes": DO_SIZES, "regions": DO_REGIONS}
+async def do_options(do_token: Optional[str] = Query(None)):
+    """Return DO droplet sizes + regions LIVE from the account.
+
+    Returning a hardcoded list silently drifted — on 2026-10-06 `s-1vcpu-1gb`
+    was offered in `nyc1`, which DO retired for AMD/Intel suffixes
+    (`s-1vcpu-1gb-amd`, `s-1vcpu-1gb-intel`) in that region. The dropdown let
+    the operator pick an unlaunchable combo and the UI showed 500. Each `size`
+    now carries `regions: [slug]` so the frontend can disable combos DO will
+    reject. Falls back to the baked-in list if the live call fails so a dead
+    API key does not empty the dropdown.
+    """
+    import httpx as _httpx
+    try:
+        token = _get_do_token(do_token)
+    except HTTPException:
+        return {"sizes": DO_SIZES, "regions": DO_REGIONS, "live": False,
+                "note": "No DO token configured — showing fallback list"}
+    hdrs = {"Authorization": f"Bearer {token}"}
+    try:
+        async with _httpx.AsyncClient(timeout=15, verify=False) as c:
+            s_resp = await c.get("https://api.digitalocean.com/v2/sizes?per_page=200", headers=hdrs)
+            r_resp = await c.get("https://api.digitalocean.com/v2/regions?per_page=200", headers=hdrs)
+    except Exception as e:
+        return {"sizes": DO_SIZES, "regions": DO_REGIONS, "live": False,
+                "note": f"DO API unreachable: {e}"}
+    if s_resp.status_code != 200 or r_resp.status_code != 200:
+        return {"sizes": DO_SIZES, "regions": DO_REGIONS, "live": False,
+                "note": f"DO API error — sizes {s_resp.status_code}, regions {r_resp.status_code}"}
+    sizes_raw = s_resp.json().get("sizes", [])
+    regions_raw = r_resp.json().get("regions", [])
+    # Keep only sizes that are `available` and attach their per-size region list
+    # so the frontend can filter. Price is monthly USD.
+    sizes = [
+        {
+            "slug": s["slug"],
+            "label": f"{s['vcpus']} vCPU / {int(s['memory']/1024)}GB (${int(s.get('price_monthly', 0))}/mo)",
+            "vcpus": s["vcpus"],
+            "memory": s["memory"],
+            "price": int(s.get("price_monthly", 0)),
+            "regions": sorted(s.get("regions") or []),
+        }
+        for s in sizes_raw if s.get("available", True)
+    ]
+    sizes.sort(key=lambda x: (x["price"], x["slug"]))
+    regions = [
+        {"slug": r["slug"], "label": r.get("name") or r["slug"]}
+        for r in regions_raw if r.get("available", True)
+    ]
+    regions.sort(key=lambda x: x["label"])
+    return {"sizes": sizes, "regions": regions, "live": True}
 
 
 _do_provision_status: dict = {}  # droplet_id -> status dict
@@ -4481,7 +4555,7 @@ async def create_do_droplet(req: DOCreateRequest):
             if resp.status_code in (200, 201):
                 fp = resp.json()["ssh_key"]["fingerprint"]
             else:
-                raise HTTPException(500, f"Failed to upload SSH key to DO: {resp.text}")
+                raise _do_error_response(resp, "upload SSH key")
 
         # Create droplet
         resp = await c.post("https://api.digitalocean.com/v2/droplets", headers=hdrs, json={
@@ -4489,7 +4563,9 @@ async def create_do_droplet(req: DOCreateRequest):
             "image": req.image, "ssh_keys": [fp], "tags": ["pentest-node"],
         })
         if resp.status_code not in (200, 201, 202):
-            raise HTTPException(500, f"Failed to create droplet: {resp.text}")
+            # DO 422 "Size is not available in this region", 404 image/region not found,
+            # 401 auth — surface the actual reason instead of a bare 500.
+            raise _do_error_response(resp, "create droplet")
         droplet_id = resp.json()["droplet"]["id"]
 
     # Determine SSH private key for tunnel connection
@@ -5146,6 +5222,43 @@ AWS_AMIS = {
 _ec2_provision_status: dict = {}  # instance_id -> status dict
 
 
+def _aws_client_error_to_http(e, operation: str = "AWS call") -> HTTPException:
+    """Convert a boto3 ClientError into a user-visible 400 with the AWS message.
+
+    Without this, a `ClientError` escapes as a bare `500 "Internal Server Error"`
+    — the operator sees no reason, and the real cause lives only in
+    `docker logs node-manager`. The create-EC2 flow on 2026-10-06 hit exactly
+    this: AWS replied `AuthFailure ... was not able to validate the provided
+    access credentials`, FastAPI returned 500, the UI showed "Internal Server
+    Error", and nobody could tell whether the key was wrong, the permission was
+    missing, or the service was down. See 2026-10-06 CHANGES_MADE.
+    """
+    try:
+        err = e.response.get("Error", {}) if hasattr(e, "response") else {}
+        code = err.get("Code") or type(e).__name__
+        msg = err.get("Message") or str(e)
+    except Exception:
+        code = type(e).__name__
+        msg = str(e)
+    return HTTPException(400, f"AWS {operation} rejected: {code} — {msg}")
+
+
+def _aws_error_boundary(fn):
+    """Decorator: catch botocore ClientError at a handler boundary and surface
+    the AWS reason to the UI. Passes HTTPException and non-AWS exceptions
+    through unchanged so existing explicit `raise HTTPException(400, ...)` and
+    unrelated bugs still read truthfully."""
+    @functools.wraps(fn)
+    async def _wrap(*args, **kwargs):
+        try:
+            return await fn(*args, **kwargs)
+        except HTTPException:
+            raise
+        except ClientError as e:
+            raise _aws_client_error_to_http(e, fn.__name__)
+    return _wrap
+
+
 def _get_aws_session(region: str = "us-east-1", override_key: str = None, override_secret: str = None):
     """Get boto3 session from override, env, or DB."""
     key_id = override_key or os.environ.get("AWS_ACCESS_KEY_ID")
@@ -5186,6 +5299,35 @@ async def aws_options():
     return {"instance_types": AWS_INSTANCE_TYPES, "regions": AWS_REGIONS, "amis": AWS_AMIS}
 
 
+class AWSTestRequest(BaseModel):
+    region: str = "us-east-1"
+    aws_key: Optional[str] = None
+    aws_secret: Optional[str] = None
+
+
+@app.post("/cloud/aws/test")
+@_aws_error_boundary
+async def test_aws_credentials(req: AWSTestRequest):
+    """Validate AWS credentials with `sts:GetCallerIdentity`.
+
+    Returns `{ok, account, arn, user_id, region}` on success. On a bad key,
+    expired key, wrong account, or missing `sts:GetCallerIdentity` permission,
+    the ClientError is converted by `_aws_error_boundary` into a 400 with the
+    real AWS message so the Settings page can refuse Save instead of persisting
+    broken config and 500-ing later on create. See 2026-10-06 CHANGES_MADE.
+    """
+    session = _get_aws_session(req.region, req.aws_key, req.aws_secret)
+    sts = session.client("sts")
+    who = sts.get_caller_identity()
+    return {
+        "ok": True,
+        "account": who.get("Account"),
+        "arn": who.get("Arn"),
+        "user_id": who.get("UserId"),
+        "region": req.region,
+    }
+
+
 @app.get("/cloud/aws/status/{instance_id}")
 async def ec2_provision_status(instance_id: str):
     status = _ec2_provision_status.get(instance_id)
@@ -5195,8 +5337,17 @@ async def ec2_provision_status(instance_id: str):
 
 
 @app.post("/cloud/aws/create")
+@_aws_error_boundary
 async def create_ec2_instance(req: AWSCreateRequest):
-    """Create an AWS EC2 instance, wait for IP, SSH, then auto-connect tunnel."""
+    """Create an AWS EC2 instance, wait for IP, SSH, then auto-connect tunnel.
+
+    `@_aws_error_boundary` surfaces any `boto3.ClientError` (AuthFailure,
+    UnauthorizedOperation, DryRunOperation, InvalidKeyPair.NotFound,
+    insufficient quota, …) to the UI as a 400 with the AWS message instead
+    of a bare 500. The background `_provision()` thread catches its own
+    exceptions and writes to `_ec2_provision_status`, so the decorator only
+    covers the sync setup path.
+    """
     session = _get_aws_session(req.region, req.aws_key, req.aws_secret)
     ec2 = session.resource("ec2")
     ec2_client = session.client("ec2")

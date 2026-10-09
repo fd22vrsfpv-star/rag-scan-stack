@@ -648,7 +648,171 @@ def _render_vuln_class_methodology(data: Dict[str, Any]) -> List[Doc]:
     return out
 
 
+def _render_common_web_paths(data: Dict[str, Any]) -> List[Doc]:
+    """Embed the common-web-paths seed list as ONE doc so retrievers can find
+    it when the operator asks "what paths should we probe?". The runtime
+    reader (api.load_common_web_paths) still reads the YAML directly for
+    speed; the embed is for RAG recall."""
+    paths = [p for p in (data.get("common_web_paths") or []) if isinstance(p, str)]
+    if not paths:
+        return []
+    body = ("Common web-path seeds probed by the 404-cluster escalation hook "
+            "when a PoC build hits consecutive 404s. These are the paths most "
+            "web apps expose; probing them finds the real attack surface when "
+            "the LLM is guessing paths that don't exist.\n\n" + "\n".join(paths))
+    return [("Common web paths — PoC 404-escalation seeds", body)]
+
+
+def _render_http_status_fingerprints(data: Dict[str, Any]) -> List[Doc]:
+    """Embed each HTTP status tier (404/401/403/500) as a doc so retrievers
+    can recall the remediation guidance by status code. api._match_http_status_tier
+    reads the YAML directly at verdict time."""
+    docs: List[Doc] = []
+    for t in (data.get("tiers") or []):
+        method = t.get("method")
+        rem = (t.get("remediation") or "").strip()
+        patterns = t.get("patterns") or []
+        if not method:
+            continue
+        body = (f"PoC verifier tier: {method}\n\n"
+                f"Fingerprint patterns (any match triggers the tier):\n  "
+                + "\n  ".join(patterns) + "\n\n"
+                f"Remediation guidance for refine:\n{rem}")
+        docs.append((f"HTTP status cluster — {method}", body))
+    return docs
+
+
+def _render_web_auth_templates(data: Dict[str, Any]) -> List[Doc]:
+    """Embed each product's auth-chain template so the build-poc extractor can
+    retrieve the SHAPE of a login + anti-CSRF chain for a product by RAG
+    lookup rather than the model guessing. The extractor queries
+    rag_documents WHERE metadata->>'source'='knowledge' AND title LIKE
+    'Web auth template - %s%%' at pre_requests derivation time."""
+    docs: List[Doc] = []
+    for t in (data.get("templates") or []):
+        prod = _s(t.get("product"))
+        if not prod:
+            continue
+        aliases = t.get("aliases") or []
+        login = t.get("login_shape") or {}
+        csrf_steps = t.get("csrf_shape") or []
+        use = t.get("exploit_use") or {}
+        import json as _j
+        body = (
+            f"Product: {prod}  (aliases: {', '.join(aliases) or 'none'})\n\n"
+            f"LOGIN step (pre_request #1):\n"
+            f"  method: {_s(login.get('method'))}  path: {_s(login.get('path'))}\n"
+            f"  content_type: {_s(login.get('content_type'))}\n"
+            f"  body_fields: {_j.dumps(login.get('body_fields') or {}, sort_keys=True)}\n"
+            f"  captures: {_j.dumps(login.get('captures') or [], sort_keys=True)}\n\n"
+            f"CSRF/token step(s) (pre_request #2+):\n"
+        )
+        for i, step in enumerate(csrf_steps, start=1):
+            if step.get("note"):
+                body += f"  [{i}] NOTE: {_s(step.get('note'))}\n"
+                continue
+            body += (
+                f"  [{i}] method: {_s(step.get('method'))}  "
+                f"path: {_s(step.get('path'))}\n"
+                f"      headers: {_j.dumps(step.get('headers') or {}, sort_keys=True)}\n"
+                f"      captures: {_j.dumps(step.get('captures') or [], sort_keys=True)}\n"
+            )
+        body += (
+            f"\nEXPLOIT request uses these captured names:\n"
+            f"  body_fields: {_j.dumps(use.get('body_fields') or {}, sort_keys=True)}\n"
+            f"  headers: {_j.dumps(use.get('headers') or {}, sort_keys=True)}\n\n"
+            f"Notes: {_s(t.get('notes'))}"
+        )
+        docs.append((f"Web auth template - {prod}", body))
+    return docs
+
+
+def _render_app_request_contracts(data: Dict[str, Any]) -> List[Doc]:
+    """Embed each app request contract so retrievers + synth can recall the
+    KNOWN request shape (action endpoint, method, anti-CSRF param name + token
+    source, injection param) instead of the model guessing it. api runtime reads
+    the YAML directly via _app_request_contract(); this embed is for RAG recall."""
+    docs: List[Doc] = []
+    for c in (data.get("contracts") or []):
+        prod = _s(c.get("product"))
+        if not prod:
+            continue
+        csrf = c.get("csrf") or {}
+        body = (f"Product: {prod}\n"
+                f"Action endpoint: {_s(c.get('action_endpoint'))}  "
+                f"Method: {_s(c.get('method'))}\n"
+                f"Anti-CSRF param: {_s(csrf.get('param')) or '(none)'}  "
+                f"(wrong names to avoid: {', '.join(csrf.get('aliases') or []) or 'n/a'})\n"
+                f"CSRF token source: {_s(csrf.get('token_source'))}\n"
+                f"Injection param: {_s(c.get('injection_param')) or '(varies)'}\n\n"
+                f"{_s(c.get('notes'))}")
+        docs.append((f"App request contract — {prod}", body))
+    return docs
+
+
+def _render_exploitation_tools(data: Dict[str, Any]) -> List[Doc]:
+    """Embed the vuln-class → specialist-tool map so the planner (and the build-
+    poc tool-handoff) can recall which tool takes a PoC further (SQLi → sqlmap,
+    command-injection → commix, SSTI → tplmap, …)."""
+    docs: List[Doc] = []
+    for t in (data.get("tools") or []):
+        cls = _s(t.get("class"))
+        tool = _s(t.get("tool"))
+        if not cls or not tool:
+            continue
+        m = t.get("match") or {}
+        body = (f"Vulnerability class: {cls}\nSpecialist tool: {tool} "
+                f"(binary: {_s(t.get('binary')) or tool})\n"
+                f"Recognized by payload markers: "
+                f"{', '.join(m.get('payload_contains') or []) or 'n/a'}\n"
+                f"Confirm markers (tool output proves it): "
+                f"{', '.join(t.get('confirm_markers') or []) or 'n/a'}\n\n"
+                f"{_s(t.get('notes'))}")
+        docs.append((f"Exploitation tool — {cls} → {tool}", body))
+    return docs
+
+
+def _render_exploit_building_blocks(data: Dict[str, Any]) -> List[Doc]:
+    """Embed the building-block checklist so the challenge (and the planner) can
+    recall which lightweight checks validate each piece of an exploit."""
+    docs: List[Doc] = []
+    for b in (data.get("blocks") or []):
+        bid = _s(b.get("id"))
+        if not bid:
+            continue
+        body = (f"Building block: {bid}\nValidates: {_s(b.get('validates'))}\n"
+                f"Cost: {_s(b.get('cost'))}\nConfirms: {_s(b.get('confirms'))}\n"
+                f"Quick check: {_s(b.get('suggest'))}")
+        docs.append((f"Exploit building block — {bid}", body))
+    return docs
+
+
+def _render_cve_exploit_specs(data: Dict[str, Any]) -> List[Doc]:
+    """Embed each per-CVE exploit recipe so the planner/build can recall the
+    concrete endpoint + vector + payload for a known CVE."""
+    docs: List[Doc] = []
+    for s in (data.get("specs") or []):
+        cve = _s(s.get("cve"))
+        if not cve:
+            continue
+        req = s.get("request") or {}
+        inj = s.get("injection") or {}
+        body = (f"CVE: {cve}  product: {_s(s.get('product'))}  class: {_s(s.get('vuln_class'))}\n"
+                f"Request: {_s(req.get('method'))} {_s(req.get('path'))} "
+                f"({_s(req.get('content_type')) or 'n/a'})\n"
+                f"Injection payload: {_s(inj.get('payload_template'))}\n\n"
+                f"{_s(s.get('notes'))}")
+        docs.append((f"CVE exploit spec — {cve}", body))
+    return docs
+
+
 RENDERERS = {
+    "app_request_contracts": _render_app_request_contracts,
+    "exploitation_tools": _render_exploitation_tools,
+    "exploit_building_blocks": _render_exploit_building_blocks,
+    "cve_exploit_specs": _render_cve_exploit_specs,
+    "common_web_paths": _render_common_web_paths,
+    "http_status_fingerprints": _render_http_status_fingerprints,
     "vuln_class_methodology": _render_vuln_class_methodology,
     "msf_learned_options": _render_msf_learned_options,
     "ajax_spider_signals": _render_ajax_spider_signals,
@@ -674,6 +838,7 @@ RENDERERS = {
     "tool_options": _render_tool_options,
     "web_profiles": _render_web_profiles,
     "credential_spray_policy": _render_credential_spray_policy,
+    "web_auth_templates": _render_web_auth_templates,
 }
 
 

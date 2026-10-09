@@ -121,6 +121,12 @@ class LLMRequestMetric(BaseModel):
     is_error: bool = False
     error_message: Optional[str] = None
     request_params: Optional[dict] = None
+    # cost_usd: USD cost of the call, computed by LiteLLM's built-in price
+    # catalog on the LiteLLM dispatch path. NULL for calls that went through
+    # a non-LiteLLM path (hand-rolled fallback, or a model LiteLLM doesn't
+    # price yet). Nullable float because the DB column is nullable
+    # NUMERIC(10,6).
+    cost_usd: Optional[float] = None
     created_at: Optional[datetime] = None
 
 
@@ -425,7 +431,7 @@ def get_llm_requests(
         SELECT id, session_id, agent_name, caller, model_name,
                prompt_tokens, completion_tokens, total_tokens, tokens_per_sec,
                latency_ms, has_tool_calls, tool_call_count, tool_names,
-               is_error, error_message, request_params, created_at
+               is_error, error_message, request_params, cost_usd, created_at
         FROM llm_request_metrics
         WHERE (%s::text IS NULL OR session_id = %s::uuid)
           AND (%s::text IS NULL OR model_name = %s::text)
@@ -446,7 +452,11 @@ def get_llm_requests(
 
     requests_list = []
     for row in rows:
-        requests_list.append(LLMRequestMetric(
+        # cost_usd attached as a `cost_usd` attribute if the response_model
+        # defines it; falls through silently when the Pydantic class hasn't
+        # been extended yet (keeps old deployments compatible on redeploy).
+        _cost = row.get("cost_usd")
+        _entry = LLMRequestMetric(
             id=str(row["id"]),
             session_id=str(row["session_id"]) if row.get("session_id") else None,
             agent_name=row.get("agent_name"),
@@ -464,7 +474,13 @@ def get_llm_requests(
             error_message=row["error_message"],
             request_params=row.get("request_params"),
             created_at=row["created_at"],
-        ))
+        )
+        if _cost is not None:
+            try:
+                _entry.cost_usd = float(_cost)
+            except Exception:  # noqa: BLE001
+                pass
+        requests_list.append(_entry)
 
     return LLMRequestsResponse(
         limit=limit,
@@ -482,6 +498,11 @@ def get_llm_summary(
     """Aggregated LLM usage stats grouped by caller."""
     from psycopg2.extras import RealDictCursor
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # cost_usd aggregates come straight from the column. SUM/AVG over a
+        # column with NULLs ignores the NULLs (standard SQL), so the figures
+        # reflect ONLY calls that went through LiteLLM — the hand-rolled
+        # fallback stays uncounted, which is what we want (one real signal,
+        # not a mix of priced + unpriced calls).
         cur.execute("""
             SELECT COALESCE(caller, agent_name, 'unknown') as caller,
                    model_name,
@@ -491,6 +512,9 @@ def get_llm_summary(
                    ROUND(AVG(tokens_per_sec)::numeric, 1) as avg_tok_per_sec,
                    ROUND(AVG(total_tokens)::numeric) as avg_tokens,
                    SUM(total_tokens) as total_tokens_used,
+                   SUM(cost_usd) as total_cost_usd,
+                   ROUND(AVG(cost_usd)::numeric, 6) as avg_cost_usd,
+                   COUNT(cost_usd) as priced_calls,
                    MIN(created_at) as first_call,
                    MAX(created_at) as last_call
             FROM llm_request_metrics
@@ -499,4 +523,30 @@ def get_llm_summary(
             ORDER BY total_calls DESC
         """, (f"{days} days",))
         rows = cur.fetchall()
-    return {"days": days, "callers": [dict(r) for r in rows]}
+        # Grand totals across all callers (header line in the UI).
+        cur.execute("""
+            SELECT SUM(cost_usd) as grand_total_cost_usd,
+                   COUNT(cost_usd) as grand_priced_calls,
+                   COUNT(*) as grand_total_calls
+              FROM llm_request_metrics
+             WHERE created_at > now() - %s::interval
+        """, (f"{days} days",))
+        totals = cur.fetchone() or {}
+    # Normalise Decimal → float for JSON serialisation of the money fields.
+    def _f(v):
+        return float(v) if v is not None else None
+    callers = []
+    for r in rows:
+        d = dict(r)
+        d["total_cost_usd"] = _f(d.get("total_cost_usd"))
+        d["avg_cost_usd"] = _f(d.get("avg_cost_usd"))
+        callers.append(d)
+    return {
+        "days": days,
+        "callers": callers,
+        "totals": {
+            "cost_usd": _f(totals.get("grand_total_cost_usd")),
+            "priced_calls": int(totals.get("grand_priced_calls") or 0),
+            "total_calls": int(totals.get("grand_total_calls") or 0),
+        },
+    }

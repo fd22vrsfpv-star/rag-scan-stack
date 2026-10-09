@@ -454,3 +454,32 @@ export function useMoveToScope() {
     },
   })
 }
+
+// ─── Auto-evidence surface (what's already collected) ────────────────────
+// Returns everything the backend knows about this finding BEFORE any manual
+// uploads: the finding's own evidence/output text, matching exploit_store
+// rows (with runnable flag), and raw_artifacts for the same target IP.
+export interface AutoEvidenceItem {
+  kind: 'finding_output' | 'finding_evidence' | 'finding_description' | 'stored_exploit' | 'target_artifact'
+  title: string
+  body: string
+  created_at: string | null
+  link: { type: string; id: string }
+  verified?: boolean
+  runnable?: boolean
+  byte_size?: number
+}
+export interface AutoEvidenceResponse {
+  items: AutoEvidenceItem[]
+  count: number
+  target_ip: string | null
+  cves: string[]
+}
+export function useAutoEvidence(source?: string, id?: string) {
+  return useQuery({
+    queryKey: ['auto-evidence', source, id],
+    queryFn: () => apiFetch<AutoEvidenceResponse>(
+      `/findings/${source}/${id}/auto-evidence`),
+    enabled: !!source && !!id,
+  })
+}

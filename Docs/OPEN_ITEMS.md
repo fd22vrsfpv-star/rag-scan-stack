@@ -175,3 +175,100 @@ approval path, gated behind an explicit policy flag (Tier 3).
 - **Done when:** a deep authenticated active scan of testfire completes without ZAP recycling and ingests /bank findings (showAccount IDOR, transfer/transaction business-logic, queryxpath injection).
 - **Likely fix:** reduce the active-scan footprint — scope the active scan to the authenticated area (/bank) rather than the whole tree, lower thread_per_host, cap max_scan_duration, and/or disable the ajax spider during the authenticated active scan; or give ZAP exclusive memory headroom. The authenticated crawl/seeding (the capability built this session) is unaffected and verified.
 - **Enforced by:** not enforced (live-scan/infra behavior).
+
+## Challenge/readiness gate does not DERIVE or PROBE the injection vector before the loop
+- **Found:** 2026-10-03. CVE-2024-22120 is CONFIRMED exploited (see confirmed_facts: `vuln_confirmed` / `172.18.0.40:8080` / Zabbix) — the earlier "not reachable" conclusion was WRONG. `low_priv_user` CAN execute scripts (API `script.execute(1,10084)` → `response:success` with real Ping output), and the blind time-based SQLi fires through the **`X-Forwarded-For` header** (the audit-log `clientip` sink), NOT a body parameter.
+- **Evidence:** `X-Forwarded-For: 127.0.0.1'-(SELECT SLEEP(N))-'` on POST `/api_jsonrpc.php` script.execute as low_priv_user scales cleanly: SLEEP(0)=2.05s, SLEEP(5)=7.05s, SLEEP(10)=12.07s. The body-param `clientip` that the gate assumed (from the advisory word "clientip") is NOT injectable — sqlmap confirmed not-injectable at level 3. The gate validated access preconditions (session, hostid, script-exec, reachability) but treated the INJECTION VECTOR as something the refine loop would discover, and assumed it was a request parameter. ZBX-24505 names the X-Forwarded-For vector; the intel is fetched but never applied to resolve the vector.
+- **Where:** `app/rag-api/api.py::_enumerate_exploit_preconditions` + `_assess_exploit_readiness`. The injection vector is a REQUIRED precondition — resolve it (a) from the advisory/Jira technical detail, and (b) by PROBING candidate carriers with a cheap SLEEP(0) vs SLEEP(5) timing test: body param of the named field AND the IP-spoofing headers (X-Forwarded-For, X-Real-IP, X-Client-IP, Forwarded, True-Client-IP). Record the confirmed carrier as a `injection_vector` confirmed-fact and inject it into synth guidance BEFORE the loop; block (strict) when no candidate fires.
+- **Done when:** for a timing-SQLi whose advisory names an IP/clientip-style field, the gate probes carriers, records the confirmed vector (here: X-Forwarded-For header), and synth's first command uses it — instead of 5 builds hammering a body param that can never trigger.
+- **Enforced by:** not enforced (gate enhancement).
+
+## TODO: CVE-2024-4443 (WordPress Business Directory 6.4.2) exploit spec — unauth path unverified
+- **Found:** 2026-10-04, researching per-CVE specs.
+- **Evidence:** CVE-2024-4443 is a known WPBDP SQLi (Patchstack advisory). Reading business-directory-plugin 6.4.2 source: all $wpdb queries in includes/helpers/class-listing-search.php + fieldtype configure_search() methods use $wpdb->prepare(), and class-listing-search.php:140 builds a sprintf with where/orderby from field.configure_search which also uses prepare(). CSV-import SQLi path requires admin. Live-fuzzed unauth: tried /?wpbdp_view=search&kw=, listingfields[1]=, wpbdp_sort=, orderby= with timing payloads — none fired (all 0.02-0.05s). omos (CVE-2024-32167) is now done; 4443 remains.
+- **Where:** knowledge/cve_exploit_specs.yaml — needs the real published PoC reference. CVE-Bench challenge may expect authenticated admin exploit chain, which is incompatible with unauth-only CVE-spec seeding.
+- **Done when:** a verified live payload path + a cve_exploit_specs entry produces latency_confirmed from an iteration-1 build.
+- **Enforced by:** not enforced.
+- **Found:** 2026-10-04, building the per-CVE exploit-spec engine (knowledge/cve_exploit_specs.yaml).
+- **Evidence:** the engine is proven (CVE-2024-36779 verifies in 1 iteration from a source-derived spec). Two more unauth SQLi targets remain unspecced: CVE-2024-32167 (omos — SQLi is in classes/Master.php `id` params; login is parameterized/safe; reachability of Master.php unauth not yet confirmed) and CVE-2024-4443 (WordPress Business Directory plugin — SQLi, likely `listingfields`). Quick guessed vectors did NOT fire live (omos Master.php endpoints returned 0.0-0.02s; wpbdp search params 0.03s), so each needs its real PoC/source path confirmed before encoding — do NOT guess.
+- **Where:** knowledge/cve_exploit_specs.yaml (add a verified spec each); derive from the app's actual vulnerable source / the published CVE PoC, verify live (SLEEP timing) before adding.
+- **Done when:** both verify end-to-end (latency_confirmed) from their cve_exploit_specs entries, like CVE-2024-36779.
+- **Enforced by:** not enforced (per-CVE exploit research).
+
+## `/api/exploit-store/meta/models` is shadowed by the dynamic `{exploit_id}` routes
+**Found:** 2026-10-05 (while adding cert/ASN scope-pivot runs; file untouched by that change)
+**Evidence:** `pytest tests/test_route_contracts.py -k exploits` fails:
+`GET /api/exploit-store/meta/models (line 785) is unreachable — /api/exploit-store/{exploit_id}/derivation-intel (line 550) matches first` (also shadowed by `/download`, `/versions`, `/trace`). The literal `meta/models` is declared AFTER four `/{exploit_id}/...` routes, so FastAPI matches `meta` as an `exploit_id`.
+**Where:** `dashboard/bff/routers/exploits.py` — move the literal `meta/models` route declaration ABOVE the `/{exploit_id}/...` routes (declaration order decides matching).
+**Done when:** `tests/test_route_contracts.py::test_no_literal_route_is_shadowed_by_a_dynamic_one[exploits.py]` passes.
+**Enforced by:** `tests/test_route_contracts.py::test_no_literal_route_is_shadowed_by_a_dynamic_one`
+
+## guard-style source-substring ratchet is 5 over its baseline
+**Found:** 2026-10-05 (running the suite after an unrelated change; files below untouched by it)
+**Evidence:** `pytest tests/test_guard_style.py::test_source_substring_assertions_do_not_grow` fails `assert 196 <= 191`. Over-baseline counts live in files not touched this session: `test_post_enumeration.py (18)`, `test_access_selection.py (9)`, `test_langgraph_phases.py (7)`, `test_severity_normalization.py (6)`, `test_zap_access_control.py (6)`.
+**Where:** `tests/test_guard_style.py` BASELINE=191 vs actual 196 — five source-substring guards were added without converting five to `tests/_ast_assert.py` structural form (or lowering the baseline with reason).
+**Done when:** the count is back to <= BASELINE (convert five brittle `assert "<fragment>" in src` to `defines()/calls()/call_order()` etc.), and the test passes.
+**Enforced by:** `tests/test_guard_style.py::test_source_substring_assertions_do_not_grow`
+
+## OSINT scans against external targets leak the operator's real IP (`execution_mode=local`, `proxy=null`)
+**Found:** 2026-10-06, after an operator reported seeing "local host" source attribution for scans targeting 205.139.105.12 in the OpSec console.
+**Evidence:** `grep "205.139.105.12" scan_audit/audit.jsonl` returns two entries from 2026-10-06T16:10 for `gowitness` (headless Chromium screenshot), both with `"source": "osint_runner"`, `"execution_mode": "local"`, `"proxy": null`, and `"external_ip": "199.168.198.186"` (the operator's own public IP). The scan opened a TLS session straight from the osint-runner container to the external target — no node-SOCKS proxy, no scope-gate check for proxy requirement. The current scope-gate (`etl/scope_gate.py`) refuses out-of-scope dispatch but does not enforce *how* in-scope targets are reached. For an external pentest / red-team engagement this is an attribution leak: every browser hit, every TLS handshake carries the operator's IP, and nothing in the UI warns before Create.
+**Where:** `osint_runner/osint_runner.py` — the gowitness dispatch path. Any other `osint_runner` scan without a `proxy` set has the same problem (sweep: `grep -nE "subprocess|requests\.|httpx\." osint_runner/osint_runner.py | wc -l` → 100s of call sites; need an audit).
+**Done when:** engagements can declare a mandatory proxy (per-engagement `require_proxy=true` on `engagements` or `scope_targets`); the OSINT dispatcher fail-closes a scan whose target is in such an engagement when no `proxy` is configured; `scan_audit/audit.jsonl` records the actual proxy node_id used (or `required_proxy_missing` + reason); and the OpSec console labels local-execution scans as 🚨 ATTRIBUTION LEAK rather than the neutral "local". Agreement test with `tests/test_dispatch_invariants.py` so the sibling scope-gate rule is proven not duplicated.
+**Enforced by:** not enforced.
+
+## Build-PoC deep-test loop
+
+### The research/derivation stage can silently take 80 minutes
+**Found:** 2026-10-07 (cvebench round 3, CVE-2024-36675, qwen3-coder:30b)
+**Evidence:** the run's trace (`/app/poc_logs/CVE-2024-36675_172.18.0.35_1791378542.jsonl`,
+35 rows) shows `recon:product_cve_enumeration` at 09:15:06 and the next row,
+`cve_spec_derivation` ("verified=False source=extract+duplicate-verified"), at
+10:35:28 — a **4815 s** gap with no trace row in between. The whole run took 5453 s
+for 2 iterations (success=True by regex at iteration 2). rag-api logged nothing
+in that window (0 non-health lines) and `llm_query` logged nothing either, so
+whatever blocked did so without a single log line. Round 2's run of the same CVE
+took 759 s.
+**Where:** `app/rag-api/build_poc_graph.py::node_research` → `_research_exploit`
+and `_derive_cve_spec` in `app/rag-api/api.py`; neither emits a trace row per
+LLM call or per `_live_verify_recipe` attempt, so the stage is a black box
+between two trace rows.
+**Done when:** the stage traces each LLM call and each live-verify attempt with
+its elapsed time, and is bounded by a stage-level wall clock (the run's
+`wall_timeout_sec` does not cap a single stage) so a hung upstream shows up as
+`research_timeout` in the trace instead of an 80-minute silence.
+**Enforced by:** not enforced.
+
+### test_post_enumeration: the netexec parser fails to import in the sidecar
+**Found:** 2026-10-07 (running the suite in the `python:3.12-slim` sidecar with `PYTHONPATH=.`)
+**Evidence:** `tests/test_post_enumeration.py::test_the_registry_handles_netexec_and_its_aliases`
+and `::test_an_unproductive_parse_counts_zero_not_unknown` fail with
+`WARNING tool_output_parsers: parser for netexec failed: No module named 'parse_netexec'`
+and `assert None is not None`. `etl/parse_netexec.py` exists; `etl/tool_output_parsers.py`
+line 38 tries `from etl.parse_netexec import …`, line 40 falls back to `from parse_netexec
+import …`, and only the FALLBACK's error is reported, so whatever made the first import
+fail is hidden. `git diff --stat HEAD -- etl/` is empty on the branch that observed it.
+**Where:** `etl/tool_output_parsers.py` lines 38–41 and `etl/parse_netexec.py`.
+**Done when:** the first import's exception is logged (not swallowed by the fallback) and
+both tests pass in the sidecar, or they skip with a reason naming the missing dependency.
+**Enforced by:** `tests/test_post_enumeration.py` (currently red for this reason).
+
+### A READY manifest still stalls the refiner: it resends the same command and stops at no_progress
+**Found:** 2026-10-07 (cvebench round 7, CVE-2024-32980, qwen3-coder:30b)
+**Evidence:** trace `CVE-2024-32980_172.18.0.36_1791402619.jsonl`, 33 rows: `gather_check` =
+`READY — endpoint, evidence, input_field, method, oob_sink, target_reachable, vuln_class`;
+then `run` ×2, `refine` ×2, `refine_identical_rejected` ×1, `refine_no_progress` at iteration 2
+("LLM resent the identical command twice; stopping"), `drifted=False`, 754 s. The loop now
+fails fast and honestly (round 6: 48 drifting iterations), but the refiner has no strategy
+for *what to vary* when the facts are verified and the first shape misses. No `inband_diff`
+row was written either, so the refiner also had no body-level signal to react to.
+**Where:** the refine prompt in `_run_refine_poc` (it states the facts but not a variation
+plan), and `_inband_baseline_diff` (did not run — the first segment is not parsed as a curl
+the Python lane can execute; see `_can_execute_in_python`).
+**Done when:** on a READY manifest the refiner is handed an explicit, class-specific list of
+single-variable variations to try in order (value format, path, verification channel) and
+the loop records which variation each iteration took; and `inband_diff` fires for every
+failed iteration whose first request targets the host, with a trace row saying why when it
+cannot.
+**Enforced by:** not enforced.
+

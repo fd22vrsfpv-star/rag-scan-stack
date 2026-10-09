@@ -193,6 +193,19 @@ def _azure_foundry_root(base: str) -> str:
         '', b.rstrip('/'), flags=re.I).rstrip('/')
 
 
+# ───────────────────────────────────────────────────────────────────────────
+# DEPRECATED (LiteLLM migration) — hand-rolled per-provider adapters.
+#
+# These helpers are scheduled for removal in PR 4 of the migration. The
+# `_generate_text()` routed path already prefers LiteLLM (PR 2); the chat(),
+# embeddings(), stream, and non-routed generate() handlers still call them,
+# so they stay until PR 4 migrates those too and the live smoke tests pass.
+# See Docs/plans/LITELLM_MIGRATION.md + the "LLM dispatch" section in CLAUDE.md.
+# Each DEPRECATED function below carries a single-line marker so a grep for
+# "DEPRECATED (LiteLLM" turns up the full set.
+# ───────────────────────────────────────────────────────────────────────────
+
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
 def _azure_chat_url(model: Optional[str] = None,
                     endpoint: Optional[str] = None) -> str:
     """Build Azure chat completions URL based on endpoint pattern.
@@ -221,6 +234,7 @@ def _azure_embed_url(model: Optional[str] = None) -> str:
     return f"{base}/openai/deployments/{mdl}/embeddings?api-version={AZURE_API_VERSION}"
 
 
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
 def _azure_headers(api_key: Optional[str] = None) -> Dict[str, str]:
     """Auth for one Azure call. `api_key` lets a named provider instance use
     its OWN key instead of the global one -- required for two Azure resources
@@ -267,6 +281,7 @@ def _retry_after_seconds(resp):
     return None
 
 
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
 def _post_with_429_retry(url: str, payload: Dict[str, Any],
                          headers: Dict[str, str]):
     """POST, retrying ONLY on 429.
@@ -295,6 +310,7 @@ def _post_with_429_retry(url: str, payload: Dict[str, Any],
     return resp
 
 
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
 def _azure_json_post(url: str, payload: Dict[str, Any],
                      api_key: Optional[str] = None) -> Dict[str, Any]:
     """POST to Azure endpoint with API key auth."""
@@ -352,14 +368,180 @@ def _azure_json_post(url: str, payload: Dict[str, Any],
         raise HTTPException(status_code=502, detail=f"Azure endpoint unreachable: {e}")
 
 
+# ---------- Azure Foundry Anthropic Passthrough ----------
+#
+# Azure AI Foundry serves Anthropic Claude deployments through a
+# dedicated client. The exact wiring is documented in Microsoft's own
+# code snippet, which we match 1:1:
+#
+#   from anthropic import AnthropicFoundry
+#   from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+#   token_provider = get_bearer_token_provider(
+#       DefaultAzureCredential(), "https://ai.azure.com/.default")
+#   client = AnthropicFoundry(
+#       azure_ad_token_provider=token_provider,
+#       base_url="https://<resource>.services.ai.azure.com/anthropic")
+#   client.messages.create(model="<deployment>", messages=..., max_tokens=...)
+#
+# Auth is Entra ID OAuth (NOT the raw api-key), via DefaultAzureCredential's
+# standard chain — environment vars (AZURE_CLIENT_ID/SECRET/TENANT_ID),
+# then workload / managed identity, then Azure CLI. The container running
+# this code needs at least one of those paths available.
+#
+# Base URL ends at /anthropic (resource-root prefix); the SDK appends
+# /v1/messages. Model name is the Foundry DEPLOYMENT name, not an
+# Anthropic model id.
+
+_FOUNDRY_ANTHROPIC_PREFIXES = ("claude-",)
+_FOUNDRY_ENTRA_SCOPE = "https://ai.azure.com/.default"
+
+
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
+def _is_anthropic_on_foundry(model: Optional[str]) -> bool:
+    """True when model id looks like an Anthropic Claude deployment that
+    should be served via Foundry's Anthropic passthrough rather than the
+    OpenAI chat-completions path."""
+    if not model:
+        return False
+    m = model.lower()
+    return any(m.startswith(p) for p in _FOUNDRY_ANTHROPIC_PREFIXES)
+
+
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
+def _foundry_resource_root(endpoint: Optional[str]) -> str:
+    """Strip /api/projects/<project> from a Foundry Project endpoint so
+    the resulting URL is the resource root the Anthropic passthrough
+    lives on. If the endpoint is already a resource root (or empty), it
+    is returned unchanged."""
+    base = (endpoint or "").rstrip("/")
+    if "/api/projects/" in base:
+        base = base.split("/api/projects/")[0].rstrip("/")
+    return base
+
+
+_foundry_anthropic_client_cache: Dict[str, Any] = {}
+
+
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
+def _foundry_anthropic_client(endpoint: Optional[str],
+                              api_key: Optional[str] = None):
+    """Build (and cache) an AnthropicFoundry client bound to the given
+    endpoint.
+
+    Auth precedence:
+      1. If `api_key` is provided, use it as a static bearer — this is
+         the simple path when the operator has a Foundry resource key
+         in llm.providers already (what we have today).
+      2. Otherwise fall back to DefaultAzureCredential + Entra OAuth
+         with scope https://ai.azure.com/.default — the production
+         pattern Microsoft documents.
+
+    Cache key is (base_url, mode) so a key-swap or an auth-mode flip
+    rebuilds the client cleanly instead of serving a stale closure.
+    """
+    base = _foundry_resource_root(endpoint)
+    if not base:
+        raise HTTPException(502, "Anthropic-on-Foundry needs an endpoint")
+    base_url = f"{base}/anthropic"
+    mode = "key" if api_key else "entra"
+    ck = f"{base_url}|{mode}"
+    cached = _foundry_anthropic_client_cache.get(ck)
+    if cached is not None:
+        return cached
+    try:
+        from anthropic import AnthropicFoundry  # type: ignore
+    except ImportError as e:
+        raise HTTPException(
+            502,
+            f"Anthropic-on-Foundry requires the `anthropic` package "
+            f"(missing: {e.name}). Install in the llm_query image.")
+    try:
+        if api_key:
+            client = AnthropicFoundry(api_key=api_key, base_url=base_url)
+        else:
+            from azure.identity import (  # type: ignore
+                DefaultAzureCredential, get_bearer_token_provider)
+            token_provider = get_bearer_token_provider(
+                DefaultAzureCredential(), _FOUNDRY_ENTRA_SCOPE)
+            client = AnthropicFoundry(
+                azure_ad_token_provider=token_provider,
+                base_url=base_url)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(
+            502,
+            f"Anthropic-on-Foundry client init failed ({mode}): "
+            f"{type(e).__name__}: {str(e)[:200]}")
+    _foundry_anthropic_client_cache[ck] = client
+    return client
+
+
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
+def _azure_anthropic_messages_post(
+    endpoint: Optional[str], api_key: Optional[str],
+    model: str, prompt: str, options: Optional[Dict[str, Any]]
+) -> tuple:
+    """Dispatch one prompt via AnthropicFoundry (Entra-authenticated).
+
+    `api_key` is used as a static bearer when present; otherwise
+    DefaultAzureCredential (Entra) kicks in. Both paths dispatch through
+    the official `AnthropicFoundry` SDK, so the response shape matches
+    `_usage_from("anthropic", data)` without extra translation."""
+    client = _foundry_anthropic_client(endpoint, api_key=api_key)
+    opts = options or {}
+    max_tokens = int(
+        opts.get("num_predict")
+        or opts.get("max_tokens")
+        or MAX_COMPLETION_TOKENS
+    )
+    kwargs: Dict[str, Any] = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if opts.get("temperature") is not None:
+        kwargs["temperature"] = opts["temperature"]
+    if opts.get("top_p") is not None:
+        kwargs["top_p"] = opts["top_p"]
+    try:
+        resp = client.messages.create(**kwargs)
+    except Exception as e:  # noqa: BLE001
+        # Anthropic SDK's APIError carries .status_code and .body; surface
+        # both so operators can distinguish Foundry deployment issues from
+        # Anthropic model-id issues.
+        status = getattr(e, "status_code", None) or 502
+        body = getattr(e, "body", None) or str(e)
+        raise HTTPException(status,
+            f"azure-foundry anthropic: {type(e).__name__}: {str(body)[:400]}")
+    # Normalize SDK response to a dict + extracted text, matching the
+    # shape _usage_from('anthropic', data) expects.
+    text = ""
+    content = getattr(resp, "content", None) or []
+    for block in content:
+        t = getattr(block, "text", None)
+        if t: text += t
+    usage = getattr(resp, "usage", None)
+    data = {
+        "content": [{"type": "text", "text": text}],
+        "usage": {
+            "input_tokens": getattr(usage, "input_tokens", None),
+            "output_tokens": getattr(usage, "output_tokens", None),
+        } if usage is not None else {},
+        "model": getattr(resp, "model", model),
+        "stop_reason": getattr(resp, "stop_reason", None),
+    }
+    return text, data
+
+
 # ---------- OpenAI Helpers ----------
 
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
 def _openai_headers(api_key: Optional[str] = None) -> Dict[str, str]:
     """`api_key` lets a named provider instance use its own key."""
     return {"Authorization": f"Bearer {api_key or OPENAI_API_KEY}",
             "Content-Type": "application/json"}
 
 
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
 def _openai_chat_url(base: Optional[str] = None) -> str:
     return f"{(base or OPENAI_API_BASE).rstrip('/')}/v1/chat/completions"
 
@@ -368,6 +550,7 @@ def _openai_embed_url() -> str:
     return f"{OPENAI_API_BASE.rstrip('/')}/v1/embeddings"
 
 
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
 def _openai_json_post(url: str, payload: Dict[str, Any],
                       api_key: Optional[str] = None) -> Dict[str, Any]:
     """POST to OpenAI endpoint."""
@@ -387,6 +570,7 @@ def _openai_json_post(url: str, payload: Dict[str, Any],
 
 # ---------- Anthropic Helpers ----------
 
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
 def _anthropic_headers() -> Dict[str, str]:
     return {
         "x-api-key": ANTHROPIC_API_KEY,
@@ -395,6 +579,7 @@ def _anthropic_headers() -> Dict[str, str]:
     }
 
 
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
 def _anthropic_json_post(payload: Dict[str, Any]) -> Dict[str, Any]:
     """POST to Anthropic messages endpoint."""
     try:
@@ -410,6 +595,7 @@ def _anthropic_json_post(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=502, detail=f"Anthropic endpoint unreachable: {e}")
 
 
+# DEPRECATED (LiteLLM migration) — PR 4 will delete this.
 def _anthropic_extract_text(data: Dict) -> str:
     """Extract text content from Anthropic response."""
     for block in data.get("content", []):
@@ -651,6 +837,57 @@ def routes():
             "routes": out}
 
 
+@router.get("/litellm-status")
+def litellm_status():
+    """Live state of the LiteLLM migration (PR 4/4 — Docs/plans/LITELLM_MIGRATION.md).
+
+    Returns which path `_generate_text()` would take right now, the kill-switch
+    value, the list of model aliases the router has registered, and whether
+    `litellm.completion()` is importable. The operator-facing smoke-test script
+    (`scripts/litellm-smoke.sh`) reads this to decide which providers to probe.
+
+    Never exposes api keys. Safe for the dashboard to poll.
+    """
+    try:
+        from litellm_router import (
+            LITELLM_ROUTER_ENABLED, router_available, get_router,
+        )
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"litellm_router unimportable: {e}",
+                "kill_switch_enabled": False, "router_available": False,
+                "path_in_use": "hand_rolled"}
+    aliases: list = []
+    try:
+        router = get_router()
+        if router is not None:
+            aliases = [m.get("model_name") for m in (router.model_list or [])]
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"get_router() failed: {e}",
+                "kill_switch_enabled": LITELLM_ROUTER_ENABLED,
+                "router_available": False, "path_in_use": "hand_rolled"}
+    try:
+        import litellm  # noqa: F401
+        litellm_importable = True
+    except Exception:  # noqa: BLE001
+        litellm_importable = False
+    avail = router_available()
+    path = ("litellm" if (LITELLM_ROUTER_ENABLED and avail and litellm_importable)
+            else "hand_rolled")
+    return {
+        "ok": True,
+        "kill_switch_enabled": LITELLM_ROUTER_ENABLED,
+        "router_available": avail,
+        "litellm_importable": litellm_importable,
+        "path_in_use": path,
+        "aliases": aliases,
+        "alias_count": len(aliases),
+        "note": ("path_in_use is what _generate_text() would use next. "
+                 "Set LITELLM_ROUTER_ENABLED=false in the llm_query env to "
+                 "force hand_rolled. Per-call path is also logged as "
+                 "'llm_query: path=litellm|hand_rolled backend=X model=Y'."),
+    }
+
+
 def _resolve_caller_provider_model(caller: str):
     """If `caller` is "provider:model" with a KNOWN provider prefix, resolve it to
     a full route (that provider's backend/endpoint/api_key + the bare model), the
@@ -752,12 +989,61 @@ def _generate_text(backend: str, model: str, prompt: str,
     Separate from generate() so a route can send a request to a backend other
     than the globally-selected one -- that is what makes "news on a local
     ollama while the agents stay on Azure" possible.
+
+    PR 2 of the LiteLLM migration (Docs/plans/LITELLM_MIGRATION.md): when the
+    `LITELLM_ROUTER_ENABLED` kill switch is on (default) AND the router can
+    be built, try the LiteLLM path first and fall back to the hand-rolled
+    dispatch on any error. The LiteLLM path returns the SAME (text, usage)
+    tuple shape so downstream telemetry doesn't branch. A warning log line
+    is emitted on fallback so an operator seeing their LiteLLM path fail
+    gets a signal, not silence.
     """
     backend = (backend or "").lower()
     temp = (options or {}).get("temperature")
     top_p = (options or {}).get("top_p")
 
+    # ─── LiteLLM path (PR 2) ─────────────────────────────────────────────
+    try:
+        from litellm_router import (
+            LITELLM_ROUTER_ENABLED, router_available, litellm_completion_for,
+        )
+        _can_route = LITELLM_ROUTER_ENABLED and router_available()
+    except Exception as e:  # noqa: BLE001
+        _can_route = False
+        logging.debug("llm_query: litellm_router import failed (%s) — hand-rolled dispatch only", e)
+    if _can_route:
+        try:
+            result = litellm_completion_for(backend, model, prompt, options,
+                                            endpoint=endpoint, api_key=api_key,
+                                            max_tokens=MAX_COMPLETION_TOKENS)
+            if result is not None:
+                # Path telemetry — one line per served call so an operator can
+                # grep the logs to confirm LiteLLM served (vs hand-rolled
+                # fallback) for a given backend+model. Lightweight — the
+                # per-call overhead is negligible compared to the model call.
+                logging.info("llm_query: path=litellm backend=%s model=%s", backend, model)
+                return result
+        except Exception as e:  # noqa: BLE001
+            # Fall through to the hand-rolled path. The exception message
+            # is kept at WARNING so the operator sees exactly which call
+            # LiteLLM couldn't serve — critical during PR 2 bake-in.
+            logging.warning("llm_query: LiteLLM path failed on backend=%s model=%s (%s) — "
+                            "falling back to hand-rolled dispatch", backend, model, e)
+    logging.info("llm_query: path=hand_rolled backend=%s model=%s", backend, model)
+
     if backend == "azure":
+        # Azure Foundry serves Anthropic Claude models through a
+        # passthrough at /anthropic/v1/messages on the RESOURCE root
+        # (not the project endpoint). The OpenAI chat-completions path
+        # returns "api_not_supported" for Anthropic deployments. Detect
+        # by model-id prefix and dispatch to the Anthropic Messages API
+        # helper. See _azure_anthropic_messages_post docstring for why
+        # Bearer + resource-root + anthropic-version are all required
+        # together (verified empirically via probe before shipping).
+        if _is_anthropic_on_foundry(model):
+            text, data = _azure_anthropic_messages_post(
+                endpoint, api_key, model, prompt, options)
+            return text, _usage_from("anthropic", data)
         payload: Dict[str, Any] = {
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": MAX_COMPLETION_TOKENS, "model": model,
@@ -817,6 +1103,97 @@ def _generate_text(backend: str, model: str, prompt: str,
             f"{backend} endpoint {url} unreachable: {str(e) or type(e).__name__}")
 
 
+def _chat_text(backend: str, model: str, messages: list,
+               options: Optional[Dict[str, Any]],
+               endpoint: Optional[str] = None,
+               api_key: Optional[str] = None):
+    """Multi-turn companion to `_generate_text()`. Same LiteLLM-first-with-
+    hand-rolled-fallback pattern, but takes `messages` and preserves the
+    system / user / assistant turn boundaries — the single-prompt path
+    would flatten them.
+
+    Used by `chat()`'s non-routed branches after the LiteLLM cutover.
+    The hand-rolled fallback replays the per-backend branches we deleted
+    from `chat()`, so an operator forcing `LITELLM_ROUTER_ENABLED=false`
+    keeps everything working.
+    """
+    backend = (backend or "").lower()
+    try:
+        from litellm_router import (
+            LITELLM_ROUTER_ENABLED, router_available, litellm_chat_completion_for,
+        )
+        _can_route = LITELLM_ROUTER_ENABLED and router_available()
+    except Exception as e:  # noqa: BLE001
+        _can_route = False
+        logging.debug("llm_query: litellm_router import failed (%s) — hand-rolled chat only", e)
+    if _can_route:
+        try:
+            result = litellm_chat_completion_for(backend, model, messages, options,
+                                                 endpoint=endpoint, api_key=api_key,
+                                                 max_tokens=MAX_COMPLETION_TOKENS)
+            if result is not None:
+                logging.info("llm_query: path=litellm backend=%s model=%s (chat)", backend, model)
+                return result
+        except Exception as e:  # noqa: BLE001
+            logging.warning("llm_query: LiteLLM chat path failed on backend=%s model=%s (%s) — "
+                            "falling back to hand-rolled dispatch", backend, model, e)
+    logging.info("llm_query: path=hand_rolled backend=%s model=%s (chat)", backend, model)
+
+    # Hand-rolled fallback — same per-backend branches chat() had before
+    # the cutover, kept so a kill-switch flip restores functionality.
+    temp = (options or {}).get("temperature")
+    top_p = (options or {}).get("top_p")
+    if backend == "azure":
+        payload: Dict[str, Any] = {
+            "messages": messages,
+            "max_tokens": MAX_COMPLETION_TOKENS,
+            "model": model,
+        }
+        if temp is not None: payload["temperature"] = temp
+        if top_p is not None: payload["top_p"] = top_p
+        data = _azure_json_post(_azure_chat_url(model, endpoint), payload, api_key)
+        return data["choices"][0]["message"]["content"], _usage_from("azure", data)
+    if backend == "openai":
+        payload = {"model": model, "messages": messages,
+                   "max_tokens": MAX_COMPLETION_TOKENS}
+        if temp is not None: payload["temperature"] = temp
+        data = _openai_json_post(_openai_chat_url(endpoint), payload, api_key)
+        return data["choices"][0]["message"]["content"], _usage_from("openai", data)
+    if backend == "anthropic":
+        system_parts = [m["content"] for m in messages if m.get("role") == "system"]
+        filtered = [m for m in messages if m.get("role") != "system"]
+        payload = {"model": model, "max_tokens": MAX_COMPLETION_TOKENS,
+                   "messages": filtered}
+        if system_parts:
+            payload["system"] = "\n\n".join(system_parts)
+        data = _anthropic_json_post(payload)
+        return _anthropic_extract_text(data), _usage_from("anthropic", data)
+    # ollama / vllm — native /api/chat
+    base = endpoint or OLLAMA_URL
+    if not endpoint and backend == "vllm" and get_llm_settings is not None:
+        try:
+            base = get_llm_settings().get("vllm_url") or base
+        except Exception:  # noqa: BLE001
+            pass
+    body: Dict[str, Any] = {"model": model, "messages": messages, "stream": False}
+    if options:
+        body.update(options)
+    url = base.rstrip("/") + "/api/chat"
+    try:
+        r = _post_with_429_retry(url, body, {"Content-Type": "application/json"})
+        r.raise_for_status()
+        j = r.json()
+        # ollama /api/chat returns {"message": {"role":"assistant","content":"…"}, ...}
+        content = (j.get("message") or {}).get("content", "")
+        return content, _usage_from(backend or "ollama", j)
+    except requests.HTTPError as e:
+        raise _http_error_from_requests(e)
+    except requests.RequestException as e:
+        raise HTTPException(
+            502,
+            f"{backend} endpoint {url} unreachable: {str(e) or type(e).__name__}")
+
+
 def _generate_routed(route: Dict[str, Any], prompt: str,
                      options: Optional[Dict[str, Any]]):
     """Generate on the route's primary, failing over to its fallback on 429.
@@ -826,8 +1203,17 @@ def _generate_routed(route: Dict[str, Any], prompt: str,
     longer will not help -- a DIFFERENT model is the only thing that will. The
     response says which one answered, because silently substituting a model the
     operator did not choose would otherwise be invisible.
+
+    Per-task reasoning_effort — if the resolved route carries one (set in
+    `get_route()` via `llm.reasoning_effort.<task>`) AND the caller didn't
+    override it in `options`, inject it so `_build_litellm_kwargs` picks it
+    up for reasoning deployments (gpt-5*, o1*, o3*, o4*). Non-reasoning
+    deployments ignore it (gated at _build_litellm_kwargs by `_is_reasoning_model`).
     """
     primary = (route.get("backend"), route.get("model"))
+    options = dict(options or {})
+    if "reasoning_effort" not in options and route.get("reasoning_effort"):
+        options["reasoning_effort"] = route["reasoning_effort"]
     try:
         text, usage = _generate_text(primary[0], primary[1], prompt, options,
                                      route.get("endpoint"), route.get("api_key"))
@@ -887,54 +1273,42 @@ def generate(req: GenerateRequest):
             "prompt_eval_count": (usage or {}).get("prompt_tokens", 0),
         })
 
-    if LLM_BACKEND == "azure":
-        # A model named by the CALLER wins; AZURE_MODEL is only the default.
-        # It used to be `AZURE_MODEL or req.model`, so the global model always
-        # won and no consumer could pick its own -- which is what made a cheap
-        # model for news and a strong one for the agents impossible.
-        # NOTE: embeddings() deliberately keeps the old behaviour; its model is
-        # a separate deployment and a chat model name there breaks the embedder.
-        model = _caller_model(req.model) or AZURE_MODEL
-        payload: Dict[str, Any] = {
-            "messages": [{"role": "user", "content": req.prompt}],
-            "max_tokens": MAX_COMPLETION_TOKENS,
-        }
-        if req.options:
-            if "temperature" in req.options:
-                payload["temperature"] = req.options["temperature"]
-            if "top_p" in req.options:
-                payload["top_p"] = req.options["top_p"]
-        payload["model"] = model
-        url = _azure_chat_url(model)
-        data = _azure_json_post(url, payload)
-        content = data["choices"][0]["message"]["content"]
-        return JSONResponse(content={"model": model, "response": content, "done": True})
+    # LITELLM CUTOVER — non-routed generate(). Previously, this split into
+    # per-backend branches (azure/openai/anthropic/ollama) each calling a
+    # hand-rolled dispatcher. All four are now unified through
+    # `_generate_text()`, which is LiteLLM-first (PR 2) with hand-rolled
+    # fallback on error (same fallback the azure/openai/anthropic branches
+    # here used directly). One code path, cost tracking populates for every
+    # call, consistent telemetry (`path=litellm|hand_rolled`).
+    #
+    # STREAM is still ollama-only via /api/generate — streaming through
+    # LiteLLM is a follow-up (SSE translation + per-chunk cost accounting).
+    # A streaming request falls through to the ollama pass-through below.
+    if not req.stream:
+        if LLM_BACKEND == "azure":
+            model = _caller_model(req.model) or AZURE_MODEL
+        elif LLM_BACKEND == "openai":
+            model = _caller_model(req.model) or OPENAI_MODEL
+        elif LLM_BACKEND == "anthropic":
+            model = _caller_model(req.model) or ANTHROPIC_MODEL
+        else:
+            # ollama / vllm: a caller-named model wins; the global default
+            # was previously only applied by the ollama pass-through, which
+            # we keep for the stream path.
+            model = _caller_model(req.model) or _normalize_model(req.model)
+        text, usage = _generate_text(LLM_BACKEND, model, req.prompt, req.options)
+        return JSONResponse(content={
+            "model": model, "response": text, "done": True,
+            # Keep the same shape the routed path returns so downstream
+            # readers (rag-api llm_generate) parse tokens + cost from one
+            # place regardless of whether a task was named.
+            "usage": usage or {},
+            "eval_count": (usage or {}).get("completion_tokens", 0),
+            "prompt_eval_count": (usage or {}).get("prompt_tokens", 0),
+        })
 
-    if LLM_BACKEND == "openai":
-        model = OPENAI_MODEL
-        payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": req.prompt}],
-            "max_tokens": MAX_COMPLETION_TOKENS,
-        }
-        if req.options:
-            if "temperature" in req.options:
-                payload["temperature"] = req.options["temperature"]
-        data = _openai_json_post(_openai_chat_url(), payload)
-        content = data["choices"][0]["message"]["content"]
-        return JSONResponse(content={"model": model, "response": content, "done": True})
-
-    if LLM_BACKEND == "anthropic":
-        model = ANTHROPIC_MODEL
-        payload = {
-            "model": model,
-            "max_tokens": MAX_COMPLETION_TOKENS,
-            "messages": [{"role": "user", "content": req.prompt}],
-        }
-        data = _anthropic_json_post(payload)
-        content = _anthropic_extract_text(data)
-        return JSONResponse(content={"model": model, "response": content, "done": True})
-
+    # STREAM — ollama-native pass-through. Hand-rolled for now; the
+    # LiteLLM streaming migration is scoped out of the cutover.
     payload_ollama: Dict[str, Any] = {
         "model": _normalize_model(req.model),
         "prompt": req.prompt,
@@ -942,14 +1316,9 @@ def generate(req: GenerateRequest):
     }
     if req.options:
         payload_ollama.update(req.options)
-
     url = _endpoint("/generate")
-    if req.stream:
-        gen = _stream_post(url, payload_ollama)
-        return StreamingResponse(gen, media_type="application/x-ndjson")
-    else:
-        data = _json_post(url, payload_ollama)
-        return JSONResponse(content=data)
+    gen = _stream_post(url, payload_ollama)
+    return StreamingResponse(gen, media_type="application/x-ndjson")
 
 def _messages_to_prompt(messages) -> str:
     """Flatten chat messages into one prompt for the routed provider path.
@@ -981,7 +1350,13 @@ def chat(req: ChatRequest):
     # to the per-backend branches below exactly as before.
     route = _route_for(req.task, req.model)
     if (req.task or route.get("endpoint")) and not req.stream:
-        text, used, failed_over = _generate_routed(
+        # `_generate_routed` returns `(text, used, failed_over, usage)` —
+        # the 4th was added when cost/token telemetry became a first-class
+        # return value. `chat()`'s routed path was still unpacking 3, which
+        # 500ed every routed chat call. Fixed here + usage surfaced in the
+        # response envelope so cost tracking (feat: 2ed8d57) persists for
+        # chat too, not just generate.
+        text, used, failed_over, usage = _generate_routed(
             route, _messages_to_prompt(req.messages), req.options)
         return JSONResponse(content={
             "model": used[1],
@@ -993,74 +1368,38 @@ def chat(req: ChatRequest):
             "task": req.task,
             "route_source": route.get("source"),
             "failed_over": failed_over,
+            "usage": usage or {},
+            "eval_count": (usage or {}).get("completion_tokens", 0),
+            "prompt_eval_count": (usage or {}).get("prompt_tokens", 0),
         })
 
-    if LLM_BACKEND == "azure":
-        # A model named by the CALLER wins; AZURE_MODEL is only the default.
-        # It used to be `AZURE_MODEL or req.model`, so the global model always
-        # won and no consumer could pick its own -- which is what made a cheap
-        # model for news and a strong one for the agents impossible.
-        # NOTE: embeddings() deliberately keeps the old behaviour; its model is
-        # a separate deployment and a chat model name there breaks the embedder.
-        model = _caller_model(req.model) or AZURE_MODEL
-        payload: Dict[str, Any] = {
-            "messages": [m.dict() for m in req.messages],
-            "max_tokens": MAX_COMPLETION_TOKENS,
-        }
-        if req.options:
-            if "temperature" in req.options:
-                payload["temperature"] = req.options["temperature"]
-            if "top_p" in req.options:
-                payload["top_p"] = req.options["top_p"]
-        payload["model"] = model
-        url = _azure_chat_url(model)
-        data = _azure_json_post(url, payload)
-        content = data["choices"][0]["message"]["content"]
-        return JSONResponse(content={
-            "model": model,
-            "message": {"role": "assistant", "content": content},
-            "done": True,
-        })
-
-    if LLM_BACKEND == "openai":
-        model = OPENAI_MODEL
-        payload = {
-            "model": model,
-            "messages": [m.dict() for m in req.messages],
-            "max_tokens": MAX_COMPLETION_TOKENS,
-        }
-        if req.options:
-            if "temperature" in req.options:
-                payload["temperature"] = req.options["temperature"]
-        data = _openai_json_post(_openai_chat_url(), payload)
-        content = data["choices"][0]["message"]["content"]
-        return JSONResponse(content={
-            "model": model,
-            "message": {"role": "assistant", "content": content},
-            "done": True,
-        })
-
-    if LLM_BACKEND == "anthropic":
-        model = ANTHROPIC_MODEL
-        # Extract system messages for Anthropic
+    # LITELLM CUTOVER — non-routed chat(). Same unification as generate():
+    # the four per-backend branches collapse into one LiteLLM-first path
+    # via `litellm_chat_completion_for()` (preserves multi-turn messages
+    # — the single-prompt `_generate_text()` path would flatten them).
+    # Hand-rolled fallback runs on any LiteLLM error, same safe pattern
+    # as `_generate_text`. STREAM remains ollama-native (follow-up).
+    if not req.stream:
+        if LLM_BACKEND == "azure":
+            model = _caller_model(req.model) or AZURE_MODEL
+        elif LLM_BACKEND == "openai":
+            model = _caller_model(req.model) or OPENAI_MODEL
+        elif LLM_BACKEND == "anthropic":
+            model = _caller_model(req.model) or ANTHROPIC_MODEL
+        else:
+            model = _caller_model(req.model) or _normalize_model(req.model)
         msgs = [m.dict() for m in req.messages]
-        system_parts = [m["content"] for m in msgs if m.get("role") == "system"]
-        filtered = [m for m in msgs if m.get("role") != "system"]
-        payload: Dict[str, Any] = {
-            "model": model,
-            "max_tokens": MAX_COMPLETION_TOKENS,
-            "messages": filtered,
-        }
-        if system_parts:
-            payload["system"] = "\n\n".join(system_parts)
-        data = _anthropic_json_post(payload)
-        content = _anthropic_extract_text(data)
+        text, usage = _chat_text(LLM_BACKEND, model, msgs, req.options)
         return JSONResponse(content={
             "model": model,
-            "message": {"role": "assistant", "content": content},
+            "message": {"role": "assistant", "content": text},
             "done": True,
+            "usage": usage or {},
+            "eval_count": (usage or {}).get("completion_tokens", 0),
+            "prompt_eval_count": (usage or {}).get("prompt_tokens", 0),
         })
 
+    # STREAM — ollama-native pass-through.
     payload_ollama: Dict[str, Any] = {
         "model": _normalize_model(req.model),
         "messages": [m.dict() for m in req.messages],
@@ -1068,14 +1407,9 @@ def chat(req: ChatRequest):
     }
     if req.options:
         payload_ollama.update(req.options)
-
     url = _endpoint("/chat")
-    if req.stream:
-        gen = _stream_post(url, payload_ollama)
-        return StreamingResponse(gen, media_type="application/x-ndjson")
-    else:
-        data = _json_post(url, payload_ollama)
-        return JSONResponse(content=data)
+    gen = _stream_post(url, payload_ollama)
+    return StreamingResponse(gen, media_type="application/x-ndjson")
 
 @router.post("/embeddings")
 

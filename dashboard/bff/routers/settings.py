@@ -1082,6 +1082,89 @@ async def put_llm_providers(body: LlmProvidersBody):
             "note": "takes effect within 30s (resolver cache TTL)"}
 
 
+def _diagnose_generate_failure(*, err_text: str, model: str,
+                               ptype: str, deployment_names: list) -> str:
+    """Attach an operator-actionable hint to a generate-step failure.
+
+    The probe surfaces the real dispatcher error (good: that's what agents
+    see), but a raw `DeploymentNotFound` or `not_found_error` is often
+    one of a handful of operator-config patterns we've seen. Each pattern
+    gets a one-line "do THIS to fix it" nudge appended to the error so
+    the operator doesn't have to guess.
+
+    Patterns covered:
+      (1) Case-mismatch: `default_model` has a case-insensitive match in
+          the deployments list on this resource. Classic Azure portal
+          typo (`deepseek4-pro` vs `DeepSeek-V4-Pro`).
+      (2) No deployments: the resource authenticates but is empty — the
+          endpoint points at the wrong resource.
+      (3) Fuzzy name match: `default_model` substring-matches one of the
+          deployments (`gpt5-mini` vs `gpt-5-mini`). Probably the
+          operator meant the one that exists.
+      (4) Anthropic model-not-found: Azure routed to Anthropic but
+          Anthropic itself rejected the model id — Microsoft's Foundry
+          deployment is misbound in the Azure portal, not fixable
+          client-side.
+      (5) Nothing matched: generic nudge pointing to Settings.
+
+    Return value includes a leading space when non-empty so it appends
+    cleanly to the error message.
+    """
+    err_lower = err_text.lower()
+    model = (model or "").strip()
+    names = [n for n in (deployment_names or []) if n]
+
+    # (4) Anthropic says "not_found" with no "deployment" prefix → the
+    # request REACHED Anthropic and Anthropic itself rejects the model.
+    # Microsoft/Foundry misbinding — fix on Azure side.
+    if ("not_found_error" in err_lower
+            and "deployment" not in err_lower
+            and model.lower().startswith("claude-")):
+        return (" — Microsoft Foundry forwarded the request to Anthropic, "
+                "which rejected the model id. The Azure deployment is "
+                "misbound. Fix: Azure Portal → AI Foundry → the project → "
+                "Deployments → delete and re-create from the Model Catalog "
+                "so Azure maps the deployment to a real Anthropic model id.")
+
+    # (1) Case-insensitive exact match in deployments list.
+    if "deploymentnotfound" in err_lower and names:
+        lower_match = next((n for n in names if n.lower() == model.lower()
+                            and n != model), None)
+        if lower_match:
+            return (f" — case mismatch? Change default_model to "
+                    f"{lower_match!r} (the exact deployment name on "
+                    f"this resource).")
+
+        # (3) Fuzzy name match: substring either direction, or trim non-alnum.
+        import re
+        def _norm(s): return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+        mn = _norm(model)
+        for n in names:
+            nn = _norm(n)
+            if mn and nn and (mn in nn or nn in mn):
+                return (f" — did you mean {n!r}? Change default_model to "
+                        f"match (deployments on this resource: "
+                        f"{', '.join(names[:6])}"
+                        f"{'…' if len(names) > 6 else ''}).")
+
+    # (2) No deployments at all — endpoint points at the wrong resource.
+    if "deploymentnotfound" in err_lower and ptype == "azure" and not names:
+        return (" — this resource has no deployments. Either remove the "
+                "provider or re-point its endpoint at a resource that has "
+                f"a {model!r} deployment (check your other configured "
+                "providers for the right URL).")
+
+    # (5) DeploymentNotFound with deployments present but no match:
+    # explicitly list what IS there.
+    if "deploymentnotfound" in err_lower and names:
+        return (f" — default_model {model!r} isn't in the deployments on "
+                f"this resource. Change it to one of: "
+                f"{', '.join(names[:8])}"
+                f"{'…' if len(names) > 8 else ''}.")
+
+    return ""
+
+
 @router.post("/api/settings/llm/providers/{provider_id}/test")
 async def test_llm_provider(provider_id: str):
     """Connectivity check for ONE named provider, step by step.
@@ -1144,6 +1227,10 @@ async def test_llm_provider(provider_id: str):
     add("endpoint", True,
         f"root {root}" + ("" if root == ep.rstrip("/") else f"  (normalised from {ep})"))
 
+    # Deployments list, hoisted to this scope so the generate step can
+    # cross-reference the operator's default_model against it (catches
+    # case-mismatches: `deepseek4-pro` vs the real `DeepSeek-V4-Pro`).
+    deployment_names: list[str] = []
     async with httpx.AsyncClient(timeout=45, verify=False) as c:
         if ptype in ("azure", "openai"):
             hdr = ({"api-key": key} if ptype == "azure"
@@ -1153,12 +1240,12 @@ async def test_llm_provider(provider_id: str):
                                 params={"api-version": "2023-03-15-preview"},
                                 headers=hdr)
                 if r.status_code == 200:
-                    names = [d.get("id") for d in (r.json().get("data") or [])
-                             if isinstance(d, dict)
-                             and (d.get("status") or "succeeded") == "succeeded"]
+                    deployment_names = [d.get("id") for d in (r.json().get("data") or [])
+                                        if isinstance(d, dict)
+                                        and (d.get("status") or "succeeded") == "succeeded"]
                     add("auth", True, "key accepted")
-                    add("deployments", bool(names),
-                        (", ".join(names) if names else
+                    add("deployments", bool(deployment_names),
+                        (", ".join(deployment_names) if deployment_names else
                          "NONE — this resource authenticates but serves no "
                          "models; the model you want is probably on a "
                          "different resource"))
@@ -1184,46 +1271,54 @@ async def test_llm_provider(provider_id: str):
         if not model:
             add("generate", False, "no default model set — nothing to test")
         else:
+            # DELEGATE to llm_query's /api/generate rather than hand-rolling
+            # a per-provider HTTP call here. The dispatcher already knows
+            # every provider's shape (LiteLLM-first → azure_ai/anthropic/<m>
+            # for Foundry Anthropic, azure_ai/<m> → openai/<m> retry for
+            # Foundry OpenAI-compat, hand-rolled fallback for anything
+            # LiteLLM doesn't yet handle, api_version translation, etc.).
+            # If llm_query returns 200, the provider works end-to-end FOR
+            # REAL TRAFFIC — not just a probe that mimics a shape nobody
+            # actually uses. If it fails, the operator sees exactly what
+            # a real agent call would see.
             try:
-                if ptype in ("azure", "openai"):
-                    hdr = ({"api-key": key, "Content-Type": "application/json"}
-                           if ptype == "azure"
-                           else {"Authorization": f"Bearer {key}",
-                                 "Content-Type": "application/json"})
-                    body = {"model": model,
-                            "messages": [{"role": "user", "content": "Reply with only: OK"}],
-                            "max_tokens": 16}
-                    r = await c.post(f"{root}/openai/v1/chat/completions",
-                                     headers=hdr, json=body)
-                    # Same swap llm_query performs: the gpt-5 / o-series
-                    # families reject max_tokens.
-                    if r.status_code == 400 and "max_completion_tokens" in (r.text or ""):
-                        body.pop("max_tokens")
-                        body["max_completion_tokens"] = 2000
-                        r = await c.post(f"{root}/openai/v1/chat/completions",
-                                         headers=hdr, json=body)
-                    if r.status_code == 200:
-                        txt = r.json()["choices"][0]["message"]["content"]
-                        add("generate", True, f"{model} answered {txt.strip()[:40]!r}")
-                    else:
-                        code = ""
-                        try:
-                            code = r.json().get("error", {}).get("code", "")
-                        except Exception:
-                            pass
-                        add("generate", False,
-                            f"HTTP {r.status_code} {code} for model {model!r}"
-                            + (" — that model is not deployed on THIS resource"
-                               if str(code) == "DeploymentNotFound" else ""))
+                alias = f"{provider_id}:{model}"
+                llm_query_url = LLM_QUERY_URL
+                # Minimal body — no options. The probe is "can this provider
+                # dispatch an answer at all?"; keeping options out avoids
+                # parameter-support bugs in the dispatch path (e.g. the
+                # hand-rolled Foundry Anthropic path rejecting `temperature`
+                # or gpt-5-mini rejecting it in reasoning mode).
+                probe_body = {
+                    "model": alias,
+                    "prompt": "Reply with only: OK",
+                    "stream": False,
+                }
+                r = await c.post(f"{llm_query_url}/api/generate",
+                                 json=probe_body, timeout=60)
+                if r.status_code == 200:
+                    d = r.json()
+                    txt = (d.get("response") or "").strip()
+                    backend_used = d.get("backend") or "?"
+                    provider_used = d.get("provider") or "?"
+                    failed_over = d.get("failed_over")
+                    detail = f"{model} answered {txt[:40]!r} via {provider_used}/{backend_used}"
+                    if failed_over:
+                        detail += " (failed over from primary)"
+                    add("generate", True, detail)
                 else:
-                    r = await c.post(f"{root}/api/generate",
-                                     json={"model": model, "prompt": "Reply with only: OK",
-                                           "stream": False})
-                    if r.status_code == 200:
-                        add("generate", True,
-                            f"{model} answered {str(r.json().get('response',''))[:40]!r}")
-                    else:
-                        add("generate", False, f"HTTP {r.status_code}: {r.text[:120]}")
+                    err = ""
+                    try:
+                        err = (r.json().get("detail") or r.json().get("error") or "")
+                        if isinstance(err, dict):
+                            err = err.get("message") or err.get("code") or json.dumps(err)[:200]
+                    except Exception:
+                        err = r.text[:200]
+                    hint = _diagnose_generate_failure(
+                        err_text=str(err), model=model, ptype=ptype,
+                        deployment_names=deployment_names)
+                    add("generate", False,
+                        f"HTTP {r.status_code} via llm_query for {alias!r}: {err}{hint}")
             except Exception as e:
                 add("generate", False, f"{str(e) or type(e).__name__}")
 
@@ -1407,14 +1502,22 @@ async def get_llm_routes():
         global_fallback = await _read_config(c, s, "llm.route.default.fallback")
         global_model = await _read_config(c, s, "llm.azure_model")
         providers_raw = await _read_config(c, s, "llm.providers")
+        default_effort = await _read_config(c, s, "llm.reasoning_effort.default")
+        global_effort = await _read_config(c, s, "llm.reasoning_effort")
         for task, desc in LLM_ROUTE_TASKS:
             model = await _read_config(c, s, f"llm.route.{task}")
             fb = await _read_config(c, s, f"llm.route.{task}.fallback")
+            effort = await _read_config(c, s, f"llm.reasoning_effort.{task}")
             out.append({
                 "task": task,
                 "description": desc,
                 "model": model,
                 "fallback": fb,
+                # Reasoning effort for this task — only applied when the
+                # effective model is a reasoning deployment (gpt-5*, o1*,
+                # o3*, o4*). Blank = inherit default/global.
+                "reasoning_effort": effort,
+                "effective_reasoning_effort": effort or default_effort or global_effort or "",
                 # What actually runs today, so a blank row is not ambiguous.
                 "effective": model or global_default or global_model or "",
                 "effective_fallback": fb or global_fallback or "",
@@ -1422,6 +1525,8 @@ async def get_llm_routes():
             })
     return {"tasks": out, "default": global_default,
             "fallback": global_fallback, "global_model": global_model,
+            "reasoning_effort_default": default_effort,
+            "reasoning_effort_global": global_effort,
             # So the UI can offer "<provider>:<model>" without the operator
             # having to remember what is configured.
             "providers": _provider_choices(providers_raw)}
@@ -1437,6 +1542,10 @@ class LlmRouteBody(BaseModel):
     fallbacks: Optional[Dict[str, str]] = None
     default: Optional[str] = None
     default_fallback: Optional[str] = None
+    # Per-task reasoning effort (minimal|low|medium|high|""). Same partial-
+    # update semantics as routes. `default` sets the global fallback effort.
+    reasoning_efforts: Optional[Dict[str, str]] = None
+    reasoning_effort_default: Optional[str] = None
 
 
 @router.put("/api/settings/llm/routes")
@@ -1445,19 +1554,36 @@ async def put_llm_routes(body: LlmRouteBody):
     silently stored — a typo'd task would create a key nothing ever reads."""
     s = get_settings()
     known = {t for t, _ in LLM_ROUTE_TASKS}
-    bad = sorted((set(body.routes or {}) | set(body.fallbacks or {})) - known)
+    bad = sorted((set(body.routes or {}) | set(body.fallbacks or {})
+                  | set(body.reasoning_efforts or {})) - known)
     if bad:
         raise HTTPException(400, f"unknown task(s): {', '.join(bad)}")
+
+    # Reasoning effort values are a closed set; silently drop unknowns so a
+    # typo in the UI doesn't become a stored value that nothing reads.
+    allowed_efforts = {"", "minimal", "low", "medium", "high"}
 
     writes = {}
     for task, val in (body.routes or {}).items():
         writes[f"llm.route.{task}"] = (val or "").strip()
     for task, val in (body.fallbacks or {}).items():
         writes[f"llm.route.{task}.fallback"] = (val or "").strip()
+    for task, val in (body.reasoning_efforts or {}).items():
+        v = (val or "").strip().lower()
+        if v not in allowed_efforts:
+            raise HTTPException(400, f"reasoning_effort for {task!r} must be one of "
+                                     f"minimal|low|medium|high (got {val!r})")
+        writes[f"llm.reasoning_effort.{task}"] = v
     if body.default is not None:
         writes["llm.route.default"] = body.default.strip()
     if body.default_fallback is not None:
         writes["llm.route.default.fallback"] = body.default_fallback.strip()
+    if body.reasoning_effort_default is not None:
+        v = body.reasoning_effort_default.strip().lower()
+        if v not in allowed_efforts:
+            raise HTTPException(400, f"reasoning_effort_default must be one of "
+                                     f"minimal|low|medium|high (got {body.reasoning_effort_default!r})")
+        writes["llm.reasoning_effort.default"] = v
 
     saved, failed = [], {}
     async with httpx.AsyncClient(timeout=15) as c:

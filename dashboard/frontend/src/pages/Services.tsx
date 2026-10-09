@@ -292,6 +292,7 @@ const SERVICE_TABS = [
   { id: 'database', label: 'Database' },
   { id: 'health', label: 'Health' },
   { id: 'gpu', label: 'GPU' },
+  { id: 'cost', label: 'Cost' },
   { id: 'optional', label: 'Optional Tools' },
 ] as const
 type ServiceTab = typeof SERVICE_TABS[number]['id']
@@ -480,6 +481,23 @@ export default function Services() {
       )}
 
       {/* ── Optional Tools Tab ───────────────────────────────── */}
+      {activeTab === 'cost' && (
+        <div className="space-y-4">
+          <div className="rounded-lg border border-primary/20 bg-primary/5 p-3 text-xs text-muted-foreground">
+            Per-call LLM cost + token usage, aggregated by caller over the last 7 days.
+            Cost figures come from LiteLLM's built-in price catalog (Azure OpenAI,
+            Foundry Anthropic, OpenAI direct, Anthropic native, Bedrock, Vertex, Groq,
+            Together, Ollama = $0). A "—" means the call went through a path that
+            doesn't price yet (hand-rolled fallback, or a model LiteLLM's catalog
+            doesn't know). Click a caller row to filter the recent-calls list.
+          </div>
+          {/* LlmMetricsPanel reused — on the dedicated Cost tab it auto-opens
+              so there's no extra click. On the Health tab it still ships
+              collapsed-by-default (long-standing behaviour there). */}
+          <LlmMetricsPanel defaultOpen />
+        </div>
+      )}
+
       {activeTab === 'optional' && (
         <div className="space-y-6">
           <div>
@@ -1933,19 +1951,36 @@ function ServiceRowWithLogs({ svc, status, healthInfo, isUnhealthy, isOptional, 
 }
 
 
-function LlmMetricsPanel() {
-  const [show, setShow] = useState(false)
+// Columns that can be sorted on the per-caller summary table. The key is
+// what the backend returns on each row; the label is what the header shows.
+// Click a header → cycles asc → desc → off (back to default call-count desc).
+type SummarySortKey = 'caller' | 'model_name' | 'total_calls' | 'error_count'
+  | 'avg_latency_ms' | 'avg_tok_per_sec' | 'total_tokens_used' | 'total_cost_usd'
+type SortDir = 'asc' | 'desc' | null
+
+function LlmMetricsPanel({ defaultOpen = false }: { defaultOpen?: boolean } = {}) {
+  const [show, setShow] = useState(defaultOpen)
   const [summary, setSummary] = useState<any>(null)
   const [recent, setRecent] = useState<any[]>([])
   const [loading, setLoading] = useState(false)
+  // Filters + sort — all operate client-side on the summary data the
+  // backend already returns (same /api/llm/summary call), so changing
+  // them is instant with no network round-trip. The backend's `days`
+  // window IS a server-side filter — the only one worth plumbing because
+  // it bounds what rows get aggregated at all.
   const [callerFilter, setCallerFilter] = useState('')
+  const [modelFilter, setModelFilter] = useState('')
+  const [callerSearch, setCallerSearch] = useState('')
+  const [days, setDays] = useState(7)
+  const [sortKey, setSortKey] = useState<SummarySortKey>('total_calls')
+  const [sortDir, setSortDir] = useState<SortDir>('desc')
 
   const load = async () => {
     setLoading(true)
     try {
       const [sumRes, recRes] = await Promise.all([
-        fetch('/api/llm/summary?days=7').then(r => r.json()),
-        fetch(`/api/llm/metrics?limit=30${callerFilter ? '&caller=' + callerFilter : ''}`).then(r => r.json()),
+        fetch(`/api/llm/summary?days=${days}`).then(r => r.json()),
+        fetch(`/api/llm/metrics?limit=50${callerFilter ? '&caller=' + encodeURIComponent(callerFilter) : ''}${modelFilter ? '&model=' + encodeURIComponent(modelFilter) : ''}`).then(r => r.json()),
       ])
       setSummary(sumRes)
       setRecent(recRes?.requests || [])
@@ -1953,7 +1988,7 @@ function LlmMetricsPanel() {
     setLoading(false)
   }
 
-  useEffect(() => { if (show) load() }, [show, callerFilter])
+  useEffect(() => { if (show) load() }, [show, callerFilter, modelFilter, days])
 
   if (!show) {
     return (
@@ -1964,13 +1999,51 @@ function LlmMetricsPanel() {
     )
   }
 
-  const callers = [...new Set((summary?.callers || []).map((c: any) => c.caller))]
+  const allCallers: string[] = [...new Set((summary?.callers || []).map((c: any) => c.caller as string))].filter(Boolean) as string[]
+  const allModels: string[] = [...new Set((summary?.callers || []).map((c: any) => c.model_name as string))].filter(Boolean) as string[]
+
+  // Client-side filter + sort on the summary table.
+  const summaryRows: any[] = (summary?.callers || []).filter((c: any) => {
+    if (modelFilter && c.model_name !== modelFilter) return false
+    if (callerSearch && !((c.caller || '').toLowerCase().includes(callerSearch.toLowerCase()))) return false
+    return true
+  })
+  if (sortDir) {
+    summaryRows.sort((a: any, b: any) => {
+      const av = a[sortKey]; const bv = b[sortKey]
+      // Nulls sort last regardless of direction (sentinel: Infinity).
+      const an = av == null ? (sortDir === 'asc' ? Infinity : -Infinity) : (typeof av === 'string' ? av.toLowerCase() : Number(av))
+      const bn = bv == null ? (sortDir === 'asc' ? Infinity : -Infinity) : (typeof bv === 'string' ? bv.toLowerCase() : Number(bv))
+      if (an < bn) return sortDir === 'asc' ? -1 : 1
+      if (an > bn) return sortDir === 'asc' ? 1 : -1
+      return 0
+    })
+  }
+  const toggleSort = (k: SummarySortKey) => {
+    if (sortKey !== k) { setSortKey(k); setSortDir('desc'); return }
+    // Cycle desc → asc → off (default = call-count desc).
+    if (sortDir === 'desc') setSortDir('asc')
+    else if (sortDir === 'asc') { setSortKey('total_calls'); setSortDir('desc') }
+    else setSortDir('desc')
+  }
+  const sortArrow = (k: SummarySortKey) => sortKey !== k ? '' : (sortDir === 'asc' ? ' ▲' : sortDir === 'desc' ? ' ▼' : '')
 
   return (
     <div className="border border-border rounded-md p-3 space-y-3">
       <div className="flex items-center justify-between">
-        <h4 className="text-xs font-semibold flex items-center gap-1.5"><Cpu className="h-3.5 w-3.5" /> LLM Performance Metrics (7 days)</h4>
+        <h4 className="text-xs font-semibold flex items-center gap-1.5"><Cpu className="h-3.5 w-3.5" /> LLM Performance Metrics ({days === 1 ? 'last 24 h' : `${days} days`})</h4>
         <div className="flex items-center gap-2">
+          {/* Total spend across all callers (LiteLLM-priced calls only — the
+              hand-rolled fallback path doesn't populate cost_usd). The
+              fraction of priced calls is shown so the operator can tell
+              whether the headline total covers everything or just part. */}
+          {summary?.totals?.cost_usd != null && (
+            <span className="text-[11px] font-mono bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 px-2 py-0.5 rounded"
+              title={`Covers ${summary.totals.priced_calls} of ${summary.totals.total_calls} calls. Hand-rolled dispatch doesn't compute cost yet.`}>
+              ${Number(summary.totals.cost_usd).toFixed(4)}
+              <span className="text-emerald-500/60 ml-1">({summary.totals.priced_calls}/{summary.totals.total_calls})</span>
+            </span>
+          )}
           <button onClick={load} disabled={loading} className="text-[10px] text-primary hover:underline">
             {loading ? 'Loading...' : 'Refresh'}
           </button>
@@ -1980,23 +2053,82 @@ function LlmMetricsPanel() {
         </div>
       </div>
 
-      {/* Summary by caller */}
+      {/* Filters toolbar — time window, model filter (dropdown), caller
+          search. Caller clicks on the summary table still filter the
+          Recent-calls list; the search box here filters the SUMMARY
+          itself (so a 50-caller list stays scannable). */}
+      <div className="flex items-center gap-2 flex-wrap text-[11px]">
+        <label className="text-muted-foreground">Window</label>
+        <select value={days} onChange={e => setDays(Number(e.target.value))}
+                className="h-6 px-1.5 rounded border border-border bg-background">
+          <option value={1}>last 24 h</option>
+          <option value={7}>7 days</option>
+          <option value={30}>30 days</option>
+        </select>
+        <label className="text-muted-foreground ml-2">Model</label>
+        <select value={modelFilter} onChange={e => setModelFilter(e.target.value)}
+                className="h-6 px-1.5 rounded border border-border bg-background max-w-[14rem]">
+          <option value="">(any)</option>
+          {allModels.sort().map(m => <option key={m} value={m}>{m}</option>)}
+        </select>
+        <label className="text-muted-foreground ml-2">Caller contains</label>
+        <input value={callerSearch} onChange={e => setCallerSearch(e.target.value)}
+               placeholder="e.g. cve_poc" list="llm-callers-list"
+               className="h-6 px-1.5 rounded border border-border bg-background w-40" />
+        <datalist id="llm-callers-list">
+          {allCallers.sort().map(c => <option key={c} value={c} />)}
+        </datalist>
+        {callerFilter && (
+          <button onClick={() => setCallerFilter('')}
+                  title="Clear the Recent-calls caller filter (the row-click filter)"
+                  className="h-6 px-1.5 rounded border border-amber-500/40 text-amber-300 hover:bg-amber-500/10">
+            recent filter: {callerFilter} ✕
+          </button>
+        )}
+        {(callerSearch || modelFilter || sortDir !== 'desc' || sortKey !== 'total_calls') && (
+          <button onClick={() => { setCallerSearch(''); setModelFilter(''); setSortKey('total_calls'); setSortDir('desc') }}
+                  className="h-6 px-1.5 rounded border border-border text-muted-foreground hover:text-foreground">
+            reset
+          </button>
+        )}
+        <span className="text-[10px] text-muted-foreground ml-auto">
+          {summaryRows.length} / {summary?.callers?.length ?? 0} rows
+        </span>
+      </div>
+
+      {/* Summary by caller — sortable headers (click to toggle asc/desc/off,
+          desc on `total_calls` is the default). Rows are the filtered
+          `summaryRows`, so model/caller search are applied before sort. */}
       {summary?.callers?.length > 0 && (
         <div className="overflow-auto">
           <table className="w-full text-xs">
             <thead>
               <tr className="bg-muted/30 border-b border-border text-left">
-                <th className="px-2 py-1.5 font-medium">Caller</th>
-                <th className="px-2 py-1.5 font-medium">Model</th>
-                <th className="px-2 py-1.5 font-medium text-right">Calls</th>
-                <th className="px-2 py-1.5 font-medium text-right">Errors</th>
-                <th className="px-2 py-1.5 font-medium text-right">Avg Latency</th>
-                <th className="px-2 py-1.5 font-medium text-right">Avg tok/s</th>
-                <th className="px-2 py-1.5 font-medium text-right">Total Tokens</th>
+                {([
+                  ['caller', 'Caller', 'left'],
+                  ['model_name', 'Model', 'left'],
+                  ['total_calls', 'Calls', 'right'],
+                  ['error_count', 'Errors', 'right'],
+                  ['avg_latency_ms', 'Avg Latency', 'right'],
+                  ['avg_tok_per_sec', 'Avg tok/s', 'right'],
+                  ['total_tokens_used', 'Total Tokens', 'right'],
+                  ['total_cost_usd', 'Cost (USD)', 'right'],
+                ] as [SummarySortKey, string, 'left' | 'right'][]).map(([key, label, align]) => (
+                  <th key={key}
+                      onClick={() => toggleSort(key)}
+                      className={`px-2 py-1.5 font-medium cursor-pointer select-none hover:text-foreground ${align === 'right' ? 'text-right' : ''} ${sortKey === key ? 'text-primary' : ''}`}>
+                    {label}{sortArrow(key)}
+                  </th>
+                ))}
               </tr>
             </thead>
             <tbody>
-              {summary.callers.map((c: any, i: number) => (
+              {summaryRows.length === 0 && (
+                <tr><td colSpan={8} className="px-2 py-3 text-center text-muted-foreground italic">
+                  No callers match the current filters.
+                </td></tr>
+              )}
+              {summaryRows.map((c: any, i: number) => (
                 <tr key={i} className="border-t border-border/30 hover:bg-muted/20 cursor-pointer"
                     onClick={() => setCallerFilter(callerFilter === c.caller ? '' : c.caller)}>
                   <td className={`px-2 py-1 font-mono ${callerFilter === c.caller ? 'text-primary font-bold' : ''}`}>{c.caller}</td>
@@ -2006,6 +2138,10 @@ function LlmMetricsPanel() {
                   <td className="px-2 py-1 text-right font-mono">{c.avg_latency_ms ? `${(c.avg_latency_ms / 1000).toFixed(1)}s` : '—'}</td>
                   <td className="px-2 py-1 text-right font-mono text-primary">{c.avg_tok_per_sec ?? '—'}</td>
                   <td className="px-2 py-1 text-right font-mono">{c.total_tokens_used?.toLocaleString() ?? '—'}</td>
+                  <td className="px-2 py-1 text-right font-mono text-emerald-300"
+                      title={c.priced_calls && c.priced_calls < c.total_calls ? `${c.priced_calls}/${c.total_calls} calls priced (rest went hand-rolled)` : undefined}>
+                    {c.total_cost_usd != null ? `$${Number(c.total_cost_usd).toFixed(4)}` : '—'}
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -2029,6 +2165,7 @@ function LlmMetricsPanel() {
                   <th className="px-1.5 py-1 text-right">Tokens</th>
                   <th className="px-1.5 py-1 text-right">tok/s</th>
                   <th className="px-1.5 py-1 text-right">Latency</th>
+                  <th className="px-1.5 py-1 text-right">Cost</th>
                   <th className="px-1.5 py-1">Status</th>
                 </tr>
               </thead>
@@ -2041,6 +2178,10 @@ function LlmMetricsPanel() {
                     <td className="px-1.5 py-0.5 text-right">{r.total_tokens ?? '—'}</td>
                     <td className="px-1.5 py-0.5 text-right text-primary font-mono">{r.tokens_per_sec ?? '—'}</td>
                     <td className="px-1.5 py-0.5 text-right font-mono">{r.latency_ms ? `${(r.latency_ms / 1000).toFixed(1)}s` : '—'}</td>
+                    <td className="px-1.5 py-0.5 text-right font-mono text-emerald-300"
+                        title={r.cost_usd == null ? 'hand-rolled dispatch — no cost computed' : undefined}>
+                      {r.cost_usd != null ? `$${Number(r.cost_usd).toFixed(5)}` : '—'}
+                    </td>
                     <td className="px-1.5 py-0.5">{r.is_error ? <span className="text-red-400">{r.error_message?.slice(0, 40) || 'error'}</span> : <span className="text-green-400">ok</span>}</td>
                   </tr>
                 ))}

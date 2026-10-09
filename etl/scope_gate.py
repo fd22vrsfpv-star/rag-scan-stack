@@ -105,8 +105,98 @@ def _host_from_url(value):
         return value
 
 
-def is_in_scope(host, scope_rows):
-    """True if `host` (an IP or hostname) matches any scope target.
+def load_not_in_scope_denylist(cur):
+    """Return a list of (target, target_type) for the deny-list, drawn
+    from two sources:
+
+      1. The GLOBAL `not_in_scope` deny-list (engagement_id IS NULL) — a
+         cross-engagement safety list, documented in CLAUDE.md. Populated
+         via POST /scope/exclude and by legacy typosquat detections.
+      2. Every engagement's `typosquats` scope (any engagement_id) — the
+         new home for typosquat-sourced blocks. Each engagement has its
+         own `typosquats` scope so operators can see them grouped per
+         engagement; the gate reads all of them so a lookalike flagged
+         in engagement A also refuses dispatch from engagement B.
+
+      3. Every engagement's `new_for_review` scope (any engagement_id) —
+         the STAGING bucket cert-pivot / asn-pivot accepts land in. A
+         pivoted target is visible under the engagement but must be
+         reviewed and PROMOTED to a live scope before it is scannable, so
+         the gate refuses dispatch to it here (same treatment as
+         `typosquats`). Moving the target out of `new_for_review` into a
+         live scope is what makes it dispatchable.
+
+    Returns [] on any query error (fail-open on the deny-list side: a
+    deny-list that can't load must not accidentally refuse legitimate
+    scope — the regular scope check still runs).
+    """
+    try:
+        cur.execute(
+            "SELECT target, target_type FROM public.scope_targets "
+            "WHERE (name = 'not_in_scope' AND engagement_id IS NULL "
+            "       OR name IN ('typosquats', 'new_for_review')) "
+            "AND target IS NOT NULL AND target <> ''"
+        )
+        rows = cur.fetchall()
+    except Exception as e:
+        logger.warning("not_in_scope deny-list load failed: %s", e)
+        return []
+    out = []
+    for r in rows:
+        if isinstance(r, dict):
+            out.append((r.get("target"), r.get("target_type")))
+        else:
+            out.append((r[0], r[1]))
+    return out
+
+
+def is_in_denylist(host, denylist):
+    """True if `host` matches ANY deny-list row.
+
+    Matching semantics mirror is_in_scope:
+      - ip     : exact IP match
+      - cidr   : host IP inside the network
+      - domain : exact host or any subdomain
+      - url    : same as domain, on the url's host
+      - asn    : not matchable from a host alone -> ignored
+    """
+    if not host or not denylist:
+        return False
+    h = host.strip().lower().rstrip(".")
+    if not h:
+        return False
+    try:
+        host_ip = ip_address(h)
+    except ValueError:
+        host_ip = None
+    for target, ttype in denylist:
+        if not target:
+            continue
+        t = target.strip().lower().rstrip(".")
+        tt = (ttype or "").lower()
+        try:
+            if tt == "ip":
+                if host_ip is not None and h == t:
+                    return True
+            elif tt == "cidr":
+                if host_ip is not None and host_ip in ip_network(t, strict=False):
+                    return True
+            elif tt == "domain":
+                if h == t or fnmatch(h, "*." + t):
+                    return True
+            elif tt == "url":
+                turl = _host_from_url(t)
+                if turl and (h == turl or fnmatch(h, "*." + turl)):
+                    return True
+            # 'asn' cannot be matched from a host string alone -> skip
+        except (ValueError, TypeError):
+            continue
+    return False
+
+
+def is_in_scope(host, scope_rows, denylist=None):
+    """True if `host` (an IP or hostname) matches any scope target AND is
+    NOT in the deny-list.
 
     Fail closed: empty/blank host or empty scope returns False.
       - ip      : exact IP match
@@ -114,11 +204,25 @@ def is_in_scope(host, scope_rows):
       - domain  : exact host or any subdomain (`*.domain`)
       - url     : same as domain, on the url's host
       - asn     : not matchable from a host alone -> ignored
+
+    `denylist` (optional): list of (target, target_type) from
+    `load_not_in_scope_denylist`. When provided, any host matching the
+    deny-list returns False IMMEDIATELY, regardless of whether `scope_rows`
+    would otherwise accept it. This is the belt-and-braces short-circuit
+    for the typosquat detector's auto-block output.
+
+    Pre-existing exclusion flowed indirectly via `_scope_exclusion_clause`
+    (app/rag-api/api.py:403) and `RESERVED_NONSCANNABLE`
+    (dashboard/bff/services/recon_agent.py:57); callers that pass
+    `denylist` here get the enforcement inside the scope gate itself.
     """
     if not host or not scope_rows:
         return False
     h = host.strip().lower().rstrip(".")
     if not h:
+        return False
+    # Deny-list short-circuit — refuse before checking positive scope.
+    if denylist and is_in_denylist(h, denylist):
         return False
     try:
         host_ip = ip_address(h)
@@ -279,7 +383,7 @@ def hosts_in_command(command):
                   if not any(h.startswith(p) or h == p for p in _SELF_ADDRS))
 
 
-def check_dispatch(target, scope_rows, command="", aliases=None):
+def check_dispatch(target, scope_rows, command="", aliases=None, denylist=None):
     """Return a refusal string when this dispatch must be refused, else None.
 
     Checks the declared target AND any IPv4 literal in the command, so omitting
@@ -290,16 +394,32 @@ def check_dispatch(target, scope_rows, command="", aliases=None):
     Omitting it is safe but STRICTER, and inconsistent strictness between paths
     is what this parameter exists to remove.
 
+    `denylist` (from load_not_in_scope_denylist) is passed through to
+    is_in_scope so that global typosquat / flagged-domain entries refuse
+    dispatch inside the gate itself (not just through
+    `_scope_exclusion_clause` + `RESERVED_NONSCANNABLE`). The refusal
+    message distinguishes a deny-list hit from a missing-scope refusal so
+    operators can tell them apart in logs.
+
     Fails CLOSED on an empty scope: an unconfigured scope is a setup mistake,
     not permission to scan anything.
     """
     if not scope_rows:
         return ("no scope targets are configured — refusing to dispatch. "
                 "Configure the engagement scope first.")
-    if target and not is_in_scope_with_aliases(str(target), scope_rows, aliases):
+    # Deny-list check runs BEFORE the positive scope check so the refusal
+    # message is specific ("...in the not_in_scope deny-list") rather than
+    # the generic "not in scope" fallback. Operators debugging a typosquat
+    # block need to see WHY it was refused.
+    if target and denylist and is_in_denylist(str(target).lower(), denylist):
+        return (f"target {target} is in the not_in_scope deny-list "
+                f"(typosquat / flagged domain) — refusing to dispatch.")
+    if target and not is_in_scope_with_aliases(str(target), scope_rows, aliases, denylist=denylist):
         return f"target {target} is not in the configured scope"
     for ip in hosts_in_command(command):
-        if not is_in_scope_with_aliases(ip, scope_rows, aliases):
+        if denylist and is_in_denylist(ip, denylist):
+            return f"command references {ip}, which is in the not_in_scope deny-list"
+        if not is_in_scope_with_aliases(ip, scope_rows, aliases, denylist=denylist):
             return f"command references {ip}, which is not in the configured scope"
     return None
 
@@ -375,7 +495,7 @@ def load_host_aliases(cur, host):
     return aliases
 
 
-def is_in_scope_with_aliases(host, scope_rows, aliases=None):
+def is_in_scope_with_aliases(host, scope_rows, aliases=None, denylist=None):
     """is_in_scope(), also accepting any known alias of `host`.
 
     Accepts a URL as well as a bare host. The ingest side already did this via
@@ -389,13 +509,17 @@ def is_in_scope_with_aliases(host, scope_rows, aliases=None):
     This does NOT loosen matching: the host is parsed out with urlparse, so
     `http://evil.example/?x=demo.testfire.net` resolves to `evil.example` and is
     still refused.
+
+    `denylist` is propagated into every is_in_scope call so an aliased
+    deny-list entry still refuses — e.g. a typosquat registered with an
+    IP that's also a legitimate reverse-DNS alias.
     """
-    if is_in_scope(host, scope_rows):
+    if is_in_scope(host, scope_rows, denylist=denylist):
         return True
     derived = _host_from_url(host) if host else None
-    if derived and derived != host and is_in_scope(derived, scope_rows):
+    if derived and derived != host and is_in_scope(derived, scope_rows, denylist=denylist):
         return True
-    return any(is_in_scope(a, scope_rows) for a in (aliases or set()) if a)
+    return any(is_in_scope(a, scope_rows, denylist=denylist) for a in (aliases or set()) if a)
 
 # ── Self-contained enforcement for services with no gate of their own ────────
 #

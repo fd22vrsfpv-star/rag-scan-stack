@@ -1076,6 +1076,11 @@ CREATE TABLE IF NOT EXISTS public.llm_request_metrics (
 ALTER TABLE public.llm_request_metrics ALTER COLUMN session_id DROP NOT NULL;
 ALTER TABLE public.llm_request_metrics ADD COLUMN IF NOT EXISTS caller text;
 ALTER TABLE public.llm_request_metrics ADD COLUMN IF NOT EXISTS tokens_per_sec numeric;
+-- cost_usd: dollar amount per call, computed by LiteLLM's built-in price
+-- catalog on the LiteLLM dispatch path (nullable because hand-rolled calls
+-- + models LiteLLM doesn't price yet come through as NULL — the summary
+-- SUMs over NOT NULL rows and the UI renders NULL as "—").
+ALTER TABLE public.llm_request_metrics ADD COLUMN IF NOT EXISTS cost_usd numeric(10,6);
 CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_session_id ON public.llm_request_metrics(session_id);
 CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_model_name ON public.llm_request_metrics(model_name);
 CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_agent_name ON public.llm_request_metrics(agent_name);
@@ -1463,6 +1468,25 @@ CREATE TABLE IF NOT EXISTS public.poc_grants (
     revoked_at    timestamptz
 );
 CREATE INDEX IF NOT EXISTS ix_poc_grants_target ON public.poc_grants(target) WHERE active;
+
+-- poc_hints: persistent operator hints prepended to synth guidance on every future
+-- build-poc run. Highest-priority guidance (ahead of recon/research/auth). Scope is
+-- most-specific first: exact (cve, host, port) -> host-only -> CVE global. This is
+-- how the operator injects knowledge the pipeline can't derive: injection point,
+-- table/column names, alt ports, non-obvious auth, the exact endpoint that triggers.
+CREATE TABLE IF NOT EXISTS public.poc_hints (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    cve           text NOT NULL,
+    target_host   text,
+    target_port   integer,
+    hint          text NOT NULL,
+    active        boolean NOT NULL DEFAULT true,
+    engagement_id uuid,
+    created_by    text,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_poc_hints_cve ON public.poc_hints(cve, active);
 
 -- poc_synthesis_log: reviewable request/response trail for the CVE PoC-builder
 -- (research -> synthesize -> run -> refine). A person reads this to tweak prompts.
@@ -2549,6 +2573,28 @@ DROP TRIGGER IF EXISTS trg_app_settings_updated ON public.app_settings;
 CREATE TRIGGER trg_app_settings_updated
   BEFORE UPDATE ON public.app_settings
   FOR EACH ROW EXECUTE FUNCTION public._touch_updated_at();
+
+-- Default per-task LLM routing for the exploit synthesis + judge path.
+-- Added 2026-10-08 as the "bump 2 to a higher level" change on PR #374:
+-- route the gather-fallback, the PoC synth, and the end-of-loop judge
+-- all to deepseek4-pro with reasoning_effort=high. The hand-rolled
+-- defaults (qwen3-coder:30b) ran all 10 iterations on CVE-2024-32511
+-- without cracking it — more iterations isn't the answer, better
+-- reasoning is. These rows seed the routing table on a fresh install;
+-- an operator can override from Settings → LLM Tuning without touching
+-- SQL. Idempotent: ON CONFLICT keeps existing operator overrides.
+-- category MUST be 'config' — `common/llm_settings.py::_read_db_llm()` filters
+-- its SELECT on `category = 'config'` and silently drops rows under any other
+-- category (caught post-apply when the live settings showed azure-main
+-- defaults even after these rows were in the table).
+INSERT INTO public.app_settings (key, value, category) VALUES
+  ('llm.route.exploit.synth',             'azure-main:DeepSeek-V4-Pro', 'config'),
+  ('llm.route.exploit.gather_fallback',   'azure-main:DeepSeek-V4-Pro', 'config'),
+  ('llm.route.exploit.judge',             'azure-main:DeepSeek-V4-Pro', 'config'),
+  ('llm.reasoning_effort.exploit.synth',           'high', 'config'),
+  ('llm.reasoning_effort.exploit.gather_fallback', 'high', 'config'),
+  ('llm.reasoning_effort.exploit.judge',           'high', 'config')
+ON CONFLICT (key) DO NOTHING;
 
 -- ============================================================================
 -- TIER 7: Engagements & Workflow (pentest lifecycle)
@@ -3883,7 +3929,7 @@ CREATE TABLE IF NOT EXISTS scope_classification_rules (
     scope_name      text NOT NULL,
     priority        int NOT NULL DEFAULT 100,
     enabled         boolean NOT NULL DEFAULT true,
-    rule_type       text NOT NULL CHECK (rule_type IN ('domain_pattern','whois_org','asn','tls_issuer','ip_cidr','composite')),
+    rule_type       text NOT NULL CHECK (rule_type IN ('domain_pattern','whois_org','asn','tls_issuer','ip_cidr','composite','typosquat')),
     conditions      jsonb NOT NULL,
     auto_apply      boolean NOT NULL DEFAULT false,
     created_at      timestamptz DEFAULT now(),
@@ -3911,7 +3957,7 @@ CREATE TABLE IF NOT EXISTS scope_suggestions (
     suggested_scope text NOT NULL,
     confidence      float NOT NULL,
     reasoning       text NOT NULL DEFAULT '',
-    method          text NOT NULL CHECK (method IN ('rule','similarity','llm')),
+    method          text NOT NULL CHECK (method IN ('rule','similarity','llm','typosquat','cert_pivot','asn_pivot')),
     rule_id         uuid REFERENCES scope_classification_rules(id) ON DELETE SET NULL,
     similar_decisions uuid[],
     status          text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','accepted','rejected')),
@@ -4337,6 +4383,23 @@ EXCEPTION WHEN OTHERS THEN NULL; END $$;
 DO $$ BEGIN ALTER TABLE scope_classification_rules ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES engagements(id); EXCEPTION WHEN OTHERS THEN NULL; END $$;
 DO $$ BEGIN ALTER TABLE scope_decisions ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES engagements(id); EXCEPTION WHEN OTHERS THEN NULL; END $$;
 DO $$ BEGIN ALTER TABLE scope_suggestions ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES engagements(id); EXCEPTION WHEN OTHERS THEN NULL; END $$;
+
+-- Step 5: Relax CHECK constraints on scope_classification_rules.rule_type
+-- and scope_suggestions.method so the typosquat detector + cert/ASN pivot
+-- helpers can write their rule/method values.
+-- (Existing dbs created BEFORE the typosquat work have a stale CHECK that
+-- would reject the new values; drop + re-add with the expanded allow-list.)
+DO $$ BEGIN
+  ALTER TABLE scope_classification_rules DROP CONSTRAINT IF EXISTS scope_classification_rules_rule_type_check;
+  ALTER TABLE scope_classification_rules ADD CONSTRAINT scope_classification_rules_rule_type_check
+    CHECK (rule_type IN ('domain_pattern','whois_org','asn','tls_issuer','ip_cidr','composite','typosquat'));
+EXCEPTION WHEN OTHERS THEN NULL; END $$;
+
+DO $$ BEGIN
+  ALTER TABLE scope_suggestions DROP CONSTRAINT IF EXISTS scope_suggestions_method_check;
+  ALTER TABLE scope_suggestions ADD CONSTRAINT scope_suggestions_method_check
+    CHECK (method IN ('rule','similarity','llm','typosquat','cert_pivot','asn_pivot'));
+EXCEPTION WHEN OTHERS THEN NULL; END $$;
 
 -- ============================================================================
 -- TIER 18: Scan Pipelines (multi-stage parallel orchestration)
@@ -6647,3 +6710,74 @@ WHERE script LIKE 'ssh-audit:%' AND port_id IS NULL AND (metadata->>'port') IS N
 UPDATE public.vulns SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{port}', '443'::jsonb)
 WHERE script LIKE ANY(ARRAY['sslscan:%','testssl:%','sslyze:%']) AND port_id IS NULL AND (metadata->>'port') IS NULL;
 
+
+-- ── Exploit-intel persistence (runtime-ensured too; here for clean installs) ──
+-- Confirmed-facts ledger: durable record of verified target/exploit state
+-- (session validity, endpoint existence, resolved object-ids, version
+-- applicability, vendor-doc answers) reused across attacks. TARGET-level
+-- facts carry cve=NULL so any attack against the same target reuses them.
+-- Identity includes PRODUCT: the same ip:port runs multiple apps (Zabbix the
+-- application vs Apache the web server) and a fact for one is not a fact for
+-- the other. host (hostname/vhost) is tracked distinctly from the ip.
+CREATE TABLE IF NOT EXISTS public.confirmed_facts (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id uuid, target text NOT NULL, host text, product text,
+    version text, cve text,
+    claim_type text NOT NULL, claim_key text NOT NULL, claim_value text,
+    status text NOT NULL, evidence text, method text,
+    confidence real NOT NULL DEFAULT 0.9, ttl_seconds int NOT NULL DEFAULT 0,
+    source_run_id text,
+    confirmed_at timestamptz NOT NULL DEFAULT now(),
+    last_checked_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_confirmed_fact ON public.confirmed_facts
+    (target, COALESCE(product,''), claim_type, claim_key,
+     COALESCE(claim_value,''), COALESCE(cve,''));
+CREATE INDEX IF NOT EXISTS idx_confirmed_target
+    ON public.confirmed_facts (target, COALESCE(product,''));
+
+-- AGENT-DERIVED CVE EXPLOIT SPECS (auto-derivation pipeline persists verified recipes here)
+CREATE TABLE IF NOT EXISTS public.derived_cve_specs (
+    cve           text PRIMARY KEY,
+    product       text,
+    version       text,
+    vuln_class    text,
+    spec          jsonb NOT NULL,
+    verified      boolean NOT NULL DEFAULT false,
+    verify_method text,
+    verify_evidence text,
+    source        text,
+    derived_at    timestamptz NOT NULL DEFAULT now(),
+    last_verified timestamptz,
+    status        text NOT NULL DEFAULT 'tentative',  -- 'tentative' | 'verified' | 'refuted'
+    attempts      integer NOT NULL DEFAULT 0,
+    last_failure  text,
+    refine_hints  jsonb NOT NULL DEFAULT '{}'::jsonb  -- {tried_payloads:[], tried_endpoints:[], tried_proof_models:[], notes:""}
+);
+-- Idempotent columns for in-place upgrades (ensure_all_tables runs on existing DBs too)
+ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'tentative';
+ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS attempts integer NOT NULL DEFAULT 0;
+ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS last_failure text;
+ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS refine_hints jsonb NOT NULL DEFAULT '{}'::jsonb;
+
+-- Discovered app knowledge: per-product/version facts the build loop learns
+-- (endpoints, params, csrf source, cookie shape, secondary products).
+CREATE TABLE IF NOT EXISTS public.discovered_app_knowledge (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    product text NOT NULL, version text, fact_type text NOT NULL, fact_value text NOT NULL,
+    confidence real NOT NULL DEFAULT 0.5, discovered_from text, source_run_id text,
+    engagement_id uuid, hits int NOT NULL DEFAULT 1,
+    last_seen_at timestamptz NOT NULL DEFAULT now(),
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_dak_product ON public.discovered_app_knowledge (lower(product));
+
+-- Refine-error patterns: operator-extensible + learned refine-time fix guidance.
+CREATE TABLE IF NOT EXISTS public.refine_error_patterns (
+    id text PRIMARY KEY, title text NOT NULL, guidance text NOT NULL, triggers jsonb NOT NULL,
+    source text NOT NULL DEFAULT 'yaml',
+    created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(),
+    approved_by text, approved_at timestamptz,
+    trial_count int NOT NULL DEFAULT 0, success_count int NOT NULL DEFAULT 0,
+    last_trial_at timestamptz
+);

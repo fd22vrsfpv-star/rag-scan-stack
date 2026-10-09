@@ -17,7 +17,7 @@ rag_feedback rows are tagged to the active engagement.
 from typing import List, Optional
 import logging
 import httpx
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from config import get_settings
@@ -419,6 +419,73 @@ async def wstg_guide(wstg_id: str):
     async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(f"{s.rag_api_url}/rag/wstg/{wstg_id}",
                            headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, _detail(resp))
+        return safe_json(resp)
+
+
+# ─── Refine-error-pattern knowledge (operator-extensible) ─────────────────
+
+@router.get("/api/refine-patterns")
+async def list_refine_patterns(include_pending: bool = True):
+    """List refine-error patterns (YAML-loaded + operator-approved learned)."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=15) as c:
+        resp = await c.get(f"{s.rag_api_url}/refine-patterns",
+                           params={"include_pending": str(include_pending).lower()},
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, _detail(resp))
+        return safe_json(resp)
+
+
+@router.get("/api/refine-patterns/pending")
+async def list_pending_refine_patterns():
+    """Learned patterns awaiting operator review."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=15) as c:
+        resp = await c.get(f"{s.rag_api_url}/refine-patterns/pending",
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, _detail(resp))
+        return safe_json(resp)
+
+
+@router.post("/api/refine-patterns/approve/{pattern_id}")
+async def approve_refine_pattern(pattern_id: str, request: Request):
+    """Approve a pending learned pattern. Body: {guidance?, operator?}."""
+    s = get_settings()
+    body = await request.json()
+    async with httpx.AsyncClient(timeout=15) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/refine-patterns/approve/{pattern_id}",
+            json=body,
+            headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, _detail(resp))
+        return safe_json(resp)
+
+
+@router.delete("/api/refine-patterns/{pattern_id}")
+async def delete_refine_pattern(pattern_id: str):
+    """Delete a learned pattern (YAML-source rows refuse 403)."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=15) as c:
+        resp = await c.delete(f"{s.rag_api_url}/refine-patterns/{pattern_id}",
+                              headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, _detail(resp))
+        return safe_json(resp)
+
+
+@router.post("/api/refine-patterns/mine")
+async def mine_refine_patterns(min_hits: int = 3, limit: int = 200):
+    """Ad-hoc trigger of the trace-mining pass."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=60) as c:
+        resp = await c.post(f"{s.rag_api_url}/refine-patterns/mine",
+                            params={"min_hits": min_hits, "limit": limit},
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, _detail(resp))
         return safe_json(resp)
