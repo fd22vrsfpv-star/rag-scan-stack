@@ -83,6 +83,7 @@ class BuildPocState(TypedDict, total=False):
     plan_verdicts: Dict[str, str]
     id_pool: Dict[str, Any]           # ids seen in recon/enumeration, for templated paths
     guidance: str
+    guidance_base: str                # pre-gather guidance; pass 2 composes from this, not from pass 1's output
     built: Optional[Dict[str, Any]]
 
     # Refine loop state
@@ -105,6 +106,7 @@ class BuildPocState(TypedDict, total=False):
     off_target: bool
     exploit_store_id: Optional[str]
     result: Dict[str, Any]
+    failure_analysis: Dict[str, Any]   # end-of-attempt analysis (unverified runs); also persisted to build_poc_attempts
 
 
 def enabled() -> bool:
@@ -119,6 +121,12 @@ def initial_state(cve: str, ip: str, port: int, product=None, version=None, eid=
                   focused_urls: Optional[List[str]] = None) -> BuildPocState:
     """Build the initial state dict handed to the graph. Mirrors the argument shape
     of _build_poc_core so the wrapper is trivial."""
+    # Supplied credentials are the FIRST cred_hint so node_auto_login logs in
+    # before the ZAP/Playwright/Arjun recon runs (authenticated crawl), not only
+    # at node_auth_establish afterwards (analysis 2026-10-09, fix #2).
+    _supplied = []
+    if auth and auth.get("username") and auth.get("password"):
+        _supplied = [f"{auth['username']}:{auth['password']}"]
     return {
         "cve": cve, "ip": ip, "port": port,
         "product": product, "version": version, "eid": eid,
@@ -128,18 +136,18 @@ def initial_state(cve: str, ip: str, port: int, product=None, version=None, eid=
         "t0": time.time(),
         "segments": [], "recon_metrics": {}, "intel_list": [],
         "zap_paths": [], "arjun_discovered": [], "focused_urls": list(focused_urls or []),
-        "cred_hints": [], "admin_paths_mined": [],
+        "cred_hints": _supplied, "admin_paths_mined": [],
         "detected_frameworks": [], "waf_family": None, "waf_characterization": {},
         "auth": auth or {}, "auth_guidance": "", "session_info": None,
         "hint_guidance": "", "hint_parts": [], "research_out": None,
-        "recon_guidance": "", "strategy": "", "plan_verdicts": {}, "guidance": "",
+        "recon_guidance": "", "strategy": "", "plan_verdicts": {}, "guidance": "", "guidance_base": "",
         "built": None,
         "command": "", "assertion": {}, "canary": None, "origin_family": None,
         "llm_model": None, "output": "",
         "success": False, "drifted": False, "iters": 0, "escalated": False,
         "escalation_guidance": "", "metrics": {},
         "verified": False, "reflection": False, "off_target": False,
-        "exploit_store_id": None, "result": {},
+        "exploit_store_id": None, "result": {}, "failure_analysis": {},
     }
 
 
@@ -459,7 +467,8 @@ def node_response_mine(state: BuildPocState) -> Dict[str, Any]:
     for x in intel_list:
         cred_hints.extend(x.get("credential_hints", []) or [])
         admin_paths.extend(x.get("admin_paths", []) or [])
-    cred_hints = list(dict.fromkeys(cred_hints))
+    # Supplied pair (seeded by initial_state) stays first; mined ones follow.
+    cred_hints = list(dict.fromkeys(list(state.get("cred_hints") or []) + cred_hints))
     admin_paths = list(dict.fromkeys(admin_paths))
     detected_frameworks = list(dict.fromkeys(
         x.get("framework") for x in intel_list if x.get("framework")))
@@ -498,7 +507,10 @@ def node_auto_login(state: BuildPocState) -> Dict[str, Any]:
     seg = []
     auth = dict(state.get("auth") or {})
     if login and login.get("cookie_header"):
-        note = (f"AUTO-LOGIN SUCCESS with mined creds {login['cred']} at "
+        _a = state.get("auth") or {}
+        _src = ("supplied" if (_a.get("username") and _a.get("password")
+                               and login.get("cred") == f"{_a['username']}:{_a['password']}") else "mined")
+        note = (f"AUTO-LOGIN SUCCESS with {_src} creds {login['cred']} at "
                 f"{login['path']} (fields {login['u_field']}/"
                 f"{login['p_field']}, signal={login['signal']}). "
                 f"Session cookie: {login['cookie_header'][:200]}. "
@@ -648,7 +660,7 @@ def node_playwright_recon(state: BuildPocState) -> Dict[str, Any]:
     seg = []
     if guidance:
         seg.append(guidance)
-        _poc_trace(state["run_id"], "recon:playwright", response=guidance[:1600])
+        _poc_trace(state["run_id"], "recon:playwright", response=guidance[:4000])
     merged_arjun = list(state.get("arjun_discovered") or [])
     for u in discovered:
         if u and u not in merged_arjun:
@@ -692,7 +704,7 @@ def node_arjun_recon(state: BuildPocState) -> Dict[str, Any]:
 def node_auth_establish(state: BuildPocState) -> Dict[str, Any]:
     """Establish an authenticated session when the operator supplied creds OR when
     auto_login already captured a cookie. Matches the monolith exactly."""
-    from api import _establish_session_for_build
+    from api import _establish_session_for_build, _poc_trace
     auth = state.get("auth") or {}
     auth_guidance = ""
     session_info = None
@@ -700,20 +712,35 @@ def node_auth_establish(state: BuildPocState) -> Dict[str, Any]:
         try:
             session_info = _establish_session_for_build(
                 state["ip"], state["port"], auth, state.get("eid"),
-                product=state.get("product"))
+                product=state.get("product"), segments=state.get("segments") or [])
             ch = (session_info or {}).get("cookie_header")
             if ch:
                 auth_guidance = (f"AUTH: an authenticated session exists — send this cookie in "
                                  f"EVERY exploit request: Cookie: {ch}. (user "
                                  f"{session_info.get('username')}). ")
+            _poc_trace(state["run_id"], "recon:auth_establish",
+                       response=f"method={(session_info or {}).get('method')} ok={bool(ch)} "
+                                f"user={(session_info or {}).get('username')} "
+                                f"note={str((session_info or {}).get('note') or '')[:300]}",
+                       extra={"auth_ok": bool(ch), "auth_method": (session_info or {}).get("method"),
+                              "login_url": (session_info or {}).get("login_url")})
+            if not ch:
+                # A failed attempt used to be returned as a session_info with
+                # cookie_header="" — downstream "session exists" checks were
+                # fooled. Keep it None; the trace above records the attempt.
+                session_info = None
         except Exception as e:  # noqa: BLE001
             logging.debug("build auth step failed: %s", e)
+            _poc_trace(state["run_id"], "recon:auth_establish",
+                       response=f"error {type(e).__name__}: {str(e)[:300]}",
+                       extra={"auth_ok": False, "auth_method": "error"})
+            session_info = None
     if auth and auth.get("_auto_cookie") and not auth_guidance:
         auth_guidance = (f"AUTH (auto-login from mined creds): send this cookie in EVERY "
                          f"exploit request: Cookie: {auth['_auto_cookie']}. "
-                         f"Logged in at {auth.get('_auto_login_path', '?')} with credentials "
-                         "extracted from a leaked README/docs — the app is now "
-                         "AUTHENTICATED, target the admin backend for post-auth CVEs.")
+                         f"Logged in at {auth.get('_auto_login_path', '?')} with the supplied "
+                         "or mined credentials — the app is now AUTHENTICATED, target the "
+                         "admin backend for post-auth CVEs.")
     return {"auth_guidance": auth_guidance, "session_info": session_info}
 
 
@@ -1097,7 +1124,8 @@ def node_gather_check(state: BuildPocState) -> Dict[str, Any]:
             analysis=((state.get("research_out") or {}).get("analysis")
                       if isinstance(state.get("research_out"), dict) else None),
             recon_text=" ".join(state.get("segments") or [])[:20000],
-            run_id=state["run_id"], id_pool=state.get("id_pool") or {})
+            run_id=state["run_id"], id_pool=state.get("id_pool") or {},
+            segments=list(state.get("segments") or []))
     except Exception as e:  # noqa: BLE001
         _poc_trace(state["run_id"], "gather_check", response=f"(skipped: {type(e).__name__}: {e})")
         return {}
@@ -1113,8 +1141,12 @@ def node_gather_check(state: BuildPocState) -> Dict[str, Any]:
                 for g, v in dr["solutions"].items() if g in (man.get("missing") or [])]
     rec = _record_gather_manifest(man, state["cve"], state["ip"], state["port"],
                                   eid=state.get("eid"), run_id=state["run_id"])
-    guidance = (_gather_manifest_text(man) + "\n" + (state.get("guidance") or "")).strip()
-    upd: Dict[str, Any] = {"guidance": guidance, "gather_manifest": {**man, "follow_up_id": rec.get("follow_up_id")},
+    # Pass 2 (after deep_recon) must not prepend a second manifest onto pass 1's
+    # output: compose from the pre-gather guidance captured on pass 1.
+    base = state.get("guidance_base") if state.get("guidance_base") else (state.get("guidance") or "")
+    guidance = (_gather_manifest_text(man) + "\n" + base).strip()
+    upd: Dict[str, Any] = {"guidance": guidance, "guidance_base": base,
+                           "gather_manifest": {**man, "follow_up_id": rec.get("follow_up_id")},
                            "recon_metrics": {**state.get("recon_metrics", {}),
                                              "gather_check": {"ready": man.get("ready"),
                                                               "missing": man.get("missing"),
@@ -1293,6 +1325,128 @@ def node_run_refine(state: BuildPocState) -> Dict[str, Any]:
             "success": bool(result.get("success"))}
 
 
+def node_failure_analysis(state: BuildPocState) -> Dict[str, Any]:
+    """End-of-attempt analysis, fired exactly once at the true end of every run
+    (after run_refine, after any deep-recon go-around, before save_store) with
+    the full state in hand. Verified runs get an attempts row only; unverified
+    runs get the deterministic analysis + one routed LLM narrative, persisted
+    to build_poc_attempts, traced, filed as a follow-up and emitted as a
+    webhook. Operator ask 2026-10-09: "when an attempt fails at the end conduct
+    an analysis and save this information so that it can be added to the
+    markdown file for manual review, or viewed in the poc summary attempt".
+    Whole body is fail-soft — it must never block save_store."""
+    from api import (_build_failure_analysis, _failure_analysis_llm, _record_build_poc_attempt,
+                     _poc_trace, _poc_run_file)
+    result = state.get("result") or {}
+    run_id = state["run_id"]
+    log_path = result.get("log_path") or _poc_run_file(run_id)
+    man = state.get("gather_manifest") or result.get("gather_manifest") or {}
+    live = (man.get("facts") or {}).get("live_recon") if isinstance(man, dict) else None
+    try:
+        if result.get("verified"):
+            _record_build_poc_attempt(
+                run_id=run_id, cve=state["cve"], ip=state["ip"], port=state.get("port"), eid=state.get("eid"),
+                verified=True, stage_reached="verified", stop_reason=result.get("stop_reason") or "success",
+                missing=[], gather_manifest=man or None, live_recon=live,
+                poc_log_path=log_path, llm_model=result.get("llm_model"))
+            return {}
+        auth = state.get("auth") or {}
+        state_bits = {
+            "segments": list(state.get("segments") or []),
+            "deep_recon": state.get("deep_recon") or {},
+            "session_info": state.get("session_info") or None,
+            "auth": {"username": auth.get("username")} if auth.get("username") else {},
+            "plan_verdicts": state.get("plan_verdicts") or {},
+            "strategy": (state.get("strategy") or "")[:2000],
+            "recon_metrics": state.get("recon_metrics") or {},
+            "built_kind": (state.get("built") or {}).get("synth_kind"),
+        }
+        fa = _build_failure_analysis(run_id, log_path, result, gather_manifest=man, state_bits=state_bits)
+        llm = None
+        try:
+            llm = _failure_analysis_llm(state["cve"], state["ip"], state.get("port"), run_id, fa)
+        except Exception as e:  # noqa: BLE001
+            logging.debug("failure_analysis llm wrapper failed: %s", e)
+        if llm:
+            fa["narrative"] = llm.get("narrative")
+            fa["ranked_next_steps"] = llm.get("ranked_next_steps") or []
+            fa["confidence"] = llm.get("confidence")
+            fa["llm_model"] = llm.get("model")
+        else:
+            fa["narrative"] = None
+            fa["ranked_next_steps"] = [{"step": s, "why": "deterministic rule", "how": ""} for s in (fa.get("next_steps_deterministic") or [])[:5]]
+            fa["confidence"] = None
+            fa["llm_model"] = None
+        try:
+            summary_for_row = None
+            from api import _read_trace_file, _summarize_build_trace
+            summary_for_row = _summarize_build_trace(_read_trace_file(log_path))
+        except Exception:  # noqa: BLE001
+            summary_for_row = None
+        _record_build_poc_attempt(
+            run_id=run_id, cve=state["cve"], ip=state["ip"], port=state.get("port"), eid=state.get("eid"),
+            verified=False, stage_reached=fa.get("stage_reached"), stop_reason=fa.get("stop_reason"),
+            missing=fa.get("missing") or [], gather_manifest=man or None, live_recon=live,
+            summary=summary_for_row, failure_analysis=fa, poc_log_path=log_path,
+            llm_model=fa.get("llm_model") or result.get("llm_model"))
+        steps_txt = "\n".join(f"{i + 1}. {s.get('step')}" + (f" — {s.get('why')}" if s.get("why") else "")
+                              for i, s in enumerate(fa.get("ranked_next_steps") or []))
+        _poc_trace(run_id, "failure_analysis",
+                   response=(f"stage={fa.get('stage_reached')} stop={fa.get('stop_reason')} missing={fa.get('missing')}\n"
+                             f"{fa.get('narrative') or '(no narrative)'}\n{steps_txt}")[:4000],
+                   llm_model=fa.get("llm_model"), extra={"failure_analysis": fa})
+        # Follow-up row — the operator's queue is where manual continuation starts.
+        follow_up_id = None
+        try:
+            import uuid as _u
+            from psycopg2.extras import Json
+            from api import get_db, _redact_attempt_blob
+            title = f"Build-PoC {state['cve']}: failure analysis ({fa.get('stage_reached')}) on {state['ip']}:{state.get('port')}"
+            notes = (fa.get("narrative") or "") + ("\n\n" if fa.get("narrative") else "") + steps_txt
+            with get_db() as conn, conn.cursor() as cur:
+                cur.execute("""INSERT INTO follow_up_items
+                    (id, finding_source, title, target, severity, reason, priority, flagged_by, rule_id,
+                     confidence, tags, notes, engagement_id, metadata)
+                    VALUES (%s,'build_poc',%s,%s,'medium',%s,'high','build_poc_failure_analysis','build_poc_failure_analysis',
+                            %s,%s,%s,%s,%s)
+                    ON CONFLICT (title, COALESCE(target,''), COALESCE(rule_id,''))
+                    DO UPDATE SET metadata = EXCLUDED.metadata, notes = EXCLUDED.notes,
+                                  reason = EXCLUDED.reason, updated_at = now()
+                    RETURNING id""",
+                    (str(_u.uuid4()), title, f"{state['ip']}:{state.get('port')}",
+                     f"stage={fa.get('stage_reached')} stop={fa.get('stop_reason')}",
+                     (fa.get("confidence") if fa.get("confidence") is not None else 0.5),
+                     ["build-poc", "failure-analysis", str(fa.get("stage_reached") or "")] + [str(m) for m in (fa.get("missing") or [])],
+                     notes[:8000], (str(state.get("eid")) if state.get("eid") else None),
+                     Json(_redact_attempt_blob({"run_id": run_id, "stage_reached": fa.get("stage_reached"),
+                                                "stop_reason": fa.get("stop_reason"), "blockers": fa.get("blockers"),
+                                                "ranked_next_steps": fa.get("ranked_next_steps"),
+                                                "confidence": fa.get("confidence")}))))
+                row = cur.fetchone(); conn.commit()
+                follow_up_id = str(row[0]) if row else None
+        except Exception as e:  # noqa: BLE001
+            logging.warning("failure_analysis follow-up write failed: %s", e)
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("build_poc_failure_analysis", "build_poc", {
+                "engagement_id": str(state.get("eid")) if state.get("eid") else None,
+                "cve": state["cve"], "target": f"{state['ip']}:{state.get('port')}", "run_id": run_id,
+                "stage_reached": fa.get("stage_reached"), "stop_reason": fa.get("stop_reason"),
+                "missing": fa.get("missing"), "follow_up_id": follow_up_id,
+                "confidence": fa.get("confidence"), "llm_model": fa.get("llm_model")})
+        except Exception:  # noqa: BLE001
+            pass
+        return {"failure_analysis": fa}
+    except Exception as e:  # noqa: BLE001
+        logging.warning("node_failure_analysis failed run=%s: %s", run_id, e)
+        try:
+            _poc_trace(run_id, "failure_analysis_error", response=f"{type(e).__name__}: {str(e)[:400]}",
+                       extra={"reason": "node exception"})
+        except Exception:  # noqa: BLE001
+            pass
+        return {}
+
+
 def node_save_store(state: BuildPocState) -> Dict[str, Any]:
     """Save the built PoC + emit webhook. Store verified/unverified — the
     unverified rows stay for operator inspection (same as monolith).
@@ -1340,9 +1494,17 @@ def node_save_store(state: BuildPocState) -> Dict[str, Any]:
                           "iterations": result.get("iterations"),
                           "metrics": metrics,
                           "research": (research_out or {}).get("analysis"),
-                          "research_sources": (research_out or {}).get("sources")})
+                          "research_sources": (research_out or {}).get("sources"),
+                          "failure_analysis": state.get("failure_analysis") or None,
+                          "attempt_run_id": state.get("run_id")})
     except Exception:  # noqa: BLE001
         pass
+    if store_id:
+        try:
+            from api import _link_attempt_to_store
+            _link_attempt_to_store(state["run_id"], store_id)
+        except Exception:  # noqa: BLE001
+            pass
     # CAPTURED CREDENTIALS — scan the exploit's output for leaked creds/tokens/
     # IDs and file them into credential_findings so the asset's Credentials
     # section shows them. Only on verified exploits (unverified output is
@@ -1529,6 +1691,31 @@ def _route_post_zap(state: BuildPocState) -> str:
 
 
 # ── graph builder ──────────────────────────────────────────────────────────────
+def _traced(name: str, fn):
+    """Wrap a node so an exception inside it leaves a `node_error:<name>` trace
+    row (with traceback) before propagating. CVE-2024-22120 (2026-10-08) died
+    between `operator_hint` and the next node with nothing in the JSONL."""
+    def _run(state):
+        try:
+            return fn(state)
+        except Exception as e:  # noqa: BLE001
+            import traceback as _tb
+            try:
+                from api import _poc_trace
+                _poc_trace(state.get("run_id"), f"node_error:{name}",
+                           response=f"{type(e).__name__}: {str(e)[:400]}\n{_tb.format_exc()[-3500:]}",
+                           extra={"node": name, "error_type": type(e).__name__})
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+    _run.__name__ = getattr(fn, "__name__", name)
+    return _run
+
+
+def _add_node(g, name: str, fn):
+    g.add_node(name, _traced(name, fn))
+
+
 def build_graph():
     """Assemble the full StateGraph. Structure:
        START -> [recon block if recon_first]
@@ -1540,41 +1727,42 @@ def build_graph():
     g = StateGraph(BuildPocState)
 
     # Recon block (all conditional on recon_first)
-    g.add_node("port_sweep", node_port_sweep)
-    g.add_node("waf_detect", node_waf_detect)
-    g.add_node("waf_characterize", node_waf_characterize)
-    g.add_node("basic_recon", node_basic_recon)
-    g.add_node("product_identification", node_product_identification)
-    g.add_node("product_cve_enumeration", node_product_cve_enumeration)
-    g.add_node("response_mine", node_response_mine)
-    g.add_node("auto_login", node_auto_login)
-    g.add_node("framework_deep_enum", node_framework_deep_enum)
-    g.add_node("zap_recon", node_zap_recon)
-    g.add_node("openapi_recon", node_openapi_recon)
-    g.add_node("discovered_knowledge_recon", node_discovered_knowledge_recon)
-    g.add_node("playwright_recon", node_playwright_recon)
-    g.add_node("arjun_recon", node_arjun_recon)
+    _add_node(g, "port_sweep", node_port_sweep)
+    _add_node(g, "waf_detect", node_waf_detect)
+    _add_node(g, "waf_characterize", node_waf_characterize)
+    _add_node(g, "basic_recon", node_basic_recon)
+    _add_node(g, "product_identification", node_product_identification)
+    _add_node(g, "product_cve_enumeration", node_product_cve_enumeration)
+    _add_node(g, "response_mine", node_response_mine)
+    _add_node(g, "auto_login", node_auto_login)
+    _add_node(g, "framework_deep_enum", node_framework_deep_enum)
+    _add_node(g, "zap_recon", node_zap_recon)
+    _add_node(g, "openapi_recon", node_openapi_recon)
+    _add_node(g, "discovered_knowledge_recon", node_discovered_knowledge_recon)
+    _add_node(g, "playwright_recon", node_playwright_recon)
+    _add_node(g, "arjun_recon", node_arjun_recon)
 
     # Auth / hints / research
-    g.add_node("auth_establish", node_auth_establish)
-    g.add_node("load_hints", node_load_hints)
-    g.add_node("research", node_research)
-    g.add_node("access_enumeration", node_access_enumeration)
-    g.add_node("precondition_enumeration", node_precondition_enumeration)
-    g.add_node("readiness_gate", node_readiness_gate)
+    _add_node(g, "auth_establish", node_auth_establish)
+    _add_node(g, "load_hints", node_load_hints)
+    _add_node(g, "research", node_research)
+    _add_node(g, "access_enumeration", node_access_enumeration)
+    _add_node(g, "precondition_enumeration", node_precondition_enumeration)
+    _add_node(g, "readiness_gate", node_readiness_gate)
 
     # Guidance assembly + strategy
-    g.add_node("assemble_guidance", node_assemble_guidance)
-    g.add_node("strategist", node_strategist)
-    g.add_node("plan_verify", node_plan_verify)
+    _add_node(g, "assemble_guidance", node_assemble_guidance)
+    _add_node(g, "strategist", node_strategist)
+    _add_node(g, "plan_verify", node_plan_verify)
 
     # Synth + execution + save
-    g.add_node("gather_check", node_gather_check)
-    g.add_node("deep_recon", node_deep_recon)
-    g.add_node("synth", node_synth)
-    g.add_node("run_refine", node_run_refine)
-    g.add_node("save_store", node_save_store)
-    g.add_node("tool_handoff", node_tool_handoff)
+    _add_node(g, "gather_check", node_gather_check)
+    _add_node(g, "deep_recon", node_deep_recon)
+    _add_node(g, "synth", node_synth)
+    _add_node(g, "run_refine", node_run_refine)
+    _add_node(g, "failure_analysis", node_failure_analysis)
+    _add_node(g, "save_store", node_save_store)
+    _add_node(g, "tool_handoff", node_tool_handoff)
 
     # Edges — the spine
     g.add_conditional_edges(START, _route_after_start,
@@ -1591,7 +1779,7 @@ def build_graph():
     # Pass-through hub after WAF so both branches converge
     def _post_waf_passthrough(state):  # no-op node
         return {}
-    g.add_node("_post_waf_hub", _post_waf_passthrough)
+    _add_node(g, "_post_waf_hub", _post_waf_passthrough)
     g.add_conditional_edges("_post_waf_hub", _route_post_waf,
                              {"basic_recon": "basic_recon",
                               "post_mine": "_post_mine_hub"})
@@ -1610,7 +1798,7 @@ def build_graph():
     g.add_edge("framework_deep_enum", "_post_mine_hub")
 
     # Pass-through hub after basic/mine/login/enum block converges
-    g.add_node("_post_mine_hub", _post_waf_passthrough)
+    _add_node(g, "_post_mine_hub", _post_waf_passthrough)
     g.add_conditional_edges("_post_mine_hub", _route_post_mine,
                              {"zap_recon": "zap_recon",
                               "arjun_recon": "openapi_recon",
@@ -1671,8 +1859,11 @@ def build_graph():
                 and not res.get("artifact_required")):
             return "deep_recon"
         return "save_store"
+    # Every end of the loop (blocked, exhausted, or the deep-recon go-around's
+    # second pass) funnels through failure_analysis before save_store.
     g.add_conditional_edges("run_refine", _route_after_refine,
-                            {"deep_recon": "deep_recon", "save_store": "save_store"})
+                            {"deep_recon": "deep_recon", "save_store": "failure_analysis"})
+    g.add_edge("failure_analysis", "save_store")
     g.add_edge("save_store", "tool_handoff")
     g.add_edge("tool_handoff", END)
 
@@ -1684,7 +1875,21 @@ def invoke_build_poc(state: BuildPocState) -> Dict[str, Any]:
     its endpoint caller: {command, assertion, canary, success, verified,
     off_target, reflection, iterations, exploit_store_id, ...}."""
     graph = build_graph()
-    final = graph.invoke(state)
+    try:
+        final = graph.invoke(state)
+    except Exception as e:  # noqa: BLE001
+        # A crash between nodes used to leave no `result` and no index row
+        # (CVE-2024-22120, 2026-10-08). Record it, then propagate.
+        try:
+            from api import _poc_trace, _poc_index, _poc_run_file
+            _poc_trace(state.get("run_id"), "result",
+                       response=f"crash: {type(e).__name__}: {str(e)[:400]}",
+                       extra={"verified": False, "crash": True, "error_type": type(e).__name__})
+            _poc_index(state.get("cve"), state.get("ip"), state.get("run_id"),
+                       _poc_run_file(state.get("run_id")), False, 0, None, state.get("eid"))
+        except Exception:  # noqa: BLE001
+            pass
+        raise
     result = final.get("result") or {}
     session_info = final.get("session_info")
     built = final.get("built") or {}

@@ -14224,6 +14224,178 @@ def _inband_baseline_diff(ip, port, command: str, timeout: int = 5) -> dict:
             "url": url, "baseline_url": base_url}
 
 
+_RECON_STATIC_EXT = (".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+                     ".woff", ".woff2", ".ttf", ".eot", ".map", ".webp", ".mp3", ".mp4",
+                     ".wav", ".avi", ".pdf")
+_RECON_DYNAMIC_EXT = (".php", ".jsp", ".jspx", ".do", ".action", ".aspx", ".asp", ".cgi",
+                      ".py", ".pl", ".rb")
+
+
+def _parse_recon_segments(segments) -> dict:
+    """PURE: turn the free-text recon segments a build-poc run accumulates in
+    state["segments"] into structured facts the gather check can consume.
+    Until 2026-10-09 gather read only the OpenAPI line and the JSON-body
+    endpoints line out of recon_text; the login form fields, the Playwright
+    crawl, the Arjun parameter names and the verb sweep were invisible to it.
+
+    Formats (all real producers):
+      - `Form GET process.php fields=['username', 'password']`           (_scout_url_recon)
+      - `Playwright SPA crawl discovered N URLs … :\\n  - /path`           (_playwright_sitemap)
+      - `Arjun deep-scan (params honored per endpoint):\\n  /p: a, b`     (_scout_arjun_paths)
+      - `Arjun recon on http://h:p/ (N honored params — …): a, b.`        (_scout_arjun)
+      - `CLASSIFIED HIGH-SIGNAL PARAMS …:\\n  /p param `x` → likely C. try …`
+      - `ZAP recon: ZAP-spidered paths: /a, /b | ZAP alerts: …`            (_zap_recon)
+      - `VERB SWEEP (deep recon; method:status per path):\\n  /p -> GET:200 POST:302`
+      - `OpenAPI paths (N at /openapi.json): GET /a; POST /b`              (_scout_url_recon)
+      - `Endpoints (from JSON body): /upload` and `Endpoints: a.php, b.php`
+    Only `re` + `urllib.parse`; safe to exec from source in tests."""
+    import re as _re
+    from urllib.parse import urlparse as _up
+
+    def _norm(u):
+        s = str(u or "").strip().strip("`'\"")
+        if not s:
+            return None, ""
+        q = ""
+        if "://" in s:
+            try:
+                p = _up(s)
+                s, q = (p.path or "/"), (p.query or "")
+            except Exception:  # noqa: BLE001
+                return None, ""
+        s = s.split("#", 1)[0]
+        if "?" in s:
+            s, q = s.split("?", 1)
+        if not s.startswith("/"):
+            s = "/" + s
+        if "*" in s or "%22" in s or "$" in s or " " in s:
+            return None, ""          # SPA-crawl glob/template junk
+        return s, q
+
+    def _is_static(p):
+        low = p.lower()
+        return any(low.endswith(e) for e in _RECON_STATIC_EXT)
+
+    out = {"form_fields": [], "crawl_urls": [], "arjun_params": {}, "classified_params": [],
+           "zap_paths": [], "verb_sweep": {}, "openapi": [], "json_body_endpoints": [],
+           "href_endpoints": [], "counts": {}}
+    seen_crawl, seen_form = set(), set()
+    for seg in (segments or []):
+        text = str(seg or "")
+        if not text:
+            continue
+        # Forms (one per match; action may be relative, absolute, or carry a query)
+        for m in _re.finditer(r"Form (\w+) (\S+) fields=\[([^\]]*)\]", text):
+            method, action, inner = m.group(1).upper(), m.group(2), m.group(3)
+            path, _q = _norm(action)
+            fields = _re.findall(r"['\"]([^'\"]*)['\"]", inner)
+            key = (path, method, tuple(fields))
+            if path and fields and key not in seen_form:
+                seen_form.add(key)
+                out["form_fields"].append({"path": path, "method": method, "fields": fields,
+                                           "raw_action": action})
+        # Playwright crawl (and deep-recon auth_crawl, same producer)
+        if "Playwright SPA crawl discovered" in text:
+            block = text.split("Playwright SPA crawl discovered", 1)[1]
+            for line in block.splitlines():
+                mm = _re.match(r"\s+-\s+(\S+)\s*$", line)
+                if not mm:
+                    continue
+                path, q = _norm(mm.group(1))
+                if not path or path == "/" or _is_static(path) or path in seen_crawl:
+                    continue
+                seen_crawl.add(path)
+                out["crawl_urls"].append(path if not q else f"{path}?{q}")
+        # Arjun deep-scan block: "  /p: a, b" lines until a blank line
+        if "Arjun deep-scan (params honored per endpoint):" in text:
+            block = text.split("Arjun deep-scan (params honored per endpoint):", 1)[1]
+            for line in block.splitlines():
+                if not line.strip():
+                    if out["arjun_params"]:
+                        break
+                    continue
+                mm = _re.match(r"\s+(/\S*):\s+(.+?)\s*$", line)
+                if not mm:
+                    if line.startswith("CLASSIFIED"):
+                        break
+                    continue
+                path, _q = _norm(mm.group(1))
+                names = [x.strip().strip("`'\"") for x in mm.group(2).split(",") if x.strip()]
+                if path and names:
+                    out["arjun_params"].setdefault(path, [])
+                    for n in names:
+                        if n not in out["arjun_params"][path]:
+                            out["arjun_params"][path].append(n)
+        # Arjun single-url form
+        for m in _re.finditer(r"Arjun recon on (\S+) \(\d+ honored params?[^)]*\):\s*([^.\n]+)\.", text):
+            path, _q = _norm(m.group(1))
+            names = [x.strip().strip("`'\"") for x in m.group(2).split(",") if x.strip()]
+            if path and names:
+                out["arjun_params"].setdefault(path, [])
+                for n in names:
+                    if n not in out["arjun_params"][path]:
+                        out["arjun_params"][path].append(n)
+        # Classified high-signal params
+        if "CLASSIFIED HIGH-SIGNAL PARAMS" in text:
+            block = text.split("CLASSIFIED HIGH-SIGNAL PARAMS", 1)[1]
+            for m in _re.finditer(r"^\s+(/\S*) param `([^`]+)` → likely ([^.\n]+)\.(?: try (.+))?$",
+                                  block, _re.M):
+                path, _q = _norm(m.group(1))
+                if path:
+                    out["classified_params"].append({"path": path, "param": m.group(2).strip(),
+                                                     "class": m.group(3).strip(),
+                                                     "hint": (m.group(4) or "").strip()[:200]})
+        # ZAP spidered paths
+        for m in _re.finditer(r"ZAP-spidered paths:\s*([^|\n]+?)(?:\s*\||\s*$)", text):
+            for x in m.group(1).split(","):
+                path, q = _norm(x)
+                if path and path != "/" and not _is_static(path) and path not in out["zap_paths"]:
+                    out["zap_paths"].append(path if not q else f"{path}?{q}")
+        # Verb sweep
+        if "VERB SWEEP" in text:
+            block = text.split("VERB SWEEP", 1)[1]
+            for line in block.splitlines():
+                mm = _re.match(r"\s+(/\S*)\s+->\s+(.+?)\s*$", line)
+                if not mm:
+                    continue
+                path, _q = _norm(mm.group(1))
+                if not path:
+                    continue
+                verbs = {}
+                for tok in mm.group(2).split():
+                    if ":" in tok:
+                        v, s = tok.split(":", 1)
+                        if v.isalpha() and s.isdigit():
+                            verbs[v.upper()] = int(s)
+                if verbs:
+                    out["verb_sweep"][path] = verbs
+        # OpenAPI line (kept self-contained; _parse_openapi_paths_line is the
+        # canonical reader for the endpoint chain)
+        for m in _re.finditer(r"OpenAPI paths \(\d+ at [^)]*\):\s*([^|\n]+)", text):
+            for item in m.group(1).split(";"):
+                mm = _re.match(r"\s*([A-Z]+)\s+(/\S*)", item)
+                if mm:
+                    out["openapi"].append({"method": mm.group(1), "path": mm.group(2)})
+        # Endpoints lines
+        for m in _re.finditer(r"Endpoints \(from JSON body\):\s*([^|\n]+)", text):
+            for x in m.group(1).split(","):
+                path, _q = _norm(x)
+                if path and path not in out["json_body_endpoints"]:
+                    out["json_body_endpoints"].append(path)
+        for m in _re.finditer(r"(?:^|\| )Endpoints:\s*([^|\n]+)", text):
+            for x in m.group(1).split(","):
+                path, _q = _norm(x)
+                if path and path not in out["href_endpoints"]:
+                    out["href_endpoints"].append(path)
+    out["crawl_urls"] = out["crawl_urls"][:80]
+    out["counts"] = {"forms": len(out["form_fields"]), "crawl_urls": len(out["crawl_urls"]),
+                     "arjun_paths": len(out["arjun_params"]),
+                     "arjun_params": sum(len(v) for v in out["arjun_params"].values()),
+                     "classified": len(out["classified_params"]), "zap_paths": len(out["zap_paths"]),
+                     "verb_sweep_paths": len(out["verb_sweep"]), "openapi": len(out["openapi"])}
+    return out
+
+
 def _parse_openapi_paths_line(recon_text: str) -> list:
     """PURE: `OpenAPI paths (112 at /openapi.json): POST /install_extension; GET /docs; …`
     → [{"path": "/install_extension", "methods": ["POST"]}, …]."""
@@ -14419,6 +14591,7 @@ def _deep_recon_for_gaps(cve, ip, port, product, eid, run_id, manifest: dict, *,
             break
         st0 = _t.time()
         note = ""
+        n_seg_before = len(out["segments"])
         try:
             if step == "default_creds":
                 # 1. product + common default pairs (bounded by default_cred_check.yaml;
@@ -14476,7 +14649,11 @@ def _deep_recon_for_gaps(cve, ip, port, product, eid, run_id, manifest: dict, *,
                     if txt:
                         out["segments"].append(txt)
                         all_text += "\n" + txt
-                    note = f"{sum(len(v or []) for v in (per_path or {}).values())} params on {len(per_path or {})} paths"
+                    # per_path values are the arjun text per path ("a, b"), not
+                    # lists — the old len() summed characters ("652 params").
+                    _n_params = sum(len([p for p in str(v or "").split(",") if p.strip()])
+                                    for v in (per_path or {}).values())
+                    note = f"{_n_params} params on {len(per_path or {})} paths"
             elif step == "verb_sweep":
                 targets = [x for x in ([(manifest or {}).get("facts", {}).get("endpoint")] + out["candidate_paths"]) if x][:8]
                 base = f"{'https' if int(port) in (443, 8443) else 'http'}://{ip}:{port}"
@@ -14502,8 +14679,10 @@ def _deep_recon_for_gaps(cve, ip, port, product, eid, run_id, manifest: dict, *,
             out["ran"].append(step)
         except Exception as e:  # noqa: BLE001
             note = f"error {type(e).__name__}: {str(e)[:120]}"
+        _seg_head = (out["segments"][-1][:1500]
+                     if len(out["segments"]) > n_seg_before else None)
         _poc_trace(run_id, f"deep_recon:{step}", response=note[:1200],
-                   extra={"seconds": round(_t.time() - st0, 2)})
+                   extra={"seconds": round(_t.time() - st0, 2), "segment_head": _seg_head})
     # ids from everything we crawled
     out["id_pool"].update({k: v for k, v in _collect_id_pool(all_text).items() if k not in out["id_pool"]})
     out["seconds"] = round(_t.time() - t0, 2)
@@ -14591,13 +14770,19 @@ def _scan_evidence_for_target(cve, ip, port, eid, vc) -> dict:
     Returns {poc_hints, discovered_params, web_findings, content, banner,
     prior_runs}. All values are plain Python (no DB rows retained)."""
     out = {"poc_hints": "", "discovered_params": [], "web_findings": [],
-           "content": {}, "banner": None, "prior_runs": []}
+           "content": {}, "banner": None, "prior_runs": [], "prior_live_recon": []}
     try:
         ip_s = str(ip) if ip is not None else None
         if not ip_s:
             return out
         port_i = int(port) if port is not None else None
         cwe_filter = _SCAN_EVIDENCE_CWE_FOR_CLASS.get((vc or "").lower())
+        # Engagement filter (2026-10-09): CVE-Bench reuses one IP for every
+        # target, so IP alone is not a key. NULL-engagement rows stay visible
+        # (legacy/global), matching the read-path convention.
+        eid_s = str(eid) if eid else None
+        _eng = " AND (a.engagement_id = %s OR a.engagement_id IS NULL)" if eid_s else ""
+        _eng_p = [eid_s] if eid_s else []
         with get_db() as conn, conn.cursor() as cur:
             # 1. Operator-authored PoC hints (reuses the existing reader).
             try:
@@ -14616,10 +14801,10 @@ def _scan_evidence_for_target(cve, ip, port, eid, vc) -> dict:
                     FROM discovered_params dp
                     JOIN assets a ON dp.asset_id = a.id
                     WHERE host(a.ip) = %s
-                      AND COALESCE(dp.discovery_source, '') NOT ILIKE %s
+                      AND COALESCE(dp.discovery_source, '') NOT ILIKE %s""" + _eng + """
                     ORDER BY dp.last_seen DESC NULLS LAST
                     LIMIT 25
-                """, (ip_s, "%burp%"))
+                """, [ip_s, "%burp%"] + _eng_p)
                 for r in cur.fetchall():
                     out["discovered_params"].append({
                         "url_pattern": r[0], "param_name": r[1],
@@ -14648,6 +14833,8 @@ def _scan_evidence_for_target(cve, ip, port, eid, vc) -> dict:
                 if cwe_filter:
                     sql += " AND wf.cwe && %s::text[]"
                     params.append(cwe_filter)
+                sql += _eng
+                params += _eng_p
                 sql += " ORDER BY wf.last_seen DESC NULLS LAST LIMIT 15"
                 cur.execute(sql, params)
                 for r in cur.fetchall():
@@ -14669,10 +14856,10 @@ def _scan_evidence_for_target(cve, ip, port, eid, vc) -> dict:
                            ce.tech_indicators
                     FROM content_extractions ce
                     JOIN assets a ON ce.asset_id = a.id
-                    WHERE host(a.ip) = %s
+                    WHERE host(a.ip) = %s""" + _eng + """
                     ORDER BY ce.created_at DESC
                     LIMIT 5
-                """, (ip_s,))
+                """, [ip_s] + _eng_p)
                 api_ep, hidden, login, files, paths, tech = [], [], [], [], [], []
                 for r in cur.fetchall():
                     def _as_list(v):
@@ -14718,10 +14905,10 @@ def _scan_evidence_for_target(cve, ip, port, eid, vc) -> dict:
                     SELECT p.banner
                     FROM ports p
                     JOIN assets a ON p.asset_id = a.id
-                    WHERE host(a.ip) = %s AND p.port = %s AND p.is_open
+                    WHERE host(a.ip) = %s AND p.port = %s AND p.is_open""" + _eng + """
                     ORDER BY p.last_seen DESC NULLS LAST
                     LIMIT 1
-                """, (ip_s, port_i))
+                """, [ip_s, port_i] + _eng_p)
                 row = cur.fetchone()
                 if row and row[0]:
                     out["banner"] = str(row[0])[:300]
@@ -14738,10 +14925,11 @@ def _scan_evidence_for_target(cve, ip, port, eid, vc) -> dict:
                            created_at
                     FROM poc_synthesis_log
                     WHERE cve = %s
-                      AND (target_ip IS NULL OR target_ip = %s)
+                      AND (target_ip IS NULL OR target_ip = %s)"""
+                    + (" AND (engagement_id = %s OR engagement_id IS NULL)" if eid_s else "") + """
                     ORDER BY created_at DESC
                     LIMIT 6
-                """, (cve, ip_s))
+                """, [cve, ip_s] + _eng_p)
                 for r in cur.fetchall():
                     out["prior_runs"].append({
                         "iteration": r[0], "phase": r[1],
@@ -14750,6 +14938,32 @@ def _scan_evidence_for_target(cve, ip, port, eid, vc) -> dict:
                         "created_at": r[4].isoformat() if r[4] else None})
             except Exception as e:  # noqa: BLE001
                 logging.debug("scan_evidence prior_runs failed: %s", e)
+
+            # 7. Prior build-poc attempts' own recon for this (engagement, cve) —
+            #    keyed on CVE, not IP: the crawl/arjun/form facts of an earlier
+            #    run of the same challenge are the best scan evidence we have.
+            try:
+                _ensure_build_poc_attempts_table()
+                cur.execute("""
+                    SELECT run_id, stage_reached, live_recon, created_at
+                    FROM build_poc_attempts
+                    WHERE cve = %s AND live_recon IS NOT NULL"""
+                    + (" AND (engagement_id = %s OR engagement_id IS NULL)" if eid_s else "") + """
+                    ORDER BY created_at DESC
+                    LIMIT 3
+                """, [cve] + _eng_p)
+                for r in cur.fetchall():
+                    lr = r[2] if isinstance(r[2], dict) else {}
+                    out["prior_live_recon"].append({
+                        "run_id": r[0], "stage_reached": r[1],
+                        "created_at": r[3].isoformat() if r[3] else None,
+                        "forms": (lr.get("forms") or [])[:10],
+                        "crawl_urls": (lr.get("crawl_urls") or [])[:40],
+                        "arjun_params": {k: (v or [])[:20] for k, v in list((lr.get("arjun_params") or {}).items())[:15]},
+                        "classified_params": (lr.get("classified_params") or [])[:10],
+                        "verb_sweep": lr.get("verb_sweep") or {}})
+            except Exception as e:  # noqa: BLE001
+                logging.debug("scan_evidence prior_live_recon failed: %s", e)
     except Exception as e:  # noqa: BLE001
         logging.debug("_scan_evidence_for_target top-level failed cve=%s: %s", cve, e)
     return out
@@ -14757,7 +14971,7 @@ def _scan_evidence_for_target(cve, ip, port, eid, vc) -> dict:
 
 def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan_verdicts=None,
                      session_info=None, auth=None, analysis=None, recon_text="", run_id=None,
-                     timeout=4, id_pool=None) -> dict:
+                     timeout=4, id_pool=None, segments=None) -> dict:
     """Operator ask 2026-10-07: "make sure everything is actually gathered and
     ready before creating a payload." Runs AFTER plan_verify (so LIVE/FAKE
     verdicts exist) and BEFORE synth. Deterministic; every probe is a 2 KB
@@ -14805,6 +15019,51 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
     facts["prior_runs"] = scan_ev.get("prior_runs") or []
     if scan_ev.get("banner"):
         facts["banner"] = scan_ev["banner"]
+
+    # The run's OWN recon (forms, crawl, arjun, verb sweep) parsed from the
+    # raw segment list — not from the 20k-truncated recon_text join.
+    try:
+        live = _parse_recon_segments(list(segments or []))
+    except Exception as e:  # noqa: BLE001
+        logging.debug("gather: _parse_recon_segments failed: %s", e)
+        live = {"form_fields": [], "crawl_urls": [], "arjun_params": {}, "classified_params": [],
+                "zap_paths": [], "verb_sweep": {}, "openapi": [], "json_body_endpoints": [],
+                "href_endpoints": [], "counts": {}}
+    facts["live_recon"] = {
+        "forms": (live.get("form_fields") or [])[:10],
+        "crawl_urls": (live.get("crawl_urls") or [])[:60],
+        "arjun_params": {k: v[:40] for k, v in list((live.get("arjun_params") or {}).items())[:20]},
+        "classified_params": (live.get("classified_params") or [])[:20],
+        "zap_paths": (live.get("zap_paths") or [])[:40],
+        "verb_sweep": live.get("verb_sweep") or {},
+        "href_endpoints": (live.get("href_endpoints") or [])[:20],
+        "counts": live.get("counts") or {},
+    }
+    # Earlier attempts of the SAME CVE in this engagement (keyed on cve, not
+    # ip) contribute their recon to the chains below. facts["live_recon"]
+    # stays this run's own; provenance is recorded separately.
+    _prior = scan_ev.get("prior_live_recon") or []
+    if _prior:
+        facts["prior_live_recon_runs"] = [{"run_id": p.get("run_id"), "stage_reached": p.get("stage_reached"),
+                                          "created_at": p.get("created_at")} for p in _prior]
+        for p in _prior:
+            for u in (p.get("crawl_urls") or []):
+                if u not in live["crawl_urls"]:
+                    live["crawl_urls"].append(u)
+            for path, names in (p.get("arjun_params") or {}).items():
+                live["arjun_params"].setdefault(path, [])
+                for n in names or []:
+                    if n not in live["arjun_params"][path]:
+                        live["arjun_params"][path].append(n)
+            for fm in (p.get("forms") or []):
+                if fm not in live["form_fields"]:
+                    live["form_fields"].append(fm)
+            for c in (p.get("classified_params") or []):
+                if c not in live["classified_params"]:
+                    live["classified_params"].append(c)
+            for path, verbs in (p.get("verb_sweep") or {}).items():
+                live["verb_sweep"].setdefault(path, verbs)
+        live["crawl_urls"] = live["crawl_urls"][:120]
 
     # 1. target reachable
     try:
@@ -14911,17 +15170,48 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
                any(f.lower() in r["path"].lower() for f in mined["fields"][:3]):
                 if r["path"] not in probe_list:
                     probe_list.append(r["path"])
+        # Live recon from THIS run, in priority order: form actions (37849
+        # verified on exactly its login-form action), arjun paths (they carry
+        # honored params), verb-sweep paths that answered, then ZAP/crawl
+        # paths — dynamic-looking ones first. Provenance is kept for _note.
+        _live_src = {}
+        def _live_add(p, src):
+            if p and p != "/" and p not in probe_list:
+                probe_list.append(p)
+                _live_src.setdefault(p, src)
+        for fm in live.get("form_fields") or []:
+            _live_add(fm.get("path"), "form")
+        for p in (live.get("arjun_params") or {}):
+            _live_add(p, "arjun")
+        for p, verbs in (live.get("verb_sweep") or {}).items():
+            if any(s not in (404, 405, 501) for s in verbs.values()):
+                _live_add(p, "verb_sweep")
+        def _dynamic_first(paths):
+            def _score(p):
+                low = p.split("?", 1)[0].lower()
+                return (0 if (low.endswith(_RECON_DYNAMIC_EXT) or "?" in p or "/api/" in low) else 1, len(p))
+            return sorted(dict.fromkeys(paths), key=_score)
+        for p in _dynamic_first(live.get("zap_paths") or [])[:15]:
+            _live_add(p.split("?", 1)[0], "zap")
+        for p in _dynamic_first(live.get("crawl_urls") or [])[:15]:
+            _live_add(p.split("?", 1)[0], "crawl")
+        for p in (live.get("href_endpoints") or [])[:8]:
+            _live_add(p, "href")
         _probe_methods = ["HEAD", "GET"] + [m for m in mined["methods"] if m not in ("HEAD", "GET")]
         if "POST" not in _probe_methods:
             _probe_methods.append("POST")       # a POST-only route (FastAPI) answers 404 to GET
         probe_list += _re.findall(r"Endpoints \(from JSON body\): ([^\n]+)", recon_text or "")[:1] and \
                       [x.strip() for x in _re.findall(r"Endpoints \(from JSON body\): ([^\n]+)", recon_text or "")[0].split(",")] or []
         seen = set()
+        import time as _time
+        _probe_deadline = _time.time() + 60          # 30 paths × 3 verbs × 4 s worst case is 6 min
         try:
             with _hx.Client(verify=False, timeout=timeout, follow_redirects=False) as cli:
-                for ep in probe_list[:20]:
+                for ep in probe_list[:30]:
                     if ep in seen:
                         continue
+                    if _time.time() > _probe_deadline:
+                        break
                     seen.add(ep)
                     try:
                         rp = None
@@ -14936,6 +15226,8 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
                                 _note = " (prefix-stripped advisory path)"
                             elif ep in _scan_paths:
                                 _note = " (scan-side path: discovered_params/content_ext/web_findings)"
+                            elif ep in _live_src:
+                                _note = f" (live recon: {_live_src[ep]})"
                             else:
                                 _note = ""
                             endpoint, ep_source = ep, f"candidate_probe:{_m} HTTP {rp.status_code}{_note}"
@@ -14996,6 +15288,14 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
             method_val, m_source = ",".join(sorted(set(_dp_methods_for_ep))), "discovered_params"
         elif _wf_methods_for_ep:
             method_val, m_source = ",".join(sorted(set(_wf_methods_for_ep))), "web_findings"
+        elif (live.get("verb_sweep") or {}).get(endpoint) and \
+                [m for m, s in live["verb_sweep"][endpoint].items() if s not in (404, 405, 501)]:
+            method_val = ",".join(sorted(m for m, s in live["verb_sweep"][endpoint].items()
+                                         if s not in (404, 405, 501)))
+            m_source = "verb_sweep"
+        elif [fm for fm in (live.get("form_fields") or []) if fm.get("path") == endpoint]:
+            method_val = next(fm["method"] for fm in live["form_fields"] if fm.get("path") == endpoint)
+            m_source = "form_fields"
         elif _parse_openapi_paths_line(recon_text or "") and any(r["path"] == endpoint for r in _parse_openapi_paths_line(recon_text or "")):
             method_val, m_source = ",".join(next(r["methods"] for r in _parse_openapi_paths_line(recon_text or "") if r["path"] == endpoint)), "openapi"
         else:
@@ -15027,6 +15327,36 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
         field, f_source = mined["fields"][0], "advisory/derived"
     if not field and mined["headers"]:
         field, f_source = f"{mined['headers'][0]} (header)", "derived_vector"
+    # Live recon from THIS run. (1) arjun params on the resolved endpoint —
+    # classified first; (2) the form posted to the resolved endpoint — first
+    # non-token field; (3) auth-bypass only: the login form's username field
+    # (a session is the exploit's output, so the login form IS the sink). A
+    # login form is never promoted for other classes — 5314's /index.php
+    # login must not feed /admin/dict.php.
+    _TOKENISH = _re.compile(r"(?i)^(token|_token|csrf.*|_wp.*|nonce.*|tz.*|_method|submit|enter|login|btn.*)$")
+    if not field and endpoint:
+        _cl = [c for c in (live.get("classified_params") or []) if c.get("path") == endpoint]
+        _ap = (live.get("arjun_params") or {}).get(endpoint) or []
+        if _cl:
+            field, f_source = _cl[0]["param"], f"arjun:{endpoint}:classified:{_cl[0].get('class')}"
+        elif _ap:
+            field, f_source = _ap[0], f"arjun:{endpoint}"
+    if not field and endpoint:
+        _fm = [fm for fm in (live.get("form_fields") or []) if fm.get("path") == endpoint]
+        if _fm:
+            _cands = [x for x in (_fm[0].get("fields") or []) if not _TOKENISH.match(x)]
+            if _cands:
+                field, f_source = _cands[0], f"form_fields:{endpoint}"
+    if not field and vc == "auth-bypass":
+        for fm in live.get("form_fields") or []:
+            flds = fm.get("fields") or []
+            pw = next((x for x in flds if _re.search(r"(?i)(pass(word|wd)?|^pwd)$", x)), None)
+            if not pw:
+                continue
+            user = next((x for x in flds if x != pw and _re.search(r"(?i)(user|login|^name$|email|^log$|^uid$)", x)), None)
+            if user:
+                field, f_source = user, f"form_fields:login:{fm.get('path')}"
+                break
     # Scan evidence: Katana/content-ext already catalogued params on this app.
     # Prefer a discovered_params row whose url_pattern matches the chosen
     # endpoint; fall back to any discovered_params row; then hidden_inputs.
@@ -15096,6 +15426,21 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
             add("auth", "missing", "exploit needs authentication; no session cookie in hand", "analysis")
     else:
         add("auth", "n/a", "not required by advisory/preconditions", "analysis")
+
+    # 7b. WordPress nonces — per-user, so only worth harvesting with a session.
+    # Five WP runs resolved /wp-admin/admin-ajax.php and then fought the nonce
+    # (2026-10-09). Recorded as facts + a guidance block; never a gate item.
+    _is_wp = ("wordpress" in (str(product or "") + " " + (recon_text or "")[:20000]).lower()
+              or any("/wp-" in str(p) for p in (live.get("crawl_urls") or []) + (live.get("zap_paths") or []))
+              or any(str(fm.get("path") or "") == "/wp-login.php" for fm in (live.get("form_fields") or [])))
+    if _is_wp and cookie:
+        try:
+            _pre = _fetch_preconditions(ip, port, timeout=timeout, cookie_header=cookie)
+            if _pre.get("tokens") or _pre.get("by_object"):
+                facts["wp_nonces"] = {"tokens": _pre.get("tokens") or [],
+                                      "by_object": _pre.get("by_object") or {}}
+        except Exception as e:  # noqa: BLE001
+            logging.debug("gather: wp nonce harvest failed: %s", e)
 
     # 8. OOB sink
     sink = spec.get("oob_sink_url")
@@ -15393,6 +15738,39 @@ def _gather_manifest_text(man: dict) -> str:
             f"{k}={mined[k]}" for k in ("paths", "methods", "fields", "headers") if mined.get(k)))
     if facts.get("banner"):
         lines.append(f"  server banner: {facts['banner'][:200]}")
+
+    # What THIS run's recon found (forms / crawl / arjun / verb sweep) — the
+    # same facts the endpoint/method/field chains above consulted.
+    lr = facts.get("live_recon") or {}
+    if any(lr.get(k) for k in ("forms", "crawl_urls", "arjun_params", "verb_sweep", "zap_paths")):
+        lines.append("")
+        lines.append("LIVE RECON (this run):")
+        for fm in (lr.get("forms") or [])[:4]:
+            lines.append(f"  form {fm.get('method')} {fm.get('path')} fields={fm.get('fields')}")
+        for p, names in list((lr.get("arjun_params") or {}).items())[:6]:
+            extra_n = max(0, len(names) - 8)
+            lines.append(f"  arjun params {p}: {', '.join(names[:8])}" + (f" (+{extra_n} more)" if extra_n else ""))
+        for c in (lr.get("classified_params") or [])[:4]:
+            lines.append(f"  classified {c.get('path')} `{c.get('param')}` → {c.get('class')}")
+        for p, verbs in list((lr.get("verb_sweep") or {}).items())[:6]:
+            lines.append(f"  verb sweep {p}: " + " ".join(f"{m}:{s}" for m, s in verbs.items()))
+        cu = lr.get("crawl_urls") or []
+        if cu:
+            lines.append(f"  crawl urls ({len(cu)}): " + ", ".join(cu[:12]) + (" …" if len(cu) > 12 else ""))
+        zp = lr.get("zap_paths") or []
+        if zp:
+            lines.append(f"  zap paths ({len(zp)}): " + ", ".join(zp[:10]) + (" …" if len(zp) > 10 else ""))
+
+    wpn = facts.get("wp_nonces") or {}
+    if wpn.get("tokens") or wpn.get("by_object"):
+        lines.append("")
+        lines.append("KNOWN WP NONCES (harvested WITH the session; per-user — use as the matching POST field, "
+                     "e.g. `security=`/`nonce=`/`_wpnonce=` for the plugin's admin-ajax action):")
+        for obj, val in list((wpn.get("by_object") or {}).items())[:8]:
+            lines.append(f"  {obj}.nonce = {val}")
+        for t in (wpn.get("tokens") or [])[:10]:
+            if "." not in t.split("=", 1)[0]:
+                lines.append(f"  {t}")
 
     # Scan-side telemetry already captured on this target. Carried into the
     # synth prompt via guidance_extra so synth builds against what we already
@@ -16109,6 +16487,45 @@ def _poc_trace(run_id, phase, iteration=0, prompt=None, response=None,
             f.write(_j.dumps(entry) + "\n")
     except Exception as e:  # noqa: BLE001
         logging.debug("poc_trace write failed: %s", e)
+
+
+_POC_TRACE_STD_KEYS = frozenset(("ts", "epoch", "phase", "iteration", "prompt", "response",
+                                 "run_output", "assertion_passed", "llm_model"))
+
+
+def _trace_extra(entry: dict) -> dict:
+    # _poc_trace flattens `extra` into the record, so there is never an
+    # "extra" key to read back; every reader that did rec.get("extra") saw {}
+    # (2026-10-09: the review.md recon dossier and plan_verdicts in the
+    # auto-hint were always empty for that reason).
+    if not isinstance(entry, dict):
+        return {}
+    if isinstance(entry.get("extra"), dict):
+        return entry["extra"]
+    return {k: v for k, v in entry.items() if k not in _POC_TRACE_STD_KEYS}
+
+
+def _touch_derived_spec_outcome(cve, verified, stop_reason=None):
+    """Record the refine loop's outcome on derived_cve_specs. Until 2026-10-09
+    the row was written only by node_research (before synth) and never
+    updated by the loop, so `verified`/`attempts`/`last_failure` described the
+    derivation, not the attempt — the CVE-Bench runner's "derive-verified"
+    column read False/? for runs the result marked verified. UPDATE only: a
+    CVE without a derived row stays without one."""
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""UPDATE derived_cve_specs
+                           SET attempts = COALESCE(attempts, 0) + 1,
+                               verified = (verified OR %s),
+                               status = CASE WHEN %s THEN 'verified' ELSE status END,
+                               last_verified = CASE WHEN %s THEN now() ELSE last_verified END,
+                               last_failure = CASE WHEN %s THEN last_failure ELSE %s END
+                           WHERE cve = %s""",
+                        (bool(verified), bool(verified), bool(verified), bool(verified),
+                         (str(stop_reason)[:300] if stop_reason else "unverified"), str(cve).upper()))
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("_touch_derived_spec_outcome failed cve=%s: %s", cve, e)
 
 
 def _poc_index(cve, target_ip, run_id, log_path, success, iterations, security_test_id, eid):
@@ -19458,37 +19875,60 @@ def _poc_needs_precondition(output):
     return any(s in low for s in _POC_PRECOND_SIGNALS)
 
 
-def _fetch_preconditions(ip, port, timeout=8):
+def _fetch_preconditions(ip, port, timeout=8, cookie_header=None, paths=None):
     """Best-effort: fetch likely exploit preconditions (CSRF nonce / token / session
     cookie) from the target so the refine step can bake them into the PoC. Returns
-    {tokens, cookies, base}."""
+    {tokens, cookies, base, by_object}.
+
+    With `cookie_header` (an authenticated session) the pages are fetched AS that
+    user and the WP admin pages are included: WordPress nonces are per-user, so
+    an anonymous `_wpnonce` is useless for an authenticated admin-ajax action
+    (five CVE-Bench WP runs fought the nonce for up to 15 iterations,
+    2026-10-09). `by_object` maps a `wp_localize_script` object name to its
+    nonce (`{"htmega_ajax": "240c8d3aa3"}`) so synth can pick the one the
+    plugin's `action=` expects. All pages are read when a cookie is given; the
+    anonymous scan keeps its first-hit short-circuit."""
     import httpx as _hx, re as _re
     Q = "[" + chr(34) + chr(39) + "]"          # matches a " or a '
     NQ = "[^" + chr(34) + chr(39) + "]"        # any non-quote char
     pat_input = r"name=" + Q + "(" + NQ + r"*(?:nonce|token|csrf|xsrf)" + NQ + r"*)" + Q + r"[^>]*value=" + Q + "(" + NQ + r"+)" + Q
-    pat_json = Q + r"(?:nonce|_wpnonce|csrf[_-]?token|authenticity_token)" + Q + r"\s*:\s*" + Q + "(" + NQ + r"+)" + Q
+    pat_json = Q + r"(?:nonce|_wpnonce|_ajax_nonce|ajax_nonce|security|csrf[_-]?token|authenticity_token)" + Q + r"\s*:\s*" + Q + "(" + NQ + r"+)" + Q
     pat_meta = r"<meta[^>]+name=" + Q + r"(?:csrf-token|_csrf)" + Q + r"[^>]+content=" + Q + "(" + NQ + r"+)" + Q
+    # `var pluginObj = {"ajax_url":"…","nonce":"abcdef0123"}` — the object name
+    # is the clue to which admin-ajax action the nonce belongs to.
+    pat_localize = r"var\s+(\w+)\s*=\s*\{[^}]{0,2000}?" + Q + r"(?:nonce|_wpnonce|_ajax_nonce|ajax_nonce|security)" + Q + r"\s*:\s*" + Q + r"([A-Za-z0-9]{6,40})" + Q
+    pat_wpnonce_url = r"_wpnonce=([a-f0-9]{8,12})"
     scheme = "https" if int(port or 80) in (443, 8443) else "http"
     base = f"{scheme}://{ip}:{port or 80}"
-    tokens, cookies = set(), set()
-    for pth in ("/", "/wp-login.php", "/wp-admin/", "/login", "/admin", "/index.php"):
+    tokens, cookies, by_object = set(), set(), {}
+    hdrs = {"Cookie": cookie_header} if cookie_header else {}
+    page_list = list(paths) if paths else ["/", "/wp-login.php", "/wp-admin/", "/login", "/admin", "/index.php"]
+    if cookie_header and not paths:
+        page_list += ["/wp-admin/profile.php", "/wp-admin/index.php", "/wp-admin/admin.php", "/wp-admin/users.php"]
+    for pth in page_list:
         try:
-            r = _hx.get(base + pth, timeout=timeout, verify=False, follow_redirects=True)
+            r = _hx.get(base + pth, timeout=timeout, verify=False, follow_redirects=True, headers=hdrs)
         except Exception:  # noqa: BLE001
             continue
-        body = (r.text or "")[:80000]
+        body = (r.text or "")[:200000]
         for m in _re.finditer(pat_input, body, _re.I):
             tokens.add(f"{m.group(1)}={m.group(2)}")
         for m in _re.finditer(pat_json, body, _re.I):
             tokens.add(f"nonce={m.group(1)}")
         for m in _re.finditer(pat_meta, body, _re.I):
             tokens.add(f"csrf-token={m.group(1)}")
+        for m in _re.finditer(pat_localize, body, _re.I | _re.S):
+            by_object.setdefault(m.group(1), m.group(2))
+            tokens.add(f"{m.group(1)}.nonce={m.group(2)}")
+        for m in _re.finditer(pat_wpnonce_url, body):
+            tokens.add(f"_wpnonce={m.group(1)}")
         sc = r.headers.get("set-cookie")
         if sc:
             cookies.add(sc.split(";")[0])
-        if tokens or cookies:
+        if (tokens or cookies) and not cookie_header:
             break
-    return {"tokens": sorted(tokens)[:8], "cookies": sorted(cookies)[:5], "base": base}
+    return {"tokens": sorted(tokens)[:24], "cookies": sorted(cookies)[:5], "base": base,
+            "by_object": dict(list(by_object.items())[:16])}
 
 
 _LOGIN_PATH_CANDIDATES = ("/wp-login.php", "/login", "/user/login", "/admin/login",
@@ -19665,7 +20105,7 @@ def _login_field_variants(ip, port, username, password, login_url=None, timeout=
     import httpx as _hx, re as _re
     scheme = "https" if int(port or 80) in (443, 8443) else "http"
     base = f"{scheme}://{ip}:{port or 80}"
-    login_paths = [login_url] if login_url else ["/index.php", "/login", "/user/login", "/"]
+    login_paths = [login_url] if login_url else ["/index.php", "/login", "/user/login", "/wp-login.php", "/"]
     # (user_field, pass_field, extra_fields)
     VARIANTS = [
         ("name", "password", {"enter": "Sign in", "autologin": "1"}),   # Zabbix
@@ -19674,6 +20114,7 @@ def _login_field_variants(ip, port, username, password, login_url=None, timeout=
         ("user", "pass", {}),
         ("email", "password", {}),
         ("j_username", "j_password", {}),                                # JavaEE
+        ("log", "pwd", {"wp-submit": "Log In", "testcookie": "1", "redirect_to": "/wp-admin/"}),  # WordPress
     ]
     for lp in login_paths:
         if not lp:
@@ -19713,7 +20154,109 @@ def _login_field_variants(ip, port, username, password, login_url=None, timeout=
             "note": "no field variant logged in"}
 
 
-def _establish_session_for_build(ip, port, auth, eid=None, product=None):
+def _login_from_discovered_form(ip, port, username, password, forms, timeout=12):
+    """Log in using a form the run's own recon already fingerprinted
+    (`Form POST /index.php?mainmenu=home fields=['token','loginfunction','tz',
+    'username','password']`) instead of guessing field names. Picks the form
+    with a password-adjacent field, re-GETs the page to harvest hidden inputs
+    (CSRF/token/tz), submits with the form's own method + action, and returns
+    the _establish_web_session shape. Six CVE-Bench runs halted on `auth` with
+    the credentials supplied and the login form sitting in recon:basic
+    (2026-10-09 analysis)."""
+    import httpx as _hx, re as _re
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    _PW = _re.compile(r"(?i)(pass(word|wd)?|^pwd$|^passwd$)")
+    # Exact names first, then substrings; hidden inputs are excluded at pick
+    # time (Dolibarr's hidden `loginfunction` must not win over `username`).
+    _USER_EXACT = ("username", "user", "login", "email", "log", "uid", "name", "user_name",
+                   "userid", "user_id", "email_address", "j_username", "account", "usr")
+    _USER_SUB = _re.compile(r"(?i)(user|email|login|account)")
+    _NOISE = _re.compile(r"(?i)^(token|_token|csrf.*|nonce.*|tz|redirect.*|action|loginfunction|submit|enter|remember.*|autologin|lang.*|_method)$")
+
+    def _pick_user(flds, pw, hidden_names):
+        pool = [x for x in flds if x != pw and x not in hidden_names and not _NOISE.match(x)]
+        for want in _USER_EXACT:
+            for x in pool:
+                if x.lower() == want:
+                    return x
+        for x in pool:
+            if _USER_SUB.search(x):
+                return x
+        return None
+
+    candidates = []
+    for fm in forms or []:
+        flds = [str(x) for x in (fm.get("fields") or [])]
+        pw = next((x for x in flds if _PW.search(x)), None)
+        if not pw:
+            continue
+        if _pick_user(flds, pw, set()) is None:
+            continue
+        candidates.append((fm, pw))
+    if not candidates:
+        return {"ok": False, "cookies": [], "cookie_header": "", "login_url": None,
+                "note": "no login-shaped form in recon"}
+    for fm, pf in candidates[:3]:
+        method = (fm.get("method") or "POST").upper()
+        action = fm.get("raw_action") or fm.get("path") or "/"
+        url = action if str(action).startswith("http") else base + (action if action.startswith("/") else "/" + action)
+        # The page that rendered the form: the basic recon fetched "/", so
+        # harvest hidden inputs from "/" first, then from the action itself.
+        pages = ["/"] + ([fm.get("path")] if fm.get("path") and fm.get("path") != "/" else [])
+        jar, hidden = {}, {}
+        try:
+            with _hx.Client(verify=False, follow_redirects=True, timeout=timeout) as cli:
+                for pg in pages:
+                    try:
+                        g = cli.get(base + pg)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    for k, v in g.headers.multi_items():
+                        if k.lower() == "set-cookie" and "=" in v.split(";", 1)[0]:
+                            n, val = v.split(";", 1)[0].split("=", 1)
+                            if val.strip():
+                                jar[n.strip()] = val.strip()
+                    for m in _re.finditer(r'<input[^>]+type=["\']hidden["\'][^>]*>', g.text or "", _re.I):
+                        nm = _re.search(r'name=["\']([^"\']+)', m.group(0))
+                        vl = _re.search(r'value=["\']([^"\']*)', m.group(0))
+                        if nm and vl and nm.group(1) in (fm.get("fields") or [nm.group(1)]):
+                            hidden[nm.group(1)] = vl.group(1)
+                flds = [str(x) for x in (fm.get("fields") or [])]
+                uf = _pick_user(flds, pf, set(hidden.keys()))
+                if not uf:
+                    continue
+                data = dict(hidden)
+                for x in flds:
+                    data.setdefault(x, "")
+                data[uf], data[pf] = username, password
+                ck_hdr = "; ".join(f"{k}={v}" for k, v in jar.items())
+                hdrs = {"Cookie": ck_hdr} if ck_hdr else {}
+                # Do NOT follow the post-login redirect: the session cookie is
+                # issued on the 30x itself, and the redirect target may set a
+                # fresh pre-login cookie that would overwrite it.
+                if method == "POST":
+                    r = cli.post(url, data=data, headers=hdrs, follow_redirects=False)
+                else:
+                    r = cli.get(url, params=data, headers=hdrs, follow_redirects=False)
+                for k, v in r.headers.multi_items():
+                    if k.lower() == "set-cookie" and "=" in v.split(";", 1)[0]:
+                        n, val = v.split(";", 1)[0].split("=", 1)
+                        if val.strip():
+                            jar[n.strip()] = val.strip()
+            if jar:
+                return {"ok": True, "cookies": [f"{k}={v}" for k, v in jar.items()],
+                        "cookie_header": "; ".join(f"{k}={v}" for k, v in jar.items()),
+                        "login_url": url, "note": f"discovered form {method} {fm.get('path')} ({uf}/{pf})",
+                        "u_field": uf, "p_field": pf}
+        except Exception as e:  # noqa: BLE001
+            logging.debug("discovered-form login failed on %s: %s", url, e)
+            continue
+    return {"ok": False, "cookies": [], "cookie_header": "", "login_url": None,
+            "note": "discovered form(s) did not set a session cookie"}
+
+
+def _establish_session_for_build(ip, port, auth, eid=None, product=None, segments=None):
     """Get an authenticated session for the build. SUPPLIED creds -> log in directly.
     bruteforce=true and no password -> reuse default_cred_check to find a documented default
     credential, then log in with it. Returns {ok, cookie_header, username, method, note}."""
@@ -19744,6 +20287,21 @@ def _establish_session_for_build(ip, port, auth, eid=None, product=None):
                     if v2:
                         return {**s2, "username": username, "method": "supplied_variant",
                                 "validated": True}
+                # The run's own recon may have fingerprinted the real login form
+                # (fields, method, action) — use it instead of the variant list.
+                forms = []
+                try:
+                    forms = _parse_recon_segments(list(segments or [])).get("form_fields") or []
+                except Exception:  # noqa: BLE001
+                    forms = []
+                if forms:
+                    s3 = _login_from_discovered_form(ip, port, username, password, forms)
+                    if s3 and s3.get("cookie_header"):
+                        v3, _ = _probe_session_valid(ip, port, s3["cookie_header"], product=product, timeout=6)
+                        if v3:
+                            return {**s3, "username": username, "method": "supplied_form",
+                                    "validated": True}
+                    _supplied_note = (s3 or {}).get("note")
         except Exception as e:  # noqa: BLE001
             logging.debug("session validate/retry failed: %s", e)
         if (s or {}).get("cookie_header") or not auth.get("bruteforce"):
@@ -24746,6 +25304,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                response=(f"success={success} verified={verified} off_target={off_target} "
                          f"drifted={drifted} security_test_id={security_test_id}"))
     _poc_index(cve, ip, run_id, log_path, verified, iters, security_test_id, eid)
+    _touch_derived_spec_outcome(cve, verified, stop_reason)
 
     # Judge-pass over discarded iterations — ran when the refine loop
     # exhausted (or stopped) without a verified verdict and did real work
@@ -25785,12 +26344,16 @@ def _try_mined_credentials(ip, port, credential_hints, admin_paths=None, timeout
             "/admin/login.php", "/admin/index.php", "/admin/", "/admin",
             "/login", "/login.php", "/wp-login.php", "/user/login",
             "/manage/login", "/auth/login", "/administrator/index.php",
-        ]))[:8]
+            "/index.php", "/",                      # Dolibarr/Zabbix-style: the form is the front page
+        ]))[:10]
     # Common field-name permutations for the login form
     field_pairs = [
         ("user", "pass"), ("username", "password"), ("user", "password"),
         ("email", "password"), ("name", "pwd"), ("account", "password"),
         ("login", "password"), ("user", "pwd"),
+        ("log", "pwd"),                             # WordPress
+        ("name", "password"),                       # Zabbix
+        ("j_username", "j_password"),               # JavaEE
     ]
     success_words = ("welcome", "dashboard", "logout", "sign out", "退出",
                      "control panel", "successfully", "profile", "settings",
@@ -27107,6 +27670,446 @@ def _ensure_poc_hints_table():
         conn.commit()
 
 
+def _ensure_build_poc_attempts_table():
+    # Mirrors db_init/ensure_all_tables.sql — keep both in sync.
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS public.build_poc_attempts (
+            id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+            engagement_id uuid,
+            cve text NOT NULL,
+            ip text NOT NULL,
+            port integer,
+            run_id text NOT NULL UNIQUE,
+            exploit_store_id uuid,
+            verified boolean NOT NULL DEFAULT false,
+            stage_reached text,
+            stop_reason text,
+            missing text[] NOT NULL DEFAULT '{}',
+            gather_manifest jsonb,
+            live_recon jsonb,
+            summary jsonb,
+            failure_analysis jsonb,
+            poc_log_path text,
+            llm_model text,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            updated_at timestamptz NOT NULL DEFAULT now())""")
+        cur.execute("""CREATE INDEX IF NOT EXISTS ix_bpa_cve_ip
+                       ON public.build_poc_attempts(cve, ip, created_at DESC)""")
+        cur.execute("""CREATE INDEX IF NOT EXISTS ix_bpa_eng
+                       ON public.build_poc_attempts(engagement_id)""")
+        conn.commit()
+
+
+_ATTEMPT_REDACT_KEYS = ("cookie_header", "cookies", "password", "_auto_cookie", "api_key", "secret")
+
+
+def _redact_attempt_blob(obj, depth=0):
+    """Drop session cookies / passwords before an attempt row or webhook payload
+    is written (the trace already carries them; the DB row must not)."""
+    if depth > 8:
+        return obj
+    if isinstance(obj, dict):
+        return {k: ("[redacted]" if str(k).lower() in _ATTEMPT_REDACT_KEYS else _redact_attempt_blob(v, depth + 1))
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redact_attempt_blob(v, depth + 1) for v in obj[:200]]
+    return obj
+
+
+def _record_build_poc_attempt(*, run_id, cve, ip, port, eid=None, exploit_store_id=None,
+                              verified=False, stage_reached=None, stop_reason=None, missing=None,
+                              gather_manifest=None, live_recon=None, summary=None,
+                              failure_analysis=None, poc_log_path=None, llm_model=None):
+    """Upsert the per-run attempt row. Returns the row id or None (fail-soft)."""
+    from psycopg2.extras import Json
+    try:
+        _ensure_build_poc_attempts_table()
+        missing_list = [str(m) for m in (missing or [])]
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""INSERT INTO build_poc_attempts
+                (run_id, engagement_id, cve, ip, port, exploit_store_id, verified, stage_reached,
+                 stop_reason, missing, gather_manifest, live_recon, summary, failure_analysis,
+                 poc_log_path, llm_model)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (run_id) DO UPDATE SET
+                    exploit_store_id = COALESCE(EXCLUDED.exploit_store_id, build_poc_attempts.exploit_store_id),
+                    verified = EXCLUDED.verified,
+                    stage_reached = COALESCE(EXCLUDED.stage_reached, build_poc_attempts.stage_reached),
+                    stop_reason = COALESCE(EXCLUDED.stop_reason, build_poc_attempts.stop_reason),
+                    missing = EXCLUDED.missing,
+                    gather_manifest = COALESCE(EXCLUDED.gather_manifest, build_poc_attempts.gather_manifest),
+                    live_recon = COALESCE(EXCLUDED.live_recon, build_poc_attempts.live_recon),
+                    summary = COALESCE(EXCLUDED.summary, build_poc_attempts.summary),
+                    failure_analysis = COALESCE(EXCLUDED.failure_analysis, build_poc_attempts.failure_analysis),
+                    poc_log_path = COALESCE(EXCLUDED.poc_log_path, build_poc_attempts.poc_log_path),
+                    llm_model = COALESCE(EXCLUDED.llm_model, build_poc_attempts.llm_model),
+                    updated_at = now()
+                RETURNING id""",
+                (str(run_id), (str(eid) if eid else None), str(cve), str(ip),
+                 (int(port) if port is not None else None),
+                 (str(exploit_store_id) if exploit_store_id else None), bool(verified),
+                 stage_reached, stop_reason, missing_list,
+                 (Json(_redact_attempt_blob(gather_manifest)) if gather_manifest is not None else None),
+                 (Json(_redact_attempt_blob(live_recon)) if live_recon is not None else None),
+                 (Json(_redact_attempt_blob(summary)) if summary is not None else None),
+                 (Json(_redact_attempt_blob(failure_analysis)) if failure_analysis is not None else None),
+                 poc_log_path, llm_model))
+            row = cur.fetchone()
+            conn.commit()
+            return str(row[0]) if row else None
+    except Exception as e:  # noqa: BLE001
+        logging.warning("build_poc_attempts upsert failed run=%s: %s", run_id, e)
+        return None
+
+
+def _read_trace_file(log_path, limit=5000):
+    """All JSONL entries of one run's trace, by path (blocked runs never get a
+    store id, so the store-id reader cannot serve them)."""
+    import json as _j
+    out = []
+    try:
+        if not log_path or not os.path.exists(log_path):
+            return out
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    out.append(_j.loads(line))
+                except Exception:  # noqa: BLE001
+                    continue
+                if len(out) >= limit:
+                    break
+    except Exception as e:  # noqa: BLE001
+        logging.debug("_read_trace_file failed %s: %s", log_path, e)
+    return out
+
+
+def _link_attempt_to_store(run_id, exploit_store_id):
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("UPDATE build_poc_attempts SET exploit_store_id=%s, updated_at=now() WHERE run_id=%s",
+                        (str(exploit_store_id), str(run_id)))
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("link attempt→store failed: %s", e)
+
+
+_FA_STAGES = ("recon", "gather", "synth", "run", "refine", "verified", "crash")
+
+
+def _build_failure_analysis(run_id, log_path, result, gather_manifest=None, state_bits=None) -> dict:
+    """Deterministic end-of-attempt analysis (no LLM): what stage the run
+    reached, why it stopped, each gather blocker with what the run's OWN recon
+    found for it, what was tried, the recon inventory, which models answered,
+    and rule-based next steps. Built from the trace JSONL (by path — blocked
+    runs have no store id), the gather manifest and a few state bits. Pure
+    apart from reading the trace file; safe to exec from source in tests with
+    _trace_extra/_summarize_build_trace/_parse_recon_segments/_read_trace_file
+    loaded alongside."""
+    import re as _re
+    result = result or {}
+    sb = state_bits or {}
+    entries = _read_trace_file(log_path) if log_path else []
+    phases = [str(e.get("phase") or "") for e in entries]
+    try:
+        summary = _summarize_build_trace(entries)
+    except Exception:  # noqa: BLE001
+        summary = {}
+    man = gather_manifest or {}
+    if not man:
+        for e in reversed(entries):
+            if e.get("phase") == "gather_check":
+                man = _trace_extra(e).get("gather_manifest") or {}
+                break
+    facts = man.get("facts") or {}
+    live = facts.get("live_recon") or {}
+    if not live and sb.get("segments"):
+        try:
+            lp = _parse_recon_segments(list(sb.get("segments") or []))
+            live = {"forms": lp.get("form_fields") or [], "crawl_urls": lp.get("crawl_urls") or [],
+                    "arjun_params": lp.get("arjun_params") or {}, "classified_params": lp.get("classified_params") or [],
+                    "zap_paths": lp.get("zap_paths") or [], "verb_sweep": lp.get("verb_sweep") or {},
+                    "href_endpoints": lp.get("href_endpoints") or [], "counts": lp.get("counts") or {}}
+        except Exception:  # noqa: BLE001
+            live = {}
+    items = man.get("items") or []
+    missing = list(man.get("missing") or [])
+    endpoint = facts.get("endpoint")
+
+    # ── stage + stop reason ────────────────────────────────────────────────
+    if result.get("verified"):
+        stage = "verified"
+    elif result.get("crash") or any(p.startswith("node_error:") for p in phases) and not any(p == "result" for p in phases):
+        stage = "crash"
+    elif "refine" in phases:
+        stage = "refine"
+    elif "run" in phases:
+        stage = "run"
+    elif "synthesize" in phases or result.get("artifact_required") or result.get("verification_method") == "artifact_required":
+        stage = "synth"
+    elif result.get("verification_method") == "gather_incomplete" or (man and not man.get("ready")):
+        stage = "gather"
+    else:
+        stage = "recon"
+    if result.get("stop_reason"):
+        stop = str(result["stop_reason"])
+    elif result.get("verification_method") == "gather_incomplete" or (stage == "gather" and missing):
+        stop = "gather_incomplete:" + ",".join(missing)
+    elif result.get("blocked") and result.get("blockers"):
+        stop = "readiness:" + ",".join(str(b) for b in (result.get("blockers") or [])[:6])
+    elif result.get("verification_method"):
+        stop = str(result["verification_method"])
+    elif stage == "crash":
+        stop = "crash"
+    else:
+        stop = result.get("reason") or "unknown"
+
+    # ── session attempt (supplied creds → session?) ────────────────────────
+    session = {"attempted": False, "method": None, "ok": False, "note": None, "creds_supplied": bool((sb.get("auth") or {}).get("username"))}
+    for e in entries:
+        ph = e.get("phase")
+        if ph == "recon:auth_establish":
+            ex = _trace_extra(e)
+            session.update({"attempted": True, "method": ex.get("auth_method"), "ok": bool(ex.get("auth_ok")),
+                            "note": (e.get("response") or "")[:200]})
+        elif ph == "recon:auto_login" and "SUCCESS" in str(e.get("response") or ""):
+            session.update({"attempted": True, "method": "auto_login", "ok": True, "note": (e.get("response") or "")[:200]})
+        elif ph == "deep_recon:default_creds" and not session["ok"]:
+            session.update({"attempted": True, "method": session["method"] or "default_creds",
+                            "note": (e.get("response") or "")[:200]})
+    si = sb.get("session_info") or {}
+    if isinstance(si, dict) and si.get("cookie_header"):
+        session.update({"attempted": True, "ok": True, "method": si.get("method") or session["method"]})
+    auth_item = next((i for i in items if i.get("item") == "auth"), {})
+    if auth_item.get("status") == "gathered":
+        session["ok"] = True
+
+    # ── blockers (one per missing gather item) ─────────────────────────────
+    deep = sb.get("deep_recon") or man.get("deep_recon") or {}
+    solutions = (deep.get("solutions") or {}) if isinstance(deep, dict) else {}
+    forms_on_ep = [f for f in (live.get("forms") or []) if f.get("path") == endpoint]
+    blockers = []
+    for it in items:
+        if it.get("status") != "missing":
+            continue
+        name = it.get("item")
+        found, cands = "", []
+        if name == "input_field":
+            ap = (live.get("arjun_params") or {}).get(endpoint) or []
+            cl = [c for c in (live.get("classified_params") or []) if c.get("path") == endpoint]
+            ff = [x for f in forms_on_ep for x in (f.get("fields") or [])]
+            cands = [c["param"] for c in cl] + ap[:10] + ff[:10]
+            found = (f"arjun honored {len(ap)} params on {endpoint}; " if ap else "") + \
+                    (f"{len(cl)} classified; " if cl else "") + \
+                    (f"form on {endpoint} with fields {ff[:6]}" if ff else "")
+        elif name == "endpoint":
+            cu = live.get("crawl_urls") or []; zp = live.get("zap_paths") or []
+            ap = list((live.get("arjun_params") or {}).keys())
+            fp = [f.get("path") for f in (live.get("forms") or [])]
+            cands = ([p for p in fp if p] + ap + cu[:10] + zp[:10])[:20]
+            found = f"{len(cu)} crawled urls, {len(zp)} zap paths, {len(ap)} arjun paths, {len(fp)} forms; " \
+                    f"strategist verdicts={summary.get('plan_verdicts') or man.get('plan_verdicts') or {}}"
+        elif name == "method":
+            vs = (live.get("verb_sweep") or {}).get(endpoint) or {}
+            cands = [m for m, s in vs.items() if s not in (404, 405, 501)]
+            found = f"verb sweep on {endpoint}: {vs}" if vs else "no verb sweep for the resolved endpoint"
+        elif name == "auth":
+            found = (f"creds supplied={session['creds_supplied']}; attempted={session['attempted']} "
+                     f"method={session['method']} ok={session['ok']}; {session.get('note') or ''}")
+            cands = [f.get("path") for f in (live.get("forms") or [])
+                     if any(_re.search(r"(?i)pass", x) for x in (f.get("fields") or []))]
+        elif name == "vuln_class":
+            cls = sorted({c.get("class") for c in (live.get("classified_params") or []) if c.get("class")})
+            sp = summary.get("strategist_primary") or {}
+            cands = cls[:5] + ([sp.get("class")] if isinstance(sp, dict) and sp.get("class") else [])
+            found = f"classifier=unknown; strategist primary={sp if sp else None}; classified param classes={cls[:5]}"
+        elif name == "artifact":
+            req = result.get("artifact_requirements") or facts.get("artifact_requirements") or {}
+            found = (req.get("summary") if isinstance(req, dict) else str(req))[:300] if req else ""
+        elif name == "endpoint_id":
+            found = str(it.get("value") or "")[:200]
+        step = None
+        sols = solutions.get(name) if isinstance(solutions, dict) else None
+        if sols and isinstance(sols, list) and isinstance(sols[0], dict):
+            step = sols[0].get("solution")
+        blockers.append({"item": name, "why": str(it.get("value") or _GATHER_FOLLOW_UP.get(name, ""))[:300],
+                         "what_live_recon_found": found.strip()[:400],
+                         "candidate_values": [str(c)[:80] for c in cands if c][:12],
+                         "suggested_manual_step": (step or _GATHER_FOLLOW_UP.get(name, ""))[:300]})
+
+    # ── what was tried ─────────────────────────────────────────────────────
+    tried = []
+    last_cmd = ""
+    it_summ = {x.get("iter"): x for x in (summary.get("iterations_summary") or []) if isinstance(x, dict)}
+    for e in entries:
+        ph = e.get("phase")
+        if ph in ("synthesize", "refine", "synth_seeded_from_confirmed"):
+            txt = str(e.get("response") or "")
+            m = _re.search(r'"command"\s*:\s*"((?:[^"\\]|\\.)*)"', txt)
+            last_cmd = (m.group(1) if m else txt).replace("\\n", " ").strip()[:160]
+        elif ph == "run":
+            ro = str(e.get("run_output") or "")
+            hm = _re.search(r"HTTP/[\d.]+ (\d{3})", ro)
+            isum = it_summ.get(e.get("iteration")) or {}
+            http = int(hm.group(1)) if hm else None
+            if http is None:
+                # curl without -i leaves no status line; the trace summariser
+                # or the run record may still carry one.
+                for cand in (isum.get("http"), isum.get("http_status"), e.get("http_status"), e.get("status_code")):
+                    try:
+                        if cand is not None and str(cand).isdigit():
+                            http = int(cand)
+                            break
+                    except Exception:  # noqa: BLE001
+                        continue
+            tried.append({"iteration": e.get("iteration"), "command_head": last_cmd,
+                          "http_status": http,
+                          "reason": str(e.get("reason") or isum.get("status") or "")[:120],
+                          "method": e.get("method")})
+    tried = tried[:25]
+
+    # ── llm telemetry ──────────────────────────────────────────────────────
+    models = {}
+    for e in entries:
+        if e.get("llm_model"):
+            models.setdefault(str(e.get("phase")), [])
+            if e["llm_model"] not in models[str(e.get("phase"))]:
+                models[str(e.get("phase"))].append(e["llm_model"])
+    fb_err = [{"phase": e.get("phase"), "detail": str(e.get("response") or "")[:200]}
+              for e in entries if str(e.get("phase") or "").endswith("_error") or str(e.get("phase") or "").startswith("node_error:")]
+    judge = {}
+    for e in reversed(entries):
+        if e.get("phase") == "judge_near_miss":
+            judge = {k: v for k, v in _trace_extra(e).items() if k in ("best_iteration", "missing_one_thing", "concrete_repair", "closest_to_success")}
+            judge["summary"] = str(e.get("response") or "")[:300]
+            break
+
+    # ── deterministic next steps ───────────────────────────────────────────
+    steps = []
+    for b in blockers:
+        if b["item"] == "input_field" and b["candidate_values"]:
+            steps.append(f"Inject via `{b['candidate_values'][0]}` on `{endpoint}` (live recon honored it); alternates: {', '.join(b['candidate_values'][1:4])}")
+        elif b["item"] == "endpoint" and b["candidate_values"]:
+            steps.append(f"Probe these recon-discovered routes with the advisory payload shape: {', '.join(b['candidate_values'][:6])}")
+        elif b["item"] == "auth":
+            if session["creds_supplied"] and not session["ok"]:
+                steps.append(f"Log in manually with the supplied credentials (attempt: method={session['method']}, {session.get('note') or 'no note'}) and pass the session cookie as a hint")
+            elif not session["creds_supplied"]:
+                steps.append("Supply credentials (username/password) or an Auth Profile — the exploit needs a session")
+        elif b["item"] == "method" and b["candidate_values"]:
+            steps.append(f"Use {'/'.join(b['candidate_values'])} on `{endpoint}` (verb sweep answered)")
+        elif b["item"] == "vuln_class":
+            steps.append("Classify the vulnerability from the advisory / fix diff" + (f"; recon suggests {', '.join(b['candidate_values'][:3])}" if b["candidate_values"] else ""))
+        elif b["item"] == "artifact":
+            steps.append("Supply the external artifact: " + (b["what_live_recon_found"] or "see artifact_requirements"))
+    if summary.get("dead_endpoints"):
+        steps.append("Do not retry these 404 routes: " + ", ".join(str(x) for x in summary["dead_endpoints"][:6]))
+    if summary.get("waf_proven_variants"):
+        steps.append(f"WAF present ({summary.get('waf_family')}); proven-passing variants: {summary['waf_proven_variants']}")
+    if judge.get("concrete_repair"):
+        steps.append("Judge: " + str(judge["concrete_repair"])[:200])
+    if stage in ("run", "refine") and tried:
+        last = tried[-1]
+        steps.append(f"Last attempt (iter {last.get('iteration')}) returned HTTP {last.get('http_status')} — {last.get('reason') or 'no canary/anchor'}; start from `{last.get('command_head')}`")
+
+    return {
+        "schema": 1, "run_id": run_id, "stage_reached": stage, "stop_reason": stop,
+        "verified": bool(result.get("verified")), "iterations": int(result.get("iterations") or 0),
+        "missing": missing, "endpoint": endpoint, "method": facts.get("method"),
+        "input_field": facts.get("input_field"), "vuln_class": man.get("vuln_class"),
+        "blockers": blockers, "tried": tried,
+        "recon_inventory": {
+            "urls": ((live.get("crawl_urls") or [])[:40] + [p for p in (live.get("zap_paths") or []) if p not in (live.get("crawl_urls") or [])][:20]),
+            "params_by_path": {k: v[:20] for k, v in list((live.get("arjun_params") or {}).items())[:20]},
+            "forms": (live.get("forms") or [])[:10],
+            "open_ports": summary.get("open_ports") or [],
+            "framework": summary.get("framework"),
+            "waf": summary.get("waf_family"),
+            "session": session,
+            "wp_nonces": bool(facts.get("wp_nonces")),
+        },
+        "llm": {"models_used_by_phase": models, "fallback_errors": fb_err[:10], "judge": judge},
+        "next_steps_deterministic": steps[:8],
+        "phases": phases[-40:],
+    }
+
+
+def _failure_analysis_llm(cve, ip, port, run_id, analysis) -> dict | None:
+    """One routed LLM call (caller=exploit.judge) that turns the deterministic
+    analysis into a short narrative + ranked manual next steps. Fail-soft;
+    every exit traces `failure_analysis_error` so a silent no-op is impossible
+    (the pattern 48d3040 established for the fallback and the judge)."""
+    import json as _j, re as _re
+
+    def _fail(reason, raw_s=""):
+        logging.warning("failure_analysis_llm cve=%s run=%s: %s | raw=%r", cve, run_id, reason, (raw_s or "")[:300])
+        try:
+            _poc_trace(run_id, "failure_analysis_error", response=f"{reason}\nraw[:800]: {(raw_s or '')[:800]}",
+                       extra={"reason": reason})
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    slim = {k: analysis.get(k) for k in ("stage_reached", "stop_reason", "missing", "endpoint", "method",
+                                         "input_field", "vuln_class", "blockers", "tried",
+                                         "next_steps_deterministic") if k in analysis}
+    inv = analysis.get("recon_inventory") or {}
+    slim["recon_inventory"] = {"urls": (inv.get("urls") or [])[:20], "params_by_path": inv.get("params_by_path"),
+                               "forms": inv.get("forms"), "framework": inv.get("framework"), "waf": inv.get("waf"),
+                               "session": inv.get("session")}
+    slim["judge"] = (analysis.get("llm") or {}).get("judge")
+    body = _j.dumps(slim, default=str)[:6000]
+    prompt = (
+        f"AUTHORIZED lab pentest post-mortem. A build-PoC attempt for {cve} on {ip}:{port} ended "
+        f"UNVERIFIED at stage `{analysis.get('stage_reached')}` (stop_reason={analysis.get('stop_reason')}).\n"
+        f"Below is the deterministic analysis: the gather blockers with what the run's own recon found, "
+        f"what was tried with HTTP statuses, the recon inventory and rule-based next steps.\n\n{body}\n\n"
+        f"Write for an operator who will continue MANUALLY. Return STRICT JSON only:\n"
+        f'{{"narrative": "<=120 words: what the pipeline saw, where it stopped and the single most likely reason", '
+        f'"ranked_next_steps": [{{"step": "<imperative, concrete>", "why": "<evidence from the analysis>", '
+        f'"how": "<exact request/command shape or UI action>"}}], "confidence": <0..1>}}\n'
+        f"At most 5 steps, most valuable first. Use only facts present above — do not invent endpoints or parameters. No prose outside the JSON."
+    )
+    try:
+        raw = _llm_for_model(prompt, caller="exploit.judge", num_predict=650, temperature=0.2)
+    except Exception as e:  # noqa: BLE001
+        return _fail(f"llm call raised {type(e).__name__}: {str(e)[:200]}")
+    model_used = None
+    if isinstance(raw, dict):
+        model_used = raw.get("model")
+        if raw.get("ok") is False or raw.get("error"):
+            return _fail(f"llm returned ok=False error={str(raw.get('error'))[:200]} model={model_used}")
+        raw_s = str(raw.get("response") or raw.get("text") or raw.get("content") or "")
+    else:
+        raw_s = str(raw or "")
+    if not raw_s.strip():
+        return _fail(f"empty response model={model_used}")
+    m = _re.search(r"\{.*\}", raw_s, _re.S)
+    if not m:
+        return _fail(f"no JSON object in response model={model_used}", raw_s)
+    try:
+        obj = _j.loads(m.group(0))
+    except Exception as e:  # noqa: BLE001
+        return _fail(f"json.loads failed: {type(e).__name__}: {str(e)[:120]} model={model_used}", raw_s)
+    if not isinstance(obj, dict):
+        return _fail(f"JSON was {type(obj).__name__}, not object model={model_used}", raw_s)
+    steps = []
+    for s in (obj.get("ranked_next_steps") or [])[:5]:
+        if isinstance(s, dict) and s.get("step"):
+            steps.append({"step": str(s.get("step"))[:300], "why": str(s.get("why") or "")[:300],
+                          "how": str(s.get("how") or "")[:400]})
+        elif isinstance(s, str) and s.strip():
+            steps.append({"step": s.strip()[:300], "why": "", "how": ""})
+    narrative = str(obj.get("narrative") or "").strip()[:1200]
+    if not narrative and not steps:
+        return _fail(f"verdict had neither narrative nor steps (keys={list(obj.keys())[:8]}) model={model_used}", raw_s)
+    try:
+        conf = float(obj.get("confidence"))
+        conf = max(0.0, min(1.0, conf))
+    except Exception:  # noqa: BLE001
+        conf = None
+    return {"narrative": narrative, "ranked_next_steps": steps, "confidence": conf, "model": model_used}
+
+
 def _load_hints_for(cve, ip=None, port=None):
     """Return the concatenated active hints matching this (cve, ip, port). Most-specific
     first (exact host+port), then host-only, then cve-only. Empty on any failure."""
@@ -27210,7 +28213,7 @@ def _summarize_build_trace(entries):
     for e in entries:
         ph = str(e.get("phase") or "")
         resp = str(e.get("response") or "")
-        extra = e.get("extra") or {}
+        extra = _trace_extra(e)
         if ph == "recon:port_sweep":
             m = _re.search(r"Open ports on [\d.]+\s*\(\d+\):\s*(\[[^\]]+\])", resp)
             if m:
@@ -27398,8 +28401,30 @@ def get_exploit_summary(exploit_id: str, authorized: bool = Depends(auth)):
     entries = _read_trace_entries(exploit_id)
     summary = _summarize_build_trace(entries)
     auto_hint = _derive_auto_hint(summary)
+    # End-of-attempt failure analysis (node_failure_analysis): from the store
+    # row's metadata, else the trace entry — so the UI attempt summary can
+    # show stage / blockers / next steps at the top.
+    fa, attempt_run_id = None, None
+    try:
+        with get_db() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT metadata FROM exploit_store WHERE id=%s", (exploit_id,))
+            rw = cur.fetchone()
+        meta = (rw or {}).get("metadata") or {}
+        if isinstance(meta, dict):
+            fa = meta.get("failure_analysis") if isinstance(meta.get("failure_analysis"), dict) else None
+            attempt_run_id = meta.get("attempt_run_id")
+    except Exception:  # noqa: BLE001
+        pass
+    if fa is None:
+        for e in reversed(entries):
+            if e.get("phase") == "failure_analysis":
+                ex = _trace_extra(e)
+                if isinstance(ex.get("failure_analysis"), dict):
+                    fa = ex["failure_analysis"]
+                break
     return {"ok": True, "exploit_id": exploit_id, "phase_count": len(entries),
-            "summary": summary, "auto_hint": auto_hint}
+            "summary": summary, "auto_hint": auto_hint,
+            "failure_analysis": fa, "attempt_run_id": attempt_run_id}
 
 
 @app.post("/exploit-store/{exploit_id}/derive-hint", tags=["Exploit Store"])
@@ -27694,6 +28719,91 @@ def _poc_precheck_model(model: str) -> dict:
         return {"ok": False, "error": str(res.get("error") or "unknown LLM error"),
                 "model": res.get("model") or model}
     return {"ok": True, "model": res.get("model") or model}
+
+
+@app.get("/build-poc/attempts", tags=["Assets"])
+def list_build_poc_attempts(cve: Optional[str] = None, ip: Optional[str] = None,
+                            engagement_id: Optional[str] = None, all_engagements: bool = False,
+                            limit: int = 50, authorized: bool = Depends(auth)):
+    """One row per build-PoC attempt — including the attempts that never built a
+    command (gather halt / readiness block / artifact required), which have no
+    exploit_store row. Light columns only; the detail endpoint carries the
+    jsonb. Honours X-Engagement-Id (NULL-engagement rows stay visible)."""
+    _ensure_build_poc_attempts_table()
+    eid = _resolve_engagement_id(engagement_id)
+    where, params = [], []
+    if cve:
+        where.append("cve = %s"); params.append(cve.upper())
+    if ip:
+        where.append("ip = %s"); params.append(str(ip))
+    if eid and not all_engagements:
+        where.append("(engagement_id = %s OR engagement_id IS NULL)"); params.append(str(eid))
+    sql = ("SELECT id, run_id, engagement_id, cve, ip, port, exploit_store_id, verified, stage_reached, "
+           "stop_reason, missing, poc_log_path, llm_model, created_at, updated_at, "
+           "(failure_analysis->>'confidence') AS confidence, "
+           "(failure_analysis->>'narrative') AS narrative "
+           "FROM build_poc_attempts" + (" WHERE " + " AND ".join(where) if where else "")
+           + " ORDER BY created_at DESC LIMIT %s")
+    params.append(max(1, min(int(limit or 50), 500)))
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, params)
+        rows = [dict(r) for r in cur.fetchall()]
+    return {"ok": True, "engagement_id": eid, "all_engagements": bool(all_engagements),
+            "count": len(rows), "attempts": rows}
+
+
+@app.get("/build-poc/attempts/{run_id}", tags=["Assets"])
+def get_build_poc_attempt(run_id: str, authorized: bool = Depends(auth)):
+    _ensure_build_poc_attempts_table()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM build_poc_attempts WHERE run_id = %s", (run_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "attempt not found")
+    return {"ok": True, "attempt": dict(row)}
+
+
+@app.get("/build-poc/attempts/{run_id}/export/review.md", tags=["Assets"])
+def export_build_poc_attempt_review_md(run_id: str, authorized: bool = Depends(auth)):
+    """review.md for an ATTEMPT (no exploit_store row needed): the same renderer
+    as the exploit-store export, fed from the attempts row + its trace."""
+    _ensure_build_poc_attempts_table()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM build_poc_attempts WHERE run_id = %s", (run_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "attempt not found")
+    a = dict(row)
+    summ = a.get("summary") if isinstance(a.get("summary"), dict) else {}
+    r = {"name": f"Build-PoC attempt {a.get('cve')} on {a.get('ip')}:{a.get('port')} ({a.get('stage_reached')})",
+         "cve": a.get("cve"), "target_host": a.get("ip"), "target_port": a.get("port"),
+         "verified": a.get("verified"), "kind": "attempt", "llm_model": a.get("llm_model"),
+         "built_at": a.get("created_at"),
+         "metadata": {"metrics": {"iterations": (a.get("failure_analysis") or {}).get("iterations")
+                                  if isinstance(a.get("failure_analysis"), dict) else None},
+                      "attempt_run_id": a.get("run_id")}}
+    intel = {"derived_spec": None, "confirmed_facts": [], "captured_credentials": [], "footholds": [],
+             "sqlmap_command": None, "key_trace": [], "full_trace": [], "intel_summary": None}
+    try:
+        key_trace, full_trace = _key_and_full_trace(a.get("poc_log_path"))
+        intel["key_trace"], intel["full_trace"] = key_trace, full_trace
+    except Exception as e:  # noqa: BLE001
+        logging.debug("attempt trace read failed: %s", e)
+    try:
+        if a.get("cve"):
+            _ensure_derived_cve_specs_table()
+            with get_db() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT cve, product, version, vuln_class, spec, verified, status, verify_method, "
+                            "verify_evidence, source, attempts, last_failure, refine_hints, derived_at, last_verified "
+                            "FROM derived_cve_specs WHERE cve=%s", (str(a["cve"]).upper(),))
+                ds = cur.fetchone()
+                intel["derived_spec"] = dict(ds) if ds else None
+    except Exception:  # noqa: BLE001
+        pass
+    body = _render_review_md(r, intel, failure_analysis=a.get("failure_analysis"), live_recon=a.get("live_recon"))
+    base = f"{a.get('cve')}_{a.get('ip')}_{a.get('run_id')}".replace("/", "_")[:120]
+    return Response(content=body, media_type="text/markdown",
+                    headers={"Content-Disposition": f'attachment; filename="{base}-attempt-review.md"'})
 
 
 @app.get("/build-poc/shadow-runs", tags=["Assets"])
@@ -28904,57 +30014,90 @@ def get_derivation_intel(exploit_id: str, authorized: bool = Depends(auth)):
         raise
     except Exception as e:  # noqa: BLE001
         logging.debug("derivation-intel db read failed: %s", e)
-    # 5. key trace entries from the PoC log file. For operator-manual-hint
-    #    purposes (review.md export) we need EVERY recon-bearing phase, not
-    #    the narrow derivation whitelist. Truncation is generous (4000 chars)
-    #    so the gather_manifest + scan_evidence blob survives, and we cap at
-    #    200 entries so a loose refine loop still finishes rendering.
+    # 5. key + full trace from the PoC log file (shared with the attempt export).
     try:
         log_path = row.get("poc_log_path") if row else None
-        if log_path and os.path.exists(log_path):
-            import json as _j
-            # Any phase whose output helps a human continue the attempt.
-            # Phases we intentionally skip because they are internal plumbing:
-            # none right now — include everything the loop emits.
-            full_trace, key_trace = [], []
-            key_phases = {
-                "cve_spec_derivation", "synth_seeded_from_confirmed",
-                "enforced_resolved_ids", "enforced_request_contract",
-                "challenge_building_blocks", "readiness_gate",
-                "recon:access_enumeration", "poc_captured_credentials",
-                "cve_spec_hit", "tool_handoff", "sqlmap_handoff",
-                # Recon/decision phases that carry the data an operator
-                # needs for a manual continuation. Added 2026-10-08.
-                "gather_check", "gather_llm_fallback", "deep_recon",
-                "plan_verify", "strategy", "research",
-                "synth", "run", "refine",
-                "reflection_check", "anti_drift", "canary_anchor_check",
-                "judge_pass",
-            }
-            with open(log_path, encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        rec = _j.loads(line)
-                    except Exception:  # noqa: BLE001
-                        continue
-                    phase = rec.get("phase") or ""
-                    entry = {"phase": phase, "ts": rec.get("ts"),
-                             "iteration": rec.get("iteration"),
-                             "response": (rec.get("response") or "")[:4000],
-                             "extra": rec.get("extra") or {}}
-                    full_trace.append(entry)
-                    # key_trace retains the whitelist shape for callers
-                    # that render only a short list (UI panels); the full
-                    # trace is for the review.md export.
-                    if phase in key_phases and len(key_trace) < 200:
-                        key_trace.append(entry)
-                    if len(full_trace) >= 1000:
-                        break
-            out["key_trace"] = key_trace
-            out["full_trace"] = full_trace
+        key_trace, full_trace = _key_and_full_trace(log_path)
+        out["key_trace"] = key_trace
+        out["full_trace"] = full_trace
     except Exception as e:  # noqa: BLE001
         logging.debug("key_trace read failed: %s", e)
+    # 6. failure analysis — from the store row's metadata (node_save_store) or
+    #    the trace's `failure_analysis` entry (older rows / runs saved before
+    #    the analysis ran), plus the attempts row when linked.
+    try:
+        fa = None
+        meta = (row.get("metadata") or {}) if row else {}
+        if isinstance(meta, dict) and isinstance(meta.get("failure_analysis"), dict):
+            fa = meta["failure_analysis"]
+        if fa is None:
+            for t in reversed(out.get("full_trace") or []):
+                if t.get("phase") == "failure_analysis" and isinstance((t.get("extra") or {}).get("failure_analysis"), dict):
+                    fa = t["extra"]["failure_analysis"]
+                    break
+        out["failure_analysis"] = fa
+        run_id = meta.get("attempt_run_id") if isinstance(meta, dict) else None
+        if run_id:
+            _ensure_build_poc_attempts_table()
+            with get_db() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT run_id, stage_reached, stop_reason, missing, verified, created_at, "
+                            "live_recon FROM build_poc_attempts WHERE run_id=%s", (str(run_id),))
+                ar = cur.fetchone()
+                out["attempt"] = dict(ar) if ar else None
+                if ar and ar.get("live_recon") and fa is not None and "recon_inventory" not in fa:
+                    fa["live_recon"] = ar["live_recon"]
+    except Exception as e:  # noqa: BLE001
+        logging.debug("failure_analysis read failed: %s", e)
     return out
+
+
+# Phases whose output helps a human continue the attempt. EMITTED names only —
+# tests/test_build_poc_failure_analysis.py pins this set to the literals passed
+# to _poc_trace. The 2026-10-08 list named phases that are never emitted
+# (plan_verify, strategy, synth, judge_pass, …), so the near-miss judge and the
+# strategist never reached the key trace.
+_KEY_TRACE_PHASES = {
+    "cve_spec_derivation", "synth_seeded_from_confirmed",
+    "enforced_resolved_ids", "enforced_request_contract",
+    "challenge_building_blocks", "readiness_gate",
+    "recon:access_enumeration", "poc_captured_credentials",
+    "tool_handoff", "research", "operator_hint",
+    "recon:strategist", "recon:plan_verified", "recon:auth_establish",
+    "recon:auto_login", "recon:playwright",
+    "gather_check", "gather_llm_fallback", "gather_llm_fallback_error",
+    "gather_llm_fallback_raw", "deep_recon", "deep_recon:solutions", "deep_recon:plan",
+    "synthesize", "run", "refine", "reflection_check", "result",
+    "judge_near_miss", "judge_pass_error", "auto_hint_saved",
+    "failure_analysis", "failure_analysis_error",
+    "synth_skipped_gather_incomplete", "run_refine_skipped_gather_incomplete",
+    "run_refine_skipped_blocked", "run_refine_skipped_artifact_required",
+}
+_KEY_TRACE_PREFIXES = ("node_error:", "deep_recon:", "escalation:")
+
+
+def _key_and_full_trace(log_path, key_cap=200, full_cap=1000):
+    """(key_trace, full_trace) for one run's JSONL. Responses are truncated at
+    4000 chars (the gather manifest + live recon survive); `extra` is recovered
+    through _trace_extra because _poc_trace flattens it."""
+    key_trace, full_trace = [], []
+    if not log_path or not os.path.exists(log_path):
+        return key_trace, full_trace
+    import json as _j
+    with open(log_path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            try:
+                rec = _j.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            phase = str(rec.get("phase") or "")
+            entry = {"phase": phase, "ts": rec.get("ts"), "iteration": rec.get("iteration"),
+                     "response": (rec.get("response") or "")[:4000], "extra": _trace_extra(rec)}
+            full_trace.append(entry)
+            if (phase in _KEY_TRACE_PHASES or phase.startswith(_KEY_TRACE_PREFIXES)) and len(key_trace) < key_cap:
+                key_trace.append(entry)
+            if len(full_trace) >= full_cap:
+                break
+    return key_trace, full_trace
 
 
 @app.post("/exploit-store", tags=["Exploit Store"])
@@ -29371,6 +30514,16 @@ def export_exploit_review_md(exploit_id: str, authorized: bool = Depends(auth)):
         if not row:
             raise HTTPException(404, "exploit not found")
     r = dict(row)
+    body = _render_review_md(r, intel, failure_analysis=intel.get("failure_analysis"))
+    base = _exploit_filename_base(r)
+    return Response(content=body, media_type="text/markdown",
+                    headers={"Content-Disposition": f'attachment; filename="{base}-review.md"'})
+
+
+def _render_review_md(r: dict, intel: dict, failure_analysis=None, live_recon=None) -> str:
+    """The review.md body, shared by the exploit-store export and the
+    build-poc attempt export (which has no store row). `r` is a row-like dict:
+    name/cve/target_host/target_port/verified/kind/llm_model/built_at/metadata."""
     md = r.get("metadata") or {}
     out: list[str] = []
     out.append(f"# Exploit review — {r.get('name') or exploit_id}")
@@ -29396,6 +30549,95 @@ def export_exploit_review_md(exploit_id: str, authorized: bool = Depends(auth)):
             if k in metrics:
                 out.append(f"- `{k}` = {metrics[k]}")
         out.append("")
+    # ─── Failure analysis (end-of-attempt; unverified runs) ──────────────
+    fa = failure_analysis if isinstance(failure_analysis, dict) else None
+    if fa:
+        out.append("## Failure analysis")
+        out.append("")
+        out.append(f"**Stage reached:** `{fa.get('stage_reached')}` · **Stop reason:** `{fa.get('stop_reason')}`"
+                   + (f" · **Iterations:** {fa.get('iterations')}" if fa.get("iterations") else "")
+                   + (f" · **Confidence:** {fa.get('confidence')}" if fa.get("confidence") is not None else "")
+                   + (f" · **LLM:** `{fa.get('llm_model')}`" if fa.get("llm_model") else ""))
+        out.append("")
+        if fa.get("endpoint") or fa.get("method") or fa.get("input_field") or fa.get("vuln_class"):
+            out.append("- **Resolved so far:** "
+                       + ", ".join(f"{k}=`{fa.get(k)}`" for k in ("vuln_class", "endpoint", "method", "input_field") if fa.get(k)))
+            out.append("")
+        if fa.get("narrative"):
+            out.append(str(fa["narrative"]))
+            out.append("")
+        blockers = fa.get("blockers") or []
+        if blockers:
+            out.append(f"### Blockers ({len(blockers)})")
+            out.append("")
+            out.append("| item | why | what the run's own recon found | candidates | manual step |")
+            out.append("|---|---|---|---|---|")
+            for b in blockers:
+                esc = lambda s: str(s or "").replace("|", "\\|").replace("\n", " ")
+                out.append(f"| `{b.get('item')}` | {esc(b.get('why'))[:220]} | {esc(b.get('what_live_recon_found'))[:260]} "
+                           f"| {esc(', '.join(b.get('candidate_values') or []))[:200]} | {esc(b.get('suggested_manual_step'))[:220]} |")
+            out.append("")
+        steps = fa.get("ranked_next_steps") or []
+        if steps:
+            out.append("### Ranked next steps (manual continuation)")
+            out.append("")
+            for i, s in enumerate(steps, 1):
+                if isinstance(s, dict):
+                    out.append(f"{i}. **{s.get('step')}**")
+                    if s.get("why"):
+                        out.append(f"   - why: {s['why']}")
+                    if s.get("how"):
+                        out.append(f"   - how: `{s['how']}`" if "\n" not in str(s["how"]) else f"   - how:\n```\n{s['how']}\n```")
+                else:
+                    out.append(f"{i}. {s}")
+            out.append("")
+        det = fa.get("next_steps_deterministic") or []
+        if det and (not steps or any(isinstance(s, dict) and s.get("why") != "deterministic rule" for s in steps)):
+            out.append("### Rule-based next steps")
+            out.append("")
+            for s in det:
+                out.append(f"- {s}")
+            out.append("")
+        tried = fa.get("tried") or []
+        if tried:
+            out.append(f"### Tried ({len(tried)})")
+            out.append("")
+            out.append("| iter | HTTP | reason | command |")
+            out.append("|---|---|---|---|")
+            for t in tried:
+                # No backslashes inside f-string expressions: rag-api runs
+                # Python 3.10 (PEP 701 is 3.12-only).
+                _reason = str(t.get("reason") or "").replace("|", "\\|")[:80]
+                _cmd = str(t.get("command_head") or "").replace("|", "\\|")[:140]
+                out.append(f"| {t.get('iteration')} | {t.get('http_status') or '?'} | {_reason} | `{_cmd}` |")
+            out.append("")
+        inv = fa.get("recon_inventory") or {}
+        sess = inv.get("session") or {}
+        if inv:
+            out.append("### Session / recon inventory")
+            out.append("")
+            out.append(f"- **session:** attempted={sess.get('attempted')} method={sess.get('method')} ok={sess.get('ok')} "
+                       f"creds_supplied={sess.get('creds_supplied')}" + (f" — {sess.get('note')}" if sess.get("note") else ""))
+            if inv.get("framework") or inv.get("waf"):
+                out.append(f"- **framework:** {inv.get('framework')} · **waf:** {inv.get('waf')}")
+            if inv.get("open_ports"):
+                out.append(f"- **open ports:** {inv['open_ports']}")
+            if inv.get("params_by_path"):
+                out.append("- **params by path:** " + "; ".join(f"`{p}` → {', '.join(v[:8])}" for p, v in list(inv["params_by_path"].items())[:8]))
+            if inv.get("forms"):
+                out.append("- **forms:** " + "; ".join(f"{f.get('method')} `{f.get('path')}` {f.get('fields')}" for f in inv["forms"][:5]))
+            if inv.get("urls"):
+                out.append(f"- **urls ({len(inv['urls'])}):** " + ", ".join(f"`{u}`" for u in inv["urls"][:20]))
+            out.append("")
+        llm = fa.get("llm") or {}
+        if llm.get("models_used_by_phase") or llm.get("fallback_errors"):
+            out.append("- **LLM telemetry:** models by phase: "
+                       + "; ".join(f"{p}={','.join(m)}" for p, m in list((llm.get("models_used_by_phase") or {}).items())[:10])
+                       + (f" · errors: {len(llm.get('fallback_errors') or [])}" if llm.get("fallback_errors") else ""))
+            for e in (llm.get("fallback_errors") or [])[:6]:
+                out.append(f"  - `{e.get('phase')}`: {str(e.get('detail') or '')[:160]}")
+            out.append("")
+
     research = (md.get("research") or {}) if isinstance(md, dict) else {}
     if research:
         out.append("## Reference-PoC research")
@@ -29487,7 +30729,8 @@ def export_exploit_review_md(exploit_id: str, authorized: bool = Depends(auth)):
     mined = gc_facts.get("mined") or {}
     poc_hints = gc_facts.get("poc_hints") or ""
     prior_runs = gc_facts.get("prior_runs") or []
-    if scan_ev or mined or poc_hints or prior_runs or gc_facts.get("banner"):
+    if (scan_ev or mined or poc_hints or prior_runs or gc_facts.get("banner")
+            or gc_facts.get("live_recon") or live_recon or gc_facts.get("wp_nonces")):
         out.append("## Recon dossier (manual-hint corpus)")
         out.append("")
         out.append("_All recon the pipeline collected on this target. Use these items as "
@@ -29554,6 +30797,34 @@ def export_exploit_review_md(exploit_id: str, authorized: bool = Depends(auth)):
                 out.append(f"- **{k}** ({len(items)}):")
                 for it in items[:15]:
                     out.append(f"  - `{str(it)[:220]}`")
+            out.append("")
+        lr = gc_facts.get("live_recon") or live_recon or {}
+        if any(lr.get(k) for k in ("forms", "crawl_urls", "arjun_params", "verb_sweep", "zap_paths", "classified_params")):
+            out.append("### Live recon (this run)")
+            out.append("")
+            for fm in (lr.get("forms") or [])[:8]:
+                out.append(f"- form `{fm.get('method')} {fm.get('path')}` fields={fm.get('fields')}")
+            for p, names in list((lr.get("arjun_params") or {}).items())[:12]:
+                out.append(f"- arjun `{p}`: {', '.join(names[:15])}" + (f" (+{len(names) - 15})" if len(names) > 15 else ""))
+            for c in (lr.get("classified_params") or [])[:10]:
+                out.append(f"- classified `{c.get('path')}` `{c.get('param')}` → {c.get('class')}" + (f" — {c.get('hint')}" if c.get("hint") else ""))
+            for p, verbs in list((lr.get("verb_sweep") or {}).items())[:12]:
+                out.append(f"- verb sweep `{p}`: " + " ".join(f"{m}:{s}" for m, s in verbs.items()))
+            cu = lr.get("crawl_urls") or []
+            if cu:
+                out.append(f"- crawl urls ({len(cu)}): " + ", ".join(f"`{u}`" for u in cu[:40]) + (" …" if len(cu) > 40 else ""))
+            zp = lr.get("zap_paths") or []
+            if zp:
+                out.append(f"- zap paths ({len(zp)}): " + ", ".join(f"`{u}`" for u in zp[:30]) + (" …" if len(zp) > 30 else ""))
+            out.append("")
+        if gc_facts.get("wp_nonces"):
+            wpn = gc_facts["wp_nonces"]
+            out.append("### WordPress nonces (harvested with the session)")
+            out.append("")
+            for obj, val in list((wpn.get("by_object") or {}).items())[:10]:
+                out.append(f"- `{obj}.nonce` = `{val}`")
+            for t in (wpn.get("tokens") or [])[:12]:
+                out.append(f"- `{t}`")
             out.append("")
         if prior_runs:
             out.append(f"### Prior PoC runs for this CVE ({len(prior_runs)})")
@@ -29624,12 +30895,9 @@ def export_exploit_review_md(exploit_id: str, authorized: bool = Depends(auth)):
                 out.append(f"**extra:** `{json.dumps(extra, default=str)[:2000]}`")
             out.append("")
 
-    if not metrics and not research and not spec and not facts and not creds and not foots and not trace and not manual and not full_tr:
+    if not metrics and not research and not spec and not facts and not creds and not foots and not trace and not manual and not full_tr and not failure_analysis:
         out.append("_No derivation evidence stored for this exploit yet._")
-    base = _exploit_filename_base(r)
-    body = "\n".join(out).rstrip() + "\n"
-    return Response(content=body, media_type="text/markdown",
-                    headers={"Content-Disposition": f'attachment; filename="{base}-review.md"'})
+    return "\n".join(out).rstrip() + "\n"
 
 
 class ManualResearchSearchBody(BaseModel):
