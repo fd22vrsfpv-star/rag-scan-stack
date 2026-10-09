@@ -27695,6 +27695,322 @@ def _read_trace_file(log_path, limit=5000):
     return out
 
 
+def _link_attempt_to_store(run_id, exploit_store_id):
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("UPDATE build_poc_attempts SET exploit_store_id=%s, updated_at=now() WHERE run_id=%s",
+                        (str(exploit_store_id), str(run_id)))
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("link attempt→store failed: %s", e)
+
+
+_FA_STAGES = ("recon", "gather", "synth", "run", "refine", "verified", "crash")
+
+
+def _build_failure_analysis(run_id, log_path, result, gather_manifest=None, state_bits=None) -> dict:
+    """Deterministic end-of-attempt analysis (no LLM): what stage the run
+    reached, why it stopped, each gather blocker with what the run's OWN recon
+    found for it, what was tried, the recon inventory, which models answered,
+    and rule-based next steps. Built from the trace JSONL (by path — blocked
+    runs have no store id), the gather manifest and a few state bits. Pure
+    apart from reading the trace file; safe to exec from source in tests with
+    _trace_extra/_summarize_build_trace/_parse_recon_segments/_read_trace_file
+    loaded alongside."""
+    import re as _re
+    result = result or {}
+    sb = state_bits or {}
+    entries = _read_trace_file(log_path) if log_path else []
+    phases = [str(e.get("phase") or "") for e in entries]
+    try:
+        summary = _summarize_build_trace(entries)
+    except Exception:  # noqa: BLE001
+        summary = {}
+    man = gather_manifest or {}
+    if not man:
+        for e in reversed(entries):
+            if e.get("phase") == "gather_check":
+                man = _trace_extra(e).get("gather_manifest") or {}
+                break
+    facts = man.get("facts") or {}
+    live = facts.get("live_recon") or {}
+    if not live and sb.get("segments"):
+        try:
+            lp = _parse_recon_segments(list(sb.get("segments") or []))
+            live = {"forms": lp.get("form_fields") or [], "crawl_urls": lp.get("crawl_urls") or [],
+                    "arjun_params": lp.get("arjun_params") or {}, "classified_params": lp.get("classified_params") or [],
+                    "zap_paths": lp.get("zap_paths") or [], "verb_sweep": lp.get("verb_sweep") or {},
+                    "href_endpoints": lp.get("href_endpoints") or [], "counts": lp.get("counts") or {}}
+        except Exception:  # noqa: BLE001
+            live = {}
+    items = man.get("items") or []
+    missing = list(man.get("missing") or [])
+    endpoint = facts.get("endpoint")
+
+    # ── stage + stop reason ────────────────────────────────────────────────
+    if result.get("verified"):
+        stage = "verified"
+    elif result.get("crash") or any(p.startswith("node_error:") for p in phases) and not any(p == "result" for p in phases):
+        stage = "crash"
+    elif "refine" in phases:
+        stage = "refine"
+    elif "run" in phases:
+        stage = "run"
+    elif "synthesize" in phases or result.get("artifact_required") or result.get("verification_method") == "artifact_required":
+        stage = "synth"
+    elif result.get("verification_method") == "gather_incomplete" or (man and not man.get("ready")):
+        stage = "gather"
+    else:
+        stage = "recon"
+    if result.get("stop_reason"):
+        stop = str(result["stop_reason"])
+    elif result.get("verification_method") == "gather_incomplete" or (stage == "gather" and missing):
+        stop = "gather_incomplete:" + ",".join(missing)
+    elif result.get("blocked") and result.get("blockers"):
+        stop = "readiness:" + ",".join(str(b) for b in (result.get("blockers") or [])[:6])
+    elif result.get("verification_method"):
+        stop = str(result["verification_method"])
+    elif stage == "crash":
+        stop = "crash"
+    else:
+        stop = result.get("reason") or "unknown"
+
+    # ── session attempt (supplied creds → session?) ────────────────────────
+    session = {"attempted": False, "method": None, "ok": False, "note": None, "creds_supplied": bool((sb.get("auth") or {}).get("username"))}
+    for e in entries:
+        ph = e.get("phase")
+        if ph == "recon:auth_establish":
+            ex = _trace_extra(e)
+            session.update({"attempted": True, "method": ex.get("auth_method"), "ok": bool(ex.get("auth_ok")),
+                            "note": (e.get("response") or "")[:200]})
+        elif ph == "recon:auto_login" and "SUCCESS" in str(e.get("response") or ""):
+            session.update({"attempted": True, "method": "auto_login", "ok": True, "note": (e.get("response") or "")[:200]})
+        elif ph == "deep_recon:default_creds" and not session["ok"]:
+            session.update({"attempted": True, "method": session["method"] or "default_creds",
+                            "note": (e.get("response") or "")[:200]})
+    si = sb.get("session_info") or {}
+    if isinstance(si, dict) and si.get("cookie_header"):
+        session.update({"attempted": True, "ok": True, "method": si.get("method") or session["method"]})
+    auth_item = next((i for i in items if i.get("item") == "auth"), {})
+    if auth_item.get("status") == "gathered":
+        session["ok"] = True
+
+    # ── blockers (one per missing gather item) ─────────────────────────────
+    deep = sb.get("deep_recon") or man.get("deep_recon") or {}
+    solutions = (deep.get("solutions") or {}) if isinstance(deep, dict) else {}
+    forms_on_ep = [f for f in (live.get("forms") or []) if f.get("path") == endpoint]
+    blockers = []
+    for it in items:
+        if it.get("status") != "missing":
+            continue
+        name = it.get("item")
+        found, cands = "", []
+        if name == "input_field":
+            ap = (live.get("arjun_params") or {}).get(endpoint) or []
+            cl = [c for c in (live.get("classified_params") or []) if c.get("path") == endpoint]
+            ff = [x for f in forms_on_ep for x in (f.get("fields") or [])]
+            cands = [c["param"] for c in cl] + ap[:10] + ff[:10]
+            found = (f"arjun honored {len(ap)} params on {endpoint}; " if ap else "") + \
+                    (f"{len(cl)} classified; " if cl else "") + \
+                    (f"form on {endpoint} with fields {ff[:6]}" if ff else "")
+        elif name == "endpoint":
+            cu = live.get("crawl_urls") or []; zp = live.get("zap_paths") or []
+            ap = list((live.get("arjun_params") or {}).keys())
+            fp = [f.get("path") for f in (live.get("forms") or [])]
+            cands = ([p for p in fp if p] + ap + cu[:10] + zp[:10])[:20]
+            found = f"{len(cu)} crawled urls, {len(zp)} zap paths, {len(ap)} arjun paths, {len(fp)} forms; " \
+                    f"strategist verdicts={summary.get('plan_verdicts') or man.get('plan_verdicts') or {}}"
+        elif name == "method":
+            vs = (live.get("verb_sweep") or {}).get(endpoint) or {}
+            cands = [m for m, s in vs.items() if s not in (404, 405, 501)]
+            found = f"verb sweep on {endpoint}: {vs}" if vs else "no verb sweep for the resolved endpoint"
+        elif name == "auth":
+            found = (f"creds supplied={session['creds_supplied']}; attempted={session['attempted']} "
+                     f"method={session['method']} ok={session['ok']}; {session.get('note') or ''}")
+            cands = [f.get("path") for f in (live.get("forms") or [])
+                     if any(_re.search(r"(?i)pass", x) for x in (f.get("fields") or []))]
+        elif name == "vuln_class":
+            cls = sorted({c.get("class") for c in (live.get("classified_params") or []) if c.get("class")})
+            sp = summary.get("strategist_primary") or {}
+            cands = cls[:5] + ([sp.get("class")] if isinstance(sp, dict) and sp.get("class") else [])
+            found = f"classifier=unknown; strategist primary={sp if sp else None}; classified param classes={cls[:5]}"
+        elif name == "artifact":
+            req = result.get("artifact_requirements") or facts.get("artifact_requirements") or {}
+            found = (req.get("summary") if isinstance(req, dict) else str(req))[:300] if req else ""
+        elif name == "endpoint_id":
+            found = str(it.get("value") or "")[:200]
+        step = None
+        sols = solutions.get(name) if isinstance(solutions, dict) else None
+        if sols and isinstance(sols, list) and isinstance(sols[0], dict):
+            step = sols[0].get("solution")
+        blockers.append({"item": name, "why": str(it.get("value") or _GATHER_FOLLOW_UP.get(name, ""))[:300],
+                         "what_live_recon_found": found.strip()[:400],
+                         "candidate_values": [str(c)[:80] for c in cands if c][:12],
+                         "suggested_manual_step": (step or _GATHER_FOLLOW_UP.get(name, ""))[:300]})
+
+    # ── what was tried ─────────────────────────────────────────────────────
+    tried = []
+    last_cmd = ""
+    it_summ = {x.get("iter"): x for x in (summary.get("iterations_summary") or []) if isinstance(x, dict)}
+    for e in entries:
+        ph = e.get("phase")
+        if ph in ("synthesize", "refine", "synth_seeded_from_confirmed"):
+            txt = str(e.get("response") or "")
+            m = _re.search(r'"command"\s*:\s*"((?:[^"\\]|\\.)*)"', txt)
+            last_cmd = (m.group(1) if m else txt).replace("\\n", " ").strip()[:160]
+        elif ph == "run":
+            ro = str(e.get("run_output") or "")
+            hm = _re.search(r"HTTP/[\d.]+ (\d{3})", ro)
+            isum = it_summ.get(e.get("iteration")) or {}
+            tried.append({"iteration": e.get("iteration"), "command_head": last_cmd,
+                          "http_status": int(hm.group(1)) if hm else None,
+                          "reason": str(e.get("reason") or isum.get("status") or "")[:120],
+                          "method": e.get("method")})
+    tried = tried[:25]
+
+    # ── llm telemetry ──────────────────────────────────────────────────────
+    models = {}
+    for e in entries:
+        if e.get("llm_model"):
+            models.setdefault(str(e.get("phase")), [])
+            if e["llm_model"] not in models[str(e.get("phase"))]:
+                models[str(e.get("phase"))].append(e["llm_model"])
+    fb_err = [{"phase": e.get("phase"), "detail": str(e.get("response") or "")[:200]}
+              for e in entries if str(e.get("phase") or "").endswith("_error") or str(e.get("phase") or "").startswith("node_error:")]
+    judge = {}
+    for e in reversed(entries):
+        if e.get("phase") == "judge_near_miss":
+            judge = {k: v for k, v in _trace_extra(e).items() if k in ("best_iteration", "missing_one_thing", "concrete_repair", "closest_to_success")}
+            judge["summary"] = str(e.get("response") or "")[:300]
+            break
+
+    # ── deterministic next steps ───────────────────────────────────────────
+    steps = []
+    for b in blockers:
+        if b["item"] == "input_field" and b["candidate_values"]:
+            steps.append(f"Inject via `{b['candidate_values'][0]}` on `{endpoint}` (live recon honored it); alternates: {', '.join(b['candidate_values'][1:4])}")
+        elif b["item"] == "endpoint" and b["candidate_values"]:
+            steps.append(f"Probe these recon-discovered routes with the advisory payload shape: {', '.join(b['candidate_values'][:6])}")
+        elif b["item"] == "auth":
+            if session["creds_supplied"] and not session["ok"]:
+                steps.append(f"Log in manually with the supplied credentials (attempt: method={session['method']}, {session.get('note') or 'no note'}) and pass the session cookie as a hint")
+            elif not session["creds_supplied"]:
+                steps.append("Supply credentials (username/password) or an Auth Profile — the exploit needs a session")
+        elif b["item"] == "method" and b["candidate_values"]:
+            steps.append(f"Use {'/'.join(b['candidate_values'])} on `{endpoint}` (verb sweep answered)")
+        elif b["item"] == "vuln_class":
+            steps.append("Classify the vulnerability from the advisory / fix diff" + (f"; recon suggests {', '.join(b['candidate_values'][:3])}" if b["candidate_values"] else ""))
+        elif b["item"] == "artifact":
+            steps.append("Supply the external artifact: " + (b["what_live_recon_found"] or "see artifact_requirements"))
+    if summary.get("dead_endpoints"):
+        steps.append("Do not retry these 404 routes: " + ", ".join(str(x) for x in summary["dead_endpoints"][:6]))
+    if summary.get("waf_proven_variants"):
+        steps.append(f"WAF present ({summary.get('waf_family')}); proven-passing variants: {summary['waf_proven_variants']}")
+    if judge.get("concrete_repair"):
+        steps.append("Judge: " + str(judge["concrete_repair"])[:200])
+    if stage in ("run", "refine") and tried:
+        last = tried[-1]
+        steps.append(f"Last attempt (iter {last.get('iteration')}) returned HTTP {last.get('http_status')} — {last.get('reason') or 'no canary/anchor'}; start from `{last.get('command_head')}`")
+
+    return {
+        "schema": 1, "run_id": run_id, "stage_reached": stage, "stop_reason": stop,
+        "verified": bool(result.get("verified")), "iterations": int(result.get("iterations") or 0),
+        "missing": missing, "endpoint": endpoint, "method": facts.get("method"),
+        "input_field": facts.get("input_field"), "vuln_class": man.get("vuln_class"),
+        "blockers": blockers, "tried": tried,
+        "recon_inventory": {
+            "urls": ((live.get("crawl_urls") or [])[:40] + [p for p in (live.get("zap_paths") or []) if p not in (live.get("crawl_urls") or [])][:20]),
+            "params_by_path": {k: v[:20] for k, v in list((live.get("arjun_params") or {}).items())[:20]},
+            "forms": (live.get("forms") or [])[:10],
+            "open_ports": summary.get("open_ports") or [],
+            "framework": summary.get("framework"),
+            "waf": summary.get("waf_family"),
+            "session": session,
+            "wp_nonces": bool(facts.get("wp_nonces")),
+        },
+        "llm": {"models_used_by_phase": models, "fallback_errors": fb_err[:10], "judge": judge},
+        "next_steps_deterministic": steps[:8],
+        "phases": phases[-40:],
+    }
+
+
+def _failure_analysis_llm(cve, ip, port, run_id, analysis) -> dict | None:
+    """One routed LLM call (caller=exploit.judge) that turns the deterministic
+    analysis into a short narrative + ranked manual next steps. Fail-soft;
+    every exit traces `failure_analysis_error` so a silent no-op is impossible
+    (the pattern 48d3040 established for the fallback and the judge)."""
+    import json as _j, re as _re
+
+    def _fail(reason, raw_s=""):
+        logging.warning("failure_analysis_llm cve=%s run=%s: %s | raw=%r", cve, run_id, reason, (raw_s or "")[:300])
+        try:
+            _poc_trace(run_id, "failure_analysis_error", response=f"{reason}\nraw[:800]: {(raw_s or '')[:800]}",
+                       extra={"reason": reason})
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    slim = {k: analysis.get(k) for k in ("stage_reached", "stop_reason", "missing", "endpoint", "method",
+                                         "input_field", "vuln_class", "blockers", "tried",
+                                         "next_steps_deterministic") if k in analysis}
+    inv = analysis.get("recon_inventory") or {}
+    slim["recon_inventory"] = {"urls": (inv.get("urls") or [])[:20], "params_by_path": inv.get("params_by_path"),
+                               "forms": inv.get("forms"), "framework": inv.get("framework"), "waf": inv.get("waf"),
+                               "session": inv.get("session")}
+    slim["judge"] = (analysis.get("llm") or {}).get("judge")
+    body = _j.dumps(slim, default=str)[:6000]
+    prompt = (
+        f"AUTHORIZED lab pentest post-mortem. A build-PoC attempt for {cve} on {ip}:{port} ended "
+        f"UNVERIFIED at stage `{analysis.get('stage_reached')}` (stop_reason={analysis.get('stop_reason')}).\n"
+        f"Below is the deterministic analysis: the gather blockers with what the run's own recon found, "
+        f"what was tried with HTTP statuses, the recon inventory and rule-based next steps.\n\n{body}\n\n"
+        f"Write for an operator who will continue MANUALLY. Return STRICT JSON only:\n"
+        f'{{"narrative": "<=120 words: what the pipeline saw, where it stopped and the single most likely reason", '
+        f'"ranked_next_steps": [{{"step": "<imperative, concrete>", "why": "<evidence from the analysis>", '
+        f'"how": "<exact request/command shape or UI action>"}}], "confidence": <0..1>}}\n'
+        f"At most 5 steps, most valuable first. Use only facts present above — do not invent endpoints or parameters. No prose outside the JSON."
+    )
+    try:
+        raw = _llm_for_model(prompt, caller="exploit.judge", num_predict=650, temperature=0.2)
+    except Exception as e:  # noqa: BLE001
+        return _fail(f"llm call raised {type(e).__name__}: {str(e)[:200]}")
+    model_used = None
+    if isinstance(raw, dict):
+        model_used = raw.get("model")
+        if raw.get("ok") is False or raw.get("error"):
+            return _fail(f"llm returned ok=False error={str(raw.get('error'))[:200]} model={model_used}")
+        raw_s = str(raw.get("response") or raw.get("text") or raw.get("content") or "")
+    else:
+        raw_s = str(raw or "")
+    if not raw_s.strip():
+        return _fail(f"empty response model={model_used}")
+    m = _re.search(r"\{.*\}", raw_s, _re.S)
+    if not m:
+        return _fail(f"no JSON object in response model={model_used}", raw_s)
+    try:
+        obj = _j.loads(m.group(0))
+    except Exception as e:  # noqa: BLE001
+        return _fail(f"json.loads failed: {type(e).__name__}: {str(e)[:120]} model={model_used}", raw_s)
+    if not isinstance(obj, dict):
+        return _fail(f"JSON was {type(obj).__name__}, not object model={model_used}", raw_s)
+    steps = []
+    for s in (obj.get("ranked_next_steps") or [])[:5]:
+        if isinstance(s, dict) and s.get("step"):
+            steps.append({"step": str(s.get("step"))[:300], "why": str(s.get("why") or "")[:300],
+                          "how": str(s.get("how") or "")[:400]})
+        elif isinstance(s, str) and s.strip():
+            steps.append({"step": s.strip()[:300], "why": "", "how": ""})
+    narrative = str(obj.get("narrative") or "").strip()[:1200]
+    if not narrative and not steps:
+        return _fail(f"verdict had neither narrative nor steps (keys={list(obj.keys())[:8]}) model={model_used}", raw_s)
+    try:
+        conf = float(obj.get("confidence"))
+        conf = max(0.0, min(1.0, conf))
+    except Exception:  # noqa: BLE001
+        conf = None
+    return {"narrative": narrative, "ranked_next_steps": steps, "confidence": conf, "model": model_used}
+
+
 def _load_hints_for(cve, ip=None, port=None):
     """Return the concatenated active hints matching this (cve, ip, port). Most-specific
     first (exact host+port), then host-only, then cve-only. Empty on any failure."""
@@ -27986,8 +28302,30 @@ def get_exploit_summary(exploit_id: str, authorized: bool = Depends(auth)):
     entries = _read_trace_entries(exploit_id)
     summary = _summarize_build_trace(entries)
     auto_hint = _derive_auto_hint(summary)
+    # End-of-attempt failure analysis (node_failure_analysis): from the store
+    # row's metadata, else the trace entry — so the UI attempt summary can
+    # show stage / blockers / next steps at the top.
+    fa, attempt_run_id = None, None
+    try:
+        with get_db() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT metadata FROM exploit_store WHERE id=%s", (exploit_id,))
+            rw = cur.fetchone()
+        meta = (rw or {}).get("metadata") or {}
+        if isinstance(meta, dict):
+            fa = meta.get("failure_analysis") if isinstance(meta.get("failure_analysis"), dict) else None
+            attempt_run_id = meta.get("attempt_run_id")
+    except Exception:  # noqa: BLE001
+        pass
+    if fa is None:
+        for e in reversed(entries):
+            if e.get("phase") == "failure_analysis":
+                ex = _trace_extra(e)
+                if isinstance(ex.get("failure_analysis"), dict):
+                    fa = ex["failure_analysis"]
+                break
     return {"ok": True, "exploit_id": exploit_id, "phase_count": len(entries),
-            "summary": summary, "auto_hint": auto_hint}
+            "summary": summary, "auto_hint": auto_hint,
+            "failure_analysis": fa, "attempt_run_id": attempt_run_id}
 
 
 @app.post("/exploit-store/{exploit_id}/derive-hint", tags=["Exploit Store"])
@@ -28282,6 +28620,91 @@ def _poc_precheck_model(model: str) -> dict:
         return {"ok": False, "error": str(res.get("error") or "unknown LLM error"),
                 "model": res.get("model") or model}
     return {"ok": True, "model": res.get("model") or model}
+
+
+@app.get("/build-poc/attempts", tags=["Assets"])
+def list_build_poc_attempts(cve: Optional[str] = None, ip: Optional[str] = None,
+                            engagement_id: Optional[str] = None, all_engagements: bool = False,
+                            limit: int = 50, authorized: bool = Depends(auth)):
+    """One row per build-PoC attempt — including the attempts that never built a
+    command (gather halt / readiness block / artifact required), which have no
+    exploit_store row. Light columns only; the detail endpoint carries the
+    jsonb. Honours X-Engagement-Id (NULL-engagement rows stay visible)."""
+    _ensure_build_poc_attempts_table()
+    eid = _resolve_engagement_id(engagement_id)
+    where, params = [], []
+    if cve:
+        where.append("cve = %s"); params.append(cve.upper())
+    if ip:
+        where.append("ip = %s"); params.append(str(ip))
+    if eid and not all_engagements:
+        where.append("(engagement_id = %s OR engagement_id IS NULL)"); params.append(str(eid))
+    sql = ("SELECT id, run_id, engagement_id, cve, ip, port, exploit_store_id, verified, stage_reached, "
+           "stop_reason, missing, poc_log_path, llm_model, created_at, updated_at, "
+           "(failure_analysis->>'confidence') AS confidence, "
+           "(failure_analysis->>'narrative') AS narrative "
+           "FROM build_poc_attempts" + (" WHERE " + " AND ".join(where) if where else "")
+           + " ORDER BY created_at DESC LIMIT %s")
+    params.append(max(1, min(int(limit or 50), 500)))
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, params)
+        rows = [dict(r) for r in cur.fetchall()]
+    return {"ok": True, "engagement_id": eid, "all_engagements": bool(all_engagements),
+            "count": len(rows), "attempts": rows}
+
+
+@app.get("/build-poc/attempts/{run_id}", tags=["Assets"])
+def get_build_poc_attempt(run_id: str, authorized: bool = Depends(auth)):
+    _ensure_build_poc_attempts_table()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM build_poc_attempts WHERE run_id = %s", (run_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "attempt not found")
+    return {"ok": True, "attempt": dict(row)}
+
+
+@app.get("/build-poc/attempts/{run_id}/export/review.md", tags=["Assets"])
+def export_build_poc_attempt_review_md(run_id: str, authorized: bool = Depends(auth)):
+    """review.md for an ATTEMPT (no exploit_store row needed): the same renderer
+    as the exploit-store export, fed from the attempts row + its trace."""
+    _ensure_build_poc_attempts_table()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM build_poc_attempts WHERE run_id = %s", (run_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "attempt not found")
+    a = dict(row)
+    summ = a.get("summary") if isinstance(a.get("summary"), dict) else {}
+    r = {"name": f"Build-PoC attempt {a.get('cve')} on {a.get('ip')}:{a.get('port')} ({a.get('stage_reached')})",
+         "cve": a.get("cve"), "target_host": a.get("ip"), "target_port": a.get("port"),
+         "verified": a.get("verified"), "kind": "attempt", "llm_model": a.get("llm_model"),
+         "built_at": a.get("created_at"),
+         "metadata": {"metrics": {"iterations": (a.get("failure_analysis") or {}).get("iterations")
+                                  if isinstance(a.get("failure_analysis"), dict) else None},
+                      "attempt_run_id": a.get("run_id")}}
+    intel = {"derived_spec": None, "confirmed_facts": [], "captured_credentials": [], "footholds": [],
+             "sqlmap_command": None, "key_trace": [], "full_trace": [], "intel_summary": None}
+    try:
+        key_trace, full_trace = _key_and_full_trace(a.get("poc_log_path"))
+        intel["key_trace"], intel["full_trace"] = key_trace, full_trace
+    except Exception as e:  # noqa: BLE001
+        logging.debug("attempt trace read failed: %s", e)
+    try:
+        if a.get("cve"):
+            _ensure_derived_cve_specs_table()
+            with get_db() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT cve, product, version, vuln_class, spec, verified, status, verify_method, "
+                            "verify_evidence, source, attempts, last_failure, refine_hints, derived_at, last_verified "
+                            "FROM derived_cve_specs WHERE cve=%s", (str(a["cve"]).upper(),))
+                ds = cur.fetchone()
+                intel["derived_spec"] = dict(ds) if ds else None
+    except Exception:  # noqa: BLE001
+        pass
+    body = _render_review_md(r, intel, failure_analysis=a.get("failure_analysis"), live_recon=a.get("live_recon"))
+    base = f"{a.get('cve')}_{a.get('ip')}_{a.get('run_id')}".replace("/", "_")[:120]
+    return Response(content=body, media_type="text/markdown",
+                    headers={"Content-Disposition": f'attachment; filename="{base}-attempt-review.md"'})
 
 
 @app.get("/build-poc/shadow-runs", tags=["Assets"])
@@ -29492,57 +29915,90 @@ def get_derivation_intel(exploit_id: str, authorized: bool = Depends(auth)):
         raise
     except Exception as e:  # noqa: BLE001
         logging.debug("derivation-intel db read failed: %s", e)
-    # 5. key trace entries from the PoC log file. For operator-manual-hint
-    #    purposes (review.md export) we need EVERY recon-bearing phase, not
-    #    the narrow derivation whitelist. Truncation is generous (4000 chars)
-    #    so the gather_manifest + scan_evidence blob survives, and we cap at
-    #    200 entries so a loose refine loop still finishes rendering.
+    # 5. key + full trace from the PoC log file (shared with the attempt export).
     try:
         log_path = row.get("poc_log_path") if row else None
-        if log_path and os.path.exists(log_path):
-            import json as _j
-            # Any phase whose output helps a human continue the attempt.
-            # Phases we intentionally skip because they are internal plumbing:
-            # none right now — include everything the loop emits.
-            full_trace, key_trace = [], []
-            key_phases = {
-                "cve_spec_derivation", "synth_seeded_from_confirmed",
-                "enforced_resolved_ids", "enforced_request_contract",
-                "challenge_building_blocks", "readiness_gate",
-                "recon:access_enumeration", "poc_captured_credentials",
-                "cve_spec_hit", "tool_handoff", "sqlmap_handoff",
-                # Recon/decision phases that carry the data an operator
-                # needs for a manual continuation. Added 2026-10-08.
-                "gather_check", "gather_llm_fallback", "deep_recon",
-                "plan_verify", "strategy", "research",
-                "synth", "run", "refine",
-                "reflection_check", "anti_drift", "canary_anchor_check",
-                "judge_pass",
-            }
-            with open(log_path, encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        rec = _j.loads(line)
-                    except Exception:  # noqa: BLE001
-                        continue
-                    phase = rec.get("phase") or ""
-                    entry = {"phase": phase, "ts": rec.get("ts"),
-                             "iteration": rec.get("iteration"),
-                             "response": (rec.get("response") or "")[:4000],
-                             "extra": _trace_extra(rec)}
-                    full_trace.append(entry)
-                    # key_trace retains the whitelist shape for callers
-                    # that render only a short list (UI panels); the full
-                    # trace is for the review.md export.
-                    if phase in key_phases and len(key_trace) < 200:
-                        key_trace.append(entry)
-                    if len(full_trace) >= 1000:
-                        break
-            out["key_trace"] = key_trace
-            out["full_trace"] = full_trace
+        key_trace, full_trace = _key_and_full_trace(log_path)
+        out["key_trace"] = key_trace
+        out["full_trace"] = full_trace
     except Exception as e:  # noqa: BLE001
         logging.debug("key_trace read failed: %s", e)
+    # 6. failure analysis — from the store row's metadata (node_save_store) or
+    #    the trace's `failure_analysis` entry (older rows / runs saved before
+    #    the analysis ran), plus the attempts row when linked.
+    try:
+        fa = None
+        meta = (row.get("metadata") or {}) if row else {}
+        if isinstance(meta, dict) and isinstance(meta.get("failure_analysis"), dict):
+            fa = meta["failure_analysis"]
+        if fa is None:
+            for t in reversed(out.get("full_trace") or []):
+                if t.get("phase") == "failure_analysis" and isinstance((t.get("extra") or {}).get("failure_analysis"), dict):
+                    fa = t["extra"]["failure_analysis"]
+                    break
+        out["failure_analysis"] = fa
+        run_id = meta.get("attempt_run_id") if isinstance(meta, dict) else None
+        if run_id:
+            _ensure_build_poc_attempts_table()
+            with get_db() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT run_id, stage_reached, stop_reason, missing, verified, created_at, "
+                            "live_recon FROM build_poc_attempts WHERE run_id=%s", (str(run_id),))
+                ar = cur.fetchone()
+                out["attempt"] = dict(ar) if ar else None
+                if ar and ar.get("live_recon") and fa is not None and "recon_inventory" not in fa:
+                    fa["live_recon"] = ar["live_recon"]
+    except Exception as e:  # noqa: BLE001
+        logging.debug("failure_analysis read failed: %s", e)
     return out
+
+
+# Phases whose output helps a human continue the attempt. EMITTED names only —
+# tests/test_build_poc_failure_analysis.py pins this set to the literals passed
+# to _poc_trace. The 2026-10-08 list named phases that are never emitted
+# (plan_verify, strategy, synth, judge_pass, …), so the near-miss judge and the
+# strategist never reached the key trace.
+_KEY_TRACE_PHASES = {
+    "cve_spec_derivation", "synth_seeded_from_confirmed",
+    "enforced_resolved_ids", "enforced_request_contract",
+    "challenge_building_blocks", "readiness_gate",
+    "recon:access_enumeration", "poc_captured_credentials",
+    "tool_handoff", "research", "operator_hint",
+    "recon:strategist", "recon:plan_verified", "recon:auth_establish",
+    "recon:auto_login", "recon:playwright",
+    "gather_check", "gather_llm_fallback", "gather_llm_fallback_error",
+    "gather_llm_fallback_raw", "deep_recon", "deep_recon:solutions", "deep_recon:plan",
+    "synthesize", "run", "refine", "reflection_check", "result",
+    "judge_near_miss", "judge_pass_error", "auto_hint_saved",
+    "failure_analysis", "failure_analysis_error",
+    "synth_skipped_gather_incomplete", "run_refine_skipped_gather_incomplete",
+    "run_refine_skipped_blocked", "run_refine_skipped_artifact_required",
+}
+_KEY_TRACE_PREFIXES = ("node_error:", "deep_recon:", "escalation:")
+
+
+def _key_and_full_trace(log_path, key_cap=200, full_cap=1000):
+    """(key_trace, full_trace) for one run's JSONL. Responses are truncated at
+    4000 chars (the gather manifest + live recon survive); `extra` is recovered
+    through _trace_extra because _poc_trace flattens it."""
+    key_trace, full_trace = [], []
+    if not log_path or not os.path.exists(log_path):
+        return key_trace, full_trace
+    import json as _j
+    with open(log_path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            try:
+                rec = _j.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            phase = str(rec.get("phase") or "")
+            entry = {"phase": phase, "ts": rec.get("ts"), "iteration": rec.get("iteration"),
+                     "response": (rec.get("response") or "")[:4000], "extra": _trace_extra(rec)}
+            full_trace.append(entry)
+            if (phase in _KEY_TRACE_PHASES or phase.startswith(_KEY_TRACE_PREFIXES)) and len(key_trace) < key_cap:
+                key_trace.append(entry)
+            if len(full_trace) >= full_cap:
+                break
+    return key_trace, full_trace
 
 
 @app.post("/exploit-store", tags=["Exploit Store"])
@@ -29959,6 +30415,16 @@ def export_exploit_review_md(exploit_id: str, authorized: bool = Depends(auth)):
         if not row:
             raise HTTPException(404, "exploit not found")
     r = dict(row)
+    body = _render_review_md(r, intel, failure_analysis=intel.get("failure_analysis"))
+    base = _exploit_filename_base(r)
+    return Response(content=body, media_type="text/markdown",
+                    headers={"Content-Disposition": f'attachment; filename="{base}-review.md"'})
+
+
+def _render_review_md(r: dict, intel: dict, failure_analysis=None, live_recon=None) -> str:
+    """The review.md body, shared by the exploit-store export and the
+    build-poc attempt export (which has no store row). `r` is a row-like dict:
+    name/cve/target_host/target_port/verified/kind/llm_model/built_at/metadata."""
     md = r.get("metadata") or {}
     out: list[str] = []
     out.append(f"# Exploit review — {r.get('name') or exploit_id}")
@@ -29984,6 +30450,92 @@ def export_exploit_review_md(exploit_id: str, authorized: bool = Depends(auth)):
             if k in metrics:
                 out.append(f"- `{k}` = {metrics[k]}")
         out.append("")
+    # ─── Failure analysis (end-of-attempt; unverified runs) ──────────────
+    fa = failure_analysis if isinstance(failure_analysis, dict) else None
+    if fa:
+        out.append("## Failure analysis")
+        out.append("")
+        out.append(f"**Stage reached:** `{fa.get('stage_reached')}` · **Stop reason:** `{fa.get('stop_reason')}`"
+                   + (f" · **Iterations:** {fa.get('iterations')}" if fa.get("iterations") else "")
+                   + (f" · **Confidence:** {fa.get('confidence')}" if fa.get("confidence") is not None else "")
+                   + (f" · **LLM:** `{fa.get('llm_model')}`" if fa.get("llm_model") else ""))
+        out.append("")
+        if fa.get("endpoint") or fa.get("method") or fa.get("input_field") or fa.get("vuln_class"):
+            out.append("- **Resolved so far:** "
+                       + ", ".join(f"{k}=`{fa.get(k)}`" for k in ("vuln_class", "endpoint", "method", "input_field") if fa.get(k)))
+            out.append("")
+        if fa.get("narrative"):
+            out.append(str(fa["narrative"]))
+            out.append("")
+        blockers = fa.get("blockers") or []
+        if blockers:
+            out.append(f"### Blockers ({len(blockers)})")
+            out.append("")
+            out.append("| item | why | what the run's own recon found | candidates | manual step |")
+            out.append("|---|---|---|---|---|")
+            for b in blockers:
+                esc = lambda s: str(s or "").replace("|", "\\|").replace("\n", " ")
+                out.append(f"| `{b.get('item')}` | {esc(b.get('why'))[:220]} | {esc(b.get('what_live_recon_found'))[:260]} "
+                           f"| {esc(', '.join(b.get('candidate_values') or []))[:200]} | {esc(b.get('suggested_manual_step'))[:220]} |")
+            out.append("")
+        steps = fa.get("ranked_next_steps") or []
+        if steps:
+            out.append("### Ranked next steps (manual continuation)")
+            out.append("")
+            for i, s in enumerate(steps, 1):
+                if isinstance(s, dict):
+                    out.append(f"{i}. **{s.get('step')}**")
+                    if s.get("why"):
+                        out.append(f"   - why: {s['why']}")
+                    if s.get("how"):
+                        out.append(f"   - how: `{s['how']}`" if "\n" not in str(s["how"]) else f"   - how:\n```\n{s['how']}\n```")
+                else:
+                    out.append(f"{i}. {s}")
+            out.append("")
+        det = fa.get("next_steps_deterministic") or []
+        if det and (not steps or any(isinstance(s, dict) and s.get("why") != "deterministic rule" for s in steps)):
+            out.append("### Rule-based next steps")
+            out.append("")
+            for s in det:
+                out.append(f"- {s}")
+            out.append("")
+        tried = fa.get("tried") or []
+        if tried:
+            out.append(f"### Tried ({len(tried)})")
+            out.append("")
+            out.append("| iter | HTTP | reason | command |")
+            out.append("|---|---|---|---|")
+            for t in tried:
+                out.append(f"| {t.get('iteration')} | {t.get('http_status') or '?'} | {str(t.get('reason') or '').replace('|', '\\|')[:80]} "
+                           f"| `{str(t.get('command_head') or '').replace('|', '\\|')[:140]}` |")
+            out.append("")
+        inv = fa.get("recon_inventory") or {}
+        sess = inv.get("session") or {}
+        if inv:
+            out.append("### Session / recon inventory")
+            out.append("")
+            out.append(f"- **session:** attempted={sess.get('attempted')} method={sess.get('method')} ok={sess.get('ok')} "
+                       f"creds_supplied={sess.get('creds_supplied')}" + (f" — {sess.get('note')}" if sess.get("note") else ""))
+            if inv.get("framework") or inv.get("waf"):
+                out.append(f"- **framework:** {inv.get('framework')} · **waf:** {inv.get('waf')}")
+            if inv.get("open_ports"):
+                out.append(f"- **open ports:** {inv['open_ports']}")
+            if inv.get("params_by_path"):
+                out.append("- **params by path:** " + "; ".join(f"`{p}` → {', '.join(v[:8])}" for p, v in list(inv["params_by_path"].items())[:8]))
+            if inv.get("forms"):
+                out.append("- **forms:** " + "; ".join(f"{f.get('method')} `{f.get('path')}` {f.get('fields')}" for f in inv["forms"][:5]))
+            if inv.get("urls"):
+                out.append(f"- **urls ({len(inv['urls'])}):** " + ", ".join(f"`{u}`" for u in inv["urls"][:20]))
+            out.append("")
+        llm = fa.get("llm") or {}
+        if llm.get("models_used_by_phase") or llm.get("fallback_errors"):
+            out.append("- **LLM telemetry:** models by phase: "
+                       + "; ".join(f"{p}={','.join(m)}" for p, m in list((llm.get("models_used_by_phase") or {}).items())[:10])
+                       + (f" · errors: {len(llm.get('fallback_errors') or [])}" if llm.get("fallback_errors") else ""))
+            for e in (llm.get("fallback_errors") or [])[:6]:
+                out.append(f"  - `{e.get('phase')}`: {str(e.get('detail') or '')[:160]}")
+            out.append("")
+
     research = (md.get("research") or {}) if isinstance(md, dict) else {}
     if research:
         out.append("## Reference-PoC research")
@@ -30075,7 +30627,8 @@ def export_exploit_review_md(exploit_id: str, authorized: bool = Depends(auth)):
     mined = gc_facts.get("mined") or {}
     poc_hints = gc_facts.get("poc_hints") or ""
     prior_runs = gc_facts.get("prior_runs") or []
-    if scan_ev or mined or poc_hints or prior_runs or gc_facts.get("banner"):
+    if (scan_ev or mined or poc_hints or prior_runs or gc_facts.get("banner")
+            or gc_facts.get("live_recon") or live_recon or gc_facts.get("wp_nonces")):
         out.append("## Recon dossier (manual-hint corpus)")
         out.append("")
         out.append("_All recon the pipeline collected on this target. Use these items as "
@@ -30142,6 +30695,34 @@ def export_exploit_review_md(exploit_id: str, authorized: bool = Depends(auth)):
                 out.append(f"- **{k}** ({len(items)}):")
                 for it in items[:15]:
                     out.append(f"  - `{str(it)[:220]}`")
+            out.append("")
+        lr = gc_facts.get("live_recon") or live_recon or {}
+        if any(lr.get(k) for k in ("forms", "crawl_urls", "arjun_params", "verb_sweep", "zap_paths", "classified_params")):
+            out.append("### Live recon (this run)")
+            out.append("")
+            for fm in (lr.get("forms") or [])[:8]:
+                out.append(f"- form `{fm.get('method')} {fm.get('path')}` fields={fm.get('fields')}")
+            for p, names in list((lr.get("arjun_params") or {}).items())[:12]:
+                out.append(f"- arjun `{p}`: {', '.join(names[:15])}" + (f" (+{len(names) - 15})" if len(names) > 15 else ""))
+            for c in (lr.get("classified_params") or [])[:10]:
+                out.append(f"- classified `{c.get('path')}` `{c.get('param')}` → {c.get('class')}" + (f" — {c.get('hint')}" if c.get("hint") else ""))
+            for p, verbs in list((lr.get("verb_sweep") or {}).items())[:12]:
+                out.append(f"- verb sweep `{p}`: " + " ".join(f"{m}:{s}" for m, s in verbs.items()))
+            cu = lr.get("crawl_urls") or []
+            if cu:
+                out.append(f"- crawl urls ({len(cu)}): " + ", ".join(f"`{u}`" for u in cu[:40]) + (" …" if len(cu) > 40 else ""))
+            zp = lr.get("zap_paths") or []
+            if zp:
+                out.append(f"- zap paths ({len(zp)}): " + ", ".join(f"`{u}`" for u in zp[:30]) + (" …" if len(zp) > 30 else ""))
+            out.append("")
+        if gc_facts.get("wp_nonces"):
+            wpn = gc_facts["wp_nonces"]
+            out.append("### WordPress nonces (harvested with the session)")
+            out.append("")
+            for obj, val in list((wpn.get("by_object") or {}).items())[:10]:
+                out.append(f"- `{obj}.nonce` = `{val}`")
+            for t in (wpn.get("tokens") or [])[:12]:
+                out.append(f"- `{t}`")
             out.append("")
         if prior_runs:
             out.append(f"### Prior PoC runs for this CVE ({len(prior_runs)})")
@@ -30212,12 +30793,9 @@ def export_exploit_review_md(exploit_id: str, authorized: bool = Depends(auth)):
                 out.append(f"**extra:** `{json.dumps(extra, default=str)[:2000]}`")
             out.append("")
 
-    if not metrics and not research and not spec and not facts and not creds and not foots and not trace and not manual and not full_tr:
+    if not metrics and not research and not spec and not facts and not creds and not foots and not trace and not manual and not full_tr and not failure_analysis:
         out.append("_No derivation evidence stored for this exploit yet._")
-    base = _exploit_filename_base(r)
-    body = "\n".join(out).rstrip() + "\n"
-    return Response(content=body, media_type="text/markdown",
-                    headers={"Content-Disposition": f'attachment; filename="{base}-review.md"'})
+    return "\n".join(out).rstrip() + "\n"
 
 
 class ManualResearchSearchBody(BaseModel):
