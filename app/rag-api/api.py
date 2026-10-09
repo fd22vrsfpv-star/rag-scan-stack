@@ -16652,7 +16652,13 @@ def _llm_for_model(prompt, model=None, caller="llm", num_predict=1024, temperatu
         except Exception:  # noqa: BLE001
             pass
         return res
-    return llm_generate(prompt, caller=caller, model=model, num_predict=num_predict)
+    # `task=caller` is what makes `llm.route.<caller>` / `llm.reasoning_effort.
+    # <caller>` apply. Without it every routed call was resolved as the
+    # default task "analyze" and `caller` only labelled the metrics row —
+    # 40/40 exploit.* calls answered on gpt-5-mini despite a deepseek route
+    # (2026-10-09 analysis). Callers with no route row still fall through
+    # get_route() to route.default, so nothing else changes.
+    return llm_generate(prompt, caller=caller, model=model, num_predict=num_predict, task=caller)
 
 
 def _new_poc_metrics():
