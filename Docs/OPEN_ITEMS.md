@@ -293,3 +293,20 @@ and `_scan_evidence_for_target` filters by `(engagement_id, cve)` with IP as a
 secondary filter — verified by a run on a reused IP returning only that
 engagement's rows.
 **Enforced by:** not enforced
+
+### `fix/validator-hardening` holds node-provisioning work that was never merged (archived)
+**Found:** 2026-10-09, reviewing every branch for merge-back to main.
+**Evidence:** `git cherry origin/main origin/fix/validator-hardening` lists two
+patches absent from main — `ab04420` "fix(nodes): remote provisioning went from
+10 tools to 139" (node_manager/node_manager.py +292/-70, ssh_manager.py) and
+`2ee4a77` "feat(validator): inventory a real node to validate commands against"
+(knowledge/tool_catalogs*.json +10.6k lines, scripts/inventory-node.sh). Both
+dated 2026-08-15, no PR was ever opened; node_manager.py has changed since.
+Operator decision 2026-10-09: **drop** — keep the branch as an archive, do not
+rebase blind.
+**Where:** `origin/fix/validator-hardening`; `node_manager/node_manager.py`,
+`knowledge/tool_catalogs.json`.
+**Done when:** the remote-provisioning tool count on a fresh node is checked
+against what `ab04420` fixed (10 vs 139 tools) — if the gap still exists, port
+that commit in a reviewed PR; otherwise delete the branch.
+**Enforced by:** not enforced
