@@ -79,6 +79,22 @@ def test_refine_loop_records_its_outcome_on_derived_specs():
     assert helper and "UPDATE derived_cve_specs" in helper and "INSERT" not in helper
 
 
+def test_build_wall_clock_is_unlimited_unless_explicit():
+    """2026-10-09: operator asked for an unlimited build wall clock. Presets must
+    not imply a cap (`eff_wall or 1800/7200` was the old shape) and the BFF
+    proxy must not cut the request at 300 s while rag-api keeps building."""
+    api = API.read_text()
+    assert "eff_wall = eff_wall or 1800" not in api and "eff_wall = eff_wall or 7200" not in api
+    assert "eff_wall = body.wall_timeout_sec if (body.wall_timeout_sec or 0) > 0 else None" in api
+    bff = (REPO / "dashboard" / "bff" / "routers" / "assets.py").read_text()
+    seg = bff[bff.index('"/api/software/build-poc"'):]
+    seg = seg[:seg.index("async with httpx.AsyncClient") + 120]
+    assert "timeout=300" not in seg
+    assert "httpx.Timeout(None, connect=" in seg
+    ui = (REPO / "dashboard" / "frontend" / "src" / "pages" / "ExploitManager.tsx").read_text()
+    assert "useState<'quick'|'deep'|'custom'>('custom')" in ui   # UI default = no preset = no cap
+
+
 def test_scan_evidence_is_engagement_filtered_and_reads_prior_attempts():
     src = _func_src("_scan_evidence_for_target")
     assert src
