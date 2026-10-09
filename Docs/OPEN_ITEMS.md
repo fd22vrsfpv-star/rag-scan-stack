@@ -272,3 +272,48 @@ failed iteration whose first request targets the host, with a trace row saying w
 cannot.
 **Enforced by:** not enforced.
 
+
+### The deep-recon "authenticated crawl" cannot carry a session cookie
+**Found:** 2026-10-09
+**Evidence:** `_deep_recon_for_gaps` (api.py, step `auth_crawl`) passes the
+`_auto_cookie` session into `_playwright_sitemap(ip, port, auth=a, …)`, but that
+helper forwards only `login_url, login_data, username, password` into the
+scanner's `/crawl` body, and `playwright_scanner.CrawlRequest.auth` accepts only
+those four keys — there is no cookie field. A session obtained from mined
+credentials (no username/password in `auth`) is therefore dropped and the
+"authenticated crawl" runs unauthenticated. 20 of 33 CVE-Bench runs on
+2026-10-08/09 took this path; every `deep_recon:auth_crawl` note reads
+"40 urls (unauthenticated crawl)" or forwards the supplied creds only.
+**Where:** `app/rag-api/api.py::_playwright_sitemap`,
+`playwright_scanner/playwright_scanner.py::CrawlRequest` and the `/crawl` handler.
+**Done when:** `CrawlRequest` accepts a `cookie_header` (or `cookies` list) that the
+crawl handler installs via `context.add_cookies()` for the target origin before
+navigation, `_playwright_sitemap` forwards `auth["_auto_cookie"]` /
+`session_info["cookie_header"]` into it, and a build-poc trace shows a
+`deep_recon:auth_crawl` note of "N urls (authenticated crawl)" after a mined-cred
+login with no supplied username.
+**Enforced by:** not enforced
+
+### Scan evidence is keyed by IP; CVE-Bench reuses one IP for every target
+**Found:** 2026-10-09
+**Evidence:** `_scan_evidence_for_target` joins `discovered_params` /
+`web_findings` / `content_extractions` / `ports` to `assets` by `host(a.ip)`.
+Every CVE-Bench container since 2026-10-08 lands on `172.18.0.11`, whose asset row
+has 0 discovered_params, 0 web_findings, 0 content_extractions; the engagement's
+~7,700 findings sit on `172.18.0.32–.37` from 2026-09-27/28, and those asset
+labels are themselves IP-reuse artefacts (`.32` and `.37` both
+`cve-2024-2624-target-1`; `.36` labelled `cve-2024-25641` holds a PHP shop).
+`discovered_params` is `UNIQUE(url_pattern, param_name, http_method,
+param_location)` — `asset_id` is not part of the key — and `url_pattern` carries
+`scheme://netloc`, so a new app on the same IP:port just bumps the old row.
+`build_poc_attempts` (2026-10-09) is the first table keyed `(engagement_id, cve,
+ip, run_id)`; the scan tables are not.
+**Where:** `db_init/ensure_all_tables.sql` (`discovered_params`),
+`etl/parse_katana.py::_upsert_param`, `playwright_scanner/param_extractor.py`,
+`app/rag-api/api.py::_scan_evidence_for_target`.
+**Done when:** `discovered_params` rows carry `engagement_id` (and the unique key
+includes it or the asset), the two writers resolve the engagement at write time,
+and `_scan_evidence_for_target` filters by `(engagement_id, cve)` with IP as a
+secondary filter — verified by a run on a reused IP returning only that
+engagement's rows.
+**Enforced by:** not enforced
