@@ -27946,8 +27946,19 @@ def _build_failure_analysis(run_id, log_path, result, gather_manifest=None, stat
             ro = str(e.get("run_output") or "")
             hm = _re.search(r"HTTP/[\d.]+ (\d{3})", ro)
             isum = it_summ.get(e.get("iteration")) or {}
+            http = int(hm.group(1)) if hm else None
+            if http is None:
+                # curl without -i leaves no status line; the trace summariser
+                # or the run record may still carry one.
+                for cand in (isum.get("http"), isum.get("http_status"), e.get("http_status"), e.get("status_code")):
+                    try:
+                        if cand is not None and str(cand).isdigit():
+                            http = int(cand)
+                            break
+                    except Exception:  # noqa: BLE001
+                        continue
             tried.append({"iteration": e.get("iteration"), "command_head": last_cmd,
-                          "http_status": int(hm.group(1)) if hm else None,
+                          "http_status": http,
                           "reason": str(e.get("reason") or isum.get("status") or "")[:120],
                           "method": e.get("method")})
     tried = tried[:25]
@@ -30590,8 +30601,11 @@ def _render_review_md(r: dict, intel: dict, failure_analysis=None, live_recon=No
             out.append("| iter | HTTP | reason | command |")
             out.append("|---|---|---|---|")
             for t in tried:
-                out.append(f"| {t.get('iteration')} | {t.get('http_status') or '?'} | {str(t.get('reason') or '').replace('|', '\\|')[:80]} "
-                           f"| `{str(t.get('command_head') or '').replace('|', '\\|')[:140]}` |")
+                # No backslashes inside f-string expressions: rag-api runs
+                # Python 3.10 (PEP 701 is 3.12-only).
+                _reason = str(t.get("reason") or "").replace("|", "\\|")[:80]
+                _cmd = str(t.get("command_head") or "").replace("|", "\\|")[:140]
+                out.append(f"| {t.get('iteration')} | {t.get('http_status') or '?'} | {_reason} | `{_cmd}` |")
             out.append("")
         inv = fa.get("recon_inventory") or {}
         sess = inv.get("session") or {}
