@@ -45,10 +45,12 @@ def _undefined_names(path: Path) -> list[str]:
 # Known debt (RATCHET — shrink, never grow). api.py had 29 undefined-name sites
 # when this guard landed: 27 bare `emit_webhook` calls in functions that never
 # import it (each inside try/except, so those webhooks were silently dropped)
-# and an undefined `ip` (2 refs). Recorded in Docs/OPEN_ITEMS.md. A NEW
-# undefined name fails by name even while the count is under the baseline.
-BASELINE_COUNT = {"app/rag-api/api.py": 29}
-BASELINE_NAMES = {"app/rag-api/api.py": {"emit_webhook", "ip"}}
+# and an undefined `ip` (2 refs; fixed 2026-10-09 — `_extract_discovered_facts`
+# now takes `ip=`, which also made tests/test_fstring_placeholders.py green).
+# Recorded in Docs/OPEN_ITEMS.md. A NEW undefined name fails by name even while
+# the count is under the baseline.
+BASELINE_COUNT = {"app/rag-api/api.py": 27}
+BASELINE_NAMES = {"app/rag-api/api.py": {"emit_webhook"}}
 
 
 @pytest.mark.parametrize("rel", FILES)

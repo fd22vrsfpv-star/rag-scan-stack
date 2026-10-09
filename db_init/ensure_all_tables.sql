@@ -1595,6 +1595,35 @@ CREATE TABLE IF NOT EXISTS public.build_poc_attempts (
 );
 CREATE INDEX IF NOT EXISTS ix_bpa_cve_ip ON public.build_poc_attempts(cve, ip, created_at DESC);
 CREATE INDEX IF NOT EXISTS ix_bpa_eng ON public.build_poc_attempts(engagement_id);
+
+-- 2026-10-09: cross-run error memory. One row per FAILING build-PoC iteration:
+-- the normalised error signature, the command that produced it, what the next
+-- command changed and whether a later iteration passed. The refine loop reads
+-- it ACROSS engagements when a build is stuck (web apps answer the same payload
+-- the same way); engagement_id is kept so a purge removes the rows. Runtime
+-- mirror: api.py::_ensure_build_poc_error_memory_table.
+CREATE TABLE IF NOT EXISTS public.build_poc_error_memory (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id uuid,
+    cve text NOT NULL,
+    ip text NOT NULL,
+    port integer,
+    run_id text NOT NULL,
+    iteration integer NOT NULL,
+    signature text NOT NULL,
+    status_tier text,
+    failing_command text,
+    next_command text,
+    next_status text,
+    change_summary text,
+    resolved boolean NOT NULL DEFAULT false,
+    verified boolean NOT NULL DEFAULT false,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (run_id, iteration)
+);
+CREATE INDEX IF NOT EXISTS ix_bpem_sig ON public.build_poc_error_memory(signature);
+CREATE INDEX IF NOT EXISTS ix_bpem_eng ON public.build_poc_error_memory(engagement_id);
+CREATE INDEX IF NOT EXISTS ix_bpem_sig_trgm ON public.build_poc_error_memory USING gin (signature gin_trgm_ops);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_exploit_versions_num ON public.exploit_store_versions(exploit_id, version);
 
 CREATE TABLE IF NOT EXISTS public.security_test_runs (

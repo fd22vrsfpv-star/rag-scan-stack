@@ -336,21 +336,23 @@ its backend within minutes rather than at the 10-min cap, and a
 that cap.
 **Enforced by:** not enforced
 
-### api.py has 29 undefined-name sites (27 bare `emit_webhook` calls, 2 × `ip`)
+### api.py has 27 undefined-name sites (27 bare `emit_webhook` calls)
 **Found:** 2026-10-09, when `tests/test_pyflakes_undefined_names.py` landed after a
 `NameError` on the last line of `_run_refine_poc` turned every completed build
-into an HTTP 500.
+into an HTTP 500. (It found 29; the 2 × `ip` in `_extract_discovered_facts` were
+fixed the same day — the function takes `ip=` now, which also turned
+`tests/test_fstring_placeholders.py` green for the first time.)
 **Evidence:** `python -m pyflakes app/rag-api/api.py | grep "undefined name"` →
 27 × `'emit_webhook'` (functions that call it bare without the local
 `from webhooks import emit_webhook` the other call sites use — each inside a
-`try/except`, so those webhook events have been silently dropped, never raised)
-and 2 × `'ip'` at `api.py:19496`. The guard ratchets at this count
-(`BASELINE_COUNT`); a NEW undefined name fails by name.
+`try/except`, so those webhook events have been silently dropped, never raised).
+The guard ratchets at this count (`BASELINE_COUNT`); a NEW undefined name fails
+by name.
 **Where:** `app/rag-api/api.py` (the 27 `emit_webhook` sites: `grep -n "emit_webhook(" api.py`
-minus the functions that import it; line 19496 for `ip`).
+minus the functions that import it).
 **Done when:** every `emit_webhook` call site has the import in scope (a
 module-level `from webhooks import emit_webhook` if it does not create an import
-cycle, else the local import), the `ip` reference at 19496 is bound, pyflakes
-reports 0 undefined names, and `BASELINE_COUNT["app/rag-api/api.py"]` is 0.
+cycle, else the local import), pyflakes reports 0 undefined names, and
+`BASELINE_COUNT["app/rag-api/api.py"]` is 0.
 **Enforced by:** `tests/test_pyflakes_undefined_names.py` (ratchet; fails on
 growth or on any new name)

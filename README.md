@@ -4,6 +4,22 @@ An open-source **workflow collector for authorized penetration testing and red t
 
 > **Authorized testing only.** This tool is built for engagements you have written permission to perform. Read [Authorized use](#authorized-use) before running it.
 
+> **New (2026-10-09) — Build-PoC remembers errors across builds, and its clocks are yours to set.**
+> Web applications answer the same payload the same way, so every build now
+> records, per failing iteration, the **normalised error it got, the command
+> that produced it, what the next command changed and whether that resolved
+> it** (`build_poc_error_memory`). When a later build is **stuck** — the same
+> status tier twice, a near-duplicate command, or the same error two iterations
+> running — the refine loop looks the error up across *all* prior builds (other
+> CVEs, other targets, other engagements, deliberately; `pg_trgm` similarity)
+> and tells the model what got past it. The matches also land in the failure
+> analysis, the Intel → Failure tab and the review.md (`### Similar errors in
+> other builds`); `GET /build-poc/error-memory?signature=` exposes the lookup.
+> Separately, the build **wall clock is unlimited unless you set it** (presets
+> no longer imply 30 min / 2 h; the dashboard proxy no longer cuts builds at
+> 5 min), and the wall clock, per-command run timeout and deep-recon budget are
+> operator settings under **Settings → Scan timeouts**.
+>
 > **New (2026-10-09) — Build-PoC reads its own recon, logs in with what it found, and explains every failed attempt.**
 > On CVE-Bench, 20 of 33 PoC attempts used to stop at the readiness gate while
 > the run's own recon held the answer. The gather step now consumes **the run's

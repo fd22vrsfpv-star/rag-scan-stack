@@ -19497,7 +19497,7 @@ def _ensure_discovered_app_knowledge_table():
 
 
 def _extract_discovered_facts(command, output, product, version, cve, run_id,
-                                 verified, converged, eid=None):
+                                 verified, converged, eid=None, ip=None):
     """Parse a successful (ran-against-target) iter's command + output into
     structured facts and upsert them under this product. We extract:
       - endpoint URL path (first POST/PUT/PATCH target)
@@ -24567,6 +24567,12 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         s = _re_dup.sub(r"'[a-f0-9]{32,}'", "'{HEX}'", s)       # hex blobs
         return s[:300]
     _stop_reason = None
+    # Cross-run error memory (2026-10-09): one row per iteration, flushed at
+    # the end by _record_error_memory; the refine prompt consults
+    # _similar_prior_errors when the loop is stuck (bounded lookups per build).
+    _err_rows = []
+    _similar_lookups = 0
+    _similar_seen_sigs = set()
     _known_cred_values = []
     try:
         _si = (metrics or {}).get("_session_cookie_header") if isinstance(metrics, dict) else None
@@ -24785,7 +24791,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                 _extract_discovered_facts(command, output, product, version,
                                           cve, run_id,
                                           verified=False, converged=False,
-                                          eid=eid)
+                                          eid=eid, ip=ip)
             except Exception as _edf:  # noqa: BLE001
                 logging.debug("extract discovered facts failed: %s", _edf)
         _this_iter_seconds = round(_t.time() - _r0, 3)
@@ -24802,11 +24808,24 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         success = _verdict["passed"]
         verification_method = _verdict["method"]
         verification_confidence = _verdict["confidence"]
+        # Cross-run error memory: normalise this iteration's error and remember
+        # the command that produced it (the run record used to carry neither).
+        try:
+            _sig_now, _tier_now = (("", "passed") if success
+                                   else _error_signature(output, method=verification_method))
+            _err_rows.append({"iteration": it, "signature": _sig_now, "tier": _tier_now,
+                              "command": (command or "")[:1500],
+                              "status": "PASSED" if success else _tier_now})
+        except Exception as _ese:  # noqa: BLE001
+            _sig_now, _tier_now = "", "other"
+            logging.debug("error signature failed: %s", _ese)
         _poc_trace(run_id, "run", iteration=it, run_output=output, assertion_passed=success,
                    extra={"target_family": list(fam), "drifted": drifted,
                           "method": verification_method,
                           "confidence": verification_confidence,
-                          "reason": _verdict.get("reason", "")})
+                          "reason": _verdict.get("reason", ""),
+                          "command": (command or "")[:600],
+                          "error_signature": _sig_now, "error_tier": _tier_now})
         if not success:
             # 2026-10-07: in-band evidence. CVE-2024-32980's /proxy "returns the
             # response" — the proxied body came back and was never compared
@@ -25015,6 +25034,37 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                            f"YOUR exploit injects (create/write/reflect it via {cve}), then "
                            f"read it back. Do not match a value that could already exist. Keep "
                            f"the exploit aimed at {orig[1] or 'the vulnerable endpoint'}.")
+        # Cross-run error memory (2026-10-09): when this build is STUCK — the
+        # same status tier twice, a near-duplicate command, or the same error
+        # signature on two consecutive iterations — look the current error up
+        # across every prior build and tell the model what changed next in the
+        # builds that got past it. Bounded: 3 lookups per build, one per
+        # distinct signature, 3 matches each. Fail-soft; traced either way.
+        similar_note = ""
+        try:
+            _cur_sig = _err_rows[-1]["signature"] if _err_rows else ""
+            _stuck = bool(_cur_sig) and (
+                _refine_dup_streak >= 1
+                or any(v >= 2 for v in _status_tier_streak.values())
+                or (len(_err_rows) >= 2 and _err_rows[-2]["signature"] == _cur_sig))
+            if _stuck and _similar_lookups < 3 and _cur_sig not in _similar_seen_sigs:
+                _similar_lookups += 1
+                _similar_seen_sigs.add(_cur_sig)
+                _sim_rows = _similar_prior_errors(_cur_sig, cve=cve, ip=ip, exclude_run_id=run_id, limit=3)
+                if _sim_rows:
+                    similar_note = _render_similar_errors_note(_sim_rows)
+                    metrics["refine_similar_errors"] = metrics.get("refine_similar_errors", 0) + 1
+                _poc_trace(run_id, "refine_similar_errors", iteration=it,
+                           response=(similar_note or "no similar prior errors in memory")[:1500],
+                           extra={"signature": _cur_sig,
+                                  "stuck": {"dup_streak": _refine_dup_streak,
+                                            "tier_streak": dict(_status_tier_streak)},
+                                  "matches": [{"run_id": r.get("run_id"), "cve": r.get("cve"),
+                                               "iteration": r.get("iteration"), "resolved": r.get("resolved"),
+                                               "verified": r.get("verified"), "sim": r.get("sim")}
+                                              for r in _sim_rows]})
+        except Exception as _sme:  # noqa: BLE001
+            logging.debug("similar prior errors failed: %s", _sme)
         # WAF-block detection in the run output: if we see a fingerprint from
         # _WAF_FINGERPRINTS in this iteration's output, the WAF just intercepted the
         # payload. Tell the LLM to reach for evasion variants rather than another plain
@@ -25136,7 +25186,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                         + str(gather_facts)[:1500]) if gather_facts else "")
         rprompt = (f"AUTHORIZED lab pentest. The PoC for {cve} on http://{ip}:{port} did NOT "
                    f"succeed.\nCommand: {command}\nOutput:\n{(output or '')[:1500]}{precond}{gather_note}"
-                   f"{shell_syntax_note}{refusal_note}{rag_pattern_notes}{regress_note}{model_switch_note}{path_discovery_note}{waf_hit_note}{escalation_guidance}{anchor_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
+                   f"{shell_syntax_note}{refusal_note}{rag_pattern_notes}{regress_note}{model_switch_note}{path_discovery_note}{waf_hit_note}{similar_note}{escalation_guidance}{anchor_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
                    f"appear. Return ONE JSON object only: {{\"command\": \"<better command, may "
                    f"chain curl calls with ; and shell vars to fetch a token first>\", "
                    f"\"assertion\": {_assert_template}}}. No prose.")
@@ -25332,6 +25382,12 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                          f"drifted={drifted} security_test_id={security_test_id}"))
     _poc_index(cve, ip, run_id, log_path, verified, iters, security_test_id, eid)
     _touch_derived_spec_outcome(cve, verified, (_stop_reason or "max_iters"))
+    # Cross-run error memory: every failing iteration + what the next command
+    # changed + whether it resolved. Future stuck builds look these up.
+    try:
+        metrics["error_memory_rows"] = _record_error_memory(_err_rows, cve, ip, port, eid, run_id, verified)
+    except Exception as _eme:  # noqa: BLE001
+        logging.debug("error memory flush failed: %s", _eme)
 
     # Judge-pass over discarded iterations — ran when the refine loop
     # exhausted (or stopped) without a verified verdict and did real work
@@ -27822,6 +27878,355 @@ def _link_attempt_to_store(run_id, exploit_store_id):
         logging.debug("link attempt→store failed: %s", e)
 
 
+# ─── Cross-run error memory (2026-10-09) ────────────────────────────────────
+# Operator: "web applications act in a similar manner with the same payloads,
+# so we look for similar errors across previous results if it gets stuck."
+# Every build records, per failing iteration, the normalised error it got, the
+# command that produced it, what the NEXT command changed and whether that
+# resolved it. When a later build is stuck (same status tier twice, a near-
+# duplicate command, or the same error twice in a row) the refine loop looks
+# the current error up across ALL prior builds — other CVEs, other targets,
+# other engagements, deliberately — and tells the model what changed next in
+# the builds that got past it. Deterministic, bounded (3 lookups per build,
+# 3 matches per lookup), fail-soft. Rows carry engagement_id so a purge
+# removes them; the lookup reads across engagements because that is the point.
+
+_ERR_SIG_MAX = 160
+
+
+def _error_signature(output, method=None):
+    """Normalise one iteration's run output into (signature, tier). The
+    signature is `<http-code|->|<tier>|<first error-bearing line>` with the
+    per-run values collapsed (URLs, IPs, canaries, hex blobs, every number),
+    so the same application error compares equal across builds. Tier is one
+    of syntax / refusal / probe / waf / 404 / 401 / 403 / 500 / other / empty —
+    or, when the body carries no error of its own (12 of 15 CVE-2024-22120
+    outputs were a bare `0.0074` timing number), the verdict `method`
+    (`latency_too_fast`, `canary_missing`, …), which is where that error lives."""
+    import re as _re
+    s = str(output or "")
+    if not s.strip():
+        return ((f"-|{method}|" if method else ""), (str(method) if method else "empty"))
+    low = s.lower()
+    code = None
+    mm = (_re.search(r"http/[\d.]+\s+(\d{3})", low)
+          or _re.search(r"\b(?:status|http)[=: ]+(\d{3})\b", low))
+    if mm:
+        code = mm.group(1)
+    tier = "other"
+    waf_needles = [n for n, _n, _f in (globals().get("_WAF_FINGERPRINTS") or ())]
+    if "/bin/sh:" in s or "syntax error" in low[:300]:
+        tier = "syntax"
+    elif s.lstrip().startswith("REFUSE") or "i cannot provide" in low[:300]:
+        tier = "refusal"
+    elif s.lstrip().startswith("PRERUN_PROBE_FAIL"):
+        tier = "probe"
+    elif any(n and n.lower() in low for n in waf_needles) or "网站防火墙" in s or "blocked by" in low:
+        tier = "waf"
+    elif code == "404" or "404 not found" in low:
+        tier = "404"
+    elif code == "401" or "401 unauthorized" in low:
+        tier = "401"
+    elif code == "403" or "403 forbidden" in low:
+        tier = "403"
+    elif (code or "").startswith("5") or "internal server error" in low or "fatal error" in low:
+        tier = "500"
+    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+    pats = [r'"(?:message|error|msg|detail|errors?|reason)"\s*:\s*"[^"]{0,200}"',
+            r"<title>[^<]{1,120}</title>",
+            r"(?i)(?:fatal error|warning:|exception|\berror\b|denied|forbidden|not found|unauthori[sz]ed|"
+            r"invalid|blocked|unsuccessful|failed|refused|rejected|csrf|token|login|expired)"]
+    pick = None
+    for i, p in enumerate(pats):
+        for ln in lines:
+            m = _re.search(p, ln)
+            if m:
+                pick = m.group(0) if i < 2 else ln
+                break
+        if pick:
+            break
+    if pick is None:
+        pick = next((ln for ln in lines if not _re.fullmatch(r"[\d.]+", ln)), lines[0])
+    sig = pick.lower()
+    sig = _re.sub(r"https?://\S+", "{url}", sig)
+    sig = _re.sub(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", "{ip}", sig)
+    sig = _re.sub(r"poc[a-z0-9]{6,}", "{canary}", sig)      # real canaries look like POCz0d38270d93
+    sig = _re.sub(r"[a-f0-9]{16,}", "{hex}", sig)
+    sig = _re.sub(r"\d+", "{n}", sig)
+    sig = _re.sub(r"\s+", " ", sig).strip()
+    if tier == "other" and method:
+        tier = str(method)[:40]
+    return (f"{code or '-'}|{tier}|{sig}"[:_ERR_SIG_MAX], tier)
+
+
+def _command_change_summary(prev_cmd, next_cmd):
+    """Human-readable, deterministic diff of what the NEXT command changed
+    relative to the failing one: path, method, headers added, token fetch
+    added, query/body param names added, encoding, tool. Pure."""
+    import re as _re
+    a, b = str(prev_cmd or ""), str(next_cmd or "")
+    if not b.strip():
+        return "no next command"
+    if a.strip() == b.strip():
+        return "identical command"
+    out = []
+
+    def _url(c):
+        m = _re.search(r"https?://([^/\s'\"]+)(/[^\s'\"?]*)?(\?[^\s'\"]*)?", c)
+        return (m.group(1) or "", m.group(2) or "/", m.group(3) or "") if m else ("", "", "")
+
+    ha, pa, qa = _url(a)
+    hb, pb, qb = _url(b)
+    if pa != pb and (pa or pb):
+        out.append(f"path {pa or '/'} → {pb or '/'}")
+
+    def _method(c):
+        m = _re.search(r"-X\s*['\"]?([A-Z]+)", c)
+        if m:
+            return m.group(1)
+        return "POST" if _re.search(r"(^|\s)(-d|--data|--data-raw|--data-binary|--data-urlencode|-F)\b", c) else "GET"
+
+    ma, mb = _method(a), _method(b)
+    if ma != mb:
+        out.append(f"method {ma} → {mb}")
+
+    def _headers(c):
+        return {h.split(":", 1)[0].strip().lower() for h in _re.findall(r"-H\s*['\"]([^'\"]+)['\"]", c)}
+
+    added_h = sorted(_headers(b) - _headers(a))
+    if added_h:
+        out.append("added header " + ", ".join(added_h[:4]))
+    if "$(curl" in b and "$(curl" not in a:
+        out.append("added inline token/cookie fetch")
+    if ("-c " in b or "--cookie-jar" in b) and not ("-c " in a or "--cookie-jar" in a):
+        out.append("added cookie jar")
+
+    def _params(c):
+        names = set(_re.findall(r"[?&]([A-Za-z_][\w\[\]]*)=", c))
+        for body in _re.findall(r"(?:-d|--data|--data-raw|--data-urlencode)\s*['\"]([^'\"]*)['\"]", c):
+            names |= set(_re.findall(r"(?:^|&)([A-Za-z_][\w\[\]]*)=", body))
+        return names
+
+    added_p = sorted(_params(b) - _params(a))
+    if added_p:
+        out.append("added param " + ", ".join(added_p[:5]))
+    if ("--data-urlencode" in b or "%27" in b or "%20" in b) and not ("--data-urlencode" in a or "%27" in a or "%20" in a):
+        out.append("url-encoded payload")
+    _KNOWN_TOOLS = ("curl", "wget", "python3", "python", "php", "perl", "ruby", "nc", "ncat", "socat",
+                    "sqlmap", "nmap", "nuclei", "ffuf", "gobuster", "openssl", "msfconsole", "bash", "sh")
+
+    def _tools(c):
+        return {t for t in _KNOWN_TOOLS if _re.search(rf"(?:^|[\s;|&(])\b{t}\b", c)}
+
+    tools_a, tools_b = _tools(a), _tools(b)
+    if tools_b - tools_a:
+        out.append("added tool " + ", ".join(sorted(tools_b - tools_a)))     # names only — never the raw prefix
+    if not out:
+        out.append("payload value changed (same endpoint/method/params)")
+    return "; ".join(out)[:240]
+
+
+def _ensure_build_poc_error_memory_table():
+    """Runtime mirror of db_init/ensure_all_tables.sql (same pattern as
+    _ensure_build_poc_attempts_table). The trigram index is best-effort."""
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS public.build_poc_error_memory (
+                id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                engagement_id uuid,
+                cve text NOT NULL,
+                ip text NOT NULL,
+                port integer,
+                run_id text NOT NULL,
+                iteration integer NOT NULL,
+                signature text NOT NULL,
+                status_tier text,
+                failing_command text,
+                next_command text,
+                next_status text,
+                change_summary text,
+                resolved boolean NOT NULL DEFAULT false,
+                verified boolean NOT NULL DEFAULT false,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                UNIQUE (run_id, iteration))""")
+            cur.execute("CREATE INDEX IF NOT EXISTS ix_bpem_sig ON public.build_poc_error_memory(signature)")
+            cur.execute("CREATE INDEX IF NOT EXISTS ix_bpem_eng ON public.build_poc_error_memory(engagement_id)")
+            conn.commit()
+            try:
+                cur.execute("CREATE INDEX IF NOT EXISTS ix_bpem_sig_trgm ON public.build_poc_error_memory "
+                            "USING gin (signature gin_trgm_ops)")
+                conn.commit()
+            except Exception:  # noqa: BLE001 — pg_trgm absent: exact match still works
+                conn.rollback()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("ensure build_poc_error_memory failed: %s", e)
+
+
+def _redact_command_for_memory(cmd):
+    import re as _re
+    s = str(cmd or "")
+    s = _re.sub(r"(?i)(cookie:\s*)[^'\"]+", r"\1REDACTED", s)
+    s = _re.sub(r"(?i)(authorization:\s*)[^'\"]+", r"\1REDACTED", s)
+    s = _re.sub(r"(?i)(?<![\w-])(-b|--cookie)(\s+|=)(['\"]?)[^'\"\s]+", r"\1\2\3REDACTED", s)   # curl -b 'name=value'
+    s = _re.sub(r"(?i)\b(password|passwd|pwd|pass|token|_wpnonce|nonce|api_key|apikey|secret)=([^&\s'\"]+)",
+                r"\1=REDACTED", s)
+    s = _re.sub(r"(?i)\b([a-z_]*sess(?:ion)?[a-z_]*|sid|phpsessid|jsessionid|csrf[a-z_]*)=([^;&\s'\"]+)",
+                r"\1=REDACTED", s)
+    return s[:1500]
+
+
+def _record_error_memory(rows, cve, ip, port, eid, run_id, verified):
+    """Flush the per-iteration rows the refine loop collected into
+    build_poc_error_memory. `rows` is the loop's ordered list of
+    {iteration, signature, tier, command, status}; a row is stored for every
+    FAILING iteration with the next iteration's command/status and whether any
+    later iteration passed. Returns the number of rows written. Fail-soft."""
+    rows = [r for r in (rows or []) if isinstance(r, dict)]
+    if not rows:
+        return 0
+    _ensure_build_poc_error_memory_table()
+    written = 0
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("SET LOCAL lock_timeout = '5s'")
+            for i, r in enumerate(rows):
+                if r.get("status") == "PASSED" or not r.get("signature"):
+                    continue
+                nxt = rows[i + 1] if i + 1 < len(rows) else None
+                resolved = any(x.get("status") == "PASSED" for x in rows[i + 1:])
+                _pc = _redact_command_for_memory(r.get("command"))
+                _nc = _redact_command_for_memory(nxt.get("command")) if nxt else None
+                cur.execute("""INSERT INTO build_poc_error_memory
+                    (engagement_id, cve, ip, port, run_id, iteration, signature, status_tier,
+                     failing_command, next_command, next_status, change_summary, resolved, verified)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (run_id, iteration) DO UPDATE SET
+                        next_command = EXCLUDED.next_command, next_status = EXCLUDED.next_status,
+                        change_summary = EXCLUDED.change_summary, resolved = EXCLUDED.resolved,
+                        verified = EXCLUDED.verified""",
+                    (str(eid) if eid else None, str(cve).upper(), str(ip), int(port) if port else None,
+                     str(run_id), int(r.get("iteration") or 0), str(r.get("signature"))[:_ERR_SIG_MAX],
+                     str(r.get("tier") or "other"), _pc, _nc,
+                     (nxt.get("status") if nxt else None),
+                     _command_change_summary(_pc, _nc) if nxt else None,
+                     bool(resolved), bool(verified)))
+                written += 1
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("record error memory cve=%s run=%s failed: %s", cve, run_id, e)
+        return written
+    try:
+        _poc_trace(run_id, "error_memory_recorded", response=f"{written} failing iteration(s) recorded",
+                   extra={"rows": written, "verified": bool(verified)})
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("build_poc_error_memory_recorded", "build_poc", {
+            "engagement_id": str(eid) if eid else None, "cve": str(cve).upper(), "target": f"{ip}:{port}",
+            "run_id": str(run_id), "rows": written, "verified": bool(verified)})
+    except Exception:  # noqa: BLE001
+        pass
+    return written
+
+
+def _similar_prior_errors(signature, cve=None, ip=None, exclude_run_id=None, limit=3, min_similarity=0.55):
+    """Prior builds that hit the same (or a trigram-similar) error. Reads ACROSS
+    engagements by design — the memory is methodology, the point is that the
+    other target answered the same payload the same way. Ranked: resolved
+    first, then verified, then same CVE, then similarity, then recency. Exact
+    match only when pg_trgm is unavailable."""
+    sig = str(signature or "")[:_ERR_SIG_MAX]
+    if not sig:
+        return []
+    _ensure_build_poc_error_memory_table()
+    cols = ("cve, ip, port, run_id, iteration, signature, status_tier, failing_command, next_command, "
+            "next_status, change_summary, resolved, verified, created_at")
+    lim = max(1, min(int(limit or 3), 20))
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(f"""SELECT {cols}, similarity(signature, %s) AS sim
+                    FROM build_poc_error_memory
+                    WHERE run_id <> %s AND (signature = %s OR similarity(signature, %s) >= %s)
+                    ORDER BY resolved DESC, verified DESC, (cve = %s) DESC,
+                             (next_command IS NOT NULL) DESC, sim DESC, created_at DESC
+                    LIMIT %s""",
+                    (sig, str(exclude_run_id or ""), sig, sig, float(min_similarity),
+                     str(cve or "").upper(), lim))
+            except Exception:  # noqa: BLE001 — no pg_trgm: exact match
+                conn.rollback()
+                cur.execute(f"""SELECT {cols}, 1.0 AS sim FROM build_poc_error_memory
+                    WHERE run_id <> %s AND signature = %s
+                    ORDER BY resolved DESC, verified DESC, (cve = %s) DESC,
+                             (next_command IS NOT NULL) DESC, created_at DESC
+                    LIMIT %s""", (str(exclude_run_id or ""), sig, str(cve or "").upper(), lim))
+            rows = [dict(r) for r in cur.fetchall()]
+    except Exception as e:  # noqa: BLE001
+        logging.debug("similar prior errors lookup failed: %s", e)
+        return []
+    for r in rows:
+        if r.get("created_at") is not None:
+            r["created_at"] = str(r["created_at"])
+        if r.get("sim") is not None:
+            r["sim"] = round(float(r["sim"]), 3)
+    return rows
+
+
+def _render_similar_errors_note(rows, max_rows=3):
+    """Refine-prompt block from _similar_prior_errors rows. Pure."""
+    rows = [r for r in (rows or []) if isinstance(r, dict)][:max_rows]
+    if not rows:
+        return ""
+    lines = ["\nSIMILAR ERRORS SEEN IN OTHER BUILDS (web apps answer the same payload the same way; "
+             "this is what changed NEXT in those builds and whether it worked):"]
+    for r in rows:
+        tag = "RESOLVED" + ("→verified" if r.get("verified") else "") if r.get("resolved") else "not resolved"
+        sig_tail = str(r.get("signature") or "").split("|", 2)[-1][:90]
+        nxt = r.get("next_status") or "n/a"
+        lines.append(f"  - [{r.get('cve')} on {r.get('ip')}:{r.get('port')} iter {r.get('iteration')}, {tag}] "
+                     f"same error \"{sig_tail}\" → next command changed: {r.get('change_summary') or 'n/a'} "
+                     f"→ next status: {nxt}")
+        if r.get("resolved") and r.get("next_command"):
+            lines.append(f"      next command (adapt host/path/param to THIS target): {str(r['next_command'])[:220]}")
+    lines.append("  Apply the change that got past this error (adapted to this target); do NOT repeat the ones that did not.")
+    return "\n".join(lines)
+
+
+@app.get("/build-poc/error-memory", tags=["Assets"])
+def list_build_poc_error_memory(signature: Optional[str] = None, cve: Optional[str] = None,
+                                ip: Optional[str] = None, engagement_id: Optional[str] = None,
+                                all_engagements: bool = False, limit: int = 50,
+                                authorized: bool = Depends(auth)):
+    """Cross-run error memory. With `signature`, returns the trigram-similar
+    rows the refine loop would inject (cross-engagement by design, labelled
+    `scope: similar_lookup`). Without it, a plain listing that honours
+    X-Engagement-Id (NULL-engagement rows stay visible) unless
+    `all_engagements=true`."""
+    _ensure_build_poc_error_memory_table()
+    eid = _resolve_engagement_id(engagement_id)
+    if signature:
+        rows = _similar_prior_errors(signature, cve=cve, ip=ip, exclude_run_id=None, limit=limit)
+        return {"ok": True, "scope": "similar_lookup", "engagement_id": eid, "all_engagements": True,
+                "count": len(rows), "rows": rows}
+    where, params = [], []
+    if cve:
+        where.append("cve = %s"); params.append(cve.upper())
+    if ip:
+        where.append("ip = %s"); params.append(str(ip))
+    if eid and not all_engagements:
+        where.append("(engagement_id = %s OR engagement_id IS NULL)"); params.append(str(eid))
+    sql = ("SELECT id, engagement_id, cve, ip, port, run_id, iteration, signature, status_tier, "
+           "next_status, change_summary, resolved, verified, created_at FROM build_poc_error_memory"
+           + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY created_at DESC LIMIT %s")
+    params.append(max(1, min(int(limit or 50), 500)))
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, params)
+        rows = [dict(r) for r in cur.fetchall()]
+    return {"ok": True, "scope": "all_engagements" if all_engagements else "engagement",
+            "engagement_id": eid, "all_engagements": bool(all_engagements), "count": len(rows), "rows": rows}
+
+
 _FA_STAGES = ("recon", "gather", "synth", "run", "refine", "verified", "crash")
 
 
@@ -28040,8 +28445,29 @@ def _build_failure_analysis(run_id, log_path, result, gather_manifest=None, stat
         last = tried[-1]
         steps.append(f"Last attempt (iter {last.get('iteration')}) returned HTTP {last.get('http_status')} — {last.get('reason') or 'no canary/anchor'}; start from `{last.get('command_head')}`")
 
+    # ── similar errors in other builds (cross-run error memory) ───────────
+    # From the LAST failing iteration's signature (the run record carries it
+    # since 2026-10-09). Cross-engagement by design; bounded to 5 rows.
+    similar = []
+    try:
+        _last_sig = next((_trace_extra(e).get("error_signature") for e in reversed(entries)
+                          if e.get("phase") == "run" and not e.get("assertion_passed")
+                          and _trace_extra(e).get("error_signature")), None)
+        if _last_sig:
+            for r in _similar_prior_errors(_last_sig, cve=result.get("cve"), exclude_run_id=run_id, limit=5):
+                similar.append({k: r.get(k) for k in (
+                    "cve", "ip", "port", "run_id", "iteration", "status_tier", "change_summary",
+                    "next_status", "resolved", "verified", "sim", "failing_command", "next_command")})
+            for r in similar:
+                if r.get("resolved") and r.get("change_summary"):
+                    steps.insert(0, f"Same error was resolved in {r.get('cve')} (run {str(r.get('run_id'))[:12]}…) by: "
+                                    f"{r['change_summary']}" + (" → verified" if r.get("verified") else ""))
+                    break
+    except Exception as _sfe:  # noqa: BLE001
+        logging.debug("failure analysis similar errors failed: %s", _sfe)
     return {
         "schema": 1, "run_id": run_id, "stage_reached": stage, "stop_reason": stop,
+        "similar_prior_errors": similar,
         "verified": bool(result.get("verified")), "iterations": int(result.get("iterations") or 0),
         "missing": missing, "endpoint": endpoint, "method": facts.get("method"),
         "input_field": facts.get("input_field"), "vuln_class": man.get("vuln_class"),
@@ -30106,6 +30532,7 @@ _KEY_TRACE_PHASES = {
     "synthesize", "run", "refine", "reflection_check", "result",
     "judge_near_miss", "judge_pass_error", "auto_hint_saved",
     "failure_analysis", "failure_analysis_error",
+    "refine_similar_errors", "error_memory_recorded",
     "synth_skipped_gather_incomplete", "run_refine_skipped_gather_incomplete",
     "run_refine_skipped_blocked", "run_refine_skipped_artifact_required",
 }
@@ -30664,6 +31091,32 @@ def _render_review_md(r: dict, intel: dict, failure_analysis=None, live_recon=No
             out.append("- **Resolved so far:** "
                        + ", ".join(f"{k}=`{fa.get(k)}`" for k in ("vuln_class", "endpoint", "method", "input_field") if fa.get(k)))
             out.append("")
+        # Cross-run error memory: the same error in OTHER builds and what got past it.
+        sim_rows = [r for r in (fa.get("similar_prior_errors") or []) if isinstance(r, dict)]
+        if sim_rows:
+            out.append("### Similar errors in other builds (cross-run error memory)")
+            out.append("")
+            out.append("Web apps answer the same payload the same way — these builds hit the same error "
+                       "as the last failing iteration here; `what changed next` is what their next command did.")
+            out.append("")
+            out.append("| build | iter | tier | what changed next | next status | resolved | sim |")
+            out.append("|---|---|---|---|---|---|---|")
+            for r in sim_rows[:5]:
+                out.append(f"| {r.get('cve')} on {r.get('ip')}:{r.get('port')} (`{str(r.get('run_id'))[:14]}`) "
+                           f"| {r.get('iteration')} | {r.get('status_tier') or ''} "
+                           f"| {str(r.get('change_summary') or '').replace('|', '/')} | {r.get('next_status') or ''} "
+                           f"| {'yes' + (' → verified' if r.get('verified') else '') if r.get('resolved') else 'no'} "
+                           f"| {r.get('sim') if r.get('sim') is not None else ''} |")
+            out.append("")
+            for r in sim_rows[:5]:
+                if r.get("resolved") and r.get("next_command"):
+                    out.append(f"- Command that got past it in {r.get('cve')}:")
+                    out.append("")
+                    out.append("```bash")
+                    out.append(str(r["next_command"])[:1200])
+                    out.append("```")
+                    out.append("")
+                    break
         if fa.get("narrative"):
             out.append(str(fa["narrative"]))
             out.append("")
