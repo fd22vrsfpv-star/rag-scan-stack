@@ -28799,34 +28799,54 @@ def get_derivation_intel(exploit_id: str, authorized: bool = Depends(auth)):
         raise
     except Exception as e:  # noqa: BLE001
         logging.debug("derivation-intel db read failed: %s", e)
-    # 5. key trace entries from the PoC log file
+    # 5. key trace entries from the PoC log file. For operator-manual-hint
+    #    purposes (review.md export) we need EVERY recon-bearing phase, not
+    #    the narrow derivation whitelist. Truncation is generous (4000 chars)
+    #    so the gather_manifest + scan_evidence blob survives, and we cap at
+    #    200 entries so a loose refine loop still finishes rendering.
     try:
         log_path = row.get("poc_log_path") if row else None
         if log_path and os.path.exists(log_path):
             import json as _j
+            # Any phase whose output helps a human continue the attempt.
+            # Phases we intentionally skip because they are internal plumbing:
+            # none right now — include everything the loop emits.
+            full_trace, key_trace = [], []
             key_phases = {
                 "cve_spec_derivation", "synth_seeded_from_confirmed",
                 "enforced_resolved_ids", "enforced_request_contract",
                 "challenge_building_blocks", "readiness_gate",
                 "recon:access_enumeration", "poc_captured_credentials",
                 "cve_spec_hit", "tool_handoff", "sqlmap_handoff",
+                # Recon/decision phases that carry the data an operator
+                # needs for a manual continuation. Added 2026-10-08.
+                "gather_check", "gather_llm_fallback", "deep_recon",
+                "plan_verify", "strategy", "research",
+                "synth", "run", "refine",
+                "reflection_check", "anti_drift", "canary_anchor_check",
+                "judge_pass",
             }
-            trace = []
             with open(log_path, encoding="utf-8") as f:
                 for line in f:
                     try:
                         rec = _j.loads(line)
                     except Exception:  # noqa: BLE001
                         continue
-                    phase = rec.get("phase")
-                    if phase in key_phases:
-                        trace.append({"phase": phase, "ts": rec.get("ts"),
-                                      "iteration": rec.get("iteration"),
-                                      "response": (rec.get("response") or "")[:600],
-                                      "extra": rec.get("extra") or {}})
-                        if len(trace) >= 40:
-                            break
-            out["key_trace"] = trace
+                    phase = rec.get("phase") or ""
+                    entry = {"phase": phase, "ts": rec.get("ts"),
+                             "iteration": rec.get("iteration"),
+                             "response": (rec.get("response") or "")[:4000],
+                             "extra": rec.get("extra") or {}}
+                    full_trace.append(entry)
+                    # key_trace retains the whitelist shape for callers
+                    # that render only a short list (UI panels); the full
+                    # trace is for the review.md export.
+                    if phase in key_phases and len(key_trace) < 200:
+                        key_trace.append(entry)
+                    if len(full_trace) >= 1000:
+                        break
+            out["key_trace"] = key_trace
+            out["full_trace"] = full_trace
     except Exception as e:  # noqa: BLE001
         logging.debug("key_trace read failed: %s", e)
     return out
@@ -29345,6 +29365,103 @@ def export_exploit_review_md(exploit_id: str, authorized: bool = Depends(auth)):
         out.append(str(intel["sqlmap_command"]))
         out.append("```")
         out.append("")
+    # ─── Recon dossier ────────────────────────────────────────────────────
+    # Everything the pipeline saw on the target that an operator could use
+    # for a manual continuation: scan_evidence (discovered_params / web
+    # findings / content extractions / banner / prior runs), mined paths/
+    # fields/methods/headers, operator-authored poc_hints. Pulled from the
+    # last gather_check entry's `extra.gather_manifest.facts` so this stays
+    # in sync with what synth actually saw via guidance_extra.
+    full_tr = intel.get("full_trace") or intel.get("key_trace") or []
+    _gc_entries = [t for t in full_tr if t.get("phase") == "gather_check"]
+    gc_facts = {}
+    if _gc_entries:
+        _last_gc = _gc_entries[-1]
+        gc_facts = ((_last_gc.get("extra") or {}).get("gather_manifest") or {}).get("facts") or {}
+    scan_ev = gc_facts.get("scan_evidence") or {}
+    mined = gc_facts.get("mined") or {}
+    poc_hints = gc_facts.get("poc_hints") or ""
+    prior_runs = gc_facts.get("prior_runs") or []
+    if scan_ev or mined or poc_hints or prior_runs or gc_facts.get("banner"):
+        out.append("## Recon dossier (manual-hint corpus)")
+        out.append("")
+        out.append("_All recon the pipeline collected on this target. Use these items as "
+                   "the starting point for a manual continuation if the auto-run stalled._")
+        out.append("")
+        if gc_facts.get("endpoint") or gc_facts.get("method") or gc_facts.get("input_field"):
+            out.append("### Gather-resolved facts")
+            out.append("")
+            for k in ("endpoint", "method", "input_field", "banner", "needs_id"):
+                if gc_facts.get(k):
+                    out.append(f"- **{k}:** `{gc_facts[k]}`")
+            out.append("")
+        if mined:
+            out.append("### Mined from advisory / derived vector")
+            out.append("")
+            for k in ("paths", "methods", "fields", "headers"):
+                if mined.get(k):
+                    out.append(f"- **{k}:** `{mined[k]}`")
+            out.append("")
+        if poc_hints:
+            out.append("### Operator-authored PoC hints")
+            out.append("")
+            out.append("```")
+            out.append(str(poc_hints))
+            out.append("```")
+            out.append("")
+        dps = scan_ev.get("discovered_params") or []
+        if dps:
+            out.append(f"### discovered_params ({len(dps)}) — Katana/ZAP-walked")
+            out.append("")
+            out.append("| method | url_pattern | param | location | sample_values | source |")
+            out.append("|---|---|---|---|---|---|")
+            for dp in dps:
+                samp = ",".join(str(x) for x in (dp.get("sample_values") or []))[:120]
+                out.append(f"| `{(dp.get('http_method') or '?').upper()}` "
+                           f"| `{dp.get('url_pattern') or ''}` | `{dp.get('param_name') or ''}` "
+                           f"| {dp.get('param_location') or ''} | {samp} "
+                           f"| {dp.get('discovery_source') or ''} |")
+            out.append("")
+        wfs = scan_ev.get("web_findings") or []
+        if wfs:
+            out.append(f"### web_findings ({len(wfs)}) — ZAP/Nuclei/manual hits on this (ip,port)")
+            out.append("")
+            out.append("| source | method | url | cwe | name | status | payload |")
+            out.append("|---|---|---|---|---|---|---|")
+            for wf in wfs:
+                cwes = ",".join(wf.get("cwe") or []) or "-"
+                payload = (str(wf.get("payload") or "")).replace("|", "\\|").replace("\n", " ")[:160]
+                out.append(f"| {wf.get('source') or '?'} | `{(wf.get('method') or '?').upper()}` "
+                           f"| `{wf.get('url') or ''}` | {cwes} "
+                           f"| {(wf.get('name') or wf.get('issue_type') or '')[:60]} "
+                           f"| {wf.get('status_code') or '?'} | `{payload}` |")
+            out.append("")
+        content = scan_ev.get("content") or {}
+        if any(content.get(k) for k in ("api_endpoints", "hidden_inputs", "login_pages",
+                                        "interesting_files", "internal_paths", "tech_indicators")):
+            out.append("### content_extractions (playwright/content-extractor)")
+            out.append("")
+            for k in ("api_endpoints", "hidden_inputs", "login_pages", "interesting_files",
+                      "internal_paths", "tech_indicators"):
+                items = content.get(k) or []
+                if not items:
+                    continue
+                out.append(f"- **{k}** ({len(items)}):")
+                for it in items[:15]:
+                    out.append(f"  - `{str(it)[:220]}`")
+            out.append("")
+        if prior_runs:
+            out.append(f"### Prior PoC runs for this CVE ({len(prior_runs)})")
+            out.append("")
+            out.append("| created_at | iter | phase | passed | run snip |")
+            out.append("|---|---|---|---|---|")
+            for pr in prior_runs:
+                snip = (str(pr.get("run_snip") or "")).replace("|", "\\|").replace("\n", " ")[:180]
+                passed = "✓" if pr.get("passed") else ("✗" if pr.get("passed") is False else "?")
+                out.append(f"| {pr.get('created_at') or ''} | {pr.get('iteration') or '?'} "
+                           f"| {pr.get('phase') or ''} | {passed} | `{snip}` |")
+            out.append("")
+
     trace = intel.get("key_trace") or []
     if trace:
         out.append(f"## Agent decisions — key trace phases ({len(trace)})")
@@ -29355,12 +29472,12 @@ def export_exploit_review_md(exploit_id: str, authorized: bool = Depends(auth)):
             if resp:
                 out.append("")
                 out.append("```")
-                out.append(resp[:600])
+                out.append(resp[:4000])
                 out.append("```")
             extra = t.get("extra") or {}
             if extra:
                 out.append("")
-                out.append(f"**extra:** `{json.dumps(extra, default=str)[:600]}`")
+                out.append(f"**extra:** `{json.dumps(extra, default=str)[:2000]}`")
             out.append("")
     manual = (md.get("manual_research_queries") or []) if isinstance(md, dict) else []
     if manual:
@@ -29378,7 +29495,31 @@ def export_exploit_review_md(exploit_id: str, authorized: bool = Depends(auth)):
                     out.append(f"- **{h.get('title') or '?'}** (sim={h.get('similarity')}) "
                                f"— {(h.get('text') or '')[:160]}…")
             out.append("")
-    if not metrics and not research and not spec and not facts and not creds and not foots and not trace and not manual:
+    # Full PoC trace — every phase emitted during this run, no whitelist.
+    # Last section because it's long; always rendered so an operator doing a
+    # manual continuation has the complete timeline without needing to crack
+    # open the JSONL log file inside the container.
+    if full_tr:
+        out.append(f"## Full PoC trace ({len(full_tr)} entries)")
+        out.append("")
+        out.append("_Every phase the pipeline emitted, in order. Response bodies truncated to "
+                   "4000 chars; the raw JSONL lives at `poc_log_path` inside rag-api._")
+        out.append("")
+        for t in full_tr:
+            out.append(f"### `{t.get('phase') or '?'}` — iter {t.get('iteration') or '?'} — {t.get('ts') or ''}")
+            resp = (t.get("response") or "").strip()
+            if resp:
+                out.append("")
+                out.append("```")
+                out.append(resp[:4000])
+                out.append("```")
+            extra = t.get("extra") or {}
+            if extra:
+                out.append("")
+                out.append(f"**extra:** `{json.dumps(extra, default=str)[:2000]}`")
+            out.append("")
+
+    if not metrics and not research and not spec and not facts and not creds and not foots and not trace and not manual and not full_tr:
         out.append("_No derivation evidence stored for this exploit yet._")
     base = _exploit_filename_base(r)
     body = "\n".join(out).rstrip() + "\n"
