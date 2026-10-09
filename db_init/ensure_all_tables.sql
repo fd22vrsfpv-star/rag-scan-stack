@@ -2618,13 +2618,21 @@ CREATE TRIGGER trg_app_settings_updated
 -- its SELECT on `category = 'config'` and silently drops rows under any other
 -- category (caught post-apply when the live settings showed azure-main
 -- defaults even after these rows were in the table).
+-- Route keys are the CALLER names _llm_for_model passes as task= (2026-10-09:
+-- routing is by task=caller; the synth/refine call sites are named
+-- cve_poc_synth / decomposed_craft / cve_poc_refine, so an `exploit.synth`
+-- row matched nothing).
 INSERT INTO public.app_settings (key, value, category) VALUES
-  ('llm.route.exploit.synth',             'azure-main:DeepSeek-V4-Pro', 'config'),
   ('llm.route.exploit.gather_fallback',   'azure-main:DeepSeek-V4-Pro', 'config'),
   ('llm.route.exploit.judge',             'azure-main:DeepSeek-V4-Pro', 'config'),
-  ('llm.reasoning_effort.exploit.synth',           'high', 'config'),
+  ('llm.route.cve_poc_synth',             'azure-main:DeepSeek-V4-Pro', 'config'),
+  ('llm.route.decomposed_craft',          'azure-main:DeepSeek-V4-Pro', 'config'),
+  ('llm.route.cve_poc_refine',            'azure-main:DeepSeek-V4-Pro', 'config'),
   ('llm.reasoning_effort.exploit.gather_fallback', 'high', 'config'),
-  ('llm.reasoning_effort.exploit.judge',           'high', 'config')
+  ('llm.reasoning_effort.exploit.judge',           'high', 'config'),
+  ('llm.reasoning_effort.cve_poc_synth',           'high', 'config'),
+  ('llm.reasoning_effort.decomposed_craft',        'high', 'config'),
+  ('llm.reasoning_effort.cve_poc_refine',          'high', 'config')
 ON CONFLICT (key) DO NOTHING;
 
 -- ============================================================================

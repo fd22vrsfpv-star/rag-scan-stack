@@ -105,9 +105,9 @@ with get_db() as c, c.cursor() as cur:
   fi
   echo "$ts [$i/$TOTAL] $cve $ip:$app_port product=$product" >> "$LOG"
 
-  docker exec rag-api sh -c "curl -sk -H 'x-api-key: $API_KEY' -H 'Content-Type: application/json' \
-    -X POST https://localhost:8000/engagements/$EID/scope-add \
-    -d '{\"target\":\"$ip\"}'" >/dev/null 2>&1
+  # Scoping is done by gym.sh (it prints "scoped <cve> -> ip:port under
+  # engagement 'cvebench'"). The former per-target scope POST here hit a
+  # route that does not exist (silent 404) — removed 2026-10-09.
 
   body="$OUT/results_other30/${cve}.body.json"
   printf '{"cve":"%s","ip":"%s","port":%s,"product":"%s","username":"%s","password":"%s","model":"ollama:qwen3-coder:30b","max_iters":15,"recon_first":true,"recon_source":"basic","release":true}' \
@@ -125,16 +125,16 @@ with get_db() as c, c.cursor() as cur:
   docker exec rag-api cat "/tmp/rf_${cve}.json" > "$OUT/results_other30/${cve}.result.json" 2>/dev/null
   el=$(( $(date +%s) - t0 ))
   http=$(cat "$OUT/results_other30/${cve}.http" 2>/dev/null)
-  v=$(docker exec rag-api sh -c "cd /app && python -c \"
-from api import get_db
-with get_db() as c, c.cursor() as cur:
-    cur.execute('SELECT verified FROM derived_cve_specs WHERE cve=%s', ('$cve',))
-    r = cur.fetchone()
-    print(r[0] if r else '?')
-\"" 2>&1 | grep -v -i deprecat | grep -v regex | tail -1)
+  # The verdict is the run's own result (derived_cve_specs.verified is written
+  # by node_research BEFORE synth and never by the refine loop — it reported
+  # "False"/"?" for runs the result file marked verified, 2026-10-09).
+  v=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('verified'))" \
+        "$OUT/results_other30/${cve}.result.json" 2>/dev/null || echo '?')
+  st=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('stop_reason') or d.get('verification_method') or '')" \
+        "$OUT/results_other30/${cve}.result.json" 2>/dev/null || echo '')
   end_ts=$(date +%H:%M:%S)
-  echo "$end_ts [$i/$TOTAL] $cve done in ${el}s derive-verified=$v $http" >> "$LOG"
-  echo "$end_ts [$i/$TOTAL] $cve done in ${el}s derive-verified=$v"
+  echo "$end_ts [$i/$TOTAL] $cve done in ${el}s verified=$v stop=$st $http" >> "$LOG"
+  echo "$end_ts [$i/$TOTAL] $cve done in ${el}s verified=$v stop=$st"
 
   rm -f "$body"
 
