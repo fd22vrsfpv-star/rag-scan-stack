@@ -15200,16 +15200,20 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
             # computation, so update the local `vc` too.
             if name == "vuln_class":
                 vc = keep
-        # Re-run the decision over the (possibly) upgraded items.
+        # Re-run the decision over the (possibly) upgraded items. Trace the
+        # outcome unconditionally — an empty proposal used to leave no
+        # record at all, which hid 31 silent failures (2026-10-09).
         if _llm_proposed:
             decision = _gather_decide(items, vc)
-            try:
-                _poc_trace(run_id, "gather_llm_fallback",
-                           response=f"proposed={_llm_proposed} new_ready={decision.get('ready')} "
-                                    f"still_missing={decision.get('missing')}",
-                           extra={"proposed": _llm_proposed, "ready_after": decision.get("ready")})
-            except Exception:  # noqa: BLE001
-                pass
+        try:
+            _poc_trace(run_id, "gather_llm_fallback",
+                       response=f"proposed={_llm_proposed or {}} new_ready={decision.get('ready')} "
+                                f"still_missing={decision.get('missing')}"
+                                + ("" if _llm_proposed else "  (fallback returned nothing — see gather_llm_fallback_error)"),
+                       extra={"proposed": _llm_proposed or {}, "ready_after": decision.get("ready"),
+                              "missing_after": decision.get("missing")})
+        except Exception:  # noqa: BLE001
+            pass
     return {"cve": cve, "target": f"{ip}:{port}", "run_id": run_id, "mode": _BUILD_POC_GATHER_CHECK,
             "vuln_class": vc, "items": items, "facts": facts,
             "llm_fallback": _llm_proposed or None, **decision}
@@ -15278,27 +15282,98 @@ def _gather_llm_fallback(cve, ip, port, product, version, *, vc, missing,
         f"vuln_class MUST be from the enum above or null. "
         f"No prose outside the JSON."
     )
+    def _fail(reason, raw_s=""):
+        # Every silent exit used to be invisible: 31 calls, 0 accepted
+        # proposals, no trail (2026-10-09 analysis). Trace + warn so a run
+        # that "called the fallback and got nothing" says why.
+        logging.warning("gather_llm_fallback cve=%s run=%s: %s | raw=%r", cve, run_id, reason, (raw_s or "")[:300])
+        try:
+            _poc_trace(run_id, "gather_llm_fallback_error",
+                       response=f"{reason}\nraw[:800]: {(raw_s or '')[:800]}",
+                       extra={"reason": reason, "missing": list(missing or [])})
+        except Exception:  # noqa: BLE001
+            pass
+        return {}
+
     try:
         raw = _llm_for_model(prompt, caller="exploit.gather_fallback",
-                             num_predict=360, temperature=0.1) or ""
+                             num_predict=360, temperature=0.1)
     except Exception as e:  # noqa: BLE001
-        logging.debug("gather_llm_fallback _llm_for_model failed: %s", e)
-        return {}
-    # Pull a JSON object out of the response (the model may add fencing).
+        return _fail(f"llm call raised {type(e).__name__}: {str(e)[:200]}")
+    # _llm_for_model returns a dict {response, ok, error, model, …}; the
+    # old code regex-searched the dict itself and raised TypeError.
+    model_used = None
+    if isinstance(raw, dict):
+        model_used = raw.get("model")
+        if raw.get("ok") is False or raw.get("error"):
+            return _fail(f"llm returned ok=False error={str(raw.get('error'))[:200]} model={model_used}")
+        raw_s = str(raw.get("response") or raw.get("text") or raw.get("content") or "")
+    else:
+        raw_s = str(raw or "")
+    if not raw_s.strip():
+        return _fail(f"empty response model={model_used}")
     import re as _re
-    m = _re.search(r"\{.*\}", raw or "", _re.S)
+    m = _re.search(r"\{.*\}", raw_s, _re.S)
     if not m:
-        return {}
+        return _fail(f"no JSON object in response model={model_used}", raw_s)
     try:
         obj = json.loads(m.group(0))
-    except Exception:  # noqa: BLE001
-        return {}
-    out = {}
+    except Exception as e:  # noqa: BLE001
+        return _fail(f"json.loads failed: {type(e).__name__}: {str(e)[:120]} model={model_used}", raw_s)
+    if not isinstance(obj, dict):
+        return _fail(f"JSON was {type(obj).__name__}, not object model={model_used}", raw_s)
+    # Tolerant normalisation — the model ignores the enum/ident contract
+    # often enough that strict validation threw away good answers
+    # ("SQL injection" for sqli, "sortfield, sortorder" for a field).
+    _VC_SYN = {
+        "sql injection": "sqli", "sqli": "sqli", "sql": "sqli", "blind sqli": "sqli",
+        "cross-site scripting": "xss", "xss": "xss",
+        "command injection": "cmdi", "os command injection": "cmdi", "cmdi": "cmdi",
+        "server-side template injection": "ssti", "template injection": "ssti", "ssti": "ssti",
+        "server-side request forgery": "ssrf", "ssrf": "ssrf",
+        "xml external entity": "xxe", "xxe": "xxe",
+        "local file inclusion": "lfi", "lfi": "lfi", "file inclusion": "lfi",
+        "remote file inclusion": "rfi", "rfi": "rfi",
+        "path traversal": "path-traversal", "directory traversal": "path-traversal",
+        "path-traversal": "path-traversal", "file access": "path-traversal", "arbitrary file read": "path-traversal",
+        "remote code execution": "rce", "rce": "rce", "code execution": "rce",
+        "insecure direct object reference": "idor", "idor": "idor",
+        "file upload": "upload", "arbitrary file upload": "upload", "upload": "upload",
+        "authentication bypass": "auth-bypass", "auth bypass": "auth-bypass", "auth-bypass": "auth-bypass",
+        "deserialization": "deser", "insecure deserialization": "deser", "deser": "deser",
+        "open redirect": "open-redirect", "open-redirect": "open-redirect",
+    }
+    out, rejected = {}, {}
     for k in needed:
         v = obj.get(k)
         if v in (None, "", "null"):
             continue
+        if k == "vuln_class":
+            key = str(v).strip().lower()
+            if key in _VC_SYN:
+                v = _VC_SYN[key]
+            else:
+                rejected[k] = f"{v!r} not in vuln_class synonyms"
+                continue
+        elif k == "input_field":
+            # "sortfield, sortorder" / "a or b" → first identifier
+            first = _re.split(r"[,\s/|]+(?:or\s+)?", str(v).strip().strip("\"'`"))[0]
+            if first:
+                v = first
+        elif k == "method":
+            v = str(v).upper().split(",", 1)[0].strip()
+        elif k == "endpoint":
+            v = str(v).strip().strip("\"'`")
+            if not v.startswith("/"):
+                rejected[k] = f"{v!r} not an absolute path"
+                continue
         out[k] = v
+    try:
+        _poc_trace(run_id, "gather_llm_fallback_raw",
+                   response=f"model={model_used} accepted={out} rejected={rejected}\nraw[:600]: {raw_s[:600]}",
+                   extra={"accepted": out, "rejected": rejected, "model": model_used})
+    except Exception:  # noqa: BLE001
+        pass
     return out
 
 
@@ -24765,25 +24840,49 @@ def _run_refine_judge_pass(cve, ip, port, run_id, log_path, *,
         f'different endpoint, auth fix, etc.) — not advice to think harder"}}.\n'
         f"No prose outside the JSON."
     )
+    def _fail(reason, raw_s=""):
+        # 7 judge calls, 0 follow-ups, no trail (2026-10-09 analysis).
+        logging.warning("judge_pass cve=%s run=%s: %s | raw=%r", cve, run_id, reason, (raw_s or "")[:300])
+        try:
+            _poc_trace(run_id, "judge_pass_error",
+                       response=f"{reason}\nraw[:800]: {(raw_s or '')[:800]}",
+                       extra={"reason": reason})
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
     try:
         raw = _llm_for_model(prompt, caller="exploit.judge",
-                             num_predict=380, temperature=0.2) or ""
+                             num_predict=380, temperature=0.2)
     except Exception as e:  # noqa: BLE001
-        logging.debug("judge-pass LLM call failed: %s", e)
-        return None
+        return _fail(f"llm call raised {type(e).__name__}: {str(e)[:200]}")
+    # _llm_for_model returns a dict {response, ok, error, model, …}; the old
+    # code regex-searched the dict and raised TypeError on every call.
+    model_used = None
+    if isinstance(raw, dict):
+        model_used = raw.get("model")
+        if raw.get("ok") is False or raw.get("error"):
+            return _fail(f"llm returned ok=False error={str(raw.get('error'))[:200]} model={model_used}")
+        raw_s = str(raw.get("response") or raw.get("text") or raw.get("content") or "")
+    else:
+        raw_s = str(raw or "")
+    if not raw_s.strip():
+        return _fail(f"empty response model={model_used}")
     import re as _re
-    m = _re.search(r"\{.*\}", raw or "", _re.S)
+    m = _re.search(r"\{.*\}", raw_s, _re.S)
     if not m:
-        return None
+        return _fail(f"no JSON object in response model={model_used}", raw_s)
     try:
         verdict = _j.loads(m.group(0))
-    except Exception:  # noqa: BLE001
-        return None
+    except Exception as e:  # noqa: BLE001
+        return _fail(f"json.loads failed: {type(e).__name__}: {str(e)[:120]} model={model_used}", raw_s)
+    if not isinstance(verdict, dict):
+        return _fail(f"JSON was {type(verdict).__name__}, not object model={model_used}", raw_s)
     best_iter = verdict.get("best_iteration")
     repair = str(verdict.get("concrete_repair") or "").strip()[:600]
     missing_one = str(verdict.get("missing_one_thing") or "").strip()[:300]
     if not repair:
-        return None
+        return _fail(f"verdict had no concrete_repair (keys={list(verdict.keys())[:8]}) model={model_used}", raw_s)
     # Write a follow-up item so the next build-poc attempt can pick up the hint.
     follow_up_id = None
     try:
