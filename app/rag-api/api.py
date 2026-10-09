@@ -19973,7 +19973,7 @@ def _login_field_variants(ip, port, username, password, login_url=None, timeout=
     import httpx as _hx, re as _re
     scheme = "https" if int(port or 80) in (443, 8443) else "http"
     base = f"{scheme}://{ip}:{port or 80}"
-    login_paths = [login_url] if login_url else ["/index.php", "/login", "/user/login", "/"]
+    login_paths = [login_url] if login_url else ["/index.php", "/login", "/user/login", "/wp-login.php", "/"]
     # (user_field, pass_field, extra_fields)
     VARIANTS = [
         ("name", "password", {"enter": "Sign in", "autologin": "1"}),   # Zabbix
@@ -19982,6 +19982,7 @@ def _login_field_variants(ip, port, username, password, login_url=None, timeout=
         ("user", "pass", {}),
         ("email", "password", {}),
         ("j_username", "j_password", {}),                                # JavaEE
+        ("log", "pwd", {"wp-submit": "Log In", "testcookie": "1", "redirect_to": "/wp-admin/"}),  # WordPress
     ]
     for lp in login_paths:
         if not lp:
@@ -20021,6 +20022,108 @@ def _login_field_variants(ip, port, username, password, login_url=None, timeout=
             "note": "no field variant logged in"}
 
 
+def _login_from_discovered_form(ip, port, username, password, forms, timeout=12):
+    """Log in using a form the run's own recon already fingerprinted
+    (`Form POST /index.php?mainmenu=home fields=['token','loginfunction','tz',
+    'username','password']`) instead of guessing field names. Picks the form
+    with a password-adjacent field, re-GETs the page to harvest hidden inputs
+    (CSRF/token/tz), submits with the form's own method + action, and returns
+    the _establish_web_session shape. Six CVE-Bench runs halted on `auth` with
+    the credentials supplied and the login form sitting in recon:basic
+    (2026-10-09 analysis)."""
+    import httpx as _hx, re as _re
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    base = f"{scheme}://{ip}:{port or 80}"
+    _PW = _re.compile(r"(?i)(pass(word|wd)?|^pwd$|^passwd$)")
+    # Exact names first, then substrings; hidden inputs are excluded at pick
+    # time (Dolibarr's hidden `loginfunction` must not win over `username`).
+    _USER_EXACT = ("username", "user", "login", "email", "log", "uid", "name", "user_name",
+                   "userid", "user_id", "email_address", "j_username", "account", "usr")
+    _USER_SUB = _re.compile(r"(?i)(user|email|login|account)")
+    _NOISE = _re.compile(r"(?i)^(token|_token|csrf.*|nonce.*|tz|redirect.*|action|loginfunction|submit|enter|remember.*|autologin|lang.*|_method)$")
+
+    def _pick_user(flds, pw, hidden_names):
+        pool = [x for x in flds if x != pw and x not in hidden_names and not _NOISE.match(x)]
+        for want in _USER_EXACT:
+            for x in pool:
+                if x.lower() == want:
+                    return x
+        for x in pool:
+            if _USER_SUB.search(x):
+                return x
+        return None
+
+    candidates = []
+    for fm in forms or []:
+        flds = [str(x) for x in (fm.get("fields") or [])]
+        pw = next((x for x in flds if _PW.search(x)), None)
+        if not pw:
+            continue
+        if _pick_user(flds, pw, set()) is None:
+            continue
+        candidates.append((fm, pw))
+    if not candidates:
+        return {"ok": False, "cookies": [], "cookie_header": "", "login_url": None,
+                "note": "no login-shaped form in recon"}
+    for fm, pf in candidates[:3]:
+        method = (fm.get("method") or "POST").upper()
+        action = fm.get("raw_action") or fm.get("path") or "/"
+        url = action if str(action).startswith("http") else base + (action if action.startswith("/") else "/" + action)
+        # The page that rendered the form: the basic recon fetched "/", so
+        # harvest hidden inputs from "/" first, then from the action itself.
+        pages = ["/"] + ([fm.get("path")] if fm.get("path") and fm.get("path") != "/" else [])
+        jar, hidden = {}, {}
+        try:
+            with _hx.Client(verify=False, follow_redirects=True, timeout=timeout) as cli:
+                for pg in pages:
+                    try:
+                        g = cli.get(base + pg)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    for k, v in g.headers.multi_items():
+                        if k.lower() == "set-cookie" and "=" in v.split(";", 1)[0]:
+                            n, val = v.split(";", 1)[0].split("=", 1)
+                            if val.strip():
+                                jar[n.strip()] = val.strip()
+                    for m in _re.finditer(r'<input[^>]+type=["\']hidden["\'][^>]*>', g.text or "", _re.I):
+                        nm = _re.search(r'name=["\']([^"\']+)', m.group(0))
+                        vl = _re.search(r'value=["\']([^"\']*)', m.group(0))
+                        if nm and vl and nm.group(1) in (fm.get("fields") or [nm.group(1)]):
+                            hidden[nm.group(1)] = vl.group(1)
+                flds = [str(x) for x in (fm.get("fields") or [])]
+                uf = _pick_user(flds, pf, set(hidden.keys()))
+                if not uf:
+                    continue
+                data = dict(hidden)
+                for x in flds:
+                    data.setdefault(x, "")
+                data[uf], data[pf] = username, password
+                ck_hdr = "; ".join(f"{k}={v}" for k, v in jar.items())
+                hdrs = {"Cookie": ck_hdr} if ck_hdr else {}
+                # Do NOT follow the post-login redirect: the session cookie is
+                # issued on the 30x itself, and the redirect target may set a
+                # fresh pre-login cookie that would overwrite it.
+                if method == "POST":
+                    r = cli.post(url, data=data, headers=hdrs, follow_redirects=False)
+                else:
+                    r = cli.get(url, params=data, headers=hdrs, follow_redirects=False)
+                for k, v in r.headers.multi_items():
+                    if k.lower() == "set-cookie" and "=" in v.split(";", 1)[0]:
+                        n, val = v.split(";", 1)[0].split("=", 1)
+                        if val.strip():
+                            jar[n.strip()] = val.strip()
+            if jar:
+                return {"ok": True, "cookies": [f"{k}={v}" for k, v in jar.items()],
+                        "cookie_header": "; ".join(f"{k}={v}" for k, v in jar.items()),
+                        "login_url": url, "note": f"discovered form {method} {fm.get('path')} ({uf}/{pf})",
+                        "u_field": uf, "p_field": pf}
+        except Exception as e:  # noqa: BLE001
+            logging.debug("discovered-form login failed on %s: %s", url, e)
+            continue
+    return {"ok": False, "cookies": [], "cookie_header": "", "login_url": None,
+            "note": "discovered form(s) did not set a session cookie"}
+
+
 def _establish_session_for_build(ip, port, auth, eid=None, product=None, segments=None):
     """Get an authenticated session for the build. SUPPLIED creds -> log in directly.
     bruteforce=true and no password -> reuse default_cred_check to find a documented default
@@ -20052,6 +20155,21 @@ def _establish_session_for_build(ip, port, auth, eid=None, product=None, segment
                     if v2:
                         return {**s2, "username": username, "method": "supplied_variant",
                                 "validated": True}
+                # The run's own recon may have fingerprinted the real login form
+                # (fields, method, action) — use it instead of the variant list.
+                forms = []
+                try:
+                    forms = _parse_recon_segments(list(segments or [])).get("form_fields") or []
+                except Exception:  # noqa: BLE001
+                    forms = []
+                if forms:
+                    s3 = _login_from_discovered_form(ip, port, username, password, forms)
+                    if s3 and s3.get("cookie_header"):
+                        v3, _ = _probe_session_valid(ip, port, s3["cookie_header"], product=product, timeout=6)
+                        if v3:
+                            return {**s3, "username": username, "method": "supplied_form",
+                                    "validated": True}
+                    _supplied_note = (s3 or {}).get("note")
         except Exception as e:  # noqa: BLE001
             logging.debug("session validate/retry failed: %s", e)
         if (s or {}).get("cookie_header") or not auth.get("bruteforce"):
