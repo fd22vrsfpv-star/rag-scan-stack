@@ -31,7 +31,16 @@ EMBEDDER_URL = os.environ.get("EMBEDDER_URL", "https://embedder:8030")
 
 
 def _get_conn():
-    return psycopg2.connect(DB_DSN)
+    # 2026-10-09: this module's scan held transactions open for hours (rule
+    # execution does per-row HTTP/embedding work between statements), so
+    # dozens of idle-in-transaction sessions stacked up and nine
+    # follow_up_items INSERTs from other writers queued on one of them for
+    # 2 h+. The server ends a transaction idle for 5 min and any lock wait
+    # over 15 s — regardless of which code path is holding it.
+    return psycopg2.connect(
+        DB_DSN,
+        options="-c idle_in_transaction_session_timeout=300000 -c lock_timeout=15000",
+    )
 
 
 def _get_or_create_unknown_scope_engagement(cur):
