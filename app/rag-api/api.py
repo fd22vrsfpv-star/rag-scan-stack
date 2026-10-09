@@ -160,6 +160,22 @@ def _get_setting(key: str, default: str = "") -> str:
     return default
 
 
+def _build_poc_timeout_setting(key: str, default: int) -> int:
+    """Operator-adjustable build-PoC timeout (seconds) from Settings → Scan
+    timeouts (`app_settings` category 'config', keys `scan_timeout_build_poc_*`,
+    written by the BFF `/api/settings/scan-timeouts`). 2026-10-09: the wall
+    clock, the per-command run timeout and the deep-recon budget were env-only
+    constants; the operator asked for them to be adjustable. An unset / blank /
+    non-numeric value falls back to `default`; 0 keeps its per-key meaning
+    (wall: unlimited; run / deep-recon: the compiled default)."""
+    raw = _get_setting(key, "")
+    try:
+        val = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return int(default)
+    return val if val >= 0 else int(default)
+
+
 _DDG_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
@@ -14564,7 +14580,11 @@ def _deep_recon_for_gaps(cve, ip, port, product, eid, run_id, manifest: dict, *,
     """
     import time as _t, httpx as _hx
     t0 = _t.time()
-    budget = int(budget_sec or _BUILD_POC_DEEP_RECON_BUDGET_SEC)
+    # Settings → Scan timeouts (`scan_timeout_build_poc_deep_recon`) overrides
+    # the env default; an explicit budget_sec from the caller still wins.
+    budget = int(budget_sec
+                 or _build_poc_timeout_setting("scan_timeout_build_poc_deep_recon", 0)
+                 or _BUILD_POC_DEEP_RECON_BUDGET_SEC)
     out = {"ran": [], "segments": [], "id_pool": dict(id_pool or {}), "auth": dict(auth or {}),
            "session_info": session_info, "candidate_paths": [], "seconds": 0, "skipped": None}
     try:
@@ -24459,7 +24479,10 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
     import httpx as _hx, time as _t
     port = port or 80
     listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
-    _vt = int(os.environ.get("VECTOR_RUN_TIMEOUT", "600"))
+    # Per-command listener run timeout: Settings → Scan timeouts
+    # (`scan_timeout_build_poc_run`), 0 / unset = env VECTOR_RUN_TIMEOUT (600).
+    _vt = (_build_poc_timeout_setting("scan_timeout_build_poc_run", 0)
+           or int(os.environ.get("VECTOR_RUN_TIMEOUT", "600")))
     built_at = _t.strftime("%Y-%m-%dT%H:%M:%S%z")
     if metrics is None:
         metrics = _new_poc_metrics()
@@ -28919,8 +28942,13 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     # explicitly. Presets bound iterations / fanout / deep flags only — they
     # no longer imply 1800 s / 7200 s, which cut off builds whose synth +
     # refine legitimately take longer (the verified 36412 run took 2009 s).
-    # 0 / None / negative all mean "no cap".
+    # 0 / None / negative all mean "no cap". When the request carries none,
+    # the operator default from Settings → Scan timeouts
+    # (app_settings `scan_timeout_build_poc_wall`, 0 = unlimited) applies.
     eff_wall = body.wall_timeout_sec if (body.wall_timeout_sec or 0) > 0 else None
+    if eff_wall is None:
+        _wall_setting = _build_poc_timeout_setting("scan_timeout_build_poc_wall", 0)
+        eff_wall = _wall_setting if _wall_setting > 0 else None
     if preset == "quick":
         eff_fanout = 1
         eff_max_iters = min(eff_max_iters, 5)

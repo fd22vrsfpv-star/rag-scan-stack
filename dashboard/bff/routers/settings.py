@@ -1782,11 +1782,16 @@ SCAN_TIMEOUT_KEYS = [
     "scan_timeout_nmap_resume",   # nmap --resume
     "scan_timeout_full",          # full-scan composite
     "scan_timeout_masscan",       # masscan-only (informational; masscan has no internal timeout)
+    # 2026-10-09: build-PoC timeouts (rag-api reads these via
+    # _build_poc_timeout_setting; an explicit per-request value still wins)
+    "scan_timeout_build_poc_wall",        # whole build wall clock; 0 = unlimited
+    "scan_timeout_build_poc_run",         # per-command listener run; 0 = env VECTOR_RUN_TIMEOUT (600)
+    "scan_timeout_build_poc_deep_recon",  # deep-recon budget per build; 0 = env BUILD_POC_DEEP_RECON_BUDGET_SEC (480)
 ]
 
 
 def _scan_timeout_defaults() -> Dict[str, int]:
-    """Match the env defaults compiled into nmap-api.py."""
+    """Match the env defaults compiled into nmap-api.py / rag-api."""
     return {
         "scan_timeout_nmap": 1800,
         "scan_timeout_nmap_proxied": 3600,
@@ -1796,6 +1801,9 @@ def _scan_timeout_defaults() -> Dict[str, int]:
         "scan_timeout_nmap_resume": 7200,
         "scan_timeout_full": 1800,
         "scan_timeout_masscan": 0,  # 0 = no timeout (masscan runs to completion)
+        "scan_timeout_build_poc_wall": 0,          # 0 = unlimited (operator decision 2026-10-09)
+        "scan_timeout_build_poc_run": 600,
+        "scan_timeout_build_poc_deep_recon": 480,
     }
 
 

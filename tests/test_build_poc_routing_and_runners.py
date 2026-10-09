@@ -95,6 +95,36 @@ def test_build_wall_clock_is_unlimited_unless_explicit():
     assert "useState<'quick'|'deep'|'custom'>('custom')" in ui   # UI default = no preset = no cap
 
 
+BUILD_POC_TIMEOUT_KEYS = ("scan_timeout_build_poc_wall", "scan_timeout_build_poc_run",
+                          "scan_timeout_build_poc_deep_recon")
+
+
+def test_build_poc_timeouts_are_operator_settings():
+    """2026-10-09: 'make the timeouts a setting that can be adjusted'. The three
+    build-PoC timeouts ride the existing Settings → Scan timeouts plumbing: the
+    BFF key list + defaults, the UI field list, and rag-api reads each key via
+    `_build_poc_timeout_setting` at its consumer (wall clock, per-command run,
+    deep-recon budget). Drop any one leg and this fails by key name."""
+    api = API.read_text()
+    helper = _func_src("_build_poc_timeout_setting")
+    assert helper and '_get_setting(key, "")' in helper
+    for k in BUILD_POC_TIMEOUT_KEYS:
+        assert f'_build_poc_timeout_setting("{k}"' in api, f"rag-api never reads {k}"
+    # wall: request value wins, else the setting, else unlimited
+    assert '_build_poc_timeout_setting("scan_timeout_build_poc_wall", 0)' in api
+    assert "eff_wall = _wall_setting if _wall_setting > 0 else None" in api
+    bff = (REPO / "dashboard" / "bff" / "routers" / "settings.py").read_text()
+    keys_src = bff[bff.index("SCAN_TIMEOUT_KEYS = ["):bff.index("]", bff.index("SCAN_TIMEOUT_KEYS = ["))]
+    defaults_src = bff[bff.index("def _scan_timeout_defaults"):bff.index("@router.get(\"/api/settings/scan-timeouts\")")]
+    ui = (REPO / "dashboard" / "frontend" / "src" / "pages" / "Settings.tsx").read_text()
+    fields_src = ui[ui.index("const SCAN_TIMEOUT_FIELDS"):ui.index("function ScanTimeoutsTab")]
+    for k in BUILD_POC_TIMEOUT_KEYS:
+        assert f'"{k}"' in keys_src, f"BFF SCAN_TIMEOUT_KEYS lacks {k}"
+        assert f'"{k}"' in defaults_src, f"BFF defaults lack {k}"
+        assert f"'{k}'" in fields_src, f"Settings.tsx SCAN_TIMEOUT_FIELDS lacks {k}"
+    assert '"scan_timeout_build_poc_wall": 0' in defaults_src   # unlimited by default
+
+
 def test_scan_evidence_is_engagement_filtered_and_reads_prior_attempts():
     src = _func_src("_scan_evidence_for_target")
     assert src
