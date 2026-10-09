@@ -14224,6 +14224,178 @@ def _inband_baseline_diff(ip, port, command: str, timeout: int = 5) -> dict:
             "url": url, "baseline_url": base_url}
 
 
+_RECON_STATIC_EXT = (".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+                     ".woff", ".woff2", ".ttf", ".eot", ".map", ".webp", ".mp3", ".mp4",
+                     ".wav", ".avi", ".pdf")
+_RECON_DYNAMIC_EXT = (".php", ".jsp", ".jspx", ".do", ".action", ".aspx", ".asp", ".cgi",
+                      ".py", ".pl", ".rb")
+
+
+def _parse_recon_segments(segments) -> dict:
+    """PURE: turn the free-text recon segments a build-poc run accumulates in
+    state["segments"] into structured facts the gather check can consume.
+    Until 2026-10-09 gather read only the OpenAPI line and the JSON-body
+    endpoints line out of recon_text; the login form fields, the Playwright
+    crawl, the Arjun parameter names and the verb sweep were invisible to it.
+
+    Formats (all real producers):
+      - `Form GET process.php fields=['username', 'password']`           (_scout_url_recon)
+      - `Playwright SPA crawl discovered N URLs … :\\n  - /path`           (_playwright_sitemap)
+      - `Arjun deep-scan (params honored per endpoint):\\n  /p: a, b`     (_scout_arjun_paths)
+      - `Arjun recon on http://h:p/ (N honored params — …): a, b.`        (_scout_arjun)
+      - `CLASSIFIED HIGH-SIGNAL PARAMS …:\\n  /p param `x` → likely C. try …`
+      - `ZAP recon: ZAP-spidered paths: /a, /b | ZAP alerts: …`            (_zap_recon)
+      - `VERB SWEEP (deep recon; method:status per path):\\n  /p -> GET:200 POST:302`
+      - `OpenAPI paths (N at /openapi.json): GET /a; POST /b`              (_scout_url_recon)
+      - `Endpoints (from JSON body): /upload` and `Endpoints: a.php, b.php`
+    Only `re` + `urllib.parse`; safe to exec from source in tests."""
+    import re as _re
+    from urllib.parse import urlparse as _up
+
+    def _norm(u):
+        s = str(u or "").strip().strip("`'\"")
+        if not s:
+            return None, ""
+        q = ""
+        if "://" in s:
+            try:
+                p = _up(s)
+                s, q = (p.path or "/"), (p.query or "")
+            except Exception:  # noqa: BLE001
+                return None, ""
+        s = s.split("#", 1)[0]
+        if "?" in s:
+            s, q = s.split("?", 1)
+        if not s.startswith("/"):
+            s = "/" + s
+        if "*" in s or "%22" in s or "$" in s or " " in s:
+            return None, ""          # SPA-crawl glob/template junk
+        return s, q
+
+    def _is_static(p):
+        low = p.lower()
+        return any(low.endswith(e) for e in _RECON_STATIC_EXT)
+
+    out = {"form_fields": [], "crawl_urls": [], "arjun_params": {}, "classified_params": [],
+           "zap_paths": [], "verb_sweep": {}, "openapi": [], "json_body_endpoints": [],
+           "href_endpoints": [], "counts": {}}
+    seen_crawl, seen_form = set(), set()
+    for seg in (segments or []):
+        text = str(seg or "")
+        if not text:
+            continue
+        # Forms (one per match; action may be relative, absolute, or carry a query)
+        for m in _re.finditer(r"Form (\w+) (\S+) fields=\[([^\]]*)\]", text):
+            method, action, inner = m.group(1).upper(), m.group(2), m.group(3)
+            path, _q = _norm(action)
+            fields = _re.findall(r"['\"]([^'\"]*)['\"]", inner)
+            key = (path, method, tuple(fields))
+            if path and fields and key not in seen_form:
+                seen_form.add(key)
+                out["form_fields"].append({"path": path, "method": method, "fields": fields,
+                                           "raw_action": action})
+        # Playwright crawl (and deep-recon auth_crawl, same producer)
+        if "Playwright SPA crawl discovered" in text:
+            block = text.split("Playwright SPA crawl discovered", 1)[1]
+            for line in block.splitlines():
+                mm = _re.match(r"\s+-\s+(\S+)\s*$", line)
+                if not mm:
+                    continue
+                path, q = _norm(mm.group(1))
+                if not path or path == "/" or _is_static(path) or path in seen_crawl:
+                    continue
+                seen_crawl.add(path)
+                out["crawl_urls"].append(path if not q else f"{path}?{q}")
+        # Arjun deep-scan block: "  /p: a, b" lines until a blank line
+        if "Arjun deep-scan (params honored per endpoint):" in text:
+            block = text.split("Arjun deep-scan (params honored per endpoint):", 1)[1]
+            for line in block.splitlines():
+                if not line.strip():
+                    if out["arjun_params"]:
+                        break
+                    continue
+                mm = _re.match(r"\s+(/\S*):\s+(.+?)\s*$", line)
+                if not mm:
+                    if line.startswith("CLASSIFIED"):
+                        break
+                    continue
+                path, _q = _norm(mm.group(1))
+                names = [x.strip().strip("`'\"") for x in mm.group(2).split(",") if x.strip()]
+                if path and names:
+                    out["arjun_params"].setdefault(path, [])
+                    for n in names:
+                        if n not in out["arjun_params"][path]:
+                            out["arjun_params"][path].append(n)
+        # Arjun single-url form
+        for m in _re.finditer(r"Arjun recon on (\S+) \(\d+ honored params?[^)]*\):\s*([^.\n]+)\.", text):
+            path, _q = _norm(m.group(1))
+            names = [x.strip().strip("`'\"") for x in m.group(2).split(",") if x.strip()]
+            if path and names:
+                out["arjun_params"].setdefault(path, [])
+                for n in names:
+                    if n not in out["arjun_params"][path]:
+                        out["arjun_params"][path].append(n)
+        # Classified high-signal params
+        if "CLASSIFIED HIGH-SIGNAL PARAMS" in text:
+            block = text.split("CLASSIFIED HIGH-SIGNAL PARAMS", 1)[1]
+            for m in _re.finditer(r"^\s+(/\S*) param `([^`]+)` → likely ([^.\n]+)\.(?: try (.+))?$",
+                                  block, _re.M):
+                path, _q = _norm(m.group(1))
+                if path:
+                    out["classified_params"].append({"path": path, "param": m.group(2).strip(),
+                                                     "class": m.group(3).strip(),
+                                                     "hint": (m.group(4) or "").strip()[:200]})
+        # ZAP spidered paths
+        for m in _re.finditer(r"ZAP-spidered paths:\s*([^|\n]+?)(?:\s*\||\s*$)", text):
+            for x in m.group(1).split(","):
+                path, q = _norm(x)
+                if path and path != "/" and not _is_static(path) and path not in out["zap_paths"]:
+                    out["zap_paths"].append(path if not q else f"{path}?{q}")
+        # Verb sweep
+        if "VERB SWEEP" in text:
+            block = text.split("VERB SWEEP", 1)[1]
+            for line in block.splitlines():
+                mm = _re.match(r"\s+(/\S*)\s+->\s+(.+?)\s*$", line)
+                if not mm:
+                    continue
+                path, _q = _norm(mm.group(1))
+                if not path:
+                    continue
+                verbs = {}
+                for tok in mm.group(2).split():
+                    if ":" in tok:
+                        v, s = tok.split(":", 1)
+                        if v.isalpha() and s.isdigit():
+                            verbs[v.upper()] = int(s)
+                if verbs:
+                    out["verb_sweep"][path] = verbs
+        # OpenAPI line (kept self-contained; _parse_openapi_paths_line is the
+        # canonical reader for the endpoint chain)
+        for m in _re.finditer(r"OpenAPI paths \(\d+ at [^)]*\):\s*([^|\n]+)", text):
+            for item in m.group(1).split(";"):
+                mm = _re.match(r"\s*([A-Z]+)\s+(/\S*)", item)
+                if mm:
+                    out["openapi"].append({"method": mm.group(1), "path": mm.group(2)})
+        # Endpoints lines
+        for m in _re.finditer(r"Endpoints \(from JSON body\):\s*([^|\n]+)", text):
+            for x in m.group(1).split(","):
+                path, _q = _norm(x)
+                if path and path not in out["json_body_endpoints"]:
+                    out["json_body_endpoints"].append(path)
+        for m in _re.finditer(r"(?:^|\| )Endpoints:\s*([^|\n]+)", text):
+            for x in m.group(1).split(","):
+                path, _q = _norm(x)
+                if path and path not in out["href_endpoints"]:
+                    out["href_endpoints"].append(path)
+    out["crawl_urls"] = out["crawl_urls"][:80]
+    out["counts"] = {"forms": len(out["form_fields"]), "crawl_urls": len(out["crawl_urls"]),
+                     "arjun_paths": len(out["arjun_params"]),
+                     "arjun_params": sum(len(v) for v in out["arjun_params"].values()),
+                     "classified": len(out["classified_params"]), "zap_paths": len(out["zap_paths"]),
+                     "verb_sweep_paths": len(out["verb_sweep"]), "openapi": len(out["openapi"])}
+    return out
+
+
 def _parse_openapi_paths_line(recon_text: str) -> list:
     """PURE: `OpenAPI paths (112 at /openapi.json): POST /install_extension; GET /docs; …`
     → [{"path": "/install_extension", "methods": ["POST"]}, …]."""
@@ -14764,7 +14936,7 @@ def _scan_evidence_for_target(cve, ip, port, eid, vc) -> dict:
 
 def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan_verdicts=None,
                      session_info=None, auth=None, analysis=None, recon_text="", run_id=None,
-                     timeout=4, id_pool=None) -> dict:
+                     timeout=4, id_pool=None, segments=None) -> dict:
     """Operator ask 2026-10-07: "make sure everything is actually gathered and
     ready before creating a payload." Runs AFTER plan_verify (so LIVE/FAKE
     verdicts exist) and BEFORE synth. Deterministic; every probe is a 2 KB
@@ -14812,6 +14984,26 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
     facts["prior_runs"] = scan_ev.get("prior_runs") or []
     if scan_ev.get("banner"):
         facts["banner"] = scan_ev["banner"]
+
+    # The run's OWN recon (forms, crawl, arjun, verb sweep) parsed from the
+    # raw segment list — not from the 20k-truncated recon_text join.
+    try:
+        live = _parse_recon_segments(list(segments or []))
+    except Exception as e:  # noqa: BLE001
+        logging.debug("gather: _parse_recon_segments failed: %s", e)
+        live = {"form_fields": [], "crawl_urls": [], "arjun_params": {}, "classified_params": [],
+                "zap_paths": [], "verb_sweep": {}, "openapi": [], "json_body_endpoints": [],
+                "href_endpoints": [], "counts": {}}
+    facts["live_recon"] = {
+        "forms": (live.get("form_fields") or [])[:10],
+        "crawl_urls": (live.get("crawl_urls") or [])[:60],
+        "arjun_params": {k: v[:40] for k, v in list((live.get("arjun_params") or {}).items())[:20]},
+        "classified_params": (live.get("classified_params") or [])[:20],
+        "zap_paths": (live.get("zap_paths") or [])[:40],
+        "verb_sweep": live.get("verb_sweep") or {},
+        "href_endpoints": (live.get("href_endpoints") or [])[:20],
+        "counts": live.get("counts") or {},
+    }
 
     # 1. target reachable
     try:
@@ -14918,17 +15110,48 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
                any(f.lower() in r["path"].lower() for f in mined["fields"][:3]):
                 if r["path"] not in probe_list:
                     probe_list.append(r["path"])
+        # Live recon from THIS run, in priority order: form actions (37849
+        # verified on exactly its login-form action), arjun paths (they carry
+        # honored params), verb-sweep paths that answered, then ZAP/crawl
+        # paths — dynamic-looking ones first. Provenance is kept for _note.
+        _live_src = {}
+        def _live_add(p, src):
+            if p and p != "/" and p not in probe_list:
+                probe_list.append(p)
+                _live_src.setdefault(p, src)
+        for fm in live.get("form_fields") or []:
+            _live_add(fm.get("path"), "form")
+        for p in (live.get("arjun_params") or {}):
+            _live_add(p, "arjun")
+        for p, verbs in (live.get("verb_sweep") or {}).items():
+            if any(s not in (404, 405, 501) for s in verbs.values()):
+                _live_add(p, "verb_sweep")
+        def _dynamic_first(paths):
+            def _score(p):
+                low = p.split("?", 1)[0].lower()
+                return (0 if (low.endswith(_RECON_DYNAMIC_EXT) or "?" in p or "/api/" in low) else 1, len(p))
+            return sorted(dict.fromkeys(paths), key=_score)
+        for p in _dynamic_first(live.get("zap_paths") or [])[:15]:
+            _live_add(p.split("?", 1)[0], "zap")
+        for p in _dynamic_first(live.get("crawl_urls") or [])[:15]:
+            _live_add(p.split("?", 1)[0], "crawl")
+        for p in (live.get("href_endpoints") or [])[:8]:
+            _live_add(p, "href")
         _probe_methods = ["HEAD", "GET"] + [m for m in mined["methods"] if m not in ("HEAD", "GET")]
         if "POST" not in _probe_methods:
             _probe_methods.append("POST")       # a POST-only route (FastAPI) answers 404 to GET
         probe_list += _re.findall(r"Endpoints \(from JSON body\): ([^\n]+)", recon_text or "")[:1] and \
                       [x.strip() for x in _re.findall(r"Endpoints \(from JSON body\): ([^\n]+)", recon_text or "")[0].split(",")] or []
         seen = set()
+        import time as _time
+        _probe_deadline = _time.time() + 60          # 30 paths × 3 verbs × 4 s worst case is 6 min
         try:
             with _hx.Client(verify=False, timeout=timeout, follow_redirects=False) as cli:
-                for ep in probe_list[:20]:
+                for ep in probe_list[:30]:
                     if ep in seen:
                         continue
+                    if _time.time() > _probe_deadline:
+                        break
                     seen.add(ep)
                     try:
                         rp = None
@@ -14943,6 +15166,8 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
                                 _note = " (prefix-stripped advisory path)"
                             elif ep in _scan_paths:
                                 _note = " (scan-side path: discovered_params/content_ext/web_findings)"
+                            elif ep in _live_src:
+                                _note = f" (live recon: {_live_src[ep]})"
                             else:
                                 _note = ""
                             endpoint, ep_source = ep, f"candidate_probe:{_m} HTTP {rp.status_code}{_note}"
@@ -15003,6 +15228,14 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
             method_val, m_source = ",".join(sorted(set(_dp_methods_for_ep))), "discovered_params"
         elif _wf_methods_for_ep:
             method_val, m_source = ",".join(sorted(set(_wf_methods_for_ep))), "web_findings"
+        elif (live.get("verb_sweep") or {}).get(endpoint) and \
+                [m for m, s in live["verb_sweep"][endpoint].items() if s not in (404, 405, 501)]:
+            method_val = ",".join(sorted(m for m, s in live["verb_sweep"][endpoint].items()
+                                         if s not in (404, 405, 501)))
+            m_source = "verb_sweep"
+        elif [fm for fm in (live.get("form_fields") or []) if fm.get("path") == endpoint]:
+            method_val = next(fm["method"] for fm in live["form_fields"] if fm.get("path") == endpoint)
+            m_source = "form_fields"
         elif _parse_openapi_paths_line(recon_text or "") and any(r["path"] == endpoint for r in _parse_openapi_paths_line(recon_text or "")):
             method_val, m_source = ",".join(next(r["methods"] for r in _parse_openapi_paths_line(recon_text or "") if r["path"] == endpoint)), "openapi"
         else:
@@ -15034,6 +15267,36 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
         field, f_source = mined["fields"][0], "advisory/derived"
     if not field and mined["headers"]:
         field, f_source = f"{mined['headers'][0]} (header)", "derived_vector"
+    # Live recon from THIS run. (1) arjun params on the resolved endpoint —
+    # classified first; (2) the form posted to the resolved endpoint — first
+    # non-token field; (3) auth-bypass only: the login form's username field
+    # (a session is the exploit's output, so the login form IS the sink). A
+    # login form is never promoted for other classes — 5314's /index.php
+    # login must not feed /admin/dict.php.
+    _TOKENISH = _re.compile(r"(?i)^(token|_token|csrf.*|_wp.*|nonce.*|tz.*|_method|submit|enter|login|btn.*)$")
+    if not field and endpoint:
+        _cl = [c for c in (live.get("classified_params") or []) if c.get("path") == endpoint]
+        _ap = (live.get("arjun_params") or {}).get(endpoint) or []
+        if _cl:
+            field, f_source = _cl[0]["param"], f"arjun:{endpoint}:classified:{_cl[0].get('class')}"
+        elif _ap:
+            field, f_source = _ap[0], f"arjun:{endpoint}"
+    if not field and endpoint:
+        _fm = [fm for fm in (live.get("form_fields") or []) if fm.get("path") == endpoint]
+        if _fm:
+            _cands = [x for x in (_fm[0].get("fields") or []) if not _TOKENISH.match(x)]
+            if _cands:
+                field, f_source = _cands[0], f"form_fields:{endpoint}"
+    if not field and vc == "auth-bypass":
+        for fm in live.get("form_fields") or []:
+            flds = fm.get("fields") or []
+            pw = next((x for x in flds if _re.search(r"(?i)(pass(word|wd)?|^pwd)$", x)), None)
+            if not pw:
+                continue
+            user = next((x for x in flds if x != pw and _re.search(r"(?i)(user|login|^name$|email|^log$|^uid$)", x)), None)
+            if user:
+                field, f_source = user, f"form_fields:login:{fm.get('path')}"
+                break
     # Scan evidence: Katana/content-ext already catalogued params on this app.
     # Prefer a discovered_params row whose url_pattern matches the chosen
     # endpoint; fall back to any discovered_params row; then hidden_inputs.
@@ -15400,6 +15663,28 @@ def _gather_manifest_text(man: dict) -> str:
             f"{k}={mined[k]}" for k in ("paths", "methods", "fields", "headers") if mined.get(k)))
     if facts.get("banner"):
         lines.append(f"  server banner: {facts['banner'][:200]}")
+
+    # What THIS run's recon found (forms / crawl / arjun / verb sweep) — the
+    # same facts the endpoint/method/field chains above consulted.
+    lr = facts.get("live_recon") or {}
+    if any(lr.get(k) for k in ("forms", "crawl_urls", "arjun_params", "verb_sweep", "zap_paths")):
+        lines.append("")
+        lines.append("LIVE RECON (this run):")
+        for fm in (lr.get("forms") or [])[:4]:
+            lines.append(f"  form {fm.get('method')} {fm.get('path')} fields={fm.get('fields')}")
+        for p, names in list((lr.get("arjun_params") or {}).items())[:6]:
+            extra_n = max(0, len(names) - 8)
+            lines.append(f"  arjun params {p}: {', '.join(names[:8])}" + (f" (+{extra_n} more)" if extra_n else ""))
+        for c in (lr.get("classified_params") or [])[:4]:
+            lines.append(f"  classified {c.get('path')} `{c.get('param')}` → {c.get('class')}")
+        for p, verbs in list((lr.get("verb_sweep") or {}).items())[:6]:
+            lines.append(f"  verb sweep {p}: " + " ".join(f"{m}:{s}" for m, s in verbs.items()))
+        cu = lr.get("crawl_urls") or []
+        if cu:
+            lines.append(f"  crawl urls ({len(cu)}): " + ", ".join(cu[:12]) + (" …" if len(cu) > 12 else ""))
+        zp = lr.get("zap_paths") or []
+        if zp:
+            lines.append(f"  zap paths ({len(zp)}): " + ", ".join(zp[:10]) + (" …" if len(zp) > 10 else ""))
 
     # Scan-side telemetry already captured on this target. Carried into the
     # synth prompt via guidance_extra so synth builds against what we already
