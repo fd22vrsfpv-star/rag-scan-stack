@@ -42,11 +42,11 @@ def _undefined_names(path: Path) -> list[str]:
     return [ln for ln in text.splitlines() if re.search(r"undefined name", ln)]
 
 
-# Known debt (RATCHET — shrink, never grow). api.py had 30 undefined-name sites
-# when this guard landed: bare `emit_webhook` in functions that never import it
-# (each inside try/except, so those webhooks were silently dropped) and an
-# undefined `ip`. Recorded in Docs/OPEN_ITEMS.md. A NEW undefined name fails by
-# name even while the count is under the baseline.
+# Known debt (RATCHET — shrink, never grow). api.py had 29 undefined-name sites
+# when this guard landed: 27 bare `emit_webhook` calls in functions that never
+# import it (each inside try/except, so those webhooks were silently dropped)
+# and an undefined `ip` (2 refs). Recorded in Docs/OPEN_ITEMS.md. A NEW
+# undefined name fails by name even while the count is under the baseline.
 BASELINE_COUNT = {"app/rag-api/api.py": 29}
 BASELINE_NAMES = {"app/rag-api/api.py": {"emit_webhook", "ip"}}
 
