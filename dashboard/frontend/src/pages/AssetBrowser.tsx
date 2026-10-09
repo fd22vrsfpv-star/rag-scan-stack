@@ -1,6 +1,6 @@
 import { useState, useMemo, useEffect, Fragment } from 'react'
 import { Link } from 'react-router-dom'
-import { useQueryClient, useQuery } from '@tanstack/react-query'
+import { useQueryClient, useQuery, useQueries } from '@tanstack/react-query'
 import PageHelp from '@/components/PageHelp'
 import { useAssets, useAssetPorts, useAssetVulns, usePortRecommendations, useSubdomains, useDeleteAssets, useDeleteSubdomains, useAssetCredentials, useAllCredentials, useUpdateCredentialStatus, useCreateCredential, useDeleteCredential, usePurgeDomain, usePurgePattern, useDetectedSoftware, useBulkDismissSoftware, useCveTuning, useUpdateCveTuning, useSearchsploit, getDdgSearchUrls, useResearchCache, useVulnxFindings, useResolveExploit, useBuildPoc, useAssetAccess, useRefreshAccess, useReviewAccess, useAccessSummary, usePendingExploitCounts, useAssetPortAdvice, useAssetEnumeration,
   type ObtainedAccess, type DdgSearchResponse, type EnumHighlight, type EnumCredential, type EnumLoot, type EnumLoginAttempt, type EnumListeningPort } from '@/api/assets'
@@ -13,7 +13,7 @@ import { DataTable } from '@/components/common/DataTable'
 import { StatusDot } from '@/components/common/StatusDot'
 import type { ColumnDef, RowSelectionState } from '@tanstack/react-table'
 import type { Asset, Port, Vuln, ScanRecommendation } from '@/lib/types'
-import { X, Trash2, Key, Plus, ShieldCheck, ShieldX, ShieldQuestion, ShieldOff, AlertTriangle, Globe, Camera, Cpu, Settings2, Search, ExternalLink, Cloud, Server, ChevronDown, ChevronRight, Eye, EyeOff, Copy, Check, Terminal, Zap} from 'lucide-react'
+import { X, Trash2, Key, Plus, ShieldCheck, ShieldX, ShieldQuestion, ShieldOff, AlertTriangle, Globe, Camera, Cpu, Settings2, Search, ExternalLink, Cloud, Server, ChevronDown, ChevronRight, Eye, EyeOff, Copy, Check, Terminal, Zap, Sparkles, Loader2} from 'lucide-react'
 import { ScopeAssignModal } from '@/components/common/ScopeAssignModal'
 import { ScopeFilter } from '@/components/common/ScopeFilter'
 import { KbSuggestionsModal } from '@/components/recommendations/KbSuggestionsModal'
@@ -115,10 +115,12 @@ const assetColumns: ColumnDef<Asset, unknown>[] = [
   }},
   // Releasable actions waiting on this host — exploits pending approval and/or a
   // small default-cred spray opportunity — highlighted and linked to their queue.
-  { accessorKey: 'pending_exploits', header: 'To Approve', size: 150, cell: ({ row }) => {
+  { accessorKey: 'pending_exploits', header: 'To Approve', size: 180, cell: ({ row }) => {
     const n = Number(row.original.pending_exploits ?? 0)
     const spray = Number(row.original.spray_ready ?? 0)
-    if (n === 0 && spray === 0) return <span className="text-xs text-muted-foreground">—</span>
+    const poc = Number(row.original.poc_count ?? 0)
+    const vpoc = Number(row.original.verified_poc_count ?? 0)
+    if (n === 0 && spray === 0 && poc === 0) return <span className="text-xs text-muted-foreground">—</span>
     return (
       <span className="inline-flex items-center gap-1 flex-wrap">
         {n > 0 && (
@@ -139,6 +141,18 @@ const assetColumns: ColumnDef<Asset, unknown>[] = [
             className="inline-flex items-center gap-1 text-xs font-semibold px-1.5 py-0.5 rounded border bg-sky-500/15 text-sky-400 border-sky-500/40 hover:bg-sky-500/25"
           >
             <Key className="h-3 w-3" />spray
+          </Link>
+        )}
+        {poc > 0 && (
+          <Link
+            to={`/exploits?tab=store&ip=${encodeURIComponent(row.original.ip)}`}
+            onClick={e => e.stopPropagation()}
+            title={`${poc} built PoC(s), ${vpoc} verified — jump to Exploit Store`}
+            className={cn('inline-flex items-center gap-1 text-xs font-semibold px-1.5 py-0.5 rounded border',
+              vpoc > 0
+                ? 'bg-green-500/15 text-green-400 border-green-500/40 hover:bg-green-500/25'
+                : 'bg-purple-500/15 text-purple-400 border-purple-500/40 hover:bg-purple-500/25')}>
+            <Sparkles className="h-3 w-3" />{vpoc > 0 ? `${vpoc}✓/${poc} PoC` : `${poc} PoC`}
           </Link>
         )}
       </span>
@@ -289,6 +303,152 @@ function CredStatusBadge({ status }: { status: string }) {
 
 const SECRET_TYPES = ['password', 'aws_key', 'azure_key', 'ssh_key', 'api_token', 'ntlm_hash', 'kerberos_ticket', 'certificate', 'other'] as const
 const PROTOCOLS = ['ssh', 'ftp', 'rdp', 'smb', 'http', 'https', 'telnet', 'vnc', 'mysql', 'mssql', 'postgres', 'oracle', 'ldap', 'snmp', 'winrm', 'other'] as const
+
+/** Operations tab inside the Exploit Workbench modal. Pulls in the slice
+ *  of /exploits that applies to the current product/version/CVE set so the
+ *  operator doesn't have to switch pages: stored exploits that match any
+ *  collected CVE, a Build-PoC shortcut (pre-filled with the first CVE), and
+ *  a jump link to the full /exploits page for deeper operational work. */
+function ExploitWorkbenchOperationsTab({ product, version, collectedCves, embedded }: {
+  product: string; version: string; collectedCves: string[]
+  // When embedded inside the Exploit Workbench's inline research surface,
+  // the outer workbench already has its own build-PoC entry — suppress the
+  // redundant "Build a new PoC for this product" subsection to avoid a
+  // second exploit-workbench stack showing up (operator-flagged).
+  embedded?: boolean
+}) {
+  // Fetch stored exploits per CVE — bounded to the first 10 so the modal
+  // doesn't fan out into dozens of parallel queries.
+  const cveQueries = useQueries({
+    queries: collectedCves.slice(0, 10).map(cve => ({
+      queryKey: ['exploit-store-by-cve', cve],
+      queryFn: () => apiFetch<{ exploits: Array<{ id: string; cve: string; verified: boolean; target_host: string | null; target_port: number | null; built_at: string | null }> }>(
+        `/exploit-store?cve=${encodeURIComponent(cve)}&limit=10`),
+    })),
+  }) as Array<{ data?: { exploits: Array<{ id: string; cve: string; verified: boolean; target_host: string | null; target_port: number | null; built_at: string | null }> } }>
+  const matchedExploits = useMemo(() => {
+    const seen = new Set<string>()
+    const rows: Array<{ id: string; cve: string; verified: boolean; target: string }> = []
+    for (const q of cveQueries) {
+      for (const ex of (q.data?.exploits || [])) {
+        if (seen.has(ex.id)) continue
+        seen.add(ex.id)
+        rows.push({
+          id: ex.id, cve: ex.cve, verified: ex.verified,
+          target: `${ex.target_host || '?'}${ex.target_port ? ':' + ex.target_port : ''}`,
+        })
+      }
+    }
+    rows.sort((a, b) => (a.verified === b.verified ? 0 : a.verified ? -1 : 1))
+    return rows
+  }, [cveQueries])
+  const buildPoc = useBuildPoc()
+  const [buildMsg, setBuildMsg] = useState<string>('')
+  const firstCve = collectedCves[0]
+  const runBuild = async () => {
+    if (!firstCve) return
+    setBuildMsg(`starting ${firstCve}…`)
+    try {
+      // Build PoC off the first collected CVE. No IP/port available in this
+      // product-oriented modal, so the operator kicks a research-only build
+      // (recon_source=basic) that will fail-closed on scope but gives a
+      // useful starting command they can push through Exploit Store. The
+      // backend returns more fields than the hook's TypeScript signature
+      // promises; cast to any to pull `verified` + `exploit_store_id` out.
+      const r = await buildPoc.mutateAsync({
+        cve: firstCve, product, version: version || undefined,
+        recon_source: 'basic', max_iters: 5, release: true,
+      } as any) as any
+      const verdict = r?.verified ? 'VERIFIED' : 'FAILED — needs tweaking'
+      const storeId = r?.exploit_store_id ? String(r.exploit_store_id).slice(0, 8) : '?'
+      setBuildMsg(`PoC build ${verdict} (id ${storeId})`)
+    } catch (e) {
+      setBuildMsg(`error: ${(e as Error).message}`)
+    }
+  }
+  return (
+    <div className="space-y-3">
+      <div className="border border-border rounded-md p-3 space-y-2">
+        <h4 className="text-sm font-semibold inline-flex items-center gap-1">
+          <Terminal className="h-3.5 w-3.5" /> Stored exploits for {product}
+          <span className="text-[10px] text-muted-foreground font-normal">
+            — matched by {collectedCves.length} CVE{collectedCves.length === 1 ? '' : 's'} from research
+          </span>
+        </h4>
+        {collectedCves.length === 0 ? (
+          <div className="text-xs text-muted-foreground italic">
+            No CVEs collected yet — run Web Search / ExploitDB in the Exploits &amp; Research tab first.
+          </div>
+        ) : matchedExploits.length === 0 ? (
+          <div className="text-xs text-muted-foreground italic">
+            No stored exploits yet for any of the collected CVEs. Click Build PoC below to generate one.
+          </div>
+        ) : (
+          <div className="space-y-1 max-h-72 overflow-y-auto">
+            {matchedExploits.slice(0, 25).map(ex => (
+              <div key={ex.id} className="flex items-center gap-2 px-2 py-1 rounded border border-border bg-muted/20 text-xs">
+                <span className={cn('h-5 px-1.5 rounded text-[9px] inline-flex items-center font-semibold uppercase',
+                  ex.verified ? 'bg-emerald-500/20 text-emerald-300' : 'bg-amber-500/20 text-amber-300')}>
+                  {ex.verified ? '✓ verified' : 'unverified'}
+                </span>
+                <span className="font-mono text-amber-400">{ex.cve}</span>
+                <span className="text-muted-foreground">on {ex.target}</span>
+                <div className="flex-1" />
+                <a href={`/exploits?open=${ex.id}`} target="_blank" rel="noopener"
+                  className="text-[10px] px-2 py-0.5 rounded border border-border hover:bg-muted">
+                  Open in /exploits
+                </a>
+              </div>
+            ))}
+            {matchedExploits.length > 25 && (
+              <div className="text-[10px] text-muted-foreground">+ {matchedExploits.length - 25} more…</div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Build-PoC section — only shown when standalone (modal form). When
+          this component is embedded inside the Exploit Workbench, the outer
+          surface already has its own build-PoC entry (the "PoC for product"
+          details panel + the top-bar "Create & Test Exploit" button), so
+          this redundant subsection is suppressed to avoid two "exploit
+          workbench" surfaces stacking on top of each other — operator
+          flagged "the second exploit workbench shows up". */}
+      {!embedded && (
+        <div className="border border-border rounded-md p-3 space-y-2">
+          <h4 className="text-sm font-semibold inline-flex items-center gap-1">
+            <Sparkles className="h-3.5 w-3.5" /> Build a new PoC for this product
+          </h4>
+          <p className="text-[11px] text-muted-foreground">
+            Kicks /software/build-poc for the first collected CVE
+            {firstCve && <> (<span className="font-mono text-amber-400">{firstCve}</span>)</>}
+            with product + version pre-filled. 5–10 min; result lands in Exploit
+            Store regardless of verdict, so you can tweak + rerun.
+          </p>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={runBuild}
+              disabled={!firstCve || buildPoc.isPending}
+              className="h-7 px-3 rounded bg-purple-600 hover:bg-purple-700 text-white text-xs inline-flex items-center gap-1 disabled:opacity-40">
+              {buildPoc.isPending ? <Loader2 className="w-3 h-3 animate-spin" /> : <Sparkles className="w-3 h-3" />}
+              Build PoC
+            </button>
+            <a href="/exploits" target="_blank" rel="noopener"
+              className="h-7 px-3 rounded border border-border hover:bg-muted text-xs inline-flex items-center gap-1">
+              <ExternalLink className="w-3 h-3" /> Open full Exploit Manager
+            </a>
+          </div>
+          {buildMsg && (
+            <div className="text-[11px] font-mono bg-muted/40 border border-border rounded p-2 whitespace-pre-wrap">
+              {buildMsg}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 
 function AddCredentialModal({ onClose }: { onClose: () => void }) {
   const createCred = useCreateCredential()
@@ -730,6 +890,215 @@ function EnumerationSection({ ip }: { ip: string }) {
   )
 }
 
+
+interface ConfirmedFact {
+  id: string
+  target: string
+  host: string | null
+  product: string | null
+  version: string | null
+  cve: string | null
+  claim_type: string
+  claim_key: string
+  claim_value: string | null
+  status: string
+  evidence: string | null
+  method: string | null
+  ttl_seconds: number | null
+  last_checked_at: string | null
+  age_s: number | null
+}
+
+// Renders the full evidence text with any `Screenshot: /confirmed-facts/screenshot/<x>.png`
+// line stripped and shown as an inline <img>. Multiple screenshots are each inlined.
+// The /confirmed-facts/screenshot/* path is proxied by the BFF to rag-api.
+function ExpandedEvidence({ evidence }: { evidence: string }) {
+  const re = /^Screenshot:\s+(\S+)\s*$/gm
+  const shots: string[] = []
+  const text = evidence.replace(re, (_m, p1) => { shots.push(p1); return '' }).replace(/\n{3,}/g, '\n\n').trim()
+  return (
+    <div className="space-y-2">
+      <pre className="text-[10px] font-mono bg-background border border-border rounded p-2 whitespace-pre-wrap break-words max-h-80 overflow-auto">{text}</pre>
+      {shots.map((src, i) => (
+        <a key={i} href={`/api${src}`} target="_blank" rel="noopener noreferrer"
+           className="block border border-border rounded overflow-hidden hover:border-blue-500/60"
+           title="Click to open full-size screenshot">
+          <img src={`/api${src}`} alt="Response screenshot"
+               className="w-full max-h-96 object-contain bg-background" />
+        </a>
+      ))}
+    </div>
+  )
+}
+
+// Confirmed Facts / Foothold panel for a host. Reads the durable confirmed_facts
+// ledger (session validity, resolved object-ids, endpoint existence, version
+// applicability, vendor-doc answers) + the live foothold, and groups them BY
+// PRODUCT — so Zabbix and Apache on the same ip:port read as distinct footholds,
+// matching the ledger's (target, product, host) identity. Operator ask: the
+// confirmed facts / foothold should show on the asset for the host.
+function ConfirmedFactsSection({ ip, hostname }: { ip: string; hostname?: string }) {
+  const { data, isLoading } = useQuery({
+    queryKey: ['confirmed-facts', ip, hostname],
+    queryFn: () => apiFetch<{ count: number; facts: ConfirmedFact[] }>('/confirmed-facts'),
+    refetchInterval: 30000,
+  })
+  const { data: access } = useAssetAccess(ip, false)
+  // Per-row expand toggle so an operator can click the Evidence cell to see
+  // the full stored text (the ledger holds up to 2000 chars; the table cell
+  // clips at ~280px). Operator ask: "nice to see the actual output."
+  const [expandedEvidence, setExpandedEvidence] = useState<Record<string, boolean>>({})
+
+  // Client-filter to this host: target is "ip:port", so match the ip prefix, OR
+  // the stored hostname matches the asset's hostname (vhost-distinct facts).
+  const facts = useMemo(() => {
+    const all = data?.facts ?? []
+    const hn = (hostname || '').toLowerCase()
+    return all.filter(f =>
+      (f.target || '').startsWith(`${ip}:`) ||
+      (f.target || '') === ip ||
+      (!!hn && (f.host || '').toLowerCase() === hn))
+  }, [data, ip, hostname])
+
+  // Group by product (the application identity), then by claim_type.
+  const byProduct = useMemo(() => {
+    const groups: Record<string, ConfirmedFact[]> = {}
+    for (const f of facts) {
+      const k = f.product || '(unattributed)'
+      ;(groups[k] = groups[k] || []).push(f)
+    }
+    return groups
+  }, [facts])
+
+  const footholds = (access?.access ?? []).filter((a: ObtainedAccess) =>
+    a.kind === 'web_session' || a.transport === 'http' || a.transport === 'https')
+
+  const isStale = (f: ConfirmedFact) =>
+    !!f.ttl_seconds && f.ttl_seconds > 0 && (f.age_s ?? 0) > f.ttl_seconds
+  const fmtAge = (s: number | null) => {
+    if (s == null) return '—'
+    if (s < 90) return `${Math.round(s)}s ago`
+    if (s < 5400) return `${Math.round(s / 60)}m ago`
+    if (s < 172800) return `${Math.round(s / 3600)}h ago`
+    return `${Math.round(s / 86400)}d ago`
+  }
+  const statusBadge = (st: string, stale: boolean) => {
+    if (stale) return <span className="px-1.5 py-0.5 rounded text-[10px] bg-amber-500/10 text-amber-400 inline-flex items-center gap-1" title="TTL elapsed — re-verify before relying on it"><ShieldQuestion className="h-3 w-3" />stale</span>
+    if (st === 'confirmed') return <span className="px-1.5 py-0.5 rounded text-[10px] bg-green-500/15 text-green-300 inline-flex items-center gap-1"><ShieldCheck className="h-3 w-3" />confirmed</span>
+    if (st === 'refuted') return <span className="px-1.5 py-0.5 rounded text-[10px] bg-red-500/15 text-red-300 inline-flex items-center gap-1"><ShieldX className="h-3 w-3" />refuted</span>
+    return <span className="px-1.5 py-0.5 rounded text-[10px] bg-gray-500/10 text-gray-400 inline-flex items-center gap-1"><ShieldQuestion className="h-3 w-3" />{st}</span>
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <h4 className="text-xs font-medium text-muted-foreground flex items-center gap-1.5">
+          <ShieldCheck className="h-3.5 w-3.5" /> Confirmed Facts &amp; Footholds
+          ({facts.length} fact{facts.length === 1 ? '' : 's'})
+        </h4>
+      </div>
+      <p className="text-[11px] text-muted-foreground">
+        Durable, evidence-backed verification reusable across attacks — grouped by
+        application, because <span className="font-mono">Zabbix</span> and{' '}
+        <span className="font-mono">Apache</span> on the same <span className="font-mono">ip:port</span>{' '}
+        are distinct footholds. A <em>stale</em> fact's freshness window (TTL) has elapsed; re-verify before relying on it.
+      </p>
+
+      {footholds.length > 0 && (
+        <div className="rounded-md border border-green-500/30 bg-green-500/5 p-3">
+          <div className="text-[11px] font-medium text-green-300 mb-1.5 flex items-center gap-1">
+            <Key className="h-3 w-3" /> Live foothold{footholds.length === 1 ? '' : 's'}
+          </div>
+          <div className="space-y-1">
+            {footholds.map((a: ObtainedAccess) => (
+              <div key={a.id} className="text-xs font-mono flex items-center gap-2 flex-wrap">
+                <span className="text-green-300">{a.handle}</span>
+                <span className="text-[10px] text-muted-foreground">
+                  {a.transport || a.kind}{a.whoami ? ` · ${a.whoami}` : ''} · score {a.score} · {a.status}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {isLoading ? (
+        <p className="text-xs text-muted-foreground">Loading…</p>
+      ) : facts.length === 0 ? (
+        <p className="text-xs text-muted-foreground">
+          No confirmed facts for this host yet. The build-PoC challenge/readiness gate records
+          verified session validity, enumerated object-ids (hosts, scripts, users), endpoint
+          existence and version applicability here as it confirms them.
+        </p>
+      ) : (
+        Object.entries(byProduct).map(([product, pfacts]) => (
+          <div key={product} className="rounded-md border border-border">
+            <div className="px-3 py-2 border-b border-border bg-muted/40 flex items-center justify-between flex-wrap gap-2">
+              <span className="text-xs font-medium">{product}</span>
+              <span className="text-[10px] text-muted-foreground font-mono">
+                {pfacts[0]?.version ? `v${pfacts[0].version} · ` : ''}{pfacts.length} fact{pfacts.length === 1 ? '' : 's'}
+              </span>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[720px] text-xs">
+                <thead className="text-muted-foreground">
+                  <tr className="border-b border-border">
+                    <th className="text-left py-1 px-2">Claim</th>
+                    <th className="text-left px-2">Value</th>
+                    <th className="text-left px-2">Status</th>
+                    <th className="text-left px-2">Evidence</th>
+                    <th className="text-left px-2">Method</th>
+                    <th className="text-right px-2">Checked</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pfacts.map(f => {
+                    const long = (f.evidence || '').length > 90 || (f.evidence || '').includes('\n')
+                    const isOpen = expandedEvidence[f.id] === true
+                    return (
+                      <Fragment key={f.id}>
+                        <tr className="border-b border-border/40 align-top">
+                          <td className="py-1 px-2">
+                            <div className="font-mono">{f.claim_type}</div>
+                            <div className="text-[10px] text-muted-foreground font-mono">{f.claim_key}</div>
+                          </td>
+                          <td className="px-2 font-mono">{f.claim_value || '—'}</td>
+                          <td className="px-2">{statusBadge(f.status, isStale(f))}</td>
+                          <td className="px-2 text-[10px] text-muted-foreground max-w-[280px]">
+                            {long ? (
+                              <button type="button"
+                                className="inline-flex items-start gap-1 text-left hover:text-foreground"
+                                title={isOpen ? "collapse evidence" : "expand to see full evidence output"}
+                                onClick={() => setExpandedEvidence(s => ({ ...s, [f.id]: !isOpen }))}>
+                                <ChevronRight className={cn("h-3 w-3 mt-0.5 shrink-0 transition-transform", isOpen && "rotate-90")} />
+                                <span className="truncate">{(f.evidence || '').slice(0, 90)}{(f.evidence || '').length > 90 ? '…' : ''}</span>
+                              </button>
+                            ) : (
+                              <span>{f.evidence || '—'}</span>
+                            )}
+                          </td>
+                          <td className="px-2 text-[10px] text-muted-foreground font-mono">{f.method || '—'}</td>
+                          <td className="px-2 text-right text-[10px] text-muted-foreground whitespace-nowrap">{fmtAge(f.age_s)}</td>
+                        </tr>
+                        {long && isOpen && (
+                          <tr>
+                            <td colSpan={6} className="px-2 pb-2">
+                              <ExpandedEvidence evidence={f.evidence || ''} />
+                            </td>
+                          </tr>
+                        )}
+                      </Fragment>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ))
+      )}
+    </div>
+  )
+}
 
 function AccessSection({ ip }: { ip: string }) {
   const [includeDead, setIncludeDead] = useState(false)
@@ -1204,7 +1573,11 @@ export default function AssetBrowser() {
   const [hideBlankProductVersion, setHideBlankProductVersion] = useState(true)
   const [softwareSort, setSoftwareSort] = useState<'hostname' | 'product' | 'version' | 'cve-count'>('hostname')
   const [showBulkDismiss, setShowBulkDismiss] = useState(false)
-  const [exploitLookup, setExploitLookup] = useState<{ product: string; version: string; cveFlags?: any[] } | null>(null)
+  // The inline <ExploitLookupModal> that used to live over Assets is gone —
+  // clicking View on a software row now opens /exploits-popout (the single
+  // chromeless Workbench) in a new tab. The ExploitLookupModal component is
+  // still exported from this file so ExploitManager's Workbench tab can
+  // render it inline there.
   const resolveExploit = useResolveExploit()
   const [resolveMsg, setResolveMsg] = useState<Record<string, string>>({})
   const buildPoc = useBuildPoc()
@@ -1222,7 +1595,7 @@ export default function AssetBrowser() {
   const [selectedIp, setSelectedIp] = useState<string | null>(null)
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null)
   const [selectedPort, setSelectedPort] = useState<Port | null>(null)
-  const [detailTab, setDetailTab] = useState<'ports' | 'credentials' | 'access' | 'enumeration' | 'screenshots' | 'recon'>('ports')
+  const [detailTab, setDetailTab] = useState<'ports' | 'credentials' | 'access' | 'facts' | 'enumeration' | 'screenshots' | 'recon'>('ports')
   const [search, setSearch] = useState('')
   const [credStatusFilter, setCredStatusFilter] = useState<string>('')
   // Track which credential rows have their audit panel expanded.  Keyed by
@@ -2191,10 +2564,23 @@ export default function AssetBrowser() {
                                   <span className="h-2 w-2 rounded-full bg-green-500 shrink-0" title="AI checked" />
                                 )}
                                 <button
-                                  onClick={() => setExploitLookup({ product: sw.product, version: sw.version || '', cveFlags: sw.cve_flags })}
+                                  onClick={() => {
+                                    // Open the single Exploit Workbench
+                                    // (chromeless /exploits-popout) in a new
+                                    // browser tab with this product + version
+                                    // pre-filled on the PoC Exploit Workbench
+                                    // tab. No inline modal in Assets — one
+                                    // consistent surface for all exploit
+                                    // functions (research, build-poc,
+                                    // operations, detail, bake-off).
+                                    const url = `/exploits-popout?tab=workbench`
+                                      + `&product=${encodeURIComponent(sw.product)}`
+                                      + (sw.version ? `&version=${encodeURIComponent(sw.version)}` : '')
+                                    window.open(url, '_blank', 'noopener,noreferrer')
+                                  }}
                                   className="px-1.5 py-0.5 rounded text-[10px] border border-purple-500/40 text-purple-400 hover:bg-purple-500/10"
-                                  title="AI-powered exploit & CVE research"
-                                ><Search className="inline h-2.5 w-2.5 mr-0.5" />{(sw as any).ai_checked ? 'View' : 'AI Check'}</button>
+                                  title="Open the Exploit Workbench in a new tab (chromeless, resizable)"
+                                ><Search className="inline h-2.5 w-2.5 mr-0.5" />{(sw as any).ai_checked ? 'View in Workbench' : 'AI Check'}</button>
                               </div>
                             </td>
                           </tr>
@@ -2248,17 +2634,19 @@ export default function AssetBrowser() {
                                                     {resolveMsg[rk] && <span className="text-[9px] text-muted-foreground mr-1">{resolveMsg[rk]}</span>}
                                                     <button
                                                       onClick={() => {
-                                                        setPocMsg(m => ({ ...m, [rk]: 'building… (may take a minute)' }))
-                                                        buildPoc.mutate(
-                                                          { cve: cid, ip: sw.ip, port: sw.port ?? undefined, product: sw.product, version: sw.version || undefined, max_iters: 3, release: true },
-                                                          {
-                                                            onSuccess: (r) => setPocMsg(m => ({ ...m, [rk]: r.success ? `✓ PoC converged (${r.iterations} it)` : `no converge (${r.iterations} it) — see log` })),
-                                                            onError: () => setPocMsg(m => ({ ...m, [rk]: 'build failed' })),
-                                                          },
-                                                        )
+                                                        // Navigate into the Exploit Workbench with the Build-PoC
+                                                        // form pre-seeded, instead of fire-and-forget. Operator
+                                                        // reviews + clicks Build inside the Workbench.
+                                                        const qs = new URLSearchParams()
+                                                        qs.set('tab', 'workbench')
+                                                        qs.set('cve', cid)
+                                                        if (sw.product) qs.set('product', sw.product)
+                                                        if (sw.version) qs.set('version', sw.version)
+                                                        if (sw.ip) qs.set('target_url', `http://${sw.ip}${sw.port ? ':' + sw.port : ''}/`)
+                                                        window.open(`/exploits-popout?${qs.toString()}`, '_blank', 'noopener,noreferrer')
                                                       }}
                                                       className="ml-0.5 mr-1 px-1 py-0.5 rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 text-[9px] whitespace-nowrap"
-                                                      title="Build & run a PoC for this CVE (research → synthesize → run-and-refine, auto nonce fetch). Approval-gated; may take a minute."
+                                                      title="Open this CVE in the Exploit Workbench with the Build-PoC form pre-filled. Review + click Build to kick the loop."
                                                     >🔨 Build PoC</button>
                                                     {pocMsg[rk] && <span className="text-[9px] text-muted-foreground mr-1">{pocMsg[rk]}</span>}
                                                   </span>
@@ -2355,8 +2743,9 @@ export default function AssetBrowser() {
         </div>
       )}
 
-      {/* Exploit Lookup Modal */}
-      {exploitLookup && <ExploitLookupModal product={exploitLookup.product} version={exploitLookup.version} cveFlags={exploitLookup.cveFlags} onClose={() => setExploitLookup(null)} />}
+      {/* The Exploit Lookup Modal is no longer rendered inline here —
+          clicking View on a software row opens the single Workbench
+          (/exploits-popout) in a new browser tab. */}
 
       {/* CVE Rule Tuning Dialog */}
       {showCveTuning && cveTuningData?.tuning && (() => {
@@ -2483,6 +2872,10 @@ export default function AssetBrowser() {
               className={`px-3 py-1.5 text-xs font-medium rounded-t-md border border-b-0 ${detailTab === 'access' ? 'bg-card text-foreground border-border' : 'bg-muted/50 text-muted-foreground border-transparent hover:text-foreground'}`}
             ><Terminal className="h-3 w-3 inline mr-1" />Current Access</button>
             <button
+              onClick={() => setDetailTab('facts')}
+              className={`px-3 py-1.5 text-xs font-medium rounded-t-md border border-b-0 ${detailTab === 'facts' ? 'bg-card text-foreground border-border' : 'bg-muted/50 text-muted-foreground border-transparent hover:text-foreground'}`}
+            ><ShieldCheck className="h-3 w-3 inline mr-1" />Confirmed Facts</button>
+            <button
               onClick={() => setDetailTab('enumeration')}
               className={`px-3 py-1.5 text-xs font-medium rounded-t-md border border-b-0 ${detailTab === 'enumeration' ? 'bg-card text-foreground border-border' : 'bg-muted/50 text-muted-foreground border-transparent hover:text-foreground'}`}
             >Enumeration</button>
@@ -2494,6 +2887,7 @@ export default function AssetBrowser() {
 
           <div className="p-4 space-y-6">
             {detailTab === 'access' && <AccessSection ip={selectedIp} />}
+            {detailTab === 'facts' && <ConfirmedFactsSection ip={selectedIp} hostname={assets.find(a => a.ip === selectedIp)?.hostname} />}
             {detailTab === 'enumeration' && <EnumerationSection ip={selectedIp} />}
             {detailTab === 'ports' && (
               <div>
@@ -3040,7 +3434,21 @@ function AssetReconIntel({ hostname, ip, asset }: { hostname?: string | null; ip
 }
 
 
-function ExploitLookupModal({ product, version, cveFlags, onClose }: { product: string; version: string; cveFlags?: any[]; onClose: () => void }) {
+// Exported so /exploits Research tab can render the same lookup/research
+// surface inline — one combined window, one component, no iframe.
+export function ExploitLookupModal({ product, version, cve, cveFlags, onClose, embedded }: {
+  product: string; version: string; cveFlags?: any[]; onClose: () => void;
+  // Explicit CVE context so the "Open in browser" DDG/ExploitDB links can
+  // anchor the search on the CVE id even when product is empty / "unknown".
+  // Operators reported every open-in-browser button searching for literal
+  // "unknown" because the exploit workbench passed product="unknown" when
+  // data.product was null — now the CVE wins over an unusable product.
+  cve?: string
+  // When true, suppress the "Open workbench in new tab" header button —
+  // the modal is already rendered INSIDE the Workbench pane, so the
+  // operator doesn't need a second pop-out trigger. Keeps the close [X].
+  embedded?: boolean
+}) {
   // Load previous research from cache
   const queryClient = useQueryClient()
   const { data: cacheData } = useResearchCache(product, version || undefined)
@@ -3059,7 +3467,7 @@ function ExploitLookupModal({ product, version, cveFlags, onClose }: { product: 
   const { data: edbData, isLoading: edbLoading } = useSearchsploit(product, edbVersion || undefined, edbAnalyze, edbWide ? version : undefined)
   const edbNoVersionResults = !edbWide && !edbLoading && (edbData?.count ?? 0) === 0
 
-  const ddgLinks = getDdgSearchUrls(product, version || undefined)
+  const ddgLinks = getDdgSearchUrls(product, version || undefined, cve)
   const [ddgData, setDdgData] = useState<DdgSearchResponse | null>(null)
   const [ddgLoading, setDdgLoading] = useState(false)
   const [ddgStage, setDdgStage] = useState('')
@@ -3069,7 +3477,14 @@ function ExploitLookupModal({ product, version, cveFlags, onClose }: { product: 
   const [manualUrls, setManualUrls] = useState('')
   const [manualUrlResults, setManualUrlResults] = useState<any[]>([])
   const [manualUrlLoading, setManualUrlLoading] = useState(false)
-  const [modalTab, setModalTab] = useState<'exploits' | 'research' | 'vulnx' | 'github' | 'log'>('exploits')
+  // 'exploits' + 'research' used to be separate tabs; they answer the same
+  // operator question ("what known attacks exist for this product?") via
+  // different sources (ExploitDB/Nuclei vs Web+LLM analysis), so they're
+  // merged into one 'exploits_research' tab that renders both sections in
+  // sequence. 'operations' pulls in the matching exploit_store rows + a
+  // "Build PoC" shortcut so research + exploit-manager work live in ONE
+  // window instead of two separate URLs the operator has to flip between.
+  const [modalTab, setModalTab] = useState<'exploits_research' | 'operations' | 'vulnx' | 'github' | 'log'>('exploits_research')
   // GitHub PoC tab data (from ddgData or standalone fetch)
   const [githubPocs, setGithubPocs] = useState<any[]>([])
   const [githubLoading, setGithubLoading] = useState(false)
@@ -3161,16 +3576,38 @@ function ExploitLookupModal({ product, version, cveFlags, onClose }: { product: 
       <div className="bg-card border border-border rounded-lg p-5 w-full max-w-3xl max-h-[85vh] overflow-auto space-y-4" onClick={e => e.stopPropagation()}>
         <div className="flex items-center justify-between">
           <h3 className="text-sm font-semibold">
-            AI Exploit Research: {product} {version || ''}
+            {embedded
+              ? <>Research &amp; Public Exploits: {product} {version || ''}</>
+              : <>Exploit Workbench: {product} {version || ''}</>}
           </h3>
-          <button onClick={onClose} className="text-muted-foreground hover:text-foreground"><X className="h-4 w-4" /></button>
+          <div className="flex items-center gap-1">
+            {!embedded && (
+              <button
+                onClick={() => {
+                  // Chromeless /exploits-popout route (no sidebar / topbar
+                  // overlaid) — just the Workbench content in a new tab.
+                  // Lands on the unified PoC Exploit Workbench tab with
+                  // product + version pre-filled; the Research surface
+                  // opens from the Open-Research button inside.
+                  const url = `/exploits-popout?tab=workbench`
+                    + `&product=${encodeURIComponent(product)}`
+                    + (version ? `&version=${encodeURIComponent(version)}` : '')
+                  window.open(url, '_blank', 'noopener,noreferrer')
+                }}
+                className="text-muted-foreground hover:text-foreground text-[11px] px-2 py-0.5 rounded border border-border inline-flex items-center gap-1"
+                title="Open the Exploit Workbench in a new browser tab — all /exploits tabs available">
+                <ExternalLink className="h-3 w-3" /> Open workbench in new tab
+              </button>
+            )}
+            <button onClick={onClose} className="text-muted-foreground hover:text-foreground"><X className="h-4 w-4" /></button>
+          </div>
         </div>
 
         {/* Tab bar */}
         <div className="flex gap-1 border-b border-border">
           {([
-            ['exploits', 'Exploits & Nuclei'],
-            ['research', 'AI Research'],
+            ['exploits_research', 'Exploits & Research'],
+            ['operations', 'Operations'],
             ['vulnx', 'VulnX CVEs'],
             ['github', 'GitHub PoCs'],
             ['log', 'Debug Log'],
@@ -3487,8 +3924,8 @@ function ExploitLookupModal({ product, version, cveFlags, onClose }: { product: 
           </div>
         )}
 
-        {/* ── TAB: Exploits & Nuclei ── */}
-        {modalTab === 'exploits' && (<>
+        {/* ── TAB: Exploits & Research — Section 1: ExploitDB ── */}
+        {modalTab === 'exploits_research' && (<>
         {/* ── Section 1: ExploitDB / SearchSploit ── */}
         <div className="border border-border rounded-md p-3 space-y-2">
           <div className="flex items-center justify-between">
@@ -3604,8 +4041,8 @@ function ExploitLookupModal({ product, version, cveFlags, onClose }: { product: 
 
         </>)}
 
-        {/* ── TAB: AI Research ── */}
-        {modalTab === 'research' && (<>
+        {/* ── TAB: Exploits & Research — Section 2: Web + AI Analysis ── */}
+        {modalTab === 'exploits_research' && (<>
         {/* ── Section 2: Web Search (DDG + AI) ── */}
         <div className="border border-border rounded-md p-3 space-y-2">
           <div className="flex items-center justify-between">
@@ -3703,8 +4140,8 @@ function ExploitLookupModal({ product, version, cveFlags, onClose }: { product: 
 
         </>)}
 
-        {/* ── TAB: Exploits (continued — Nuclei in same tab) ── */}
-        {modalTab === 'exploits' && ddgData && (<>
+        {/* ── TAB: Exploits & Research — Section 3: Nuclei templates ── */}
+        {modalTab === 'exploits_research' && ddgData && (<>
         {/* ── Section 3: Nuclei Templates ── */}
         {ddgData?.nuclei_templates && ddgData.nuclei_templates.length > 0 && (
           <div className="border border-cyan-500/30 rounded-md p-3 bg-cyan-500/5 space-y-2">
@@ -3731,6 +4168,42 @@ function ExploitLookupModal({ product, version, cveFlags, onClose }: { product: 
           </div>
         )}
         </>)}
+
+        {/* ── TAB: Operations — pulls in the Exploit Manager slice for the
+            product/version so research + operational state live in ONE
+            window. Replaces having /exploits open in a separate tab. */}
+        {modalTab === 'operations' && (
+          <ExploitWorkbenchOperationsTab
+            product={product}
+            version={version || ''}
+            embedded={embedded}
+            collectedCves={(() => {
+              const seen = new Set<string>()
+              // Pull every CVE the modal has gathered — from VulnX, DDG
+              // analysis, SearchSploit, and the inbound cveFlags prop. The
+              // specific field names vary per source + evolve over time;
+              // treat the containers as any-shaped and pick off whatever
+              // CVE-looking strings they carry.
+              const extract = (val: unknown) => {
+                if (typeof val === 'string' && /^CVE-\d{4}-\d{4,}/i.test(val)) seen.add(val.toUpperCase())
+              }
+              for (const c of (vulnxData?.findings || []) as any[]) {
+                extract(c?.cve_id); extract(c?.cve); extract(c?.id)
+              }
+              for (const a of (ddgData?.analysis || []) as any[]) {
+                for (const c of (a?.cves || [])) extract(c)
+                extract(a?.cve)
+              }
+              for (const e of (edbData?.exploits || []) as any[]) {
+                for (const c of (e?.cves || [])) extract(c)
+                extract(e?.cve)
+              }
+              for (const f of ((cveFlags as any[]) || [])) {
+                extract(f?.cve); extract(f?.cve_id)
+              }
+              return Array.from(seen).sort()
+            })()} />
+        )}
 
         {/* ── TAB: VulnX CVEs ── */}
         {modalTab === 'vulnx' && (
@@ -3869,10 +4342,10 @@ function ExploitLookupModal({ product, version, cveFlags, onClose }: { product: 
         )}
         {modalTab === 'log' && !showLog && (
           <div className="text-xs text-muted-foreground">
-            <p>Run an AI Research first — the debug log appears after the LLM analysis completes.</p>
-            <button onClick={() => { setShowLog(true); setModalTab('research') }}
+            <p>Run a Web Search first (Exploits &amp; Research tab) — the debug log appears after the LLM analysis completes.</p>
+            <button onClick={() => { setShowLog(true); setModalTab('exploits_research') }}
               className="mt-2 px-3 py-1.5 text-xs rounded border border-border hover:bg-muted">
-              Go to AI Research tab
+              Go to Exploits &amp; Research tab
             </button>
           </div>
         )}

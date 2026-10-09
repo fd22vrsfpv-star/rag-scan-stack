@@ -740,17 +740,29 @@ export function useSearchsploit(product?: string, version?: string, analyze?: bo
   })
 }
 
-export function getDdgSearchUrls(product: string, version?: string) {
-  const q = `${product} ${version || ''}`.trim().replace(/ /g, '+')
+export function getDdgSearchUrls(product: string, version?: string, cve?: string) {
+  // Guard against callers that passed the literal fallback string "unknown"
+  // or an empty product. When product is unusable but a CVE is in hand, anchor
+  // every search on the CVE id — operators clicking "Open in browser" from the
+  // exploit workbench are looking for THAT CVE, not a search for the word
+  // "unknown". Falls back to product-based search when product is real.
+  const effectiveProduct = (product && product.toLowerCase() !== 'unknown') ? product : ''
+  const anchor = effectiveProduct || cve || ''
+  const q = `${anchor} ${version || ''}`.trim().replace(/ /g, '+')
   // Short product name for vendor-specific searches
-  const words = product.split(' ').filter(w => w.length >= 4 && !['server', 'data', 'center', 'cloud'].includes(w.toLowerCase()))
-  const short = words[words.length - 1] || product
+  const words = effectiveProduct.split(' ').filter(w => w.length >= 4 && !['server', 'data', 'center', 'cloud'].includes(w.toLowerCase()))
+  const short = words[words.length - 1] || effectiveProduct || cve || ''
   const shortQ = `${short}+${version || ''}`.replace(/ /g, '+')
+  // When CVE is known, add it to the main queries so results pin to the exact
+  // vuln instead of returning every exploit for the product.
+  const cveTail = cve ? `+${cve}` : ''
   return [
-    { label: 'Exploits', url: `https://duckduckgo.com/?q=${q}+exploit` },
-    { label: 'CVEs', url: `https://duckduckgo.com/?q=${q}+CVE` },
-    { label: 'ExploitDB', url: `https://duckduckgo.com/?q=site%3Aexploit-db.com+${q}` },
-    { label: 'Tenable', url: `https://www.tenable.com/plugins/search?q=${shortQ}` },
+    { label: 'Exploits', url: `https://duckduckgo.com/?q=${q}+exploit${cveTail}` },
+    { label: 'CVEs', url: cve
+        ? `https://nvd.nist.gov/vuln/detail/${cve}`
+        : `https://duckduckgo.com/?q=${q}+CVE` },
+    { label: 'ExploitDB', url: `https://duckduckgo.com/?q=site%3Aexploit-db.com+${q}${cveTail}` },
+    { label: 'Tenable', url: `https://www.tenable.com/plugins/search?q=${cve || shortQ}` },
     { label: 'Releases', url: `https://duckduckgo.com/?q=${shortQ}+release+notes` },
   ]
 }
@@ -880,7 +892,7 @@ export interface BulkDismissParams {
 export function useBuildPoc() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (params: { cve: string; ip: string; port?: number; product?: string; version?: string; max_iters?: number; release?: boolean }) =>
+    mutationFn: (params: { cve: string; ip: string; port?: number; product?: string; version?: string; max_iters?: number; release?: boolean; recon_first?: boolean; recon_source?: 'basic' | 'zap' | 'both' | 'zap-active'; hint?: string }) =>
       apiFetch<{ ok: boolean; success: boolean; iterations: number; security_test_id: string | null; final_command?: string; log_path?: string }>(
         '/software/build-poc',
         { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params) },
@@ -1010,5 +1022,99 @@ export function useRecommendationBlockers() {
     queryKey: ['recommendation-blockers'],
     queryFn: () => apiFetch<BlockerSummary>('/scan-recommendations/blockers'),
     refetchInterval: POLL.NORMAL,
+  })
+}
+
+// ─── Operator hints for PoC builds ──────────────────────────────────────────
+export interface PocHint {
+  id: string
+  cve: string
+  target_host: string | null
+  target_port: number | null
+  hint: string
+  active: boolean
+  engagement_id: string | null
+  created_by: string | null
+  created_at: string
+  updated_at: string
+}
+
+/** List persistent hints for a CVE (and optional target host). */
+export function usePocHints(cve?: string, target_host?: string) {
+  return useQuery({
+    queryKey: ['poc-hints', cve || 'all', target_host || ''],
+    queryFn: () => {
+      const qs = new URLSearchParams()
+      if (cve) qs.set('cve', cve)
+      if (target_host) qs.set('target_host', target_host)
+      return apiFetch<{ hints: PocHint[] }>(`/software/poc-hints${qs.toString() ? '?' + qs.toString() : ''}`)
+    },
+    enabled: !!cve,
+  })
+}
+
+/** Persist a new operator hint. Applied to future build-poc runs for this (cve, host, port). */
+export function useAddPocHint() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (body: { cve: string; hint: string; target_host?: string; target_port?: number }) =>
+      apiFetch<PocHint>('/software/poc-hints', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['poc-hints'] }),
+  })
+}
+
+/** Deactivate a hint (soft delete). */
+export function useDeletePocHint() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) =>
+      apiFetch<{ ok: boolean; deleted: number }>(`/software/poc-hints/${id}`, { method: 'DELETE' }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['poc-hints'] }),
+  })
+}
+
+// ─── Exploit build summary (one-glance recon overview) ──────────────────────
+export interface ExploitSummary {
+  framework: string | null
+  waf_family: string | null
+  waf_proven_variants: Record<string, string[]>
+  open_ports: number[]
+  endpoints_discovered: string[]
+  honored_params: Array<{ path: string; param: string; class?: string; payload_hint?: string }>
+  credentials_found: string[]
+  admin_paths: string[]
+  has_captcha: boolean
+  strategist_primary: { class: string; endpoint: string; param: string; method: string } | null
+  strategist_alts: Array<{ label: string; class: string; endpoint: string; param: string }>
+  plan_verdicts: Record<string, string>
+  iterations_summary: Array<{ iter: number; status: string; output_head: string }>
+  dead_endpoints: string[]
+  waf_blocks: number
+  final_verdict?: { verified: boolean; reason: string }
+}
+
+export function useExploitSummary(exploitId: string | null | undefined) {
+  return useQuery({
+    queryKey: ['exploit-summary', exploitId],
+    queryFn: () => apiFetch<{ ok: boolean; exploit_id: string; phase_count: number; summary: ExploitSummary; auto_hint: string }>(
+      `/exploit-store/${exploitId}/summary`,
+    ),
+    enabled: !!exploitId,
+  })
+}
+
+export function useDeriveHint() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (exploitId: string) =>
+      apiFetch<{ ok: boolean; hint_id: string | null; hint_text: string; reason?: string }>(
+        `/exploit-store/${exploitId}/derive-hint`,
+        { method: 'POST' },
+      ),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['poc-hints'] }),
   })
 }

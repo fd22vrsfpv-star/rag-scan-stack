@@ -1,0 +1,113 @@
+# Common web-path seeds for the 404-cluster escalation hook.
+#
+# When a PoC build's refine loop hits consecutive all_404 iterations, the
+# escalation path-discovery probe runs each of these through the kali-listener
+# and keeps non-404 hits as a "pick from these REAL paths" list for the model.
+#
+# Operators extend by appending new paths — framework-specific (e.g. Drupal's
+# /user/login, Joomla's /administrator), service-specific (/geoserver/web/,
+# /jolokia/), or engagement-specific (/old-api/). No code change needed; the
+# loader embeds this file into rag_documents and _discover_live_paths reads
+# it at probe time.
+#
+# Order matters only cosmetically — probing is parallel-friendly from the
+# shell loop's perspective. Keep the list short-ish (<= ~60) to stay inside
+# the listener timeout and the refine-prompt size budget.
+
+common_web_paths:
+  # Roots + metadata
+  - /
+  - /robots.txt
+  - /sitemap.xml
+  - /.env
+  - /.git/HEAD
+  - /server-status
+
+  # Admin consoles
+  - /admin
+  - /admin/
+  - /administrator
+  - /manage
+  - /manager
+  - /manager/html
+  - /console
+  - /control
+
+  # Auth
+  - /login
+  - /login.php
+  - /login.html
+  - /signin
+  - /signup
+  - /register
+  - /auth
+  - /auth/login
+  - /user/login
+  - /users/sign_in
+  - /oauth/authorize
+  - /sso
+
+  # Dashboards
+  - /dashboard
+  - /home
+  - /portal
+  - /index.php
+  - /index.html
+  - /app
+  - /webapp
+
+  # APIs
+  - /api
+  - /api/
+  - /api/v1
+  - /api/v1/
+  - /api/v2
+  - /api/v2/
+  - /api/v3/
+  - /rest
+  - /rest/
+  - /graphql
+  - /swagger
+  - /swagger-ui.html
+  - /openapi.json
+  - /api/openapi.json
+  - /api/v1/openapi.json
+  - /api/v2/openapi.json
+  - /api/v3/openapi.json
+  - /swagger.json
+  - /api/swagger.json
+  - /v2/api-docs
+  - /v3/api-docs
+  - /api-docs
+  - /api/docs
+  - /docs
+  - /redoc
+  - /v1/
+  - /v2/
+
+  # Spring Boot
+  - /actuator
+  - /actuator/health
+  - /actuator/env
+  - /actuator/mappings
+
+  # WordPress
+  - /wp-admin/
+  - /wp-login.php
+  - /wp-json/
+  - /wp-json/wp/v2/
+  - /wp-content/
+  - /xmlrpc.php
+
+  # Joomla / Drupal
+  - /administrator/
+  - /user/login
+  - /user/register
+
+  # Phpmyadmin / tools
+  - /phpmyadmin/
+  - /pma/
+
+  # Spring Security common error paths
+  - /error
+  - /favicon.ico

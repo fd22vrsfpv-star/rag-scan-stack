@@ -14,6 +14,7 @@ import type { Engagement, CampaignEvent, KillChainPhase } from '@/lib/types'
 import { Briefcase, Plus, X, ChevronRight, Eye, Trash2, Pencil, ArrowRight, Loader2, Upload, FileText } from 'lucide-react'
 import { ReconAgentPanel } from '@/components/common/ReconAgentPanel'
 import { GapAnalysisAgentPanel } from '@/components/common/GapAnalysisPanel'
+import { ScopePivotPanel } from '@/components/ScopePivotPanel'
 
 const ENGAGEMENT_TYPES = [
   'external_pentest', 'internal_pentest', 'web_app', 'red_team', 'purple_team', 'phishing', 'other',
@@ -590,6 +591,15 @@ function ScopeTab({ engagementId }: { engagementId: string }) {
         {!activeScope && (
           <p className="text-sm text-muted-foreground text-center py-12">Create a scope to manage targets</p>
         )}
+      </div>
+
+      {/* Scope Pivot & Typosquats — engagement-level entry point for the
+          OSINT pivot pass. Operator complaint from the first UI pass was
+          that "going into the one domain with thousands of subdomains is
+          clunky"; the natural home is here, at the engagement where the
+          scope's apex seeds live. */}
+      <div className="rounded-lg border border-border bg-card p-3">
+        <ScopePivotPanel engagementId={engagementId} />
       </div>
     </div>
   )

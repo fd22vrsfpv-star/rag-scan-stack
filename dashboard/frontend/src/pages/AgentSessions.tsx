@@ -29,7 +29,7 @@ import {
   useSynthesizeTest,
   useCompareSources,
 } from '@/api/securityTests'
-import type { SecurityTest, WstgGuide } from '@/api/securityTests'
+import type { SecurityTest, SecurityTestRun, WstgGuide } from '@/api/securityTests'
 import { useAddSkill } from '@/api/skills'
 import { apiFetch } from '@/api/client'
 import { useScopeNames, useScope } from '@/api/scope'
@@ -378,8 +378,14 @@ function ScanFlowSummary({ summary, validation }: {
   )
 }
 
-function ScanCard({ scan }: { scan: SessionScan }) {
-  const [expanded, setExpanded] = useState(false)
+function ScanCard({ scan, forceExpanded }: { scan: SessionScan; forceExpanded?: boolean | null }) {
+  // Local expand state, syncing to a parent-controlled expand-all toggle when set.
+  // Lets the operator open every scan card in one click (no more click-per-row) while
+  // still allowing per-card toggle after that.
+  const [expanded, setExpanded] = useState<boolean>(!!forceExpanded)
+  useEffect(() => {
+    if (forceExpanded !== null && forceExpanded !== undefined) setExpanded(forceExpanded)
+  }, [forceExpanded])
   const p = scan.progress
 
   const durationStr = scan.duration_seconds != null
@@ -539,6 +545,10 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     : storedFlow)
   const claimValidation = sessionMeta?.claim_validation as ClaimValidation | undefined
   const [activeTab, setActiveTab] = useState<'messages' | 'scans' | 'security'>('messages')
+  // Global expand control for the Scans & Tools tab: null = per-card, true =
+  // everyone open, false = everyone closed, 'interesting' = auto-open only
+  // failed / no-output cards. Reset on tab switch so it doesn't stick.
+  const [scansExpand, setScansExpand] = useState<null | boolean | 'interesting'>(null)
   const [showToolCalls, setShowToolCalls] = useState(true)
 
   const logRef = useRef<HTMLDivElement>(null)
@@ -1048,8 +1058,10 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
           {flowSummary && (
             <ScanFlowSummary summary={flowSummary} validation={claimValidation} />
           )}
-          {/* Summary bar */}
-          <div className="flex items-center gap-4 text-xs">
+          {/* Summary bar + expand controls — one click to see every scan's output
+              without click-per-row. `forceExpanded` propagates to each ScanCard;
+              cards keep their own state when it's null. */}
+          <div className="flex items-center gap-4 text-xs flex-wrap">
             <span className="text-muted-foreground">
               Total: <span className="text-foreground font-medium">{scanCounts.total}</span>
             </span>
@@ -1068,6 +1080,20 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
                 Failed: {scanCounts.failed}
               </span>
             )}
+            <div className="flex-1" />
+            <button onClick={() => setScansExpand(true)}
+              className="h-6 px-2 rounded border border-border hover:bg-accent text-[11px]">
+              Expand all
+            </button>
+            <button onClick={() => setScansExpand(false)}
+              className="h-6 px-2 rounded border border-border hover:bg-accent text-[11px]">
+              Collapse all
+            </button>
+            <button onClick={() => setScansExpand('interesting')}
+              className="h-6 px-2 rounded border border-primary/40 text-primary hover:bg-primary/10 text-[11px]"
+              title="Open failed scans + scans that produced no output (the ones worth reviewing)">
+              Open interesting
+            </button>
           </div>
           {/* Scan cards */}
           {scans.length === 0 && (
@@ -1076,9 +1102,18 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
             </p>
           )}
           <div className="space-y-2">
-            {scans.map(scan => (
-              <ScanCard key={scan.scan_id || scan.job_id} scan={scan} />
-            ))}
+            {scans.map(scan => {
+              // Compute per-card forceExpanded: null = card decides; else parent decides.
+              let forced: boolean | null = null
+              if (scansExpand === true) forced = true
+              else if (scansExpand === false) forced = false
+              else if (scansExpand === 'interesting') {
+                forced = scan.status === 'failed'
+                  || scan.status === 'error'
+                  || (scan.status === 'completed' && !((scan as any).result_bytes) && !((scan as any).artifact_bytes))
+              }
+              return <ScanCard key={scan.scan_id || scan.job_id} scan={scan} forceExpanded={forced} />
+            })}
           </div>
 
           {/* Available MCP Tools */}
@@ -1111,7 +1146,9 @@ function statusPill(status?: string | null) {
   )
 }
 
-function SecurityTestRunHistory({ testId }: { testId: string }) {
+function SecurityTestRunHistory({ testId, forceExpanded }: {
+  testId: string; forceExpanded?: boolean | null
+}) {
   const { data } = useSecurityTestRuns(testId)
   const runs = data?.runs ?? []
   if (runs.length === 0)
@@ -1119,28 +1156,93 @@ function SecurityTestRunHistory({ testId }: { testId: string }) {
   return (
     <div className="px-3 py-2 space-y-1">
       {runs.map(r => (
-        <div key={r.id} className="flex items-start gap-2 text-xs border-l-2 border-border pl-2">
-          {statusPill(r.status)}
-          <span className="px-1 rounded bg-muted text-muted-foreground uppercase text-[10px]">{r.lane}</span>
-          <div className="flex-1 min-w-0">
-            <p className="font-mono break-words" style={{ overflowWrap: 'anywhere' }}>
-              {r.result_summary || r.command_run || '(no summary)'}
-            </p>
-            <span className="text-muted-foreground">
-              {r.ran_at ? new Date(r.ran_at).toLocaleString() : ''}
-              {r.exit_code != null && ` · exit ${r.exit_code}`}
-              {r.tool_execution_id && ` · exec ${r.tool_execution_id.slice(0, 8)}`}
-              {r.exploit_result_id && ` · exploit ${r.exploit_result_id.slice(0, 8)}`}
-            </span>
-          </div>
-        </div>
+        <SecurityTestRunRow key={r.id} run={r} forceExpanded={forceExpanded} />
       ))}
     </div>
   )
 }
 
-function SecurityTestRow({ test, sessionId }: { test: SecurityTest; sessionId?: string }) {
-  const [expanded, setExpanded] = useState(false)
+function SecurityTestRunRow({ run: r, forceExpanded }: {
+  run: SecurityTestRun; forceExpanded?: boolean | null
+}) {
+  // output + metadata are hidden by default — a tool scan can be 10 KB and
+  // every row stacking its output would hide the list. One-click per row,
+  // or the parent panel's "Expand all" cascades through forceExpanded.
+  const [open, setOpen] = useState<boolean>(!!forceExpanded)
+  useEffect(() => {
+    if (forceExpanded !== null && forceExpanded !== undefined) setOpen(forceExpanded)
+  }, [forceExpanded])
+  const hasBody = Boolean(r.output || r.command_run || (r.metadata && Object.keys(r.metadata).length))
+  return (
+    <div className="text-xs border-l-2 border-border pl-2">
+      <div className="flex items-start gap-2">
+        {statusPill(r.status)}
+        <span className="px-1 rounded bg-muted text-muted-foreground uppercase text-[10px]">{r.lane}</span>
+        <div className="flex-1 min-w-0">
+          <p className="font-mono break-words" style={{ overflowWrap: 'anywhere' }}>
+            {r.result_summary || r.command_run || '(no summary)'}
+          </p>
+          <span className="text-muted-foreground">
+            {r.ran_at ? new Date(r.ran_at).toLocaleString() : ''}
+            {r.exit_code != null && ` · exit ${r.exit_code}`}
+            {r.duration_ms != null && ` · ${r.duration_ms}ms`}
+            {r.triggered_by && ` · by ${r.triggered_by}`}
+            {r.tool_execution_id && ` · exec ${r.tool_execution_id.slice(0, 8)}`}
+            {r.exploit_result_id && ` · exploit ${r.exploit_result_id.slice(0, 8)}`}
+          </span>
+        </div>
+        {hasBody && (
+          <button
+            onClick={() => setOpen(o => !o)}
+            className="text-[10px] px-1.5 py-0.5 rounded border border-border hover:bg-muted shrink-0"
+            title={open ? 'Hide output' : 'Show command + output'}>
+            {open ? 'hide' : 'output'}
+          </button>
+        )}
+      </div>
+      {open && (
+        <div className="mt-1 space-y-1">
+          {r.command_run && (
+            <div>
+              <div className="text-[10px] text-muted-foreground uppercase tracking-wider">Command</div>
+              <pre className="text-[10px] bg-muted/40 rounded p-2 overflow-x-auto max-h-24 whitespace-pre-wrap break-all">{r.command_run}</pre>
+            </div>
+          )}
+          {r.output ? (
+            <div>
+              <div className="text-[10px] text-muted-foreground uppercase tracking-wider">Output ({r.output.length.toLocaleString()} chars)</div>
+              <pre className="text-[10px] bg-background/90 border border-border rounded p-2 overflow-x-auto max-h-96 whitespace-pre-wrap">{r.output}</pre>
+            </div>
+          ) : (
+            <div className="text-[10px] text-muted-foreground italic">No output recorded for this run.</div>
+          )}
+          {r.assertion_eval && Object.keys(r.assertion_eval).length > 0 && (
+            <div>
+              <div className="text-[10px] text-muted-foreground uppercase tracking-wider">Assertion eval</div>
+              <pre className="text-[10px] bg-muted/40 rounded p-2 overflow-x-auto max-h-24 whitespace-pre-wrap">{JSON.stringify(r.assertion_eval, null, 2)}</pre>
+            </div>
+          )}
+          {r.metadata && Object.keys(r.metadata).length > 0 && (
+            <div>
+              <div className="text-[10px] text-muted-foreground uppercase tracking-wider">Metadata</div>
+              <pre className="text-[10px] bg-muted/40 rounded p-2 overflow-x-auto max-h-24 whitespace-pre-wrap">{JSON.stringify(r.metadata, null, 2)}</pre>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function SecurityTestRow({ test, sessionId, forceExpanded }: {
+  test: SecurityTest; sessionId?: string; forceExpanded?: boolean | null
+}) {
+  const [expanded, setExpanded] = useState<boolean>(!!forceExpanded)
+  // Match the ScanCard behaviour: null means "row decides"; a true/false override
+  // from the parent panel wins and overrides local state until the next toggle.
+  useEffect(() => {
+    if (forceExpanded !== null && forceExpanded !== undefined) setExpanded(forceExpanded)
+  }, [forceExpanded])
   const [notice, setNotice] = useState<string | null>(null)
   const runTest = useRunSecurityTest(sessionId)
   const toggleTest = useToggleSecurityTest(sessionId)
@@ -1235,7 +1337,7 @@ function SecurityTestRow({ test, sessionId }: { test: SecurityTest; sessionId?: 
               $ {test.command}
             </p>
           )}
-          <SecurityTestRunHistory testId={test.id} />
+          <SecurityTestRunHistory testId={test.id} forceExpanded={forceExpanded} />
         </div>
       )}
     </div>
@@ -1472,6 +1574,13 @@ function SourceCompareForm({ sessionId }: { sessionId?: string }) {
 function SecurityTestsPanel({ sessionId, tests }: { sessionId?: string; tests: SecurityTest[] }) {
   const safe = tests.filter(t => t.tier === 'safe').length
   const impactful = tests.length - safe
+  const failedOrEmpty = tests.filter(
+    t => t.last_run_status === 'fail' || t.last_run_status === 'error' || t.run_count === 0,
+  ).length
+  // null = each row decides; true = force open; false = force closed; 'interesting'
+  // opens only tests that failed, errored, or have no runs yet. Mirrors the Tool
+  // Outputs tab's ScanCard bar so the two surfaces look + behave the same way.
+  const [expand, setExpand] = useState<null | boolean | 'interesting'>(null)
   return (
     <div className="space-y-2">
       <CustomPayloadForm sessionId={sessionId} />
@@ -1483,14 +1592,39 @@ function SecurityTestsPanel({ sessionId, tests }: { sessionId?: string; tests: S
         </p>
       ) : (
         <>
-          <div className="flex items-center gap-4 text-xs">
+          <div className="flex items-center gap-4 text-xs flex-wrap">
             <span className="text-muted-foreground">Total: <span className="text-foreground font-medium">{tests.length}</span></span>
             <span className="text-blue-400">Safe: {safe}</span>
             <span className="text-red-400">Impactful: {impactful}</span>
+            {failedOrEmpty > 0 && (
+              <span className="text-amber-400">Needs review: {failedOrEmpty}</span>
+            )}
+            <div className="flex-1" />
+            <button onClick={() => setExpand(true)}
+              className="h-6 px-2 rounded border border-border hover:bg-accent text-[11px]">
+              Expand all
+            </button>
+            <button onClick={() => setExpand(false)}
+              className="h-6 px-2 rounded border border-border hover:bg-accent text-[11px]">
+              Collapse all
+            </button>
+            <button onClick={() => setExpand('interesting')}
+              className="h-6 px-2 rounded border border-primary/40 text-primary hover:bg-primary/10 text-[11px]"
+              title="Open tests that failed, errored, or have no runs yet (the ones worth reviewing)">
+              Open interesting
+            </button>
           </div>
-          {tests.map(t => (
-            <SecurityTestRow key={t.id} test={t} sessionId={sessionId} />
-          ))}
+          {tests.map(t => {
+            let forced: boolean | null = null
+            if (expand === true) forced = true
+            else if (expand === false) forced = false
+            else if (expand === 'interesting') {
+              forced = t.last_run_status === 'fail'
+                || t.last_run_status === 'error'
+                || t.run_count === 0
+            }
+            return <SecurityTestRow key={t.id} test={t} sessionId={sessionId} forceExpanded={forced} />
+          })}
         </>
       )}
     </div>

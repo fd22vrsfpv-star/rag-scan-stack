@@ -4,7 +4,7 @@ import InfoTip from '@/components/InfoTip'
 import KaliAllowlistPanel from '@/components/settings/KaliAllowlistPanel'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useScopeNames } from '@/api/scope'
-import { useBurpStatus } from '@/api/burp'
+import { useBurpStatus, downloadBurpBridgeExtension, useBurpBridgeReadme } from '@/api/burp'
 import { useZapAddons, useInstallAddon, useUninstallAddon } from '@/api/zapAddons'
 import type { ZapAddon } from '@/api/zapAddons'
 import { useApiKeys, useUpsertApiKey, useDeleteApiKey } from '@/api/apiKeys'
@@ -957,6 +957,37 @@ function ApiKeyRow({ keyName, label, description, storedMasked, updatedAt }: {
   const upsert = useUpsertApiKey()
   const remove = useDeleteApiKey()
 
+  // AWS keys get a Test button so a bad/expired key is caught before Create
+  // 500s. The test endpoint reads the stored creds (sts:GetCallerIdentity) and
+  // surfaces the actual AWS error message instead of a bare "Internal Server
+  // Error". See 2026-10-06 CHANGES_MADE.
+  const isAwsTestable = keyName === 'aws_access_key_id'
+  const [testStatus, setTestStatus] = useState<'idle' | 'testing' | 'ok' | 'fail'>('idle')
+  const [testMsg, setTestMsg] = useState<string>('')
+
+  const handleTestAws = async () => {
+    setTestStatus('testing')
+    setTestMsg('')
+    try {
+      const resp = await fetch('/api/cloud/aws/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ region: 'us-east-1' }),
+      })
+      const body = await resp.json().catch(() => ({}))
+      if (resp.ok && body?.ok) {
+        setTestStatus('ok')
+        setTestMsg(`account ${body.account ?? '?'} · ${body.arn ?? ''}`)
+      } else {
+        setTestStatus('fail')
+        setTestMsg(body?.detail ?? `HTTP ${resp.status}`)
+      }
+    } catch (e) {
+      setTestStatus('fail')
+      setTestMsg(String(e))
+    }
+  }
+
   const handleSave = async () => {
     if (!value.trim()) return
     setStatus('saving')
@@ -1030,8 +1061,24 @@ function ApiKeyRow({ keyName, label, description, storedMasked, updatedAt }: {
             <Trash2 className="h-3.5 w-3.5" />
           </button>
         )}
+        {isAwsTestable && isStored && (
+          <button
+            onClick={handleTestAws}
+            disabled={testStatus === 'testing'}
+            title="Validate AWS credentials with sts:GetCallerIdentity"
+            className="px-2.5 py-1.5 text-xs rounded-md border border-blue-400/40 text-blue-400 hover:bg-blue-400/10 disabled:opacity-50"
+          >
+            {testStatus === 'testing' ? 'Testing…' : 'Test'}
+          </button>
+        )}
         {status === 'saved' && <span className="text-xs text-green-500">Saved!</span>}
         {status === 'error' && <span className="text-xs text-red-400">Failed</span>}
+        {isAwsTestable && testStatus === 'ok' && (
+          <span className="text-xs text-green-500" title={testMsg}>OK · {testMsg.slice(0, 40)}</span>
+        )}
+        {isAwsTestable && testStatus === 'fail' && (
+          <span className="text-xs text-red-400" title={testMsg}>Fail · {testMsg.slice(0, 60)}</span>
+        )}
       </div>
     </div>
   )
@@ -2175,6 +2222,12 @@ function ToolOptionsTab() {
       {/* Profile selector */}
       <ProfileSelector />
 
+      {/* Burp bridge extension download — the Jython .py the operator loads
+          into Burp Pro so the dashboard can push/pull findings to/from Burp
+          Repeater + Scanner. Lives in the rag-api image (COPY from the
+          repo's burp-extension/ dir). */}
+      <BurpBridgeDownloadPanel />
+
       {/* Tool Updates */}
       <ToolUpdates />
 
@@ -3068,6 +3121,73 @@ function ToolUpdates() {
 }
 
 
+/* ─── Burp Bridge Extension download panel ────────────────────────────── */
+// Serves `burp-extension/RagScanBridge.py` + its README from the rag-api
+// image. The operator downloads the .py file and loads it into Burp Pro
+// as a Jython extension (Extensions → Add → Python). Also surfaced on
+// the Exploit Workbench Tools tab for a selected PoC.
+function BurpBridgeDownloadPanel() {
+  const [showReadme, setShowReadme] = useState(false)
+  const [downloading, setDownloading] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const { data: readme, isLoading: readmeLoading, error: readmeErr } = useBurpBridgeReadme(showReadme)
+  const doDownload = async () => {
+    setErr(null); setDownloading(true)
+    try { await downloadBurpBridgeExtension() }
+    catch (e) { setErr((e as Error).message) }
+    finally { setDownloading(false) }
+  }
+  return (
+    <div className="border border-orange-500/30 rounded-lg bg-orange-500/5 p-3 space-y-2">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <div>
+          <h3 className="text-sm font-semibold inline-flex items-center gap-1.5">
+            <Download className="w-4 h-4" /> Burp Suite Bridge Extension
+          </h3>
+          <p className="text-[11px] text-muted-foreground mt-0.5">
+            Bidirectional finding sync between RAG Scan Stack and Burp Suite
+            Professional. Load the Jython file into Burp — adds a <span className="font-mono">RAG Scan Bridge</span> tab for preview-count, filter-by-scope, push findings to Repeater.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={doDownload}
+            disabled={downloading}
+            className="h-8 px-3 rounded bg-orange-600 hover:bg-orange-500 text-white text-xs inline-flex items-center gap-1 disabled:opacity-50">
+            {downloading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
+            RagScanBridge.py
+          </button>
+          <button
+            onClick={() => setShowReadme(v => !v)}
+            className="h-8 px-3 rounded border border-border hover:bg-accent text-xs inline-flex items-center gap-1">
+            {showReadme ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+            Install steps
+          </button>
+        </div>
+      </div>
+      {err && <div className="text-[11px] text-red-400">{err}</div>}
+      {showReadme && (
+        <div className="border border-border rounded bg-background/50 p-2 max-h-[50vh] overflow-y-auto">
+          {readmeLoading ? (
+            <div className="text-[11px] text-muted-foreground inline-flex items-center gap-1">
+              <Loader2 className="w-3 h-3 animate-spin" /> Loading README…
+            </div>
+          ) : readmeErr ? (
+            <div className="text-[11px] text-red-400">{String(readmeErr)}</div>
+          ) : (
+            // README is markdown; render as preformatted text (dependency-free,
+            // avoids pulling a markdown lib into the Settings bundle just for
+            // this one surface). Operator reads install steps + feature list
+            // inline; the full repo copy is `burp-extension/README.md`.
+            <pre className="text-[11px] whitespace-pre-wrap font-mono leading-relaxed">{readme || ''}</pre>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+
 function BurpApiConfig() {
   const { data: status } = useBurpStatus()
   const connected = status?.connected ?? false
@@ -3084,19 +3204,21 @@ function BurpApiConfig() {
         </span>
       </div>
       <p className="text-[10px] text-muted-foreground mb-3">
-        Connect to Burp Suite Professional for headless scanning. Set <code className="font-mono bg-muted px-1 rounded">BURP_API_URL</code> and <code className="font-mono bg-muted px-1 rounded">BURP_API_KEY</code> in your environment.
+        Connect to Burp Suite Professional for headless scanning. This panel is read-only — the three
+        variables live in <code className="font-mono bg-muted px-1 rounded">.env</code> at the stack root
+        and are picked up when the dashboard container is recreated.
       </p>
       <div className="space-y-2 text-xs text-muted-foreground">
         <div className="bg-muted/30 border border-border rounded p-3 space-y-1.5">
-          <p className="font-medium text-foreground">Setup Instructions:</p>
+          <p className="font-medium text-foreground">Setup:</p>
           <ol className="list-decimal list-inside space-y-1">
-            <li>Enable Burp REST API: <code className="font-mono bg-muted px-1 rounded text-[10px]">Settings &gt; Suite &gt; REST API &gt; Enable</code></li>
-            <li>Note the API port (default 1337) and optionally set an API key</li>
-            <li>Set environment variables on the dashboard container:
-              <pre className="mt-1 bg-muted rounded p-2 text-[10px] font-mono">BURP_API_URL=http://host.docker.internal:1337{'\n'}BURP_API_KEY=your-api-key-here{'\n'}BURP_PROXY_URL=http://host.docker.internal:8080</pre>
+            <li>In Burp: <code className="font-mono bg-muted px-1 rounded text-[10px]">Settings &gt; Suite &gt; REST API &gt; Enable</code>, note the port (default 1337), generate an API key.</li>
+            <li>Open the port on the Burp host's firewall if Burp is on another machine.</li>
+            <li>Edit <code className="font-mono bg-muted px-1 rounded text-[10px]">.env</code> at the repo root — add or update:
+              <pre className="mt-1 bg-muted rounded p-2 text-[10px] font-mono">BURP_API_URL=http://192.168.1.183:1337   # LAN host example{'\n'}# or:  BURP_API_URL=http://host.docker.internal:1337   # Burp on this box{'\n'}BURP_API_KEY=your-api-key-here{'\n'}BURP_PROXY_URL=http://192.168.1.183:8080   # only if routing tools through Burp proxy</pre>
             </li>
-            <li>Restart the dashboard container</li>
-            <li>Use the <strong>Burp Suite</strong> scan type in the Scan Launcher, or enable <strong>"Route through Burp"</strong> toggle on any web scan</li>
+            <li>Recreate the dashboard: <code className="font-mono bg-muted px-1 rounded text-[10px]">docker compose up -d --force-recreate pentest-dashboard</code>. This panel will flip to <span className="text-green-400">Connected</span>.</li>
+            <li>Use the <strong>Burp Suite</strong> scan type in the Scan Launcher, or enable <strong>"Route through Burp"</strong> on any web scan.</li>
           </ol>
         </div>
         {connected && status?.url && (
@@ -4144,6 +4266,29 @@ function buildOptions(provs: AvailModels[]): ModelOption[] {
 
 /** A model picker that never traps the operator: the dropdown lists what we
  *  found, and "Custom…" switches to free text for anything we did not. */
+// Reasoning-effort dropdown for the per-task routing table. Classic chat
+// models silently ignore the value — the dispatcher only sends it when the
+// effective model is a reasoning deployment (gpt-5*, o1*, o3*, o4*).
+// Placeholder shows "inherit" (or the default effort if one is set) when
+// the operator leaves the row blank.
+function ReasoningEffortSelect({ value, onChange, placeholder }: {
+  value: string
+  onChange: (v: string) => void
+  placeholder?: string
+}) {
+  return (
+    <select value={value || ''} onChange={e => onChange(e.target.value)}
+      className="h-8 px-1.5 rounded border border-border bg-background text-xs">
+      <option value="">{placeholder || 'inherit'}</option>
+      <option value="minimal">minimal</option>
+      <option value="low">low</option>
+      <option value="medium">medium</option>
+      <option value="high">high</option>
+    </select>
+  )
+}
+
+
 function ModelSelect({ value, onChange, opts, placeholder }: {
   value: string
   onChange: (v: string) => void
@@ -4199,6 +4344,12 @@ type RouteEntry = {
   effective: string
   effective_fallback: string
   inherited: boolean
+  // Reasoning effort for this task — only applied when the effective model
+  // is a reasoning deployment (gpt-5*, o1*, o3*, o4*). Blank = inherit the
+  // default; `effective_reasoning_effort` is what the dispatcher would use
+  // right now.
+  reasoning_effort?: string
+  effective_reasoning_effort?: string
 }
 
 function TaskRoutingSection() {
@@ -4208,6 +4359,12 @@ function TaskRoutingSection() {
   const [dfltFb, setDfltFb] = useState('')
   const [routes, setRoutes] = useState<Record<string, string>>({})
   const [fallbacks, setFallbacks] = useState<Record<string, string>>({})
+  // Per-task reasoning_effort. Blank = inherit. One of ""|"minimal"|"low"|"medium"|"high".
+  // Only applied by the dispatcher when the effective model is a reasoning
+  // deployment (gpt-5*, o1*, o3*, o4*); a classic chat model silently
+  // ignores it.
+  const [efforts, setEfforts] = useState<Record<string, string>>({})
+  const [effortDefault, setEffortDefault] = useState('')
   const [opts, setOpts] = useState<ModelOption[]>([])
   const [avail, setAvail] = useState<AvailModels[]>([])
   const [saving, setSaving] = useState(false)
@@ -4217,8 +4374,10 @@ function TaskRoutingSection() {
     try {
       const r = await apiFetch<{
         tasks: RouteEntry[]; default: string; fallback: string; global_model: string
+        reasoning_effort_default?: string; reasoning_effort_global?: string
       }>('/settings/llm/routes')
       setTasks(r.tasks)
+      setEffortDefault(r.reasoning_effort_default || r.reasoning_effort_global || '')
       // Dropdown options come from a separate probe so a slow provider cannot
       // delay the routes table itself.
       try {
@@ -4234,6 +4393,7 @@ function TaskRoutingSection() {
       setGlobalModel(r.global_model || '')
       setRoutes(Object.fromEntries(r.tasks.map(t => [t.task, t.model || ''])))
       setFallbacks(Object.fromEntries(r.tasks.map(t => [t.task, t.fallback || ''])))
+      setEfforts(Object.fromEntries(r.tasks.map(t => [t.task, (t as RouteEntry).reasoning_effort || ''])))
       setMsg(null)
     } catch (e) {
       setMsg({ kind: 'err', text: `Load failed: ${String(e)}` })
@@ -4250,6 +4410,8 @@ function TaskRoutingSection() {
           method: 'PUT',
           body: JSON.stringify({
             routes, fallbacks, default: dflt, default_fallback: dfltFb,
+            reasoning_efforts: efforts,
+            reasoning_effort_default: effortDefault,
           }),
         },
       )
@@ -4307,7 +4469,7 @@ function TaskRoutingSection() {
         )}
       </div>
 
-      <div className="grid gap-2 sm:grid-cols-2 max-w-3xl">
+      <div className="grid gap-2 sm:grid-cols-3 max-w-4xl">
         <div className="text-xs">
           <div className="text-muted-foreground mb-1">Default for all tasks</div>
           <ModelSelect value={dflt} onChange={setDflt} opts={opts}
@@ -4318,6 +4480,12 @@ function TaskRoutingSection() {
           <ModelSelect value={dfltFb} onChange={setDfltFb} opts={opts}
             placeholder="none" />
         </div>
+        <div className="text-xs">
+          <div className="text-muted-foreground mb-1" title="Only applied to reasoning deployments (gpt-5*, o1*, o3*, o4*). Classic chat models ignore it.">
+            Default reasoning effort
+          </div>
+          <ReasoningEffortSelect value={effortDefault} onChange={setEffortDefault} />
+        </div>
       </div>
 
       <div className="overflow-x-auto border border-border rounded">
@@ -4327,6 +4495,7 @@ function TaskRoutingSection() {
               <th className="px-3 py-2 text-left">Task</th>
               <th className="px-3 py-2 text-left">Model</th>
               <th className="px-3 py-2 text-left">Fallback on rate limit</th>
+              <th className="px-3 py-2 text-left" title="Only applied when the effective model is a reasoning deployment (gpt-5*, o1*, o3*, o4*).">Reasoning</th>
               <th className="px-3 py-2 text-left">Effective</th>
             </tr>
           </thead>
@@ -4353,12 +4522,24 @@ function TaskRoutingSection() {
                     placeholder="inherit"
                   />
                 </td>
+                <td className="px-3 py-2">
+                  <ReasoningEffortSelect
+                    value={efforts[t.task] ?? ''}
+                    onChange={v => setEfforts({ ...efforts, [t.task]: v })}
+                    placeholder={effortDefault || 'inherit'}
+                  />
+                </td>
                 <td className="px-3 py-2 text-xs">
                   <span className="font-mono">{t.effective || '—'}</span>
                   {t.inherited && <span className="ml-1 text-muted-foreground">(inherited)</span>}
                   {t.effective_fallback && (
                     <div className="text-[11px] text-muted-foreground">
                       → {t.effective_fallback}
+                    </div>
+                  )}
+                  {t.effective_reasoning_effort && (
+                    <div className="text-[11px] text-muted-foreground" title="Only applied if the model is a reasoning deployment.">
+                      effort: {t.effective_reasoning_effort}
                     </div>
                   )}
                 </td>

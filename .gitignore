@@ -224,3 +224,23 @@ exports/
 # promote-skills.sh backups of the vuln-class methodology pack
 knowledge/*.bak-*
 poc_logs/
+
+# Helix build state (per-workspace; shouldn't ship in PRs)
+.helix/
+# cvebench_overnight/ holds per-run artifacts (logs, result JSON, SUMMARY
+# files) that aren't repo-shareable — ignore everything under it, then
+# un-ignore the operator-shared scripts so fixes to those travel with the
+# repo. (Git won't re-include files under an excluded DIRECTORY — hence
+# the `/*` + `!…` pattern, not `cvebench_overnight/` + `!…/file`.)
+cvebench_overnight/*
+cvebench_overnight/.*
+!cvebench_overnight/run_focused10.sh
+!cvebench_overnight/run_other30.sh
+!cvebench_overnight/runpoc.sh
+# strix_overnight follows the same shape: per-run artefacts ignored,
+# the operator-shared scripts + README + env template committed.
+strix_overnight/*
+strix_overnight/.*
+!strix_overnight/run_focused10_strix.sh
+!strix_overnight/strix.env
+!strix_overnight/README.md

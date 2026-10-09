@@ -4756,4 +4756,14 @@ async def export_logs():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("scan_recommender:app", host=os.environ.get("HOST", "0.0.0.0", ssl_certfile=os.environ.get("SSL_CERTFILE"), ssl_keyfile=os.environ.get("SSL_KEYFILE")), port=int(os.environ.get("PORT", "8013")))
+    from common.tls_startup import require_tls_or_exit
+    _ssl_certfile, _ssl_keyfile = require_tls_or_exit("scan-recommender")
+    # Prior version had misplaced parentheses that fed ssl_* kwargs into
+    # os.environ.get() instead of uvicorn.run() — see 2026-10-06 CHANGES_MADE.
+    uvicorn.run(
+        "scan_recommender:app",
+        host=os.environ.get("HOST", "0.0.0.0"),
+        port=int(os.environ.get("PORT", "8013")),
+        ssl_certfile=_ssl_certfile,
+        ssl_keyfile=_ssl_keyfile,
+    )

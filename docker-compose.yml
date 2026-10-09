@@ -248,12 +248,22 @@ services:
       DETECTION_RULES_DIR: /knowledge/detection_rules
       SCOPE_RULES_DIR: /knowledge/scope_rules
       EXPLOITDB_CSV: /exploitdb/files_exploits.csv
+      # B-rollout decomposed-synth shadow mode (added 2026-10-07):
+      #   off (default) — only legacy single-prompt synth runs
+      #   shadow        — legacy authoritative; decomposed runs in parallel;
+      #                   divergence recorded to build_poc_shadow_runs
+      #   on            — decomposed authoritative (post-Phase-4 flip)
+      BUILD_POC_DECOMPOSED: ${BUILD_POC_DECOMPOSED:-off}
       NEWS_RUNNER_URL: ${NEWS_RUNNER_URL:-http://news-runner:8028}
       # Ollama — used by cloud_triage_agent, takeover_hunter, vault_import_agent.
       # OLLAMA_BASE_URL points at the llm_query proxy (a drop-in Ollama that
       # exposes /api/* and translates to the CONFIGURED backend), so these agents
       # run on the selected LLM (e.g. DeepSeek) instead of hitting Ollama direct.
       # OLLAMA_URL stays at real Ollama for anything that needs raw Ollama.
+      POSTEX_SEMANTIC_ENUMERATE: ${POSTEX_SEMANTIC_ENUMERATE:-1}
+      BUILD_POC_LANGGRAPH: ${BUILD_POC_LANGGRAPH:-1}   # StateGraph refactor of _build_poc_core (default ON post-migration; set 0 to fall back)
+      RAG_OBSERVED_FACTS: ${RAG_OBSERVED_FACTS:-0}     # Embed observed target facts + enum_facts into rag_documents so prior observations recall across builds (off by default; opt-in)
+      POC_SEMANTIC_VERIFY: ${POC_SEMANTIC_VERIFY:-1}   # Hybrid regex+semantic PoC verification; regex-first, canary-grounded LLM fallback (on by default)
       ZAP_URL: ${ZAP_URL:-http://zap:8090}
       ZAP_API_KEY: ${ZAP_API_KEY:-changeme}
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
@@ -269,6 +279,7 @@ services:
     volumes:
       - ./nmap_out:/app/nmap_out
       - ./poc_logs:/app/poc_logs        # PoC-builder review trail (verbose logs; DB stores only the final)
+      - ./fact_screenshots:/app/fact_screenshots  # Headless screenshots attached to confirmed_facts evidence
       - ./etl:/app/etl:ro
       - ./common:/app/common:ro    # /skills reuses common/vuln_skills.py
       - ${WORDLISTS_DIR:-./wordlists}:/wordlists
@@ -284,6 +295,14 @@ services:
       - ./exploitdb:/exploitdb
       - ./certs:/certs:ro
       - ./vault/init:/vault/init:ro   # secrets.py reads root_token from init.json
+      # CTF-mode support — intel for agent-driven CVE derivation:
+      #   /opt/cve-bench (ro): read challenge eval.yml for per-CVE attack-goal
+      #     list (file access, admin login, priv-esc, …) → feeds LLM extractor.
+      #   /var/run/docker.sock: for CTF/lab engagements only, lets
+      #     _audit_target_source grep the target container's source for common
+      #     vuln patterns. Gated BY ENGAGEMENT via engagements.metadata.ctf_mode.
+      - /opt/cve-bench:/opt/cve-bench:ro
+      - /var/run/docker.sock:/var/run/docker.sock
     networks: [agents_net]
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -522,7 +541,7 @@ services:
       - ./scan_audit/audit_writer.py:/scanner/audit_writer.py:ro
       - ./certs:/certs:ro
     healthcheck:
-      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8010/health || curl -f http://127.0.0.1:8010/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8010/health || exit 1"]
       interval: 20s
       timeout: 5s
       retries: 15
@@ -572,7 +591,7 @@ services:
     networks: [agents_net]
     ports: ["8011:8011"]
     healthcheck:
-      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8011/health || curl -f http://127.0.0.1:8011/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8011/health || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 5
@@ -582,6 +601,7 @@ services:
       - ./scan_results:/scan_results
       - ./scan_audit:/scan_audit
       - ./scan_audit/audit_writer.py:/runner/audit_writer.py:ro
+      - ./common:/runner/common:ro    # shared TLS-startup guard (common/tls_startup.py)
 
 
       - ./certs:/certs:ro
@@ -657,11 +677,12 @@ services:
       - ./scan_results:/scan_results
       - ./scan_audit:/scan_audit
       - ./scan_audit/audit_writer.py:/runner/audit_writer.py:ro
+      - ./common:/runner/common:ro    # shared TLS-startup guard (common/tls_startup.py)
     # SHM size needed for Chromium (gowitness screenshots) to avoid crashes
       - ./certs:/certs:ro
     shm_size: '1gb'
     healthcheck:
-      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8024/health || curl -f http://127.0.0.1:8024/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8024/health || exit 1"]
       interval: 20s
       timeout: 5s
       retries: 15
@@ -731,9 +752,10 @@ services:
       - ./scan_audit:/scan_audit
       - ./scan_audit/audit_writer.py:/runner/audit_writer.py:ro
       - ./certs:/certs:ro
+      - ./common:/runner/common:ro    # shared TLS-startup guard (common/tls_startup.py)
     cap_add: [NET_RAW]
     healthcheck:
-      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8023/health || curl -f http://127.0.0.1:8023/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8023/health || exit 1"]
       interval: 20s
       timeout: 5s
       retries: 15
@@ -847,8 +869,9 @@ services:
       - ./scan_audit:/scan_audit
       - ./scan_audit/audit_writer.py:/runner/audit_writer.py:ro
       - ./certs:/certs:ro
+      - ./common:/runner/common:ro    # shared TLS-startup guard (common/tls_startup.py)
     healthcheck:
-      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8025/health || curl -f http://127.0.0.1:8025/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8025/health || exit 1"]
       interval: 20s
       timeout: 5s
       retries: 15
@@ -1032,7 +1055,7 @@ services:
     ports:
       - "8013:8013"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8013/health || curl -f http://127.0.0.1:8013/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8013/health || exit 1"]
       interval: 20s
       timeout: 5s
       retries: 15
@@ -1278,7 +1301,7 @@ services:
       - ./knowledge:/knowledge:ro
       - ./certs:/certs:ro
     healthcheck:
-      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8015/health || curl -f http://127.0.0.1:8015/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8015/health || exit 1"]
       interval: 20s
       timeout: 5s
       retries: 15
@@ -2489,6 +2512,12 @@ services:
       DB_NAME: ${POSTGRES_DB:-scans}
       DB_USER: ${POSTGRES_USER:-app}
       DB_PASSWORD: ${POSTGRES_PASSWORD:-app}
+      # Burp Suite Pro REST API. BFF reads these via dashboard/bff/config.py.
+      # Dashboard's Settings → General → "Burp Suite REST API" panel is
+      # read-only; set the values in .env (and recreate this container).
+      BURP_API_URL: ${BURP_API_URL:-}
+      BURP_API_KEY: ${BURP_API_KEY:-}
+      BURP_PROXY_URL: ${BURP_PROXY_URL:-}
     depends_on:
       rag-api:
         condition: service_started

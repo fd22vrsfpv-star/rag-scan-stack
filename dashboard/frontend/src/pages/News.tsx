@@ -3,7 +3,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import {
   Newspaper, Search, RefreshCw, Loader2, X, ExternalLink, Github, Server,
   Trash2, CheckSquare, Square, Eye, Settings as SettingsIcon, Wand2,
-  HelpCircle, Globe, ShieldAlert, Plus, Sparkles, CalendarClock,
+  HelpCircle, Globe, ShieldAlert, Plus, Sparkles, CalendarClock, Target,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import PageHelp from '@/components/PageHelp'
@@ -12,6 +12,7 @@ import {
   useTriggerIngest, useUpdateNewsItem, useBulkNewsAction,
   useMatchAssets, useGithubSearch, useEnrichItem, useNewsStage2,
   useDeepSearch, useUpdateSource, useRefetchSource, useCreateSource,
+  useMatchNewsEngagement, useBatchMatchNewsEngagement,
 } from '@/api/news'
 import type { NewsSort } from '@/api/news'
 import type { NewsItem, NewsStatus, NewsSource } from '@/lib/types'
@@ -60,6 +61,11 @@ export default function News() {
   const [kevOnly, setKevOnly] = useState(false)
   const [rceOnly, setRceOnly] = useState(false)
   const [redTeamOnly, setRedTeamOnly] = useState(true)
+  // Engagement-match filter: show only items the backend has tagged as
+  // affecting this engagement. strong_only narrows to confidence='strong'
+  // (CVE-confirmed hits), muting the weak product-mention tier.
+  const [affectsEngagement, setAffectsEngagement] = useState(false)
+  const [strongOnly, setStrongOnly] = useState(false)
   const [hideStatuses, setHideStatuses] = useState<Set<NewsStatus>>(new Set(['deleted']))
   const [maxAgeDays, setMaxAgeDays] = useState<number | null>(30)
   const [sort, setSort] = useState<NewsSort>('relevance')
@@ -103,6 +109,8 @@ export default function News() {
       kev_listed: kevOnly || undefined,
       rce: rceOnly || undefined,
       red_team_only: redTeamOnly || undefined,
+      affects_engagement: affectsEngagement || undefined,
+      strong_only: affectsEngagement && strongOnly ? true : undefined,
       q: search || undefined,
       since,
       sort,
@@ -128,6 +136,8 @@ export default function News() {
   const matchAssets = useMatchAssets()
   const githubSearch = useGithubSearch()
   const enrichItem = useEnrichItem()
+  const matchEngagement = useMatchNewsEngagement()
+  const batchMatch = useBatchMatchNewsEngagement()
   const runStage2 = useNewsStage2()
   const deepSearch = useDeepSearch()
   const updateSource = useUpdateSource()
@@ -356,6 +366,40 @@ export default function News() {
           <ShieldAlert className="h-3.5 w-3.5" />
           {redTeamOnly ? 'Offensive security focus' : 'Show all (commentary too)'}
         </button>
+        <button
+          onClick={() => setAffectsEngagement(v => !v)}
+          className={cn(
+            'px-3 py-1 rounded text-sm border flex items-center gap-1.5 font-medium',
+            affectsEngagement
+              ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
+              : 'bg-muted border-border text-muted-foreground',
+          )}
+          title="Only items where the engagement-match analyser found a hit against your assets, software, or open follow-ups for the current engagement"
+        >
+          <Target className="h-3.5 w-3.5" />
+          {affectsEngagement ? 'Affects this engagement' : 'Any engagement relevance'}
+        </button>
+        {affectsEngagement && (
+          <label className="flex items-center gap-1 text-xs text-muted-foreground cursor-pointer">
+            <input type="checkbox" checked={strongOnly}
+              onChange={e => setStrongOnly(e.target.checked)}
+              className="h-3 w-3" />
+            strong only (CVE-confirmed)
+          </label>
+        )}
+        <button
+          onClick={async () => {
+            const r = await batchMatch.mutateAsync({ limit: 200, max_age_hours: 24 })
+            // simple toast via alert — the project doesn't ship a toast primitive
+            alert(`Engagement match: scanned=${r.scanned} updated=${r.updated} skipped=${r.skipped} hits=${r.matched_hits}`)
+          }}
+          disabled={batchMatch.isPending}
+          className="px-2 py-1 rounded text-xs border border-border hover:bg-muted flex items-center gap-1 disabled:opacity-40"
+          title="Re-run the engagement matcher across active news items for the current engagement"
+        >
+          {batchMatch.isPending ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+          Analyze news
+        </button>
         <div className="flex items-center gap-1 bg-muted rounded-md px-2 py-1">
           <Search className="h-3.5 w-3.5 text-muted-foreground" />
           <input
@@ -523,6 +567,32 @@ export default function News() {
                       : item.enriched_at
                         ? <div className="text-xs text-muted-foreground italic mt-1">no summary returned</div>
                         : <div className="text-xs text-muted-foreground/70 italic mt-1">not enriched — select and click Enrich</div>}
+                    {item.engagement_match && item.engagement_match.match_count > 0 && (() => {
+                      const em = item.engagement_match
+                      const strong = em.confidence === 'strong'
+                      const sigil = strong ? '✓' : '~'
+                      const unique = em.unique_assets ?? 0
+                      // Single affected host — name it (what the operator wants on
+                      // the chip itself, not just in the tooltip). Multi-host —
+                      // give the count so the chip stays short.
+                      const label =
+                        unique === 1 && em.primary_target
+                          ? `${sigil} ${em.primary_target}`
+                          : unique > 1
+                            ? `${sigil} ${unique} assets affected`
+                            : `${sigil} ${strong ? 'Affects engagement' : 'Possible match'} (${em.match_count})`
+                      return (
+                        <div className={cn(
+                          'inline-flex items-center gap-1 mt-1 px-1.5 py-0.5 rounded border text-[10px] font-medium',
+                          strong
+                            ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
+                            : 'bg-amber-500/15 text-amber-300 border-amber-500/40')}
+                          title={em.summary}>
+                          <Target className="h-3 w-3" />
+                          {label}
+                        </div>
+                      )
+                    })()}
                   </td>
                   <td className="px-3 py-2 text-xs">
                     {item.primary_cve
@@ -574,11 +644,13 @@ export default function News() {
             onMatchAssets={(id) => matchAssets.mutate(id)}
             onGithubSearch={(id) => githubSearch.mutate(id)}
             onEnrich={(id) => enrichItem.mutate(id)}
+            onMatchEngagement={(id) => matchEngagement.mutate(id)}
             onUpdate={(id, patch) => updateItem.mutate({ id, ...patch })}
             onDeepSearchTopic={(t) => { setTopic(t); onRunDeepSearch() }}
             busyMatch={matchAssets.isPending}
             busyGithub={githubSearch.isPending}
             busyEnrich={enrichItem.isPending}
+            busyMatchEngagement={matchEngagement.isPending}
           />
         )}
       </div>
@@ -609,19 +681,22 @@ export default function News() {
 // ============================================================================
 
 function DetailDrawer({
-  id, onClose, onMatchAssets, onGithubSearch, onEnrich, onUpdate, onDeepSearchTopic,
-  busyMatch, busyGithub, busyEnrich,
+  id, onClose, onMatchAssets, onGithubSearch, onEnrich, onMatchEngagement,
+  onUpdate, onDeepSearchTopic,
+  busyMatch, busyGithub, busyEnrich, busyMatchEngagement,
 }: {
   id: string
   onClose: () => void
   onMatchAssets: (id: string) => void
   onGithubSearch: (id: string) => void
   onEnrich: (id: string) => void
+  onMatchEngagement: (id: string) => void
   onUpdate: (id: string, patch: Partial<{ status: NewsStatus; notes: string; tags: string[]; acknowledged_by: string }>) => void
   onDeepSearchTopic: (topic: string) => void
   busyMatch: boolean
   busyGithub: boolean
   busyEnrich: boolean
+  busyMatchEngagement: boolean
 }) {
   const itemQ = useNewsItem(id)
   const item = itemQ.data
@@ -741,6 +816,90 @@ function DetailDrawer({
             </li>
           ))}
         </ul>
+      </div>
+
+      {/* Where it applies in THIS engagement — the new engagement-match block.
+          Distinct from "Asset matches" below, which is the (global) news-runner
+          CVE→vuln match that doesn't scope by engagement. This section pulls
+          from news_items.metadata.engagement_match.<current eid>. */}
+      <div>
+        <div className="text-muted-foreground text-xs mb-1 flex items-center justify-between gap-1">
+          <div className="flex items-center gap-1">
+            <Target className="h-3 w-3" />
+            Where it applies in this engagement
+            {item.engagement_match && (
+              <span className={cn('ml-1 text-[10px] px-1 rounded border',
+                item.engagement_match.confidence === 'strong'
+                  ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
+                  : 'bg-amber-500/15 text-amber-300 border-amber-500/40')}>
+                {item.engagement_match.confidence}
+              </span>
+            )}
+          </div>
+          <button
+            onClick={() => onMatchEngagement(item.id)}
+            disabled={busyMatchEngagement}
+            className="text-[10px] px-1.5 py-0.5 rounded border border-border hover:bg-muted flex items-center gap-1 disabled:opacity-50"
+            title="Re-run the engagement matcher for this item against the current engagement">
+            {busyMatchEngagement ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+            Re-analyze
+          </button>
+        </div>
+        {!item.engagement_match ? (
+          <div className="text-xs text-muted-foreground italic">
+            Not analysed yet — click <em>Re-analyze</em>, or wait for the next sweep.
+          </div>
+        ) : item.engagement_match.match_count === 0 ? (
+          <div className="text-xs text-muted-foreground italic">
+            {item.engagement_match.summary}
+          </div>
+        ) : (
+          <div className="space-y-1">
+            <div className="text-xs">{item.engagement_match.summary}</div>
+            {item.engagement_match.sources.vulns.length > 0 && (
+              <div>
+                <div className="text-[10px] text-muted-foreground uppercase tracking-wider mt-1">Vulns ({item.engagement_match.sources.vulns.length})</div>
+                <ul className="space-y-0.5">
+                  {item.engagement_match.sources.vulns.slice(0, 10).map((v, i) => (
+                    <li key={i} className="text-xs border border-border rounded px-2 py-1">
+                      <span className="font-mono text-amber-400">{v.cve}</span>
+                      <span className="ml-2">{v.hostname || v.ip}</span>
+                      {v.severity && <span className="ml-1 text-muted-foreground">({v.severity})</span>}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {item.engagement_match.sources.follow_ups.length > 0 && (
+              <div>
+                <div className="text-[10px] text-muted-foreground uppercase tracking-wider mt-1">Open follow-ups ({item.engagement_match.sources.follow_ups.length})</div>
+                <ul className="space-y-0.5">
+                  {item.engagement_match.sources.follow_ups.slice(0, 10).map((f, i) => (
+                    <li key={i} className="text-xs border border-border rounded px-2 py-1" title={f.title}>
+                      <span className="font-mono text-amber-400">{f.cves.join(', ')}</span>
+                      <span className="ml-2">{f.ip}</span>
+                      {f.severity && <span className="ml-1 text-muted-foreground">({f.severity})</span>}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {item.engagement_match.sources.software.length > 0 && (
+              <div>
+                <div className="text-[10px] text-muted-foreground uppercase tracking-wider mt-1">Detected software ({item.engagement_match.sources.software.length})</div>
+                <ul className="space-y-0.5">
+                  {item.engagement_match.sources.software.slice(0, 10).map((s, i) => (
+                    <li key={i} className="text-xs border border-border rounded px-2 py-1">
+                      <span className="font-mono">{s.product}{s.version ? ` ${s.version}` : ''}</span>
+                      <span className="ml-2">{s.ip}{s.port ? `:${s.port}` : ''}</span>
+                      <span className="ml-1 text-muted-foreground text-[10px]">({s.source})</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Asset matches */}

@@ -72,18 +72,25 @@ class LLMMetricsContext:
             with get_db() as conn:
                 with conn.cursor() as cur:
                     for row in rows:
+                        # cost_usd: new column added for the LiteLLM migration.
+                        # LangChain callback can populate it when the chain uses
+                        # LiteLLM (which attaches `response_cost` to the message
+                        # metadata). Older rows / non-LiteLLM paths pass None,
+                        # which stores NULL and the UI renders as "—".
+                        row.setdefault("cost_usd", None)
                         cur.execute("""
                             INSERT INTO llm_request_metrics
                                 (session_id, agent_name, model_name,
                                  prompt_tokens, completion_tokens, total_tokens,
                                  latency_ms, has_tool_calls, tool_call_count,
-                                 tool_names, is_error, error_message, request_params)
+                                 tool_names, is_error, error_message, request_params,
+                                 cost_usd)
                             VALUES
                                 (%(session_id)s::uuid, %(agent_name)s, %(model_name)s,
                                  %(prompt_tokens)s, %(completion_tokens)s, %(total_tokens)s,
                                  %(latency_ms)s, %(has_tool_calls)s, %(tool_call_count)s,
                                  %(tool_names)s, %(is_error)s, %(error_message)s,
-                                 %(request_params)s::jsonb)
+                                 %(request_params)s::jsonb, %(cost_usd)s)
                         """, row)
                 conn.commit()
             logger.debug(f"[LLMMetrics] Flushed {len(rows)} metrics to DB")
