@@ -14558,6 +14558,203 @@ def _gather_decide(items: list, vuln_class: str) -> dict:
                        else ("NOT READY — missing: " + ", ".join(missing))}
 
 
+# Vuln-class → CWE map used to narrow web_findings to the ones likely relevant
+# to this exploit. Unknown vuln_class → no CWE filter (return recent findings).
+_SCAN_EVIDENCE_CWE_FOR_CLASS = {
+    "sqli":           ["CWE-89"],
+    "xss":            ["CWE-79", "CWE-80"],
+    "cmdi":           ["CWE-77", "CWE-78"],
+    "ssti":           ["CWE-94", "CWE-1336"],
+    "ssrf":           ["CWE-918"],
+    "xxe":            ["CWE-611"],
+    "lfi":            ["CWE-22", "CWE-98"],
+    "rfi":            ["CWE-98"],
+    "path-traversal": ["CWE-22"],
+    "rce":            ["CWE-77", "CWE-78", "CWE-94", "CWE-502"],
+    "idor":           ["CWE-639", "CWE-284", "CWE-285"],
+    "upload":         ["CWE-434"],
+    "auth-bypass":    ["CWE-287", "CWE-306", "CWE-863"],
+    "deser":          ["CWE-502"],
+    "open-redirect":  ["CWE-601"],
+}
+
+
+def _scan_evidence_for_target(cve, ip, port, eid, vc) -> dict:
+    """Pull scan-side evidence already captured for this (ip, port, cve) so the
+    build-poc gather + synth can solve from our own telemetry instead of
+    re-mining advisory text.
+
+    Burp-sourced rows are explicitly excluded (operator intent 2026-10-08:
+    "solve it on our own"). Every query is a cheap, bounded SELECT with hard
+    LIMITs. Fail-soft on any error — an empty dict never breaks gather.
+
+    Returns {poc_hints, discovered_params, web_findings, content, banner,
+    prior_runs}. All values are plain Python (no DB rows retained)."""
+    out = {"poc_hints": "", "discovered_params": [], "web_findings": [],
+           "content": {}, "banner": None, "prior_runs": []}
+    try:
+        ip_s = str(ip) if ip is not None else None
+        if not ip_s:
+            return out
+        port_i = int(port) if port is not None else None
+        cwe_filter = _SCAN_EVIDENCE_CWE_FOR_CLASS.get((vc or "").lower())
+        with get_db() as conn, conn.cursor() as cur:
+            # 1. Operator-authored PoC hints (reuses the existing reader).
+            try:
+                out["poc_hints"] = _load_hints_for(cve, ip_s, port_i) or ""
+            except Exception:  # noqa: BLE001
+                out["poc_hints"] = ""
+
+            # 2. discovered_params — Katana + friends already walked the app
+            #    and recorded the exact (endpoint, method, param) triads we're
+            #    scraping advisory text for.
+            try:
+                cur.execute("""
+                    SELECT dp.url_pattern, dp.param_name, dp.param_type,
+                           dp.http_method, dp.param_location, dp.sample_values,
+                           dp.discovery_source
+                    FROM discovered_params dp
+                    JOIN assets a ON dp.asset_id = a.id
+                    WHERE host(a.ip) = %s
+                      AND COALESCE(dp.discovery_source, '') NOT ILIKE %s
+                    ORDER BY dp.last_seen DESC NULLS LAST
+                    LIMIT 25
+                """, (ip_s, "%burp%"))
+                for r in cur.fetchall():
+                    out["discovered_params"].append({
+                        "url_pattern": r[0], "param_name": r[1],
+                        "param_type": r[2], "http_method": r[3],
+                        "param_location": r[4],
+                        "sample_values": (r[5] or [])[:3] if r[5] else [],
+                        "discovery_source": r[6]})
+            except Exception as e:  # noqa: BLE001
+                logging.debug("scan_evidence discovered_params failed: %s", e)
+
+            # 3. web_findings — ZAP/Nuclei/manual hits on THIS (ip, port).
+            #    Burp excluded by source. CWE narrowed when vuln_class is known.
+            try:
+                sql = """
+                    SELECT wf.url, wf.method, wf.param, wf.payload, wf.cwe,
+                           wf.source, wf.issue_type, wf.name, wf.status_code
+                    FROM web_findings wf
+                    JOIN assets a ON wf.asset_id = a.id
+                    WHERE host(a.ip) = %s
+                      AND (wf.port = %s OR wf.port IS NULL)
+                      AND COALESCE(LOWER(wf.source), '') NOT IN
+                          ('burp', 'burpsuite', 'burp-scanner', 'burp_scanner')
+                      AND COALESCE(wf.issue_type, '') NOT ILIKE %s
+                """
+                params = [ip_s, port_i, "burp%"]
+                if cwe_filter:
+                    sql += " AND wf.cwe && %s::text[]"
+                    params.append(cwe_filter)
+                sql += " ORDER BY wf.last_seen DESC NULLS LAST LIMIT 15"
+                cur.execute(sql, params)
+                for r in cur.fetchall():
+                    out["web_findings"].append({
+                        "url": r[0], "method": r[1], "param": r[2],
+                        "payload": (r[3] or "")[:400],
+                        "cwe": list(r[4]) if r[4] else [],
+                        "source": r[5], "issue_type": r[6],
+                        "name": r[7], "status_code": r[8]})
+            except Exception as e:  # noqa: BLE001
+                logging.debug("scan_evidence web_findings failed: %s", e)
+
+            # 4. content_extractions — playwright/content-extractor distilled
+            #    endpoint/field inventory per asset. Jsonb fields; cap sizes.
+            try:
+                cur.execute("""
+                    SELECT ce.api_endpoints, ce.hidden_inputs, ce.login_pages,
+                           ce.interesting_files, ce.internal_paths,
+                           ce.tech_indicators
+                    FROM content_extractions ce
+                    JOIN assets a ON ce.asset_id = a.id
+                    WHERE host(a.ip) = %s
+                    ORDER BY ce.created_at DESC
+                    LIMIT 5
+                """, (ip_s,))
+                api_ep, hidden, login, files, paths, tech = [], [], [], [], [], []
+                for r in cur.fetchall():
+                    def _as_list(v):
+                        if v is None:
+                            return []
+                        if isinstance(v, list):
+                            return v
+                        if isinstance(v, dict):
+                            return list(v.values())
+                        return [v]
+                    api_ep += _as_list(r[0])
+                    hidden += _as_list(r[1])
+                    login  += _as_list(r[2])
+                    files  += _as_list(r[3])
+                    paths  += _as_list(r[4])
+                    tech   += _as_list(r[5])
+                # De-dupe while preserving order, cap each.
+                def _dedup(xs, cap):
+                    seen, out_ = set(), []
+                    for x in xs:
+                        k = str(x)[:200]
+                        if k in seen:
+                            continue
+                        seen.add(k); out_.append(x)
+                        if len(out_) >= cap:
+                            break
+                    return out_
+                out["content"] = {
+                    "api_endpoints":     _dedup(api_ep, 25),
+                    "hidden_inputs":     _dedup(hidden, 15),
+                    "login_pages":       _dedup(login, 5),
+                    "interesting_files": _dedup(files, 10),
+                    "internal_paths":    _dedup(paths, 15),
+                    "tech_indicators":   _dedup(tech, 10)}
+            except Exception as e:  # noqa: BLE001
+                logging.debug("scan_evidence content_extractions failed: %s", e)
+
+            # 5. ports.banner — the caller already passes product/version but
+            #    nmap's raw banner often names the reverse-proxy / framework
+            #    the classifier didn't catch (Werkzeug, Tomcat, Spring Boot…).
+            try:
+                cur.execute("""
+                    SELECT p.banner
+                    FROM ports p
+                    JOIN assets a ON p.asset_id = a.id
+                    WHERE host(a.ip) = %s AND p.port = %s AND p.is_open
+                    ORDER BY p.last_seen DESC NULLS LAST
+                    LIMIT 1
+                """, (ip_s, port_i))
+                row = cur.fetchone()
+                if row and row[0]:
+                    out["banner"] = str(row[0])[:300]
+            except Exception as e:  # noqa: BLE001
+                logging.debug("scan_evidence banner failed: %s", e)
+
+            # 6. Prior build-poc runs for the SAME CVE — what we tried, what
+            #    the last run's run_output looked like, whether it passed.
+            #    Short so the synth prompt stays narrow.
+            try:
+                cur.execute("""
+                    SELECT iteration, phase, assertion_passed,
+                           substring(run_output for 400) AS run_snip,
+                           created_at
+                    FROM poc_synthesis_log
+                    WHERE cve = %s
+                      AND (target_ip IS NULL OR target_ip = %s)
+                    ORDER BY created_at DESC
+                    LIMIT 6
+                """, (cve, ip_s))
+                for r in cur.fetchall():
+                    out["prior_runs"].append({
+                        "iteration": r[0], "phase": r[1],
+                        "passed": bool(r[2]) if r[2] is not None else None,
+                        "run_snip": (r[3] or ""),
+                        "created_at": r[4].isoformat() if r[4] else None})
+            except Exception as e:  # noqa: BLE001
+                logging.debug("scan_evidence prior_runs failed: %s", e)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("_scan_evidence_for_target top-level failed cve=%s: %s", cve, e)
+    return out
+
+
 def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan_verdicts=None,
                      session_info=None, auth=None, analysis=None, recon_text="", run_id=None,
                      timeout=4, id_pool=None) -> dict:
@@ -14592,6 +14789,22 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
                 "candidate_endpoints": [], "input_source": {}, "_spec_error": str(_se)[:120]}
     vc = (spec.get("vuln_class") or "unknown").lower()
     ls = _local_source_routes(cve)
+
+    # Scan telemetry already on hand for this (ip, port, cve). Pulled once up
+    # front so merges below (probe list, field candidates) see it, and the
+    # manifest text carries it into synth's guidance block. Burp-sourced rows
+    # are excluded inside the helper per operator intent 2026-10-08.
+    try:
+        scan_ev = _scan_evidence_for_target(cve, ip, port, eid, vc)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("gather: scan_evidence lookup failed: %s", e)
+        scan_ev = {"poc_hints": "", "discovered_params": [], "web_findings": [],
+                   "content": {}, "banner": None, "prior_runs": []}
+    facts["scan_evidence"] = scan_ev
+    facts["poc_hints"] = scan_ev.get("poc_hints") or ""
+    facts["prior_runs"] = scan_ev.get("prior_runs") or []
+    if scan_ev.get("banner"):
+        facts["banner"] = scan_ev["banner"]
 
     # 1. target reachable
     try:
@@ -14653,6 +14866,43 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
         for _mp in mined["paths"]:
             probe_list += _path_variants(_mp)          # advisory path, then prefix-stripped
         probe_list += [c for c in (spec.get("candidate_endpoints") or []) if isinstance(c, str) and c.startswith("/") and c != "/"]
+        # Scan-side evidence: Katana/ZAP/Nuclei already walked this target.
+        # Append their paths so the probe loop tries them before we invent one.
+        _scan_paths = set()
+        def _url_to_path(u):
+            if not isinstance(u, str):
+                return None
+            s = u.strip()
+            if "://" in s:
+                try:
+                    from urllib.parse import urlparse as _up
+                    s = _up(s).path or ""
+                except Exception:  # noqa: BLE001
+                    return None
+            s = s.split("?", 1)[0].strip()
+            return s if s.startswith("/") and s not in ("/",) else None
+        for dp in scan_ev.get("discovered_params") or []:
+            p = _url_to_path(dp.get("url_pattern") or "")
+            if p:
+                _scan_paths.add(p)
+        for ae in (scan_ev.get("content") or {}).get("api_endpoints") or []:
+            # api_endpoints rows can be a str, {"path": ...}, {"url": ...}, …
+            raw = ae if isinstance(ae, str) else (
+                ae.get("path") or ae.get("endpoint") or ae.get("url") if isinstance(ae, dict) else None)
+            p = _url_to_path(raw) if raw else None
+            if p:
+                _scan_paths.add(p)
+        for ip_path in (scan_ev.get("content") or {}).get("internal_paths") or []:
+            p = _url_to_path(ip_path if isinstance(ip_path, str) else "")
+            if p:
+                _scan_paths.add(p)
+        for wf in scan_ev.get("web_findings") or []:
+            p = _url_to_path(wf.get("url") or "")
+            if p:
+                _scan_paths.add(p)
+        for p in list(_scan_paths)[:20]:
+            if p not in probe_list:
+                probe_list.append(p)
         # routes the target itself published (OpenAPI) that match a mined path or a mined field name
         _oa_routes = _parse_openapi_paths_line(recon_text or "")
         _oa_methods = {r["path"]: r["methods"] for r in _oa_routes}
@@ -14669,7 +14919,7 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
         seen = set()
         try:
             with _hx.Client(verify=False, timeout=timeout, follow_redirects=False) as cli:
-                for ep in probe_list[:12]:
+                for ep in probe_list[:20]:
                     if ep in seen:
                         continue
                     seen.add(ep)
@@ -14680,7 +14930,14 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
                             if rp.status_code not in (404, 405):
                                 break
                         if rp is not None and rp.status_code != 404:
-                            _note = " (advisory/derived path)" if ep in mined["paths"] else (" (prefix-stripped advisory path)" if any(ep in _path_variants(x) for x in mined["paths"]) else "")
+                            if ep in mined["paths"]:
+                                _note = " (advisory/derived path)"
+                            elif any(ep in _path_variants(x) for x in mined["paths"]):
+                                _note = " (prefix-stripped advisory path)"
+                            elif ep in _scan_paths:
+                                _note = " (scan-side path: discovered_params/content_ext/web_findings)"
+                            else:
+                                _note = ""
                             endpoint, ep_source = ep, f"candidate_probe:{_m} HTTP {rp.status_code}{_note}"
                             break
                     except Exception:  # noqa: BLE001
@@ -14703,14 +14960,42 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
     else:
         add("endpoint_id", "n/a", None, None)
 
-    # 5. method — local source first, else OPTIONS, else HEAD/POST probe
+    # 5. method — local source first, else scan evidence, else OPTIONS, else HEAD/POST probe
     method_val = None
     if endpoint:
         rt = next((r for r in (ls.get("routes") or []) if r["path"] == endpoint), None)
+        def _dp_path(up):
+            if not isinstance(up, str):
+                return None
+            s = up.strip()
+            if "://" in s:
+                try:
+                    from urllib.parse import urlparse as _up
+                    s = _up(s).path or ""
+                except Exception:  # noqa: BLE001
+                    return None
+            return s.split("?", 1)[0].strip() or None
+        _VALID_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD")
+        _dp_methods_for_ep = [
+            (dp.get("http_method") or "").upper()
+            for dp in (scan_ev.get("discovered_params") or [])
+            if _dp_path(dp.get("url_pattern")) == endpoint
+               and (dp.get("http_method") or "").upper() in _VALID_METHODS
+        ]
+        _wf_methods_for_ep = []
+        for wf in scan_ev.get("web_findings") or []:
+            if _dp_path(wf.get("url")) == endpoint:
+                m = (wf.get("method") or "").upper()
+                if m in _VALID_METHODS:
+                    _wf_methods_for_ep.append(m)
         if rt:
             method_val, m_source = ",".join(rt["methods"]), "local_source"
         elif mined["methods"] and endpoint in mined["paths"]:
             method_val, m_source = ",".join(mined["methods"]), "advisory_poc"
+        elif _dp_methods_for_ep:
+            method_val, m_source = ",".join(sorted(set(_dp_methods_for_ep))), "discovered_params"
+        elif _wf_methods_for_ep:
+            method_val, m_source = ",".join(sorted(set(_wf_methods_for_ep))), "web_findings"
         elif _parse_openapi_paths_line(recon_text or "") and any(r["path"] == endpoint for r in _parse_openapi_paths_line(recon_text or "")):
             method_val, m_source = ",".join(next(r["methods"] for r in _parse_openapi_paths_line(recon_text or "") if r["path"] == endpoint)), "openapi"
         else:
@@ -14742,6 +15027,40 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
         field, f_source = mined["fields"][0], "advisory/derived"
     if not field and mined["headers"]:
         field, f_source = f"{mined['headers'][0]} (header)", "derived_vector"
+    # Scan evidence: Katana/content-ext already catalogued params on this app.
+    # Prefer a discovered_params row whose url_pattern matches the chosen
+    # endpoint; fall back to any discovered_params row; then hidden_inputs.
+    def _dp_path_norm(up):
+        if not isinstance(up, str):
+            return None
+        s = up.strip()
+        if "://" in s:
+            try:
+                from urllib.parse import urlparse as _up
+                s = _up(s).path or ""
+            except Exception:  # noqa: BLE001
+                return None
+        return s.split("?", 1)[0].strip() or None
+    if not field and endpoint and (scan_ev.get("discovered_params") or []):
+        _ep_dps = [dp for dp in scan_ev["discovered_params"]
+                   if _dp_path_norm(dp.get("url_pattern")) == endpoint]
+        if _ep_dps and _ep_dps[0].get("param_name"):
+            field, f_source = _ep_dps[0]["param_name"], "discovered_params:url_match"
+    if not field and (scan_ev.get("discovered_params") or []):
+        for dp in scan_ev["discovered_params"]:
+            if dp.get("param_name"):
+                field, f_source = dp["param_name"], "discovered_params:recent"
+                break
+    if not field and ((scan_ev.get("content") or {}).get("hidden_inputs") or []):
+        for hi in scan_ev["content"]["hidden_inputs"]:
+            name = None
+            if isinstance(hi, str):
+                name = hi
+            elif isinstance(hi, dict):
+                name = hi.get("name") or hi.get("field") or hi.get("id")
+            if isinstance(name, str) and name:
+                field, f_source = name, "content_extraction:hidden_input"
+                break
     if not field and spec.get("advisory_poc"):
         mm = _re.search(r"[?&]([A-Za-z_][\w\[\]]*)=", spec["advisory_poc"]) or _re.search(r'"([A-Za-z_]\w*)"\s*:', spec["advisory_poc"])
         if mm:
@@ -14992,10 +15311,77 @@ def _gather_manifest_text(man: dict) -> str:
     for i in man.get("items") or []:
         if i["status"] == "missing":
             lines.append(f"  [MISSING] {i['item']}: {i.get('value') or ''}")
-    mined = (man.get("facts") or {}).get("mined") or {}
+    facts = man.get("facts") or {}
+    mined = facts.get("mined") or {}
     if any(mined.get(k) for k in ("paths", "fields", "methods", "headers")):
         lines.append("  mined from advisory/derived: " + "; ".join(
             f"{k}={mined[k]}" for k in ("paths", "methods", "fields", "headers") if mined.get(k)))
+    if facts.get("banner"):
+        lines.append(f"  server banner: {facts['banner'][:200]}")
+
+    # Scan-side telemetry already captured on this target. Carried into the
+    # synth prompt via guidance_extra so synth builds against what we already
+    # found rather than re-mining advisory text. Burp-sourced rows are
+    # excluded upstream in _scan_evidence_for_target per operator intent.
+    ev = facts.get("scan_evidence") or {}
+    hints = facts.get("poc_hints") or ""
+    if hints:
+        lines.append("")
+        lines.append("OPERATOR_HINTS (poc_hints table, host/port-specific first):")
+        for h in hints.split("\n")[:5]:
+            if h.strip():
+                lines.append(f"  - {h.strip()[:280]}")
+
+    dps = ev.get("discovered_params") or []
+    if dps:
+        lines.append("")
+        lines.append("SCAN_EVIDENCE — discovered_params (Katana/ZAP-walked endpoints on this target):")
+        for dp in dps[:10]:
+            mth = (dp.get("http_method") or "?").upper()
+            loc = dp.get("param_location") or "?"
+            samp = ""
+            if dp.get("sample_values"):
+                samp = f"  samples={','.join(str(x)[:40] for x in dp['sample_values'][:2])}"
+            lines.append(f"  {mth} {dp.get('url_pattern') or '/'}  param={dp.get('param_name')}  ({loc}){samp}")
+
+    wfs = ev.get("web_findings") or []
+    if wfs:
+        lines.append("")
+        lines.append("SCAN_EVIDENCE — web_findings (ZAP/Nuclei/manual hits on THIS host:port):")
+        for wf in wfs[:8]:
+            cwes = ",".join(wf.get("cwe") or [])
+            mth = (wf.get("method") or "?").upper()
+            lines.append(f"  [{wf.get('source') or '?'}] {mth} {wf.get('url')}  cwe={cwes or '-'}  "
+                         f"name={(wf.get('name') or wf.get('issue_type') or '')[:80]}  "
+                         f"status={wf.get('status_code') or '?'}")
+            if wf.get("payload"):
+                lines.append(f"    payload: {str(wf['payload'])[:200]}")
+
+    content = ev.get("content") or {}
+    content_bits = []
+    if content.get("api_endpoints"):
+        content_bits.append(f"api_endpoints={len(content['api_endpoints'])}")
+    if content.get("hidden_inputs"):
+        content_bits.append(f"hidden_inputs={len(content['hidden_inputs'])}")
+    if content.get("login_pages"):
+        content_bits.append(f"login_pages={len(content['login_pages'])}")
+    if content_bits:
+        lines.append("")
+        lines.append("SCAN_EVIDENCE — content_extractions summary: " + "; ".join(content_bits))
+        for p in (content.get("api_endpoints") or [])[:5]:
+            lines.append(f"  api_endpoint: {str(p)[:200]}")
+        for lp in (content.get("login_pages") or [])[:2]:
+            lines.append(f"  login_page: {str(lp)[:200]}")
+
+    prior = ev.get("prior_runs") or []
+    if prior:
+        lines.append("")
+        lines.append(f"PRIOR_RUNS — {len(prior)} earlier poc_synthesis_log rows for this CVE "
+                     f"(most recent first). Avoid repeating what already failed; build on what landed.")
+        for pr in prior[:4]:
+            passed = "PASS" if pr.get("passed") else ("FAIL" if pr.get("passed") is False else "?")
+            snip = (pr.get("run_snip") or "").replace("\n", " ")[:260]
+            lines.append(f"  iter={pr.get('iteration')} phase={pr.get('phase')} [{passed}]  snip: {snip}")
     return "\n".join(lines)
 
 
