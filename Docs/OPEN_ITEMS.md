@@ -310,3 +310,30 @@ rebase blind.
 against what `ab04420` fixed (10 vs 139 tools) — if the gap still exists, port
 that commit in a reviewed PR; otherwise delete the branch.
 **Enforced by:** not enforced
+
+### Orphaned idle-in-transaction DB sessions survive the owning container's restart
+**Found:** 2026-10-09, diagnosing a stalled build-PoC run.
+**Evidence:** `pg_stat_activity` on the live DB showed 28 non-idle/long sessions:
+one `idle in transaction` backend (pid 3431892, `RELEASE SAVEPOINT any_scope`,
+idle 5 h) blocking nine `INSERT INTO follow_up_items …` statements for up to
+2.2 h (`wait_event_type='Lock'`, `pg_blocking_pids` → 3431892), plus ~15 more
+idle-in-transaction sessions at `osint_agent` savepoints (`host_aliases`,
+`any_scope`, `followup_insert`, `already_flagged_check`) from two client IPs.
+The statements belong to `app/rag-api/osint_agent.py` (`scan_new_findings`, a
+FastAPI background task on every ingest, raw `psycopg2.connect` — no timeouts),
+yet the blocker outlived two `docker compose restart rag-api` cycles, so the
+backend is kept alive on the DB side after the local socket died (the SSH
+tunnel `rag-db-tunnel` is the only path to the DB). Server settings:
+`idle_in_transaction_session_timeout=0`, `lock_timeout=0`, `statement_timeout=0`.
+Only the rag-api pool sets a per-connection idle cap (2 min).
+**Where:** `app/rag-api/osint_agent.py::_get_conn` (now sets a 5-min idle cap +
+15 s lock wait), `app/rag-api/api.py::_get_pool` (idle cap 2 min, lock_timeout
+15 s since 2026-10-09), the remote Postgres server config, `ssh-tunnel/`.
+**Done when:** the server has a database-level default
+(`ALTER DATABASE scans SET idle_in_transaction_session_timeout = '10min'` and a
+`lock_timeout`) so a leaked transaction cannot outlive its client regardless of
+code path, the tunnel carries TCP keepalives (`ServerAliveInterval` /
+`tcp_keepalives_idle` on the server) so a dead local socket ends the backend
+within minutes, and a re-check of `pg_stat_activity` after a service restart
+shows no session older than that cap.
+**Enforced by:** not enforced

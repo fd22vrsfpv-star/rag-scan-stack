@@ -761,7 +761,11 @@ def _get_pool() -> ThreadedConnectionPool:
                 # that forget to commit/rollback from holding locks indefinitely.
                 _DB_POOL = ThreadedConnectionPool(
                     _DB_POOL_MIN, _DB_POOL_MAX, dsn=DB_DSN,
-                    options="-c idle_in_transaction_session_timeout=120000",
+                    # lock_timeout (2026-10-09): nine follow_up_items INSERTs
+                    # queued 2 h+ behind one leaked transaction. Shed, do not
+                    # queue — a contended write fails after 15 s and the
+                    # fail-soft writers log it instead of hanging a build.
+                    options="-c idle_in_transaction_session_timeout=120000 -c lock_timeout=15000",
                 )
                 logger.info("DB pool initialized: min=%d max=%d", _DB_POOL_MIN, _DB_POOL_MAX)
     return _DB_POOL
