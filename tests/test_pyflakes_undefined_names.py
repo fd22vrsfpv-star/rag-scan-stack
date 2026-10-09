@@ -47,7 +47,7 @@ def _undefined_names(path: Path) -> list[str]:
 # (each inside try/except, so those webhooks were silently dropped) and an
 # undefined `ip`. Recorded in Docs/OPEN_ITEMS.md. A NEW undefined name fails by
 # name even while the count is under the baseline.
-BASELINE_COUNT = {"app/rag-api/api.py": 30}
+BASELINE_COUNT = {"app/rag-api/api.py": 29}
 BASELINE_NAMES = {"app/rag-api/api.py": {"emit_webhook", "ip"}}
 
 
