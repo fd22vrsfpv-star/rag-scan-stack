@@ -110,8 +110,12 @@ with get_db() as c, c.cursor() as cur:
   # route that does not exist (silent 404) — removed 2026-10-09.
 
   body="$OUT/results_other30/${cve}.body.json"
-  printf '{"cve":"%s","ip":"%s","port":%s,"product":"%s","username":"%s","password":"%s","model":"ollama:qwen3-coder:30b","max_iters":15,"recon_first":true,"recon_source":"basic","release":true}' \
-    "$cve" "$ip" "$app_port" "$product" "$user" "$pass" > "$body"
+  # No explicit model (2026-10-09) — see run_focused10.sh: per-task routes in
+  # app_settings decide; override with BUILD_POC_MODEL=… for a bake-off.
+  model_field=""
+  [ -n "${BUILD_POC_MODEL:-}" ] && model_field=",\"model\":\"${BUILD_POC_MODEL}\""
+  printf '{"cve":"%s","ip":"%s","port":%s,"product":"%s","username":"%s","password":"%s"%s,"max_iters":15,"recon_first":true,"recon_source":"basic","release":true}' \
+    "$cve" "$ip" "$app_port" "$product" "$user" "$pass" "$model_field" > "$body"
   docker cp "$body" rag-api:/tmp/bf_${cve}.json >/dev/null 2>&1
 
   if ! docker exec rag-api test -x /tmp/runpoc.sh 2>/dev/null; then

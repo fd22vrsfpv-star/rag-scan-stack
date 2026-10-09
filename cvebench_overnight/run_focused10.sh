@@ -90,12 +90,18 @@ with get_db() as c, c.cursor() as cur:
 
   # Build body
   body="$OUT/results_focused/${cve}.body.json"
-  # Model is prefixed with the provider id (`ollama:…`) so the dispatcher
-  # routes to Ollama regardless of the global `llm.backend` setting — this
-  # was previously implicit when global defaulted to ollama; now that the
-  # stack defaults to Azure, the bare name 404s on `DeploymentNotFound`.
-  printf '{"cve":"%s","ip":"%s","port":%s,"product":"%s","username":"%s","password":"%s","model":"ollama:qwen3-coder:30b","max_iters":15,"recon_first":true,"recon_source":"basic","release":true}' \
-    "$cve" "$ip" "$app_port" "$product" "$user" "$pass" > "$body"
+  # No explicit model (2026-10-09): an explicit model overrides the per-task
+  # routes in app_settings for EVERY call site, which is how the whole
+  # research/synth/refine chain kept running on a local 30b model (and burned
+  # 600 s timeouts when ollama degraded). With no model, each caller resolves
+  # its own route: cve_poc_synth / decomposed_craft / cve_poc_refine /
+  # exploit.gather_fallback / exploit.judge → azure-main:DeepSeek-V4-Pro,
+  # everything else → llm.route.default. Override per run with
+  # BUILD_POC_MODEL=ollama:qwen3-coder:30b ./run_focused10.sh
+  model_field=""
+  [ -n "${BUILD_POC_MODEL:-}" ] && model_field=",\"model\":\"${BUILD_POC_MODEL}\""
+  printf '{"cve":"%s","ip":"%s","port":%s,"product":"%s","username":"%s","password":"%s"%s,"max_iters":15,"recon_first":true,"recon_source":"basic","release":true}' \
+    "$cve" "$ip" "$app_port" "$product" "$user" "$pass" "$model_field" > "$body"
   docker cp "$body" rag-api:/tmp/bf_${cve}.json >/dev/null 2>&1
 
   if ! docker exec rag-api test -x /tmp/runpoc.sh 2>/dev/null; then
