@@ -121,6 +121,12 @@ def initial_state(cve: str, ip: str, port: int, product=None, version=None, eid=
                   focused_urls: Optional[List[str]] = None) -> BuildPocState:
     """Build the initial state dict handed to the graph. Mirrors the argument shape
     of _build_poc_core so the wrapper is trivial."""
+    # Supplied credentials are the FIRST cred_hint so node_auto_login logs in
+    # before the ZAP/Playwright/Arjun recon runs (authenticated crawl), not only
+    # at node_auth_establish afterwards (analysis 2026-10-09, fix #2).
+    _supplied = []
+    if auth and auth.get("username") and auth.get("password"):
+        _supplied = [f"{auth['username']}:{auth['password']}"]
     return {
         "cve": cve, "ip": ip, "port": port,
         "product": product, "version": version, "eid": eid,
@@ -130,7 +136,7 @@ def initial_state(cve: str, ip: str, port: int, product=None, version=None, eid=
         "t0": time.time(),
         "segments": [], "recon_metrics": {}, "intel_list": [],
         "zap_paths": [], "arjun_discovered": [], "focused_urls": list(focused_urls or []),
-        "cred_hints": [], "admin_paths_mined": [],
+        "cred_hints": _supplied, "admin_paths_mined": [],
         "detected_frameworks": [], "waf_family": None, "waf_characterization": {},
         "auth": auth or {}, "auth_guidance": "", "session_info": None,
         "hint_guidance": "", "hint_parts": [], "research_out": None,
@@ -461,7 +467,8 @@ def node_response_mine(state: BuildPocState) -> Dict[str, Any]:
     for x in intel_list:
         cred_hints.extend(x.get("credential_hints", []) or [])
         admin_paths.extend(x.get("admin_paths", []) or [])
-    cred_hints = list(dict.fromkeys(cred_hints))
+    # Supplied pair (seeded by initial_state) stays first; mined ones follow.
+    cred_hints = list(dict.fromkeys(list(state.get("cred_hints") or []) + cred_hints))
     admin_paths = list(dict.fromkeys(admin_paths))
     detected_frameworks = list(dict.fromkeys(
         x.get("framework") for x in intel_list if x.get("framework")))
@@ -500,7 +507,10 @@ def node_auto_login(state: BuildPocState) -> Dict[str, Any]:
     seg = []
     auth = dict(state.get("auth") or {})
     if login and login.get("cookie_header"):
-        note = (f"AUTO-LOGIN SUCCESS with mined creds {login['cred']} at "
+        _a = state.get("auth") or {}
+        _src = ("supplied" if (_a.get("username") and _a.get("password")
+                               and login.get("cred") == f"{_a['username']}:{_a['password']}") else "mined")
+        note = (f"AUTO-LOGIN SUCCESS with {_src} creds {login['cred']} at "
                 f"{login['path']} (fields {login['u_field']}/"
                 f"{login['p_field']}, signal={login['signal']}). "
                 f"Session cookie: {login['cookie_header'][:200]}. "
@@ -728,9 +738,9 @@ def node_auth_establish(state: BuildPocState) -> Dict[str, Any]:
     if auth and auth.get("_auto_cookie") and not auth_guidance:
         auth_guidance = (f"AUTH (auto-login from mined creds): send this cookie in EVERY "
                          f"exploit request: Cookie: {auth['_auto_cookie']}. "
-                         f"Logged in at {auth.get('_auto_login_path', '?')} with credentials "
-                         "extracted from a leaked README/docs — the app is now "
-                         "AUTHENTICATED, target the admin backend for post-auth CVEs.")
+                         f"Logged in at {auth.get('_auto_login_path', '?')} with the supplied "
+                         "or mined credentials — the app is now AUTHENTICATED, target the "
+                         "admin backend for post-auth CVEs.")
     return {"auth_guidance": auth_guidance, "session_info": session_info}
 
 

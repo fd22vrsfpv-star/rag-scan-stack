@@ -26344,12 +26344,16 @@ def _try_mined_credentials(ip, port, credential_hints, admin_paths=None, timeout
             "/admin/login.php", "/admin/index.php", "/admin/", "/admin",
             "/login", "/login.php", "/wp-login.php", "/user/login",
             "/manage/login", "/auth/login", "/administrator/index.php",
-        ]))[:8]
+            "/index.php", "/",                      # Dolibarr/Zabbix-style: the form is the front page
+        ]))[:10]
     # Common field-name permutations for the login form
     field_pairs = [
         ("user", "pass"), ("username", "password"), ("user", "password"),
         ("email", "password"), ("name", "pwd"), ("account", "password"),
         ("login", "password"), ("user", "pwd"),
+        ("log", "pwd"),                             # WordPress
+        ("name", "password"),                       # Zabbix
+        ("j_username", "j_password"),               # JavaEE
     ]
     success_words = ("welcome", "dashboard", "logout", "sign out", "退出",
                      "control panel", "successfully", "profile", "settings",

@@ -145,3 +145,39 @@ def test_auth_establish_node_traces_and_never_returns_an_empty_session():
     src = _func_src("node_auth_establish", GRAPH)
     assert src and '"recon:auth_establish"' in src
     assert "session_info = None" in src and "segments=state.get(\"segments\")" in src
+
+
+# ── fix #2: supplied creds are the first auto-login hint (authenticated recon) ──
+
+def test_initial_state_seeds_supplied_creds_as_first_cred_hint():
+    src = _func_src("initial_state", GRAPH)
+    assert src and "f\"{auth['username']}:{auth['password']}\"" in src
+    assert '"cred_hints": _supplied' in src
+
+
+def test_response_mine_keeps_supplied_hint_ahead_of_mined_ones():
+    src = _func_src("node_response_mine", GRAPH)
+    assert src and 'list(state.get("cred_hints") or []) + cred_hints' in src
+
+
+def test_auto_login_paths_and_pairs_cover_dolibarr_wordpress_zabbix():
+    src = _func_src("_try_mined_credentials")
+    assert src
+    for p in ('"/index.php"', '"/wp-login.php"'):
+        assert p in src, p
+    for pair in ('("log", "pwd")', '("name", "password")', '("j_username", "j_password")'):
+        assert pair in src, pair
+
+
+def test_initial_state_executes_and_orders_hints(tmp_path):
+    # exec the real initial_state source: supplied pair first, nothing when absent
+    import ast as _a, time as _t
+    src = GRAPH.read_text(); tree = _a.parse(src)
+    node = next(x for x in _a.walk(tree) if isinstance(x, _a.FunctionDef) and x.name == "initial_state")
+    ns: dict = {"time": _t, "Optional": object, "List": list, "BuildPocState": dict}
+    exec(_a.get_source_segment(src, node), ns)
+    st = ns["initial_state"]("CVE-2024-5314", "10.0.0.5", 9090, auth={"username": "user", "password": "pw"})
+    assert st["cred_hints"] == ["user:pw"]
+    st2 = ns["initial_state"]("CVE-2024-5314", "10.0.0.5", 9090, auth={"username": "user"})
+    assert st2["cred_hints"] == []
+    assert ns["initial_state"]("CVE-2024-5314", "10.0.0.5", 9090)["cred_hints"] == []
