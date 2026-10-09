@@ -106,6 +106,7 @@ class BuildPocState(TypedDict, total=False):
     off_target: bool
     exploit_store_id: Optional[str]
     result: Dict[str, Any]
+    failure_analysis: Dict[str, Any]   # end-of-attempt analysis (unverified runs); also persisted to build_poc_attempts
 
 
 def enabled() -> bool:
@@ -140,7 +141,7 @@ def initial_state(cve: str, ip: str, port: int, product=None, version=None, eid=
         "success": False, "drifted": False, "iters": 0, "escalated": False,
         "escalation_guidance": "", "metrics": {},
         "verified": False, "reflection": False, "off_target": False,
-        "exploit_store_id": None, "result": {},
+        "exploit_store_id": None, "result": {}, "failure_analysis": {},
     }
 
 
@@ -1314,6 +1315,128 @@ def node_run_refine(state: BuildPocState) -> Dict[str, Any]:
             "success": bool(result.get("success"))}
 
 
+def node_failure_analysis(state: BuildPocState) -> Dict[str, Any]:
+    """End-of-attempt analysis, fired exactly once at the true end of every run
+    (after run_refine, after any deep-recon go-around, before save_store) with
+    the full state in hand. Verified runs get an attempts row only; unverified
+    runs get the deterministic analysis + one routed LLM narrative, persisted
+    to build_poc_attempts, traced, filed as a follow-up and emitted as a
+    webhook. Operator ask 2026-10-09: "when an attempt fails at the end conduct
+    an analysis and save this information so that it can be added to the
+    markdown file for manual review, or viewed in the poc summary attempt".
+    Whole body is fail-soft — it must never block save_store."""
+    from api import (_build_failure_analysis, _failure_analysis_llm, _record_build_poc_attempt,
+                     _poc_trace, _poc_run_file)
+    result = state.get("result") or {}
+    run_id = state["run_id"]
+    log_path = result.get("log_path") or _poc_run_file(run_id)
+    man = state.get("gather_manifest") or result.get("gather_manifest") or {}
+    live = (man.get("facts") or {}).get("live_recon") if isinstance(man, dict) else None
+    try:
+        if result.get("verified"):
+            _record_build_poc_attempt(
+                run_id=run_id, cve=state["cve"], ip=state["ip"], port=state.get("port"), eid=state.get("eid"),
+                verified=True, stage_reached="verified", stop_reason=result.get("stop_reason") or "success",
+                missing=[], gather_manifest=man or None, live_recon=live,
+                poc_log_path=log_path, llm_model=result.get("llm_model"))
+            return {}
+        auth = state.get("auth") or {}
+        state_bits = {
+            "segments": list(state.get("segments") or []),
+            "deep_recon": state.get("deep_recon") or {},
+            "session_info": state.get("session_info") or None,
+            "auth": {"username": auth.get("username")} if auth.get("username") else {},
+            "plan_verdicts": state.get("plan_verdicts") or {},
+            "strategy": (state.get("strategy") or "")[:2000],
+            "recon_metrics": state.get("recon_metrics") or {},
+            "built_kind": (state.get("built") or {}).get("synth_kind"),
+        }
+        fa = _build_failure_analysis(run_id, log_path, result, gather_manifest=man, state_bits=state_bits)
+        llm = None
+        try:
+            llm = _failure_analysis_llm(state["cve"], state["ip"], state.get("port"), run_id, fa)
+        except Exception as e:  # noqa: BLE001
+            logging.debug("failure_analysis llm wrapper failed: %s", e)
+        if llm:
+            fa["narrative"] = llm.get("narrative")
+            fa["ranked_next_steps"] = llm.get("ranked_next_steps") or []
+            fa["confidence"] = llm.get("confidence")
+            fa["llm_model"] = llm.get("model")
+        else:
+            fa["narrative"] = None
+            fa["ranked_next_steps"] = [{"step": s, "why": "deterministic rule", "how": ""} for s in (fa.get("next_steps_deterministic") or [])[:5]]
+            fa["confidence"] = None
+            fa["llm_model"] = None
+        try:
+            summary_for_row = None
+            from api import _read_trace_file, _summarize_build_trace
+            summary_for_row = _summarize_build_trace(_read_trace_file(log_path))
+        except Exception:  # noqa: BLE001
+            summary_for_row = None
+        _record_build_poc_attempt(
+            run_id=run_id, cve=state["cve"], ip=state["ip"], port=state.get("port"), eid=state.get("eid"),
+            verified=False, stage_reached=fa.get("stage_reached"), stop_reason=fa.get("stop_reason"),
+            missing=fa.get("missing") or [], gather_manifest=man or None, live_recon=live,
+            summary=summary_for_row, failure_analysis=fa, poc_log_path=log_path,
+            llm_model=fa.get("llm_model") or result.get("llm_model"))
+        steps_txt = "\n".join(f"{i + 1}. {s.get('step')}" + (f" — {s.get('why')}" if s.get("why") else "")
+                              for i, s in enumerate(fa.get("ranked_next_steps") or []))
+        _poc_trace(run_id, "failure_analysis",
+                   response=(f"stage={fa.get('stage_reached')} stop={fa.get('stop_reason')} missing={fa.get('missing')}\n"
+                             f"{fa.get('narrative') or '(no narrative)'}\n{steps_txt}")[:4000],
+                   llm_model=fa.get("llm_model"), extra={"failure_analysis": fa})
+        # Follow-up row — the operator's queue is where manual continuation starts.
+        follow_up_id = None
+        try:
+            import uuid as _u
+            from psycopg2.extras import Json
+            from api import get_db, _redact_attempt_blob
+            title = f"Build-PoC {state['cve']}: failure analysis ({fa.get('stage_reached')}) on {state['ip']}:{state.get('port')}"
+            notes = (fa.get("narrative") or "") + ("\n\n" if fa.get("narrative") else "") + steps_txt
+            with get_db() as conn, conn.cursor() as cur:
+                cur.execute("""INSERT INTO follow_up_items
+                    (id, finding_source, title, target, severity, reason, priority, flagged_by, rule_id,
+                     confidence, tags, notes, engagement_id, metadata)
+                    VALUES (%s,'build_poc',%s,%s,'medium',%s,'high','build_poc_failure_analysis','build_poc_failure_analysis',
+                            %s,%s,%s,%s,%s)
+                    ON CONFLICT (title, COALESCE(target,''), COALESCE(rule_id,''))
+                    DO UPDATE SET metadata = EXCLUDED.metadata, notes = EXCLUDED.notes,
+                                  reason = EXCLUDED.reason, updated_at = now()
+                    RETURNING id""",
+                    (str(_u.uuid4()), title, f"{state['ip']}:{state.get('port')}",
+                     f"stage={fa.get('stage_reached')} stop={fa.get('stop_reason')}",
+                     (fa.get("confidence") if fa.get("confidence") is not None else 0.5),
+                     ["build-poc", "failure-analysis", str(fa.get("stage_reached") or "")] + [str(m) for m in (fa.get("missing") or [])],
+                     notes[:8000], (str(state.get("eid")) if state.get("eid") else None),
+                     Json(_redact_attempt_blob({"run_id": run_id, "stage_reached": fa.get("stage_reached"),
+                                                "stop_reason": fa.get("stop_reason"), "blockers": fa.get("blockers"),
+                                                "ranked_next_steps": fa.get("ranked_next_steps"),
+                                                "confidence": fa.get("confidence")}))))
+                row = cur.fetchone(); conn.commit()
+                follow_up_id = str(row[0]) if row else None
+        except Exception as e:  # noqa: BLE001
+            logging.warning("failure_analysis follow-up write failed: %s", e)
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("build_poc_failure_analysis", "build_poc", {
+                "engagement_id": str(state.get("eid")) if state.get("eid") else None,
+                "cve": state["cve"], "target": f"{state['ip']}:{state.get('port')}", "run_id": run_id,
+                "stage_reached": fa.get("stage_reached"), "stop_reason": fa.get("stop_reason"),
+                "missing": fa.get("missing"), "follow_up_id": follow_up_id,
+                "confidence": fa.get("confidence"), "llm_model": fa.get("llm_model")})
+        except Exception:  # noqa: BLE001
+            pass
+        return {"failure_analysis": fa}
+    except Exception as e:  # noqa: BLE001
+        logging.warning("node_failure_analysis failed run=%s: %s", run_id, e)
+        try:
+            _poc_trace(run_id, "failure_analysis_error", response=f"{type(e).__name__}: {str(e)[:400]}",
+                       extra={"reason": "node exception"})
+        except Exception:  # noqa: BLE001
+            pass
+        return {}
+
+
 def node_save_store(state: BuildPocState) -> Dict[str, Any]:
     """Save the built PoC + emit webhook. Store verified/unverified — the
     unverified rows stay for operator inspection (same as monolith).
@@ -1361,9 +1484,17 @@ def node_save_store(state: BuildPocState) -> Dict[str, Any]:
                           "iterations": result.get("iterations"),
                           "metrics": metrics,
                           "research": (research_out or {}).get("analysis"),
-                          "research_sources": (research_out or {}).get("sources")})
+                          "research_sources": (research_out or {}).get("sources"),
+                          "failure_analysis": state.get("failure_analysis") or None,
+                          "attempt_run_id": state.get("run_id")})
     except Exception:  # noqa: BLE001
         pass
+    if store_id:
+        try:
+            from api import _link_attempt_to_store
+            _link_attempt_to_store(state["run_id"], store_id)
+        except Exception:  # noqa: BLE001
+            pass
     # CAPTURED CREDENTIALS — scan the exploit's output for leaked creds/tokens/
     # IDs and file them into credential_findings so the asset's Credentials
     # section shows them. Only on verified exploits (unverified output is
@@ -1619,6 +1750,7 @@ def build_graph():
     _add_node(g, "deep_recon", node_deep_recon)
     _add_node(g, "synth", node_synth)
     _add_node(g, "run_refine", node_run_refine)
+    _add_node(g, "failure_analysis", node_failure_analysis)
     _add_node(g, "save_store", node_save_store)
     _add_node(g, "tool_handoff", node_tool_handoff)
 
@@ -1717,8 +1849,11 @@ def build_graph():
                 and not res.get("artifact_required")):
             return "deep_recon"
         return "save_store"
+    # Every end of the loop (blocked, exhausted, or the deep-recon go-around's
+    # second pass) funnels through failure_analysis before save_store.
     g.add_conditional_edges("run_refine", _route_after_refine,
-                            {"deep_recon": "deep_recon", "save_store": "save_store"})
+                            {"deep_recon": "deep_recon", "save_store": "failure_analysis"})
+    g.add_edge("failure_analysis", "save_store")
     g.add_edge("save_store", "tool_handoff")
     g.add_edge("tool_handoff", END)
 

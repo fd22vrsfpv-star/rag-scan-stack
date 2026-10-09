@@ -1100,7 +1100,8 @@ export interface ExploitSummary {
 export function useExploitSummary(exploitId: string | null | undefined) {
   return useQuery({
     queryKey: ['exploit-summary', exploitId],
-    queryFn: () => apiFetch<{ ok: boolean; exploit_id: string; phase_count: number; summary: ExploitSummary; auto_hint: string }>(
+    queryFn: () => apiFetch<{ ok: boolean; exploit_id: string; phase_count: number; summary: ExploitSummary; auto_hint: string
+                             failure_analysis?: Record<string, unknown> | null; attempt_run_id?: string | null }>(
       `/exploit-store/${exploitId}/summary`,
     ),
     enabled: !!exploitId,
