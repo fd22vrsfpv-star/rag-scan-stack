@@ -14770,13 +14770,19 @@ def _scan_evidence_for_target(cve, ip, port, eid, vc) -> dict:
     Returns {poc_hints, discovered_params, web_findings, content, banner,
     prior_runs}. All values are plain Python (no DB rows retained)."""
     out = {"poc_hints": "", "discovered_params": [], "web_findings": [],
-           "content": {}, "banner": None, "prior_runs": []}
+           "content": {}, "banner": None, "prior_runs": [], "prior_live_recon": []}
     try:
         ip_s = str(ip) if ip is not None else None
         if not ip_s:
             return out
         port_i = int(port) if port is not None else None
         cwe_filter = _SCAN_EVIDENCE_CWE_FOR_CLASS.get((vc or "").lower())
+        # Engagement filter (2026-10-09): CVE-Bench reuses one IP for every
+        # target, so IP alone is not a key. NULL-engagement rows stay visible
+        # (legacy/global), matching the read-path convention.
+        eid_s = str(eid) if eid else None
+        _eng = " AND (a.engagement_id = %s OR a.engagement_id IS NULL)" if eid_s else ""
+        _eng_p = [eid_s] if eid_s else []
         with get_db() as conn, conn.cursor() as cur:
             # 1. Operator-authored PoC hints (reuses the existing reader).
             try:
@@ -14795,10 +14801,10 @@ def _scan_evidence_for_target(cve, ip, port, eid, vc) -> dict:
                     FROM discovered_params dp
                     JOIN assets a ON dp.asset_id = a.id
                     WHERE host(a.ip) = %s
-                      AND COALESCE(dp.discovery_source, '') NOT ILIKE %s
+                      AND COALESCE(dp.discovery_source, '') NOT ILIKE %s""" + _eng + """
                     ORDER BY dp.last_seen DESC NULLS LAST
                     LIMIT 25
-                """, (ip_s, "%burp%"))
+                """, [ip_s, "%burp%"] + _eng_p)
                 for r in cur.fetchall():
                     out["discovered_params"].append({
                         "url_pattern": r[0], "param_name": r[1],
@@ -14827,6 +14833,8 @@ def _scan_evidence_for_target(cve, ip, port, eid, vc) -> dict:
                 if cwe_filter:
                     sql += " AND wf.cwe && %s::text[]"
                     params.append(cwe_filter)
+                sql += _eng
+                params += _eng_p
                 sql += " ORDER BY wf.last_seen DESC NULLS LAST LIMIT 15"
                 cur.execute(sql, params)
                 for r in cur.fetchall():
@@ -14848,10 +14856,10 @@ def _scan_evidence_for_target(cve, ip, port, eid, vc) -> dict:
                            ce.tech_indicators
                     FROM content_extractions ce
                     JOIN assets a ON ce.asset_id = a.id
-                    WHERE host(a.ip) = %s
+                    WHERE host(a.ip) = %s""" + _eng + """
                     ORDER BY ce.created_at DESC
                     LIMIT 5
-                """, (ip_s,))
+                """, [ip_s] + _eng_p)
                 api_ep, hidden, login, files, paths, tech = [], [], [], [], [], []
                 for r in cur.fetchall():
                     def _as_list(v):
@@ -14897,10 +14905,10 @@ def _scan_evidence_for_target(cve, ip, port, eid, vc) -> dict:
                     SELECT p.banner
                     FROM ports p
                     JOIN assets a ON p.asset_id = a.id
-                    WHERE host(a.ip) = %s AND p.port = %s AND p.is_open
+                    WHERE host(a.ip) = %s AND p.port = %s AND p.is_open""" + _eng + """
                     ORDER BY p.last_seen DESC NULLS LAST
                     LIMIT 1
-                """, (ip_s, port_i))
+                """, [ip_s, port_i] + _eng_p)
                 row = cur.fetchone()
                 if row and row[0]:
                     out["banner"] = str(row[0])[:300]
@@ -14917,10 +14925,11 @@ def _scan_evidence_for_target(cve, ip, port, eid, vc) -> dict:
                            created_at
                     FROM poc_synthesis_log
                     WHERE cve = %s
-                      AND (target_ip IS NULL OR target_ip = %s)
+                      AND (target_ip IS NULL OR target_ip = %s)"""
+                    + (" AND (engagement_id = %s OR engagement_id IS NULL)" if eid_s else "") + """
                     ORDER BY created_at DESC
                     LIMIT 6
-                """, (cve, ip_s))
+                """, [cve, ip_s] + _eng_p)
                 for r in cur.fetchall():
                     out["prior_runs"].append({
                         "iteration": r[0], "phase": r[1],
@@ -14929,6 +14938,32 @@ def _scan_evidence_for_target(cve, ip, port, eid, vc) -> dict:
                         "created_at": r[4].isoformat() if r[4] else None})
             except Exception as e:  # noqa: BLE001
                 logging.debug("scan_evidence prior_runs failed: %s", e)
+
+            # 7. Prior build-poc attempts' own recon for this (engagement, cve) —
+            #    keyed on CVE, not IP: the crawl/arjun/form facts of an earlier
+            #    run of the same challenge are the best scan evidence we have.
+            try:
+                _ensure_build_poc_attempts_table()
+                cur.execute("""
+                    SELECT run_id, stage_reached, live_recon, created_at
+                    FROM build_poc_attempts
+                    WHERE cve = %s AND live_recon IS NOT NULL"""
+                    + (" AND (engagement_id = %s OR engagement_id IS NULL)" if eid_s else "") + """
+                    ORDER BY created_at DESC
+                    LIMIT 3
+                """, [cve] + _eng_p)
+                for r in cur.fetchall():
+                    lr = r[2] if isinstance(r[2], dict) else {}
+                    out["prior_live_recon"].append({
+                        "run_id": r[0], "stage_reached": r[1],
+                        "created_at": r[3].isoformat() if r[3] else None,
+                        "forms": (lr.get("forms") or [])[:10],
+                        "crawl_urls": (lr.get("crawl_urls") or [])[:40],
+                        "arjun_params": {k: (v or [])[:20] for k, v in list((lr.get("arjun_params") or {}).items())[:15]},
+                        "classified_params": (lr.get("classified_params") or [])[:10],
+                        "verb_sweep": lr.get("verb_sweep") or {}})
+            except Exception as e:  # noqa: BLE001
+                logging.debug("scan_evidence prior_live_recon failed: %s", e)
     except Exception as e:  # noqa: BLE001
         logging.debug("_scan_evidence_for_target top-level failed cve=%s: %s", cve, e)
     return out
@@ -15004,6 +15039,31 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
         "href_endpoints": (live.get("href_endpoints") or [])[:20],
         "counts": live.get("counts") or {},
     }
+    # Earlier attempts of the SAME CVE in this engagement (keyed on cve, not
+    # ip) contribute their recon to the chains below. facts["live_recon"]
+    # stays this run's own; provenance is recorded separately.
+    _prior = scan_ev.get("prior_live_recon") or []
+    if _prior:
+        facts["prior_live_recon_runs"] = [{"run_id": p.get("run_id"), "stage_reached": p.get("stage_reached"),
+                                          "created_at": p.get("created_at")} for p in _prior]
+        for p in _prior:
+            for u in (p.get("crawl_urls") or []):
+                if u not in live["crawl_urls"]:
+                    live["crawl_urls"].append(u)
+            for path, names in (p.get("arjun_params") or {}).items():
+                live["arjun_params"].setdefault(path, [])
+                for n in names or []:
+                    if n not in live["arjun_params"][path]:
+                        live["arjun_params"][path].append(n)
+            for fm in (p.get("forms") or []):
+                if fm not in live["form_fields"]:
+                    live["form_fields"].append(fm)
+            for c in (p.get("classified_params") or []):
+                if c not in live["classified_params"]:
+                    live["classified_params"].append(c)
+            for path, verbs in (p.get("verb_sweep") or {}).items():
+                live["verb_sweep"].setdefault(path, verbs)
+        live["crawl_urls"] = live["crawl_urls"][:120]
 
     # 1. target reachable
     try:
@@ -16443,6 +16503,29 @@ def _trace_extra(entry: dict) -> dict:
     if isinstance(entry.get("extra"), dict):
         return entry["extra"]
     return {k: v for k, v in entry.items() if k not in _POC_TRACE_STD_KEYS}
+
+
+def _touch_derived_spec_outcome(cve, verified, stop_reason=None):
+    """Record the refine loop's outcome on derived_cve_specs. Until 2026-10-09
+    the row was written only by node_research (before synth) and never
+    updated by the loop, so `verified`/`attempts`/`last_failure` described the
+    derivation, not the attempt — the CVE-Bench runner's "derive-verified"
+    column read False/? for runs the result marked verified. UPDATE only: a
+    CVE without a derived row stays without one."""
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""UPDATE derived_cve_specs
+                           SET attempts = COALESCE(attempts, 0) + 1,
+                               verified = (verified OR %s),
+                               status = CASE WHEN %s THEN 'verified' ELSE status END,
+                               last_verified = CASE WHEN %s THEN now() ELSE last_verified END,
+                               last_failure = CASE WHEN %s THEN last_failure ELSE %s END
+                           WHERE cve = %s""",
+                        (bool(verified), bool(verified), bool(verified), bool(verified),
+                         (str(stop_reason)[:300] if stop_reason else "unverified"), str(cve).upper()))
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("_touch_derived_spec_outcome failed cve=%s: %s", cve, e)
 
 
 def _poc_index(cve, target_ip, run_id, log_path, success, iterations, security_test_id, eid):
@@ -25221,6 +25304,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                response=(f"success={success} verified={verified} off_target={off_target} "
                          f"drifted={drifted} security_test_id={security_test_id}"))
     _poc_index(cve, ip, run_id, log_path, verified, iters, security_test_id, eid)
+    _touch_derived_spec_outcome(cve, verified, stop_reason)
 
     # Judge-pass over discarded iterations — ran when the refine loop
     # exhausted (or stopped) without a verified verdict and did real work
