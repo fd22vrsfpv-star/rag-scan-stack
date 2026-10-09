@@ -4,6 +4,36 @@ An open-source **workflow collector for authorized penetration testing and red t
 
 > **Authorized testing only.** This tool is built for engagements you have written permission to perform. Read [Authorized use](#authorized-use) before running it.
 
+> **New — Build-PoC reads its own recon, logs in with what it found, and explains every failed attempt.**
+> On CVE-Bench, 20 of 33 PoC attempts used to stop at the readiness gate while
+> the run's own recon held the answer. The gather step now consumes **the run's
+> live recon** — form actions and fields, the Playwright crawl, Arjun's honored
+> parameters, the verb sweep — to resolve the endpoint, method and input field
+> (with provenance), and **supplied credentials log in through the login form
+> the recon fingerprinted** before ZAP/Playwright/Arjun run, so discovery is
+> authenticated. WordPress nonces are harvested **as the logged-in user** and
+> mapped to the plugin object that owns them. When an attempt still ends
+> unverified, an **end-of-attempt failure analysis** records the stage reached,
+> each blocker with what the recon found for it, what was tried (HTTP statuses),
+> the session attempt and ranked next steps (one routed LLM call, fail-soft) —
+> persisted per run in `build_poc_attempts` (even when nothing was built),
+> filed as a follow-up, emitted as a webhook, and shown in the Exploit
+> workbench's *Derivation Intel → Failure analysis* tab, the build-summary card,
+> the per-exploit **review.md** and a per-attempt one
+> (`GET /build-poc/attempts/{run_id}/export/review.md`). Every graph node is
+> crash-traced (`node_error:<node>`), so a dead run always leaves a trail.
+
+> **New — scope pivots you can run, and a safer ZAP.**
+> The Scope Pivot panel can now **run** a certificate pivot (SAN overlap on
+> stored certs) and an ASN pivot (CIDR ranges of in-scope ASNs, cloud/CDN
+> dropped unless the AS name matches the org). Accepting a suggestion lands it
+> in the engagement's **`new_for_review` staging scope** — visible, but
+> gate-blocked until an operator promotes it to a live scope. ZAP's spider is
+> **seeded with the authenticated crawl's URLs** so the logged-in area is
+> actually traversed, and the **active scan is memory-bounded** (threads per
+> host / hosts per scan, ajax spider stopped first) so a deep authenticated
+> scan no longer gets ZAP recycled mid-scan.
+
 > **New — bind payloads prefer a callback and always need a human.**
 > A reverse payload dials out to an address you control; a **bind payload opens
 > an unauthenticated listening shell on the target** that anyone who can reach
@@ -181,6 +211,7 @@ A detection-rules engine raises **Follow-Ups** for items needing human attention
 - **HAR** — standard import into Burp or ZAP.
 - **SARIF** — for AppSec / CI hand-off.
 - **JSON + CSV** — deterministic, documented exports for reporting and ticketing.
+- **Review markdown** — one `review.md` per exploit *and* per build attempt: the failure analysis (stage, blockers, what was tried, ranked next steps), the recon dossier the pipeline actually saw (live recon, discovered params, operator hints, WordPress nonces), the derived spec, confirmed facts, captured credentials and the full phase trace — what an operator needs to continue by hand.
 
 ### Operate safely — scope, OPSEC, infrastructure
 
@@ -201,7 +232,12 @@ task (`recon`, `analyze`, `exploit`, `scan`, `postex`, `news`, `recommend`,
 `exploit_gen`, `extract`, `triage`, `chat`) picks its own model, and each can
 name a fallback used when the primary returns a rate limit its retries could
 not absorb. A task with no route configured uses the global model, so routing
-is opt-in.
+is opt-in. Route keys are the **caller names** the code passes (the build-PoC
+stages are `cve_poc_synth`, `decomposed_craft`, `cve_poc_refine`,
+`exploit.gather_fallback`, `exploit.judge`), values use the `provider:deployment`
+form (`azure-main:DeepSeek-V4-Pro`), and an explicit `model` in a request
+overrides routing for every stage of that run — leave it unset to let the routes
+decide.
 
 > **Data locality is your choice, and it is a real one.** Routing a task to a
 > local Ollama keeps that task's engagement data on the host. Routing it to
