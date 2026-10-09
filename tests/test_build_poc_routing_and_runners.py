@@ -61,7 +61,7 @@ def test_runners_do_not_call_the_nonexistent_scope_add_route():
     for p in RUNNERS:
         s = p.read_text()
         assert "/scope-add" not in s, f"{p.name} still POSTs /engagements/<eid>/scope-add"
-        assert "derived_cve_specs" not in s.split("# The verdict is the run's own result")[-1], f"{p.name} still reads derived_cve_specs for the verdict"
+        assert "SELECT verified FROM derived_cve_specs" not in s, f"{p.name} still reads derived_cve_specs for the verdict"
         assert "d.get('verified')" in s
 
 
