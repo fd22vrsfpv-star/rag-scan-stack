@@ -244,3 +244,6 @@ strix_overnight/.*
 !strix_overnight/run_focused10_strix.sh
 !strix_overnight/strix.env
 !strix_overnight/README.md
+
+# runtime probe screenshots (confirmed-facts evidence), not source
+fact_screenshots/
