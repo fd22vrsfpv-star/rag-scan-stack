@@ -1404,6 +1404,10 @@ def node_failure_analysis(state: BuildPocState) -> Dict[str, Any]:
             title = f"Build-PoC {state['cve']}: failure analysis ({fa.get('stage_reached')}) on {state['ip']}:{state.get('port')}"
             notes = (fa.get("narrative") or "") + ("\n\n" if fa.get("narrative") else "") + steps_txt
             with get_db() as conn, conn.cursor() as cur:
+                # A leaked transaction elsewhere (2026-10-09: osint_agent left
+                # idle-in-transaction sessions holding follow_up_items for
+                # hours) must fail this insert fast, never hang the build.
+                cur.execute("SET LOCAL lock_timeout = '5s'")
                 cur.execute("""INSERT INTO follow_up_items
                     (id, finding_source, title, target, severity, reason, priority, flagged_by, rule_id,
                      confidence, tags, notes, engagement_id, metadata)

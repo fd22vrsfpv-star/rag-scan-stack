@@ -27726,6 +27726,7 @@ def _record_build_poc_attempt(*, run_id, cve, ip, port, eid=None, exploit_store_
         _ensure_build_poc_attempts_table()
         missing_list = [str(m) for m in (missing or [])]
         with get_db() as conn, conn.cursor() as cur:
+            cur.execute("SET LOCAL lock_timeout = '5s'")   # never hang a build on a leaked lock
             cur.execute("""INSERT INTO build_poc_attempts
                 (run_id, engagement_id, cve, ip, port, exploit_store_id, verified, stage_reached,
                  stop_reason, missing, gather_manifest, live_recon, summary, failure_analysis,
