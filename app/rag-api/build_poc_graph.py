@@ -649,7 +649,7 @@ def node_playwright_recon(state: BuildPocState) -> Dict[str, Any]:
     seg = []
     if guidance:
         seg.append(guidance)
-        _poc_trace(state["run_id"], "recon:playwright", response=guidance[:1600])
+        _poc_trace(state["run_id"], "recon:playwright", response=guidance[:4000])
     merged_arjun = list(state.get("arjun_discovered") or [])
     for u in discovered:
         if u and u not in merged_arjun:
@@ -1113,7 +1113,8 @@ def node_gather_check(state: BuildPocState) -> Dict[str, Any]:
             analysis=((state.get("research_out") or {}).get("analysis")
                       if isinstance(state.get("research_out"), dict) else None),
             recon_text=" ".join(state.get("segments") or [])[:20000],
-            run_id=state["run_id"], id_pool=state.get("id_pool") or {})
+            run_id=state["run_id"], id_pool=state.get("id_pool") or {},
+            segments=list(state.get("segments") or []))
     except Exception as e:  # noqa: BLE001
         _poc_trace(state["run_id"], "gather_check", response=f"(skipped: {type(e).__name__}: {e})")
         return {}
