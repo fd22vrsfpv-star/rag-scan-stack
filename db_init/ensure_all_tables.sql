@@ -2665,7 +2665,11 @@ INSERT INTO public.app_settings (key, value, category) VALUES
   -- 2026-10-10 db-txn-watchdog (rag-api): alert on transactions older than N min;
   -- terminate when > 0 (Postgres 16 has no transaction_timeout of its own).
   ('db_txn_alert_after_min',                       '15',   'config'),
-  ('db_txn_terminate_after_min',                   '0',    'config')
+  ('db_txn_terminate_after_min',                   '0',    'config'),
+  -- in-DB client-IP block: the db-txn-watchdog terminates every session from
+  -- these hosts on sight (comma-separated IPs; empty = none). Used when a host
+  -- cannot be rejected in pg_hba (role `app` is not a superuser).
+  ('db_txn_block_client_addrs',                    '',     'config')
 ON CONFLICT (key) DO NOTHING;
 
 -- ============================================================================

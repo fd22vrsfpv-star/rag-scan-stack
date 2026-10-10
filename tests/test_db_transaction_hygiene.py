@@ -115,7 +115,10 @@ def test_sweep_is_single_flight_clamped_and_short_transactions():
 
 @pytest.fixture()
 def watchdog():
-    ns = {"logging": logging, "_DB_TXN_ALERTED": {}}
+    ns = {"logging": logging, "_DB_TXN_ALERTED": {},
+          # defaults so the age-based tests don't exercise the IP-block path
+          "_db_blocked_client_addrs": lambda: [],
+          "_db_terminate_client_addrs": lambda addrs: []}
     exec(_func_src("_db_txn_watchdog_pass"), ns)
     return ns
 
@@ -147,6 +150,47 @@ def test_watchdog_alerts_once_per_hour_and_terminates_only_past_the_threshold(wa
         assert r3["terminated"] == [] and terminated_calls == []
     finally:
         sys.modules.pop("webhooks", None)
+
+
+def test_watchdog_blocks_a_client_ip_on_sight(watchdog):
+    """A blocked IP's sessions are terminated every pass, any age/state — the
+    in-DB block for a host we cannot reject in pg_hba (role `app` not superuser)."""
+    killed, emitted = [], []
+    watchdog["_get_setting"] = lambda k, d="": {"db_txn_alert_after_min": "15",
+                                                "db_txn_terminate_after_min": "0"}[k]
+    watchdog["_db_long_transactions"] = lambda min_age_min=10.0, limit=50: []
+    watchdog["_db_terminate_backends"] = lambda pids: list(pids)
+    watchdog["_db_blocked_client_addrs"] = lambda: ["107.205.216.218"]
+
+    def fake_block(addrs):
+        assert addrs == ["107.205.216.218"]
+        killed.append(addrs)
+        return [{"pid": 900, "client_addr": "107.205.216.218"},
+                {"pid": 901, "client_addr": "107.205.216.218"}]
+    watchdog["_db_terminate_client_addrs"] = fake_block
+    import types, sys
+    fake = types.ModuleType("webhooks")
+    fake.emit_webhook = lambda et, src, data, **k: emitted.append((et, data))
+    sys.modules["webhooks"] = fake
+    try:
+        r = watchdog["_db_txn_watchdog_pass"](now=1_000_000)
+    finally:
+        sys.modules.pop("webhooks", None)
+    assert r["blocked_client_addrs"] == ["107.205.216.218"]
+    assert r["blocked_terminated"] == [900, 901]
+    assert killed == [["107.205.216.218"]]
+    assert emitted and emitted[0][0] == "db_blocked_ip_terminated"
+    assert emitted[0][1]["pids"] == [900, 901]
+
+
+def test_blocked_addrs_parsing_and_helpers_exist():
+    api = API.read_text()
+    assert "def _db_blocked_client_addrs(" in api and "db_txn_block_client_addrs" in api
+    assert "def _db_terminate_client_addrs(" in api and "host(client_addr)::text = ANY(%s)" in api
+    assert "_DB_TXN_BLOCK_INTERVAL_SEC" in api               # the loop runs tight while a block is active
+    assert "if _db_blocked_client_addrs():" in api
+    sql = SQL.read_text()
+    assert "('db_txn_block_client_addrs'" in sql
 
 
 def test_watchdog_is_wired_and_the_endpoint_exists():
