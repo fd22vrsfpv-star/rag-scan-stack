@@ -5311,6 +5311,623 @@ def ingest_microburst(
             "poll": f"/jobs/{job_id}"}
 
 
+# ── SAST / Semgrep scanning ──────────────────────────────────────────────────
+# Static-analysis findings from source code. Three input modes:
+#   1. Upload pre-run Semgrep JSON results
+#   2. Point at a GitHub URL — clone + scan
+#   3. Fetch web-app page source (JS/HTML) and scan inline
+# Findings land in sast_findings (all source code) and, when web-relevant,
+# also cross-feed into web_findings so the exploit workbench can use them.
+
+def _ensure_sast_tables():
+    """Runtime DDL for sast_findings + sast_scans (idempotent)."""
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS public.sast_findings (
+                id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                engagement_id uuid, scan_id text,
+                source_type text NOT NULL DEFAULT 'upload',
+                source_url text, target_host text, target_port integer,
+                rule_id text NOT NULL, severity text, confidence text,
+                vuln_class text, file_path text,
+                line_start integer, line_end integer,
+                col_start integer, col_end integer,
+                matched_code text, message text, fix text,
+                cwe text[] DEFAULT '{}', owasp text[] DEFAULT '{}',
+                metadata jsonb DEFAULT '{}'::jsonb,
+                fingerprint text NOT NULL,
+                semgrep_version text,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now()
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_sast_fingerprint
+                ON public.sast_findings(fingerprint);
+            CREATE INDEX IF NOT EXISTS ix_sast_eng ON public.sast_findings(engagement_id);
+            CREATE INDEX IF NOT EXISTS ix_sast_vuln ON public.sast_findings(vuln_class);
+            CREATE TABLE IF NOT EXISTS public.sast_scans (
+                id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                engagement_id uuid, scan_id text NOT NULL UNIQUE,
+                source_type text NOT NULL, source_url text,
+                target_host text, target_port integer,
+                status text NOT NULL DEFAULT 'pending',
+                findings_count integer DEFAULT 0,
+                high_count integer DEFAULT 0, medium_count integer DEFAULT 0,
+                error_message text,
+                metadata jsonb DEFAULT '{}'::jsonb,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now()
+            );
+        """)
+        conn.commit()
+
+
+def _store_sast_findings(findings: list, scan_id: str, source_type: str,
+                         source_url: str = None, target_host: str = None,
+                         target_port: int = None, eid: str = None) -> dict:
+    """Insert parsed SAST findings into the application-level sast_findings
+    table. Findings stay here until a network path is established, at which
+    point the operator promotes web-relevant ones via POST /sast/promote."""
+    from psycopg2.extras import Json
+    _ensure_sast_tables()
+    stored = 0
+    dupes = 0
+    with get_db() as conn, conn.cursor() as cur:
+        for f in findings:
+            try:
+                cur.execute("""
+                    INSERT INTO sast_findings
+                        (engagement_id, scan_id, source_type, source_url,
+                         target_host, target_port, rule_id, severity, confidence,
+                         vuln_class, file_path, line_start, line_end,
+                         col_start, col_end, matched_code, message, fix,
+                         cwe, owasp, metadata, fingerprint, semgrep_version)
+                    VALUES (%s,%s,%s,%s, %s,%s,%s,%s,%s, %s,%s,%s,%s, %s,%s,%s,%s,%s,
+                            %s,%s,%s,%s,%s)
+                    ON CONFLICT (fingerprint) DO UPDATE SET
+                        updated_at = now(),
+                        scan_id = EXCLUDED.scan_id
+                    RETURNING (xmax = 0) AS inserted
+                """, (
+                    eid, scan_id, source_type, source_url,
+                    target_host, target_port,
+                    f["rule_id"], f["severity"], f["confidence"],
+                    f["vuln_class"], f["file_path"],
+                    f["line_start"], f["line_end"],
+                    f["col_start"], f["col_end"],
+                    f["matched_code"], f["message"], f.get("fix"),
+                    f["cwe"], f["owasp"],
+                    Json(f.get("metadata") or {}),
+                    f["fingerprint"], f.get("semgrep_version"),
+                ))
+                row = cur.fetchone()
+                if row and row[0]:
+                    stored += 1
+                else:
+                    dupes += 1
+            except Exception as e:
+                logging.warning(f"sast_findings insert: {e}")
+                conn.rollback()
+                continue
+        conn.commit()
+    return {"stored": stored, "duplicates": dupes}
+
+
+class SastUploadBody(BaseModel):
+    """Upload pre-run Semgrep JSON results."""
+    results: Any
+    target_host: Optional[str] = None
+    target_port: Optional[int] = None
+    source_url: Optional[str] = None
+    engagement_id: Optional[str] = None
+
+
+@app.post("/sast/upload", tags=["SAST"])
+def sast_upload_results(body: SastUploadBody, authorized: bool = Depends(auth)):
+    """Ingest pre-run Semgrep JSON results. The operator ran semgrep
+    locally and uploads the output. Findings go into sast_findings
+    and web-relevant ones cross-feed into web_findings."""
+    import sys
+    sys.path.insert(0, "/app")
+    from etl.parse_semgrep import parse_semgrep_json, findings_to_attack_surface
+
+    scan_id = f"sast-upload-{uuid.uuid4().hex[:12]}"
+    eid = _resolve_engagement_id(body.engagement_id)
+    findings = parse_semgrep_json(body.results)
+    if not findings:
+        return {"ok": False, "error": "No findings parsed from input", "scan_id": scan_id}
+
+    counts = _store_sast_findings(
+        findings, scan_id, "upload",
+        source_url=body.source_url,
+        target_host=body.target_host,
+        target_port=body.target_port,
+        eid=eid,
+    )
+    surface = findings_to_attack_surface(findings)
+
+    # Record scan
+    _ensure_sast_tables()
+    with get_db() as conn, conn.cursor() as cur:
+        from psycopg2.extras import Json
+        cur.execute("""
+            INSERT INTO sast_scans
+                (scan_id, engagement_id, source_type, source_url,
+                 target_host, target_port, status,
+                 findings_count, high_count, medium_count, metadata)
+            VALUES (%s,%s,'upload',%s,%s,%s,'completed',%s,%s,%s,%s)
+            ON CONFLICT (scan_id) DO NOTHING
+        """, (scan_id, eid, body.source_url,
+              body.target_host, body.target_port,
+              len(findings),
+              sum(1 for f in findings if f["severity"] in ("high", "critical")),
+              sum(1 for f in findings if f["severity"] == "medium"),
+              Json({"attack_surface": surface})))
+        conn.commit()
+
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("sast_scan_completed", "sast", {
+            "scan_id": scan_id, "source_type": "upload",
+            "target_host": body.target_host,
+            "findings": len(findings), **counts,
+            "engagement_id": eid,
+        })
+    except Exception:
+        pass
+
+    return {"ok": True, "scan_id": scan_id, "findings": len(findings),
+            **counts, "attack_surface": surface}
+
+
+class SastGithubBody(BaseModel):
+    """Scan a GitHub repository with Semgrep."""
+    url: str
+    branch: Optional[str] = None
+    target_host: Optional[str] = None
+    target_port: Optional[int] = None
+    engagement_id: Optional[str] = None
+    rulesets: Optional[List[str]] = None
+
+
+@app.post("/sast/github", tags=["SAST"])
+def sast_scan_github(body: SastGithubBody, background_tasks: BackgroundTasks = None,
+                     authorized: bool = Depends(auth)):
+    """Clone a GitHub repo and run Semgrep against it. Runs in background.
+    Poll GET /sast/scans/{scan_id} for status."""
+    scan_id = f"sast-gh-{uuid.uuid4().hex[:12]}"
+    eid = _resolve_engagement_id(body.engagement_id)
+
+    _ensure_sast_tables()
+    with get_db() as conn, conn.cursor() as cur:
+        from psycopg2.extras import Json
+        cur.execute("""
+            INSERT INTO sast_scans
+                (scan_id, engagement_id, source_type, source_url,
+                 target_host, target_port, status, metadata)
+            VALUES (%s,%s,'github',%s,%s,%s,'running',%s)
+        """, (scan_id, eid, body.url,
+              body.target_host, body.target_port,
+              Json({"branch": body.branch, "rulesets": body.rulesets})))
+        conn.commit()
+
+    if background_tasks:
+        background_tasks.add_task(_run_semgrep_github, scan_id, body.url,
+                                  body.branch, body.target_host, body.target_port,
+                                  eid, body.rulesets)
+    return {"ok": True, "scan_id": scan_id, "status": "running",
+            "poll": f"/sast/scans/{scan_id}"}
+
+
+def _run_semgrep_github(scan_id: str, url: str, branch: str,
+                        target_host: str, target_port: int,
+                        eid: str, rulesets: list):
+    """Background: clone repo + run semgrep + ingest."""
+    import subprocess, tempfile, shutil
+    clone_dir = tempfile.mkdtemp(prefix="sast-")
+    try:
+        cmd = ["git", "clone", "--depth", "1"]
+        if branch:
+            cmd += ["-b", branch]
+        cmd += [url, clone_dir + "/repo"]
+        subprocess.run(cmd, capture_output=True, timeout=120, check=True)
+
+        semgrep_cmd = ["semgrep", "--json", "--config", "auto"]
+        if rulesets:
+            semgrep_cmd = ["semgrep", "--json"]
+            for rs in rulesets:
+                semgrep_cmd += ["--config", rs]
+        semgrep_cmd.append(clone_dir + "/repo")
+
+        result = subprocess.run(semgrep_cmd, capture_output=True, timeout=600, text=True)
+        if result.returncode not in (0, 1):
+            _update_sast_scan(scan_id, "failed", error=result.stderr[:2000])
+            return
+
+        import sys
+        sys.path.insert(0, "/app")
+        from etl.parse_semgrep import parse_semgrep_json, findings_to_attack_surface
+
+        findings = parse_semgrep_json(result.stdout)
+        counts = _store_sast_findings(
+            findings, scan_id, "github",
+            source_url=url, target_host=target_host,
+            target_port=target_port, eid=eid,
+        )
+        surface = findings_to_attack_surface(findings)
+        _update_sast_scan(scan_id, "completed",
+                          findings_count=len(findings),
+                          high_count=sum(1 for f in findings if f["severity"] in ("high", "critical")),
+                          medium_count=sum(1 for f in findings if f["severity"] == "medium"),
+                          metadata={"attack_surface": surface})
+
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("sast_scan_completed", "sast", {
+                "scan_id": scan_id, "source_type": "github", "source_url": url,
+                "target_host": target_host,
+                "findings": len(findings), **counts,
+                "engagement_id": eid,
+            })
+        except Exception:
+            pass
+    except subprocess.TimeoutExpired:
+        _update_sast_scan(scan_id, "failed", error="Timeout cloning or scanning")
+    except Exception as e:
+        _update_sast_scan(scan_id, "failed", error=str(e)[:2000])
+    finally:
+        shutil.rmtree(clone_dir, ignore_errors=True)
+
+
+class SastWebSourceBody(BaseModel):
+    """Scan web-app page source (JS/HTML) with Semgrep."""
+    url: str
+    target_host: Optional[str] = None
+    target_port: Optional[int] = None
+    engagement_id: Optional[str] = None
+    fetch_linked_js: bool = True
+
+
+@app.post("/sast/web-source", tags=["SAST"])
+def sast_scan_web_source(body: SastWebSourceBody,
+                         background_tasks: BackgroundTasks = None,
+                         authorized: bool = Depends(auth)):
+    """Fetch a web page's source (HTML + linked JS files), save to a temp
+    dir, and run Semgrep on it. Ideal for SPAs where the source is
+    available in the browser."""
+    scan_id = f"sast-web-{uuid.uuid4().hex[:12]}"
+    eid = _resolve_engagement_id(body.engagement_id)
+    host = body.target_host
+    port = body.target_port
+    if not host:
+        parsed = urlparse(body.url)
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+    _ensure_sast_tables()
+    with get_db() as conn, conn.cursor() as cur:
+        from psycopg2.extras import Json
+        cur.execute("""
+            INSERT INTO sast_scans
+                (scan_id, engagement_id, source_type, source_url,
+                 target_host, target_port, status, metadata)
+            VALUES (%s,%s,'web_source',%s,%s,%s,'running',%s)
+        """, (scan_id, eid, body.url, host, port,
+              Json({"fetch_linked_js": body.fetch_linked_js})))
+        conn.commit()
+
+    if background_tasks:
+        background_tasks.add_task(_run_semgrep_web_source, scan_id, body.url,
+                                  host, port, eid, body.fetch_linked_js)
+    return {"ok": True, "scan_id": scan_id, "status": "running",
+            "poll": f"/sast/scans/{scan_id}"}
+
+
+def _run_semgrep_web_source(scan_id: str, url: str, target_host: str,
+                            target_port: int, eid: str, fetch_linked_js: bool):
+    """Background: fetch page source + JS, run semgrep."""
+    import subprocess, tempfile, shutil, re as _re
+    scan_dir = tempfile.mkdtemp(prefix="sast-web-")
+    try:
+        import httpx
+        client = httpx.Client(verify=False, timeout=30, follow_redirects=True)
+        resp = client.get(url)
+        page_html = resp.text
+
+        with open(os.path.join(scan_dir, "index.html"), "w") as f:
+            f.write(page_html)
+
+        if fetch_linked_js:
+            js_urls = _re.findall(r'src=["\']([^"\']+\.js(?:\?[^"\']*)?)["\']', page_html)
+            from urllib.parse import urljoin
+            for i, js_url in enumerate(js_urls[:30]):
+                abs_url = urljoin(url, js_url)
+                try:
+                    js_resp = client.get(abs_url)
+                    fname = f"script_{i}.js"
+                    with open(os.path.join(scan_dir, fname), "w") as f:
+                        f.write(js_resp.text)
+                except Exception:
+                    pass
+
+        semgrep_cmd = ["semgrep", "--json", "--config", "auto", scan_dir]
+        result = subprocess.run(semgrep_cmd, capture_output=True, timeout=300, text=True)
+
+        import sys
+        sys.path.insert(0, "/app")
+        from etl.parse_semgrep import parse_semgrep_json, findings_to_attack_surface
+
+        findings = parse_semgrep_json(result.stdout)
+        counts = _store_sast_findings(
+            findings, scan_id, "web_source",
+            source_url=url, target_host=target_host,
+            target_port=target_port, eid=eid,
+        )
+        surface = findings_to_attack_surface(findings)
+        _update_sast_scan(scan_id, "completed",
+                          findings_count=len(findings),
+                          high_count=sum(1 for f in findings if f["severity"] in ("high", "critical")),
+                          medium_count=sum(1 for f in findings if f["severity"] == "medium"),
+                          metadata={"attack_surface": surface})
+
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("sast_scan_completed", "sast", {
+                "scan_id": scan_id, "source_type": "web_source", "source_url": url,
+                "target_host": target_host,
+                "findings": len(findings), **counts,
+                "engagement_id": eid,
+            })
+        except Exception:
+            pass
+    except Exception as e:
+        _update_sast_scan(scan_id, "failed", error=str(e)[:2000])
+    finally:
+        shutil.rmtree(scan_dir, ignore_errors=True)
+
+
+def _update_sast_scan(scan_id: str, status: str, error: str = None,
+                      findings_count: int = None, high_count: int = None,
+                      medium_count: int = None, metadata: dict = None):
+    with get_db() as conn, conn.cursor() as cur:
+        sets = ["status = %s", "updated_at = now()"]
+        args: list = [status]
+        if error:
+            sets.append("error_message = %s"); args.append(error[:2000])
+        if findings_count is not None:
+            sets.append("findings_count = %s"); args.append(findings_count)
+        if high_count is not None:
+            sets.append("high_count = %s"); args.append(high_count)
+        if medium_count is not None:
+            sets.append("medium_count = %s"); args.append(medium_count)
+        if metadata:
+            from psycopg2.extras import Json
+            sets.append("metadata = %s"); args.append(Json(metadata))
+        args.append(scan_id)
+        cur.execute(f"UPDATE sast_scans SET {', '.join(sets)} WHERE scan_id = %s", args)
+        conn.commit()
+
+
+@app.get("/sast/scans", tags=["SAST"])
+def list_sast_scans(engagement_id: Optional[str] = None,
+                    all_engagements: bool = False,
+                    limit: int = 50,
+                    authorized: bool = Depends(auth)):
+    """List SAST scan runs."""
+    _ensure_sast_tables()
+    eid = _resolve_engagement_id(engagement_id)
+    where, args = [], []
+    if eid and not all_engagements:
+        where.append("(engagement_id = %s OR engagement_id IS NULL)")
+        args.append(eid)
+    sql = "SELECT * FROM sast_scans"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created_at DESC LIMIT %s"
+    args.append(max(1, min(200, limit)))
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, args)
+        return {"scans": [dict(r) for r in cur.fetchall()]}
+
+
+@app.get("/sast/scans/{scan_id}", tags=["SAST"])
+def get_sast_scan(scan_id: str, authorized: bool = Depends(auth)):
+    """Get a single SAST scan run with its attack surface summary."""
+    _ensure_sast_tables()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM sast_scans WHERE scan_id = %s", (scan_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Scan not found")
+        return dict(row)
+
+
+@app.get("/sast/findings", tags=["SAST"])
+def list_sast_findings(scan_id: Optional[str] = None,
+                       vuln_class: Optional[str] = None,
+                       severity: Optional[str] = None,
+                       target_host: Optional[str] = None,
+                       engagement_id: Optional[str] = None,
+                       all_engagements: bool = False,
+                       limit: int = 100,
+                       authorized: bool = Depends(auth)):
+    """List SAST findings with filters. Web-relevant findings are also
+    in web_findings for the exploit workbench."""
+    _ensure_sast_tables()
+    eid = _resolve_engagement_id(engagement_id)
+    where, args = [], []
+    if scan_id:
+        where.append("scan_id = %s"); args.append(scan_id)
+    if vuln_class:
+        where.append("vuln_class = %s"); args.append(vuln_class)
+    if severity:
+        where.append("severity = %s"); args.append(severity)
+    if target_host:
+        where.append("target_host = %s"); args.append(target_host)
+    if eid and not all_engagements:
+        where.append("(engagement_id = %s OR engagement_id IS NULL)")
+        args.append(eid)
+    sql = ("SELECT id, scan_id, source_type, source_url, target_host, target_port, "
+           "rule_id, severity, confidence, vuln_class, file_path, line_start, line_end, "
+           "matched_code, message, cwe, fingerprint, created_at "
+           "FROM sast_findings")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
+    sql += "WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END, created_at DESC "
+    sql += "LIMIT %s"
+    args.append(max(1, min(500, limit)))
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, args)
+        return {"findings": [dict(r) for r in cur.fetchall()]}
+
+
+@app.get("/sast/findings/{finding_id}", tags=["SAST"])
+def get_sast_finding(finding_id: str, authorized: bool = Depends(auth)):
+    """Get a single SAST finding with full detail."""
+    _ensure_sast_tables()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM sast_findings WHERE id = %s", (finding_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Finding not found")
+        return dict(row)
+
+
+@app.get("/sast/attack-surface", tags=["SAST"])
+def sast_attack_surface(target_host: Optional[str] = None,
+                        engagement_id: Optional[str] = None,
+                        authorized: bool = Depends(auth)):
+    """Get the aggregated attack surface from all SAST findings for a target.
+    This is what the build-PoC gather phase reads to focus attacks."""
+    _ensure_sast_tables()
+    import sys
+    sys.path.insert(0, "/app")
+    from etl.parse_semgrep import findings_to_attack_surface
+
+    eid = _resolve_engagement_id(engagement_id)
+    where, args = [], []
+    if target_host:
+        where.append("target_host = %s"); args.append(target_host)
+    if eid:
+        where.append("(engagement_id = %s OR engagement_id IS NULL)")
+        args.append(eid)
+    sql = "SELECT * FROM sast_findings"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created_at DESC LIMIT 500"
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, args)
+        rows = [dict(r) for r in cur.fetchall()]
+    surface = findings_to_attack_surface(rows)
+    return {"target_host": target_host, "engagement_id": eid, **surface}
+
+
+_WEB_VULN_CLASSES = {"sqli", "xss", "cmdi", "lfi", "ssrf", "xxe", "ssti",
+                     "csrf", "idor", "auth-bypass", "upload", "nosql-injection",
+                     "ldap-injection", "deserialization", "prototype-pollution"}
+
+
+class SastPromoteBody(BaseModel):
+    """Promote SAST findings to web_findings after a network path is confirmed."""
+    finding_ids: Optional[List[str]] = None
+    scan_id: Optional[str] = None
+    target_host: Optional[str] = None
+    target_port: Optional[int] = None
+    base_url: Optional[str] = None
+    engagement_id: Optional[str] = None
+
+
+@app.post("/sast/promote", tags=["SAST"])
+def sast_promote_to_web(body: SastPromoteBody, authorized: bool = Depends(auth)):
+    """Promote SAST findings to web_findings once a network path is
+    established. Only web-relevant vuln classes are promoted. The operator
+    calls this after confirming the application is reachable — source code
+    findings stay in the application area until then.
+
+    Supply either finding_ids (specific findings) or scan_id (all web-relevant
+    findings from that scan). target_host/target_port/base_url are used to
+    construct the web_findings URL if the findings don't already have them."""
+    _ensure_sast_tables()
+    eid = _resolve_engagement_id(body.engagement_id)
+
+    where, args = [], []
+    if body.finding_ids:
+        where.append("id = ANY(%s)")
+        args.append(body.finding_ids)
+    elif body.scan_id:
+        where.append("scan_id = %s")
+        args.append(body.scan_id)
+    else:
+        return {"ok": False, "error": "Provide finding_ids or scan_id"}
+
+    sql = "SELECT * FROM sast_findings"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+
+    promoted = 0
+    skipped = 0
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, args)
+        rows = [dict(r) for r in cur.fetchall()]
+
+        for f in rows:
+            vc = f.get("vuln_class") or "other"
+            if vc not in _WEB_VULN_CLASSES:
+                skipped += 1
+                continue
+
+            host = body.target_host or f.get("target_host")
+            port = body.target_port or f.get("target_port") or 443
+            if not host:
+                skipped += 1
+                continue
+
+            if body.base_url:
+                _url = f"{body.base_url.rstrip('/')}{f.get('file_path') or '/'}"
+            else:
+                _url = f"https://{host}:{port}{f.get('file_path') or '/'}"
+
+            try:
+                cur.execute("""
+                    INSERT INTO web_findings
+                        (engagement_id, url, source, issue_type, name,
+                         severity, evidence, method, param, description,
+                         cwe, port, first_seen, last_seen)
+                    VALUES (%s,%s,'semgrep',%s,%s, %s,%s,'GET',%s,%s,
+                            %s,%s,now(),now())
+                    ON CONFLICT DO NOTHING
+                """, (
+                    eid or f.get("engagement_id"),
+                    _url, vc,
+                    f"[SAST] {f['rule_id']}",
+                    f["severity"],
+                    f"Source: {f['file_path']}:{f['line_start']} — {str(f.get('matched_code') or '')[:500]}",
+                    (f.get("metadata") or {}).get("param_hint") if isinstance(f.get("metadata"), dict) else None,
+                    str(f.get("message") or "")[:1000],
+                    f.get("cwe") or [],
+                    port,
+                ))
+                promoted += 1
+            except Exception as e:
+                logging.warning(f"sast promote: {e}")
+                conn.rollback()
+                continue
+        conn.commit()
+
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("sast_findings_promoted", "sast", {
+            "promoted": promoted, "skipped": skipped,
+            "target_host": body.target_host,
+            "engagement_id": eid,
+        })
+    except Exception:
+        pass
+
+    return {"ok": True, "promoted": promoted, "skipped_non_web": skipped,
+            "total": len(rows)}
+
+
 # ── Cloud Scan Suggestor ──
 
 def _refresh_cloud_suggestions():

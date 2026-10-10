@@ -6848,6 +6848,66 @@ CREATE TABLE IF NOT EXISTS public.discovered_app_knowledge (
 );
 CREATE INDEX IF NOT EXISTS idx_dak_product ON public.discovered_app_knowledge (lower(product));
 
+-- ─── SAST findings (Semgrep / static-analysis source-code scans) ────────────
+-- Source-code level findings from static analysis tools.  NOT limited to web
+-- apps — covers any language/framework Semgrep supports. Tied to an engagement
+-- and optionally to a target host (when the source corresponds to a deployed
+-- service). The build-PoC gather phase reads these to know the exact injection
+-- point, parameter, and code path to target.
+CREATE TABLE IF NOT EXISTS public.sast_findings (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id uuid,
+    scan_id       text,
+    source_type   text NOT NULL DEFAULT 'upload',
+    source_url    text,
+    target_host   text,
+    target_port   integer,
+    rule_id       text NOT NULL,
+    severity      text CHECK (severity IN ('info','low','medium','high','critical') OR severity IS NULL),
+    confidence    text,
+    vuln_class    text,
+    file_path     text,
+    line_start    integer,
+    line_end      integer,
+    col_start     integer,
+    col_end       integer,
+    matched_code  text,
+    message       text,
+    fix           text,
+    cwe           text[] DEFAULT '{}',
+    owasp         text[] DEFAULT '{}',
+    metadata      jsonb DEFAULT '{}'::jsonb,
+    fingerprint   text NOT NULL,
+    semgrep_version text,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_sast_fingerprint ON public.sast_findings(fingerprint);
+CREATE INDEX IF NOT EXISTS ix_sast_eng ON public.sast_findings(engagement_id);
+CREATE INDEX IF NOT EXISTS ix_sast_vuln ON public.sast_findings(vuln_class);
+CREATE INDEX IF NOT EXISTS ix_sast_scan ON public.sast_findings(scan_id);
+CREATE INDEX IF NOT EXISTS ix_sast_target ON public.sast_findings(target_host);
+
+-- Semgrep scan runs — tracks each scan invocation (GitHub clone, upload, web source)
+CREATE TABLE IF NOT EXISTS public.sast_scans (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id uuid,
+    scan_id       text NOT NULL UNIQUE,
+    source_type   text NOT NULL,
+    source_url    text,
+    target_host   text,
+    target_port   integer,
+    status        text NOT NULL DEFAULT 'pending',
+    findings_count integer DEFAULT 0,
+    high_count    integer DEFAULT 0,
+    medium_count  integer DEFAULT 0,
+    error_message text,
+    metadata      jsonb DEFAULT '{}'::jsonb,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_sast_scans_eng ON public.sast_scans(engagement_id);
+
 -- Refine-error patterns: operator-extensible + learned refine-time fix guidance.
 CREATE TABLE IF NOT EXISTS public.refine_error_patterns (
     id text PRIMARY KEY, title text NOT NULL, guidance text NOT NULL, triggers jsonb NOT NULL,
