@@ -30621,6 +30621,8 @@ def list_exploit_store(cve: Optional[str] = None, kind: Optional[str] = None,
                        engagement_id: Optional[str] = None,
                        all_engagements: bool = False,
                        scope_only: bool = False,
+                       sort_by: Optional[str] = None,
+                       sort_order: Optional[str] = None,
                        authorized: bool = Depends(auth)):
     """List saved exploits (Exploit Store). Filter by cve/kind/verified.
 
@@ -30670,7 +30672,11 @@ def list_exploit_store(cve: Optional[str] = None, kind: Optional[str] = None,
            "FROM exploit_store es")
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY es.updated_at DESC LIMIT %s"; args.append(max(1, min(1000, limit)))
+    _SORT_COLS = {"time": "es.built_at", "ip": "es.target_host", "cve": "es.cve",
+                  "name": "es.name", "updated": "es.updated_at", "verified": "es.verified"}
+    col = _SORT_COLS.get(sort_by, "es.updated_at")
+    direction = "ASC" if sort_order == "asc" else "DESC"
+    sql += f" ORDER BY {col} {direction} NULLS LAST LIMIT %s"; args.append(max(1, min(1000, limit)))
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(sql, args)
         return {"exploits": [dict(r) for r in cur.fetchall()],
@@ -31708,12 +31714,35 @@ def _render_review_md(r: dict, intel: dict, failure_analysis=None, live_recon=No
         out.append("")
         for t in trace:
             out.append(f"### `{t.get('phase')}` (iter {t.get('iteration') or '?'}, {t.get('ts') or ''})")
+            if t.get("llm_model"):
+                out.append(f"**model:** `{t['llm_model']}`")
+            prompt = (t.get("prompt") or "").strip()
+            if prompt:
+                out.append("")
+                out.append("<details><summary>prompt (%d chars)</summary>" % len(prompt))
+                out.append("")
+                out.append("```")
+                out.append(prompt[:8000])
+                out.append("```")
+                out.append("</details>")
             resp = (t.get("response") or "").strip()
             if resp:
+                out.append("")
+                out.append("**response:**")
                 out.append("")
                 out.append("```")
                 out.append(resp[:4000])
                 out.append("```")
+            run_out = (t.get("run_output") or "").strip()
+            if run_out:
+                out.append("")
+                out.append("**target output:**")
+                out.append("")
+                out.append("```")
+                out.append(run_out[:4000])
+                out.append("```")
+            if t.get("assertion_passed") is not None:
+                out.append(f"\n**assertion:** {'PASS' if t['assertion_passed'] else 'FAIL'}")
             extra = t.get("extra") or {}
             if extra:
                 out.append("")
@@ -31742,17 +31771,41 @@ def _render_review_md(r: dict, intel: dict, failure_analysis=None, live_recon=No
     if full_tr:
         out.append(f"## Full PoC trace ({len(full_tr)} entries)")
         out.append("")
-        out.append("_Every phase the pipeline emitted, in order. Response bodies truncated to "
+        out.append("_Every phase the pipeline emitted, in order. Bodies truncated to "
                    "4000 chars; the raw JSONL lives at `poc_log_path` inside rag-api._")
         out.append("")
         for t in full_tr:
-            out.append(f"### `{t.get('phase') or '?'}` — iter {t.get('iteration') or '?'} — {t.get('ts') or ''}")
+            phase_label = t.get('phase') or '?'
+            out.append(f"### `{phase_label}` — iter {t.get('iteration') or '?'} — {t.get('ts') or ''}")
+            if t.get("llm_model"):
+                out.append(f"**model:** `{t['llm_model']}`")
+            prompt = (t.get("prompt") or "").strip()
+            if prompt:
+                out.append("")
+                out.append("<details><summary>prompt (%d chars)</summary>" % len(prompt))
+                out.append("")
+                out.append("```")
+                out.append(prompt[:8000])
+                out.append("```")
+                out.append("</details>")
             resp = (t.get("response") or "").strip()
             if resp:
+                out.append("")
+                out.append("**response:**")
                 out.append("")
                 out.append("```")
                 out.append(resp[:4000])
                 out.append("```")
+            run_out = (t.get("run_output") or "").strip()
+            if run_out:
+                out.append("")
+                out.append("**target output:**")
+                out.append("")
+                out.append("```")
+                out.append(run_out[:4000])
+                out.append("```")
+            if t.get("assertion_passed") is not None:
+                out.append(f"\n**assertion:** {'PASS' if t['assertion_passed'] else 'FAIL'}")
             extra = t.get("extra") or {}
             if extra:
                 out.append("")

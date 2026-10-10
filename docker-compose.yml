@@ -1,6 +1,8 @@
 networks:
   agents_net:
     external: true
+  test_net:
+    external: true
 
 volumes:
   rag-pgdata:
@@ -303,7 +305,7 @@ services:
       #     vuln patterns. Gated BY ENGAGEMENT via engagements.metadata.ctf_mode.
       - /opt/cve-bench:/opt/cve-bench:ro
       - /var/run/docker.sock:/var/run/docker.sock
-    networks: [agents_net]
+    networks: [agents_net, test_net]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     cap_add: [NET_RAW, NET_ADMIN]
@@ -429,7 +431,7 @@ services:
     # rather than disabling web scanning until someone notices.
     restart: unless-stopped
     mem_limit: ${ZAP_MEM_LIMIT:-8g}
-    networks: [agents_net]
+    networks: [agents_net, test_net]
     environment:
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       TZ: ${TZ:-America/New_York}
@@ -526,7 +528,7 @@ services:
       REPORT_DIR: /reports
       PD_RUNNER_URL: "https://pd-runner:8023"
     depends_on: [zap]
-    networks: [agents_net]
+    networks: [agents_net, test_net]
     ports: ["8010:8010"]
     volumes:
       - ./web_reports:/reports
@@ -588,7 +590,7 @@ services:
       NUCLEI_AUTO_UPDATE: ${NUCLEI_AUTO_UPDATE:-1}
       REPORT_DIR: /reports
     depends_on: [rag-api]
-    networks: [agents_net]
+    networks: [agents_net, test_net]
     ports: ["8011:8011"]
     healthcheck:
       test: ["CMD-SHELL", "curl -fk https://127.0.0.1:8011/health || exit 1"]
@@ -669,7 +671,7 @@ services:
       # fresh installs that haven't visited Settings yet.
       CERTSPOTTER_API_KEY: ${CERTSPOTTER_API_KEY:-}
     depends_on: [rag-api]
-    networks: [agents_net]
+    networks: [agents_net, test_net]
     ports: ["8024:8024"]
     volumes:
       - ./osint_reports:/reports
@@ -743,7 +745,7 @@ services:
       WEB_PORTS: ${WEB_PORTS:-80,443,8080,8443,8000,8888,3000,5000}
       REPORT_DIR: /reports
     depends_on: [rag-api]
-    networks: [agents_net]
+    networks: [agents_net, test_net]
     ports: ["8023:8023"]
     volumes:
       - ./pd_reports:/reports
@@ -859,7 +861,7 @@ services:
       API_KEY: ${API_KEY:-changeme}
       REPORT_DIR: /reports
     depends_on: [rag-api]
-    networks: [agents_net]
+    networks: [agents_net, test_net]
     ports: ["8026:8025"]
     volumes:
       - ./brutus_reports:/reports
@@ -930,7 +932,7 @@ services:
       NUCLEI_URL: ${NUCLEI_URL:-https://nuclei-runner:8011}
       OSINT_RUNNER_URL: ${OSINT_RUNNER_URL:-https://osint-runner:8024}
     # depends_on: [wait-for-db]  # removed — wait-for-db is local-db profile only
-    networks: [agents_net]
+    networks: [agents_net, test_net]
     ports: ["8012:8012"]
     volumes:
       - ./nmap_out:/app/nmap_out
@@ -1042,6 +1044,7 @@ services:
         required: false
     networks:
       - agents_net
+      - test_net
     volumes:
       - ./common:/app/common:ro    # shared llm_settings resolver (one copy, see common/llm_settings.py)
       - ./etl:/app/etl:ro                             # shared scope gate (etl/scope_gate.py)
@@ -1113,6 +1116,7 @@ services:
         condition: service_started
     networks:
       - agents_net
+      - test_net
     ports:
       - "8014:8014"
     volumes:
@@ -1278,6 +1282,7 @@ services:
         condition: service_started
     networks:
       - agents_net
+      - test_net
     ports:
       - "8015:8015"
     volumes:
@@ -1584,6 +1589,7 @@ services:
         required: false
     networks:
       - agents_net
+      - test_net
     ports:
       - "8017:8017"
     volumes:
@@ -1965,6 +1971,7 @@ services:
           required: false
       networks:
         - agents_net
+        - test_net
       ports:
         - "8002:8002"  # Expose on port 8002 locally
       healthcheck:

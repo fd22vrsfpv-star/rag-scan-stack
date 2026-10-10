@@ -1914,6 +1914,103 @@ async def list_scans(
     except Exception as _e:
         log.debug(f"tool_executions merge skipped: {_e}")
 
+    # ── Build-PoC attempts ───────────────────────────────────────────────
+    #
+    # Build-PoC runs are attacks against a target server: they probe,
+    # authenticate, synthesize and execute exploit payloads. They belong
+    # in the Scan Monitor for opsec visibility — the operator must see
+    # what is hitting which target and when.
+    #
+    # Sourced from build_poc_attempts (written by the rag-api graph at
+    # run end) and from poc_synthesis_log phase='index' rows (which
+    # record the run start, so in-flight runs appear as "running").
+    _bpc_total = 0
+    try:
+        from db import get_db
+        with get_db() as _c, _c.cursor() as _cur:
+            _bpc_cap = (offset + limit + len(jobs)) if limit else 500
+            _cur.execute("SELECT count(*) FROM build_poc_attempts")
+            _bpc_total = _cur.fetchone()[0] or 0
+            _eid_filter = ""
+            _eid_params: list = []
+            if engagement_id:
+                _eid_filter = " AND (engagement_id = %s OR engagement_id IS NULL)"
+                _eid_params = [engagement_id]
+            _cur.execute(
+                f"""SELECT id, engagement_id, cve, ip, port, run_id,
+                          verified, stage_reached, stop_reason, llm_model,
+                          created_at, updated_at
+                     FROM build_poc_attempts
+                    WHERE true {_eid_filter}
+                    ORDER BY created_at DESC NULLS LAST
+                    LIMIT %s""",
+                (*_eid_params, _bpc_cap),
+            )
+            _bpc_run_ids = set()
+            for r in _cur.fetchall():
+                (_id, _eid, _cve, _ip, _port, _rid, _verified,
+                 _stage, _stop, _model, _start, _end) = r
+                _bpc_run_ids.add(_rid)
+                _status = "completed"
+                if _verified:
+                    _status = "completed"
+                elif _stop in ("crash", "error"):
+                    _status = "failed"
+                jobs.append({
+                    "job_id": f"bpc-{_rid}",
+                    "type": f"build-poc ({_cve})",
+                    "kind": "build_poc",
+                    "status": _status,
+                    "target": f"{_ip}:{_port}" if _port else _ip,
+                    "created_at": _start.isoformat() if _start else None,
+                    "completed_at": _end.isoformat() if _end else None,
+                    "service_url": "rag-api (build-poc)",
+                    "last_data": {
+                        "cve": _cve,
+                        "verified": _verified,
+                        "stage_reached": _stage,
+                        "stop_reason": _stop,
+                        "model": _model,
+                        "run_id": _rid,
+                    },
+                })
+
+            # In-flight runs: poc_synthesis_log phase='index' rows whose
+            # run_id is NOT in build_poc_attempts yet (still running).
+            _cur.execute(
+                f"""SELECT DISTINCT ON (exploit_id)
+                           exploit_id, response, created_at
+                      FROM poc_synthesis_log
+                     WHERE phase = 'recon:port_sweep'
+                       AND exploit_id NOT IN (
+                           SELECT run_id FROM build_poc_attempts
+                       )
+                     ORDER BY exploit_id, created_at ASC
+                     LIMIT 50""",
+            )
+            for r in _cur.fetchall():
+                _rid, _resp, _start = r
+                if f"bpc-{_rid}" in {j["job_id"] for j in jobs}:
+                    continue
+                _target = ""
+                if _resp:
+                    import re as _re
+                    _m = _re.search(r"on ([\d.]+)", str(_resp))
+                    if _m:
+                        _target = _m.group(1)
+                jobs.append({
+                    "job_id": f"bpc-{_rid}",
+                    "type": "build-poc (running)",
+                    "kind": "build_poc",
+                    "status": "running",
+                    "target": _target,
+                    "created_at": _start.isoformat() if _start else None,
+                    "service_url": "rag-api (build-poc)",
+                    "last_data": {"run_id": _rid},
+                })
+    except Exception as _e:
+        log.debug(f"build_poc_attempts merge skipped: {_e}")
+
     if kind:
         jobs = [j for j in jobs if (j.get("kind") or "") == kind]
 
@@ -1921,12 +2018,14 @@ async def list_scans(
     # no timestamp sort last rather than crashing the comparison.
     jobs.sort(key=lambda j: (j.get("created_at") or ""), reverse=True)
 
-    # non-tool sources are fully materialised; tool rows are windowed, so the
-    # honest total is (everything else) + (all tool executions).
-    _non_tool = len([j for j in jobs if (j.get("kind") or "") != "tool"])
-    total = _non_tool + (_tool_total)
+    # non-tool sources are fully materialised; tool + build_poc rows are
+    # windowed, so the honest total is (everything else) + all windowed sources.
+    _non_windowed = len([j for j in jobs if (j.get("kind") or "") not in ("tool", "build_poc")])
+    total = _non_windowed + _tool_total + _bpc_total
     if kind == "tool":
         total = _tool_total
+    elif kind == "build_poc":
+        total = _bpc_total
     elif kind:
         total = len(jobs)
     # `limit` is opt-in. Defaulting it on would silently truncate existing

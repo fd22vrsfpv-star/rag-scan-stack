@@ -112,6 +112,7 @@ export interface ScanRecommendation {
 export interface ScanJob {
   job_id: string
   type: string
+  kind?: string
   status: string
   service_url?: string
   last_data?: Record<string, unknown>
