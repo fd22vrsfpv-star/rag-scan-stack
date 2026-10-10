@@ -338,6 +338,7 @@ CRITICAL_TABLES=(
     "exploit_store_versions"
     "build_poc_attempts"
     "build_poc_error_memory"
+    "build_poc_lessons"
     "learned_postex_overlays"
     "wstg_manual_reviews"
     "exploit_chunks"
