@@ -45508,18 +45508,42 @@ def submit_follow_up_feedback(item_id: str, body: FeedbackBody, _: bool = Depend
 # ============================================================================
 
 class AgentScanRequest(BaseModel):
-    since_minutes: int = 0  # 0 = scan all findings (no time filter)
+    since_minutes: int = 0  # 0 = default window (24 h); full=true = everything
+    full: bool = False
+
+
+#: default window when the caller sends nothing; the periodic BFF trigger used
+#: to arrive as 0 (query params, read as a body) and was treated as "a year"
+AGENT_SCAN_DEFAULT_MINUTES = 1440
+AGENT_SCAN_FULL_MINUTES = 525600
+
+
+def _agent_scan_window(q_since, body_since, full: bool) -> int:
+    """Query param wins over body; 0/None → default window; full → everything.
+    2026-10-10: the recon agent sends `?since_minutes=N` while this endpoint
+    read a JSON body, so every cycle swept a YEAR of findings in one
+    transaction (the four-hour `assets` lock). Both shapes are honoured now."""
+    v = q_since if (q_since is not None and int(q_since) > 0) else int(body_since or 0)
+    if full:
+        return AGENT_SCAN_FULL_MINUTES
+    return v if v > 0 else AGENT_SCAN_DEFAULT_MINUTES
 
 
 @app.post("/agent/scan", tags=["OSINT Agent"])
-def trigger_agent_scan(background_tasks: BackgroundTasks, body: AgentScanRequest = AgentScanRequest(), _: bool = Depends(auth)):
-    """Manually trigger the OSINT flagging agent. since_minutes=0 scans all findings."""
+def trigger_agent_scan(background_tasks: BackgroundTasks,
+                       body: AgentScanRequest = AgentScanRequest(),
+                       since_minutes: Optional[int] = Query(None, description="window in minutes (query form; wins over the body)"),
+                       full: bool = Query(False, description="sweep everything, ignoring the 24 h cap"),
+                       engagement_id: Optional[str] = Query(None),
+                       _: bool = Depends(auth)):
+    """Trigger the OSINT flagging agent. Window = ?since_minutes or body.since_minutes,
+    default 24 h; `full=true` sweeps all findings. One sweep runs at a time."""
     try:
         from osint_agent import scan_new_findings
-        # since_minutes=0 → use a very large window to scan everything
-        mins = body.since_minutes if body.since_minutes > 0 else 525600  # 1 year
-        background_tasks.add_task(scan_new_findings, since_minutes=mins)
-        return {"ok": True, "message": f"Agent scan queued (last {mins} min)"}
+        mins = _agent_scan_window(since_minutes, body.since_minutes, bool(full or body.full))
+        background_tasks.add_task(scan_new_findings, since_minutes=mins, full=bool(full or body.full))
+        return {"ok": True, "message": f"Agent scan queued (last {mins} min)", "since_minutes": mins,
+                "full": bool(full or body.full)}
     except ImportError:
         raise HTTPException(500, "osint_agent module not available")
 
@@ -48057,6 +48081,153 @@ def _start_refine_mine_daemon():
         _ensure_refine_mine_daemon()
     except Exception as e:  # noqa: BLE001
         logging.warning("refine-mine daemon start failed: %s", e)
+
+
+# ── Long-transaction watchdog ────────────────────────────────────────────────
+# 2026-10-10: Postgres 16 has no server-side transaction-age limit (that is
+# PG17's transaction_timeout) and the 10-min idle cap never fires on a busy
+# transaction. Seventeen multi-hour sweep transactions held AccessShare on
+# `assets`; one ALTER queued behind them and every reader queued behind the
+# ALTER. This daemon alerts on, and (when the operator enables it) terminates,
+# transactions on THIS database older than the configured ages.
+#   app_settings (category config):
+#     db_txn_alert_after_min      default 15  — webhook + log per offending pid
+#     db_txn_terminate_after_min  default 0   — 0 = never terminate (alert only)
+_DB_TXN_WATCHDOG_INTERVAL_SEC = int(os.environ.get("DB_TXN_WATCHDOG_INTERVAL_SEC", "300") or "300")
+_DB_TXN_ALERTED: dict = {}        # pid -> epoch of the last alert (re-alert hourly)
+_db_txn_watchdog_started = False
+
+
+def _db_long_transactions(min_age_min: float = 10.0, limit: int = 50) -> list:
+    """Backends on the current database whose transaction is older than
+    `min_age_min` minutes, oldest first. Read-only; includes every client
+    (another installation pointed at the same server shows up with its
+    client_addr), excludes this connection."""
+    rows = []
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT pid, host(client_addr)::text AS client_addr, application_name, state,
+                   EXTRACT(EPOCH FROM (now() - xact_start))::int AS xact_age_sec,
+                   EXTRACT(EPOCH FROM (now() - state_change))::int AS state_age_sec,
+                   wait_event_type, left(regexp_replace(query, '\\s+', ' ', 'g'), 160) AS query
+            FROM pg_stat_activity
+            WHERE datname = current_database() AND pid <> pg_backend_pid()
+              AND xact_start IS NOT NULL
+              AND now() - xact_start > (%s::float8 * interval '1 minute')
+            ORDER BY xact_start
+            LIMIT %s""", (float(min_age_min), int(limit)))
+        rows = [dict(r) for r in cur.fetchall()]
+    return rows
+
+
+def _db_terminate_backends(pids) -> list:
+    """pg_terminate_backend for each pid; returns the pids the server confirmed."""
+    done = []
+    if not pids:
+        return done
+    with get_db() as conn, conn.cursor() as cur:
+        for pid in pids:
+            try:
+                cur.execute("SELECT pg_terminate_backend(%s)", (int(pid),))
+                r = cur.fetchone()
+                if r and r[0]:
+                    done.append(int(pid))
+            except Exception as e:  # noqa: BLE001
+                logging.warning("db-txn-watchdog: terminate %s failed: %s", pid, e)
+        conn.commit()
+    return done
+
+
+def _db_txn_watchdog_pass(now=None) -> dict:
+    """One watchdog pass. Alerts (webhook + log, once per pid per hour) on
+    transactions older than db_txn_alert_after_min; terminates those older
+    than db_txn_terminate_after_min when that setting is > 0."""
+    import time as _t
+    now = now or _t.time()
+    alert_after = float(_get_setting("db_txn_alert_after_min", "15") or 15)
+    term_after = float(_get_setting("db_txn_terminate_after_min", "0") or 0)
+    long_rows = _db_long_transactions(min_age_min=alert_after)
+    alerted, terminated = [], []
+    for r in long_rows:
+        pid = r["pid"]
+        last = _DB_TXN_ALERTED.get(pid, 0)
+        if now - last >= 3600:
+            _DB_TXN_ALERTED[pid] = now
+            alerted.append(pid)
+            logging.warning("db-txn-watchdog: pid %s (%s) transaction open %ss, state=%s, last=%s",
+                            pid, r.get("client_addr"), r.get("xact_age_sec"), r.get("state"),
+                            (r.get("query") or "")[:80])
+            try:
+                from webhooks import emit_webhook as _emit_wh
+                _emit_wh("db_long_transaction_detected", "rag-api",
+                             {"pid": pid, "client_addr": r.get("client_addr"),
+                              "xact_age_sec": r.get("xact_age_sec"), "state": r.get("state"),
+                              "query": (r.get("query") or "")[:160],
+                              "alert_after_min": alert_after})
+            except Exception as e:  # noqa: BLE001
+                logging.warning("db-txn-watchdog: webhook failed: %s", e)
+    if term_after > 0:
+        victims = [r["pid"] for r in long_rows if (r.get("xact_age_sec") or 0) >= term_after * 60]
+        terminated = _db_terminate_backends(victims)
+        if terminated:
+            logging.warning("db-txn-watchdog: terminated %d backend(s) over %s min: %s",
+                            len(terminated), term_after, terminated)
+            try:
+                from webhooks import emit_webhook as _emit_wh
+                _emit_wh("db_long_transaction_terminated", "rag-api",
+                             {"pids": terminated, "terminate_after_min": term_after,
+                              "count": len(terminated)})
+            except Exception as e:  # noqa: BLE001
+                logging.warning("db-txn-watchdog: webhook failed: %s", e)
+    # forget pids that are gone so a reused pid alerts again
+    live = {r["pid"] for r in long_rows}
+    for pid in list(_DB_TXN_ALERTED):
+        if pid not in live:
+            _DB_TXN_ALERTED.pop(pid, None)
+    return {"checked": len(long_rows), "alerted": alerted, "terminated": terminated,
+            "alert_after_min": alert_after, "terminate_after_min": term_after}
+
+
+def _db_txn_watchdog_loop():
+    import time as _t
+    while True:
+        try:
+            if os.environ.get("DB_TXN_WATCHDOG_DISABLE", "0").lower() not in ("1", "true", "yes", "on"):
+                _db_txn_watchdog_pass()
+        except Exception as e:  # noqa: BLE001
+            logging.warning("db-txn-watchdog pass failed: %s", e)
+        _t.sleep(_DB_TXN_WATCHDOG_INTERVAL_SEC)
+
+
+def _ensure_db_txn_watchdog():
+    global _db_txn_watchdog_started
+    if _db_txn_watchdog_started:
+        return
+    import threading as _th
+    _th.Thread(target=_db_txn_watchdog_loop, name="db-txn-watchdog", daemon=True).start()
+    _db_txn_watchdog_started = True
+    logging.info("db-txn-watchdog armed (interval=%ds)", _DB_TXN_WATCHDOG_INTERVAL_SEC)
+
+
+@app.on_event("startup")
+def _start_db_txn_watchdog():
+    try:
+        _ensure_db_txn_watchdog()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("db-txn-watchdog start failed: %s", e)
+
+
+@app.get("/db/long-transactions", tags=["Health"])
+def get_db_long_transactions(min_age_min: float = Query(10.0, ge=0), limit: int = Query(50, ge=1, le=500),
+                             _: bool = Depends(auth)):
+    """Transactions on this database older than `min_age_min` minutes (all
+    clients), plus the watchdog thresholds. What the health check and the
+    operator look at before running DDL."""
+    rows = _db_long_transactions(min_age_min=min_age_min, limit=limit)
+    return {"ok": True, "count": len(rows), "min_age_min": min_age_min, "rows": rows,
+            "watchdog": {"alert_after_min": float(_get_setting("db_txn_alert_after_min", "15") or 15),
+                         "terminate_after_min": float(_get_setting("db_txn_terminate_after_min", "0") or 0),
+                         "interval_sec": _DB_TXN_WATCHDOG_INTERVAL_SEC}}
 
 
 @app.on_event("startup")
