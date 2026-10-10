@@ -100,6 +100,12 @@ class BuildPocState(TypedDict, total=False):
     escalation_guidance: str
     metrics: Dict[str, Any]
 
+    # Cross-round command dedup: signatures from the first run_refine pass
+    # survive into the second pass (after deep_recon go-around) so the dup
+    # detector catches round 2 re-synthesizing a command that already failed
+    # in round 1.
+    prior_cmd_signatures: List[str]
+
     # Final verdict
     verified: bool
     reflection: bool
@@ -1316,13 +1322,15 @@ def node_run_refine(state: BuildPocState) -> Dict[str, Any]:
         # Resolved object-ids from the login's post-access inventory /
         # precondition enumeration — enforced into every command so the model
         # can't substitute an invented id for one the login actually proved.
-        resolved_ids=(state.get("precond_result") or {}).get("resolved"))
+        resolved_ids=(state.get("precond_result") or {}).get("resolved"),
+        prior_cmd_signatures=state.get("prior_cmd_signatures"))
     return {"result": result,
             "verified": bool(result.get("verified")),
             "reflection": bool(result.get("reflection")),
             "off_target": bool(result.get("off_target")),
             "iters": int(result.get("iterations", 0)),
-            "success": bool(result.get("success"))}
+            "success": bool(result.get("success")),
+            "prior_cmd_signatures": result.get("cmd_signatures") or []}
 
 
 def node_failure_analysis(state: BuildPocState) -> Dict[str, Any]:
@@ -1889,9 +1897,10 @@ def build_graph():
     def _route_after_refine(state):
         from api import _BUILD_POC_DEEP_RECON, _BUILD_POC_EARLY_STOP_ITERS
         res = state.get("result") or {}
-        gave_up = (res.get("stop_reason") in ("identical_resend", "dup_exit")
+        gave_up = (res.get("stop_reason") in ("identical_resend", "dup_exit", "cross_round_dup")
                    or bool((res.get("metrics") or {}).get("identical_resend_stop"))
-                   or bool((res.get("metrics") or {}).get("refine_dup_exit")))
+                   or bool((res.get("metrics") or {}).get("refine_dup_exit"))
+                   or bool((res.get("metrics") or {}).get("cross_round_dup")))
         # "early" = the loop gave up (whatever the count — round 8 stopped at
         # iteration 3 and never widened) OR it ended within the first iterations
         early = (not res.get("success")) and (gave_up or int(res.get("iterations") or 0) <= _BUILD_POC_EARLY_STOP_ITERS)

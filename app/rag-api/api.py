@@ -15466,6 +15466,25 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
         except Exception as e:  # noqa: BLE001
             logging.debug("gather: wp nonce harvest failed: %s", e)
 
+    # 7c. Generic CSRF/token harvest for NON-WP apps (Cacti, Dolibarr, D-Tale…).
+    # The LLM guessed token-extraction regexes that never matched the actual HTML
+    # (CVE-2024-25641 __csrf_magic, CVE-2024-5314 token, CVE-2024-3408 session).
+    # Harvest the real token names+values from the resolved endpoint so synth can
+    # reference them literally instead of fabricating a grep -oP pattern.
+    if not _is_wp and endpoint:
+        try:
+            _tok_pages = [endpoint]
+            if endpoint != "/" and endpoint != "/index.php":
+                _tok_pages.append("/")
+            _pre_generic = _fetch_preconditions(ip, port, timeout=timeout,
+                                                 cookie_header=cookie,
+                                                 paths=_tok_pages)
+            if _pre_generic.get("tokens"):
+                facts["csrf_tokens"] = {"tokens": _pre_generic["tokens"][:12],
+                                         "endpoint": endpoint}
+        except Exception as e:  # noqa: BLE001
+            logging.debug("gather: generic csrf harvest failed: %s", e)
+
     # 8. OOB sink
     sink = spec.get("oob_sink_url")
     if vc in _GATHER_OOB_CLASSES:
@@ -15795,6 +15814,16 @@ def _gather_manifest_text(man: dict) -> str:
         for t in (wpn.get("tokens") or [])[:10]:
             if "." not in t.split("=", 1)[0]:
                 lines.append(f"  {t}")
+
+    csrf = facts.get("csrf_tokens") or {}
+    if csrf.get("tokens"):
+        lines.append("")
+        lines.append("CSRF/TOKEN VALUES (harvested LIVE from the target — use these literal name=value "
+                     "pairs in your exploit instead of guessing a regex to extract them; fetch fresh "
+                     "with a GET before each POST since they rotate per request):")
+        for t in (csrf["tokens"])[:12]:
+            lines.append(f"  {t}")
+        lines.append(f"  (from {csrf.get('endpoint') or '/'})")
 
     # Scan-side telemetry already captured on this target. Carried into the
     # synth prompt via guidance_extra so synth builds against what we already
@@ -24540,7 +24569,8 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                     product=None, version=None, max_iters=3, canary=None,
                     origin_family=None, llm_model=None, metrics=None, model=None,
                     recon_source_used=None, arjun_discovered=None,
-                    focused_urls_from_body=None, resolved_ids=None, gather_facts=None):
+                    focused_urls_from_body=None, resolved_ids=None, gather_facts=None,
+                    prior_cmd_signatures=None):
     """Increment 2: run the PoC against the target; on failure, refine via the LLM,
     re-run — up to max_iters. Verbose trail -> filesystem.
 
@@ -24632,7 +24662,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
     # signature per iteration; after 2+ consecutive duplicates (configurable
     # via REFINE_DUP_EXIT_AT), stop refining and surface a clear reason.
     _REFINE_DUP_EXIT_AT = int(os.environ.get("REFINE_DUP_EXIT_AT", "2") or "2")
-    _cmd_signatures = []
+    _cmd_signatures = list(prior_cmd_signatures or [])
     _refine_dup_streak = 0
     import re as _re_dup
     def _refine_signature(cmd):
@@ -25410,6 +25440,16 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         # command as the previous iteration(s)? If so, further iterations will
         # repeat the same shape and burn the budget. Stop and tell the operator.
         _sig = _refine_signature(_new_cmd)
+        _prior_count = len(prior_cmd_signatures or [])
+        if _prior_count and _sig in _cmd_signatures[:_prior_count]:
+            _stop_reason = "cross_round_dup"
+            metrics["cross_round_dup"] = True
+            _poc_trace(run_id, "cross_round_dup_exit", iteration=it,
+                       extra={"signature": _sig[:150],
+                              "prior_round_sigs": _prior_count,
+                              "reason": "round 2 re-synthesized a command that "
+                                        "already failed in round 1 — stopping."})
+            break
         if _cmd_signatures and _sig == _cmd_signatures[-1]:
             _refine_dup_streak += 1
         else:
@@ -25564,7 +25604,8 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             "security_test_id": security_test_id, "log_path": log_path,
             "verification_method": verification_method,
             "verification_confidence": verification_confidence,
-            "judge_hint": judge_hint}
+            "judge_hint": judge_hint,
+            "cmd_signatures": _cmd_signatures}
 
 
 def _run_refine_judge_pass(cve, ip, port, run_id, log_path, *,
@@ -30830,6 +30871,7 @@ _KEY_TRACE_PHASES = {
     "judge_near_miss", "judge_pass_error", "auto_hint_saved",
     "failure_analysis", "failure_analysis_error",
     "refine_similar_errors", "error_memory_recorded", "prerun_tool_check",
+    "refine_dup_exit", "refine_no_progress", "cross_round_dup_exit",
     "synth_skipped_gather_incomplete", "run_refine_skipped_gather_incomplete",
     "run_refine_skipped_blocked", "run_refine_skipped_artifact_required",
 }
