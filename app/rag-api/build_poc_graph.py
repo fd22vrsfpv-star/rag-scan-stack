@@ -1501,8 +1501,44 @@ def node_save_store(state: BuildPocState) -> Dict[str, Any]:
                           "research_sources": (research_out or {}).get("sources"),
                           "failure_analysis": state.get("failure_analysis") or None,
                           "attempt_run_id": state.get("run_id")})
-    except Exception:  # noqa: BLE001
-        pass
+        elif state.get("failure_analysis"):
+            # No final command — the run FAILED (blocked, gather-incomplete, or
+            # every iteration unverified). Operator (2026-10-10): "at the end of
+            # failed runs ... add the analysis ... stored with the exploit
+            # workbench for review." Store a `failed_poc` row carrying the full
+            # failure analysis so it shows in the Exploit workbench next to the
+            # real PoCs, and its review.md export has the ## Failure analysis
+            # section. kind='failed_poc' + verified=False so the UI can filter it.
+            fa = state.get("failure_analysis") or {}
+            tried = fa.get("tried") or []
+            last_cmd = (tried[-1].get("command_head") if tried else None) \
+                or "(no command reached the target — see failure analysis)"
+            stage = fa.get("stage_reached") or "unknown"
+            stop = fa.get("stop_reason") or result.get("stop_reason") or "failed"
+            store_id = _save_exploit_store(
+                name=f"PoC {state['cve']} on {state['ip']} (failed — {stage})",
+                cve=state["cve"], kind="failed_poc",
+                target_host=state["ip"], target_port=state["port"],
+                product=state.get("product"), version=state.get("version"),
+                command=last_cmd, assertion=None,
+                rationale=(fa.get("narrative") or built.get("rationale", "")),
+                verified=False, source="cve_poc_builder",
+                poc_log_path=result.get("log_path") or fa.get("poc_log_path"),
+                llm_model=result.get("llm_model") or fa.get("llm_model"),
+                built_at=result.get("built_at"), eid=state.get("eid"),
+                created_by="cve_poc_builder",
+                metadata={"failed_attempt": True,
+                          "stage_reached": stage, "stop_reason": stop,
+                          "missing": fa.get("missing") or [],
+                          "iterations": result.get("iterations"),
+                          "metrics": metrics,
+                          "research": (research_out or {}).get("analysis"),
+                          "research_sources": (research_out or {}).get("sources"),
+                          "failure_analysis": fa,
+                          "attempt_run_id": state.get("run_id")})
+    except Exception as _sse:  # noqa: BLE001
+        logging.warning("node_save_store: exploit_store write failed run=%s: %s",
+                        state.get("run_id"), _sse)
     if store_id:
         try:
             from api import _link_attempt_to_store
