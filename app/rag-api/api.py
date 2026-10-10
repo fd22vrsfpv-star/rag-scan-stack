@@ -48094,8 +48094,50 @@ def _start_refine_mine_daemon():
 #     db_txn_alert_after_min      default 15  — webhook + log per offending pid
 #     db_txn_terminate_after_min  default 0   — 0 = never terminate (alert only)
 _DB_TXN_WATCHDOG_INTERVAL_SEC = int(os.environ.get("DB_TXN_WATCHDOG_INTERVAL_SEC", "300") or "300")
+# While a client-IP block is active the loop runs this often (not the 5-min
+# cadence) so a blocked host's sessions are killed before they can hold a lock.
+_DB_TXN_BLOCK_INTERVAL_SEC = int(os.environ.get("DB_TXN_BLOCK_INTERVAL_SEC", "30") or "30")
 _DB_TXN_ALERTED: dict = {}        # pid -> epoch of the last alert (re-alert hourly)
 _db_txn_watchdog_started = False
+
+
+def _db_blocked_client_addrs() -> list:
+    """Host IPs the operator has blocked (app_settings `db_txn_block_client_addrs`,
+    comma/semicolon-separated). We cannot reject a host in pg_hba (role `app` is
+    not a superuser and the file lives on the DB VPS), but role `app` CAN
+    pg_terminate_backend another `app` session, so the watchdog kills every
+    session from these IPs on sight — an in-DB block for a host we cannot
+    firewall from here. Durable fix is still to update that host; this stops it
+    holding locks in the meantime. Empty = nothing blocked."""
+    raw = _get_setting("db_txn_block_client_addrs", "") or ""
+    return [a.strip() for a in raw.replace(";", ",").split(",") if a.strip()]
+
+
+def _db_terminate_client_addrs(addrs) -> list:
+    """Terminate every backend on this database connecting from one of `addrs`
+    (host-IP strings), regardless of state or age. Returns [{pid, client_addr}]
+    the server confirmed. Never raises on an individual pid."""
+    if not addrs:
+        return []
+    killed = []
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT pid, host(client_addr)::text AS client_addr
+            FROM pg_stat_activity
+            WHERE datname = current_database() AND pid <> pg_backend_pid()
+              AND client_addr IS NOT NULL
+              AND host(client_addr)::text = ANY(%s)""", (list(addrs),))
+        targets = [dict(r) for r in cur.fetchall()]
+        for t in targets:
+            try:
+                cur.execute("SELECT pg_terminate_backend(%s) AS ok", (int(t["pid"]),))
+                r = cur.fetchone()
+                if r and (r.get("ok") if isinstance(r, dict) else r[0]):
+                    killed.append({"pid": int(t["pid"]), "client_addr": t["client_addr"]})
+            except Exception as e:  # noqa: BLE001
+                logging.warning("db-txn-watchdog: block-terminate %s failed: %s", t.get("pid"), e)
+        conn.commit()
+    return killed
 
 
 def _db_long_transactions(min_age_min: float = 10.0, limit: int = 50) -> list:
@@ -48146,6 +48188,20 @@ def _db_txn_watchdog_pass(now=None) -> dict:
     now = now or _t.time()
     alert_after = float(_get_setting("db_txn_alert_after_min", "15") or 15)
     term_after = float(_get_setting("db_txn_terminate_after_min", "0") or 0)
+    # Client-IP block first: kill every session from a blocked host on sight,
+    # regardless of age/state (an in-DB block — see _db_blocked_client_addrs).
+    blocked_addrs = _db_blocked_client_addrs()
+    blocked_killed = _db_terminate_client_addrs(blocked_addrs) if blocked_addrs else []
+    if blocked_killed:
+        logging.warning("db-txn-watchdog: blocked-IP terminate %d session(s) from %s",
+                        len(blocked_killed), blocked_addrs)
+        try:
+            from webhooks import emit_webhook as _emit_wh
+            _emit_wh("db_blocked_ip_terminated", "rag-api",
+                     {"count": len(blocked_killed), "blocked_client_addrs": blocked_addrs,
+                      "pids": [k["pid"] for k in blocked_killed]})
+        except Exception as e:  # noqa: BLE001
+            logging.warning("db-txn-watchdog: webhook failed: %s", e)
     long_rows = _db_long_transactions(min_age_min=alert_after)
     alerted, terminated = [], []
     for r in long_rows:
@@ -48185,7 +48241,9 @@ def _db_txn_watchdog_pass(now=None) -> dict:
         if pid not in live:
             _DB_TXN_ALERTED.pop(pid, None)
     return {"checked": len(long_rows), "alerted": alerted, "terminated": terminated,
-            "alert_after_min": alert_after, "terminate_after_min": term_after}
+            "alert_after_min": alert_after, "terminate_after_min": term_after,
+            "blocked_client_addrs": blocked_addrs,
+            "blocked_terminated": [k["pid"] for k in blocked_killed]}
 
 
 def _db_txn_watchdog_loop():
@@ -48196,7 +48254,15 @@ def _db_txn_watchdog_loop():
                 _db_txn_watchdog_pass()
         except Exception as e:  # noqa: BLE001
             logging.warning("db-txn-watchdog pass failed: %s", e)
-        _t.sleep(_DB_TXN_WATCHDOG_INTERVAL_SEC)
+        # Run tight while a client-IP block is active so a blocked host cannot
+        # grab a lock in the gap; otherwise the normal 5-min cadence.
+        interval = _DB_TXN_WATCHDOG_INTERVAL_SEC
+        try:
+            if _db_blocked_client_addrs():
+                interval = _DB_TXN_BLOCK_INTERVAL_SEC
+        except Exception:  # noqa: BLE001
+            pass
+        _t.sleep(interval)
 
 
 def _ensure_db_txn_watchdog():
@@ -48227,6 +48293,7 @@ def get_db_long_transactions(min_age_min: float = Query(10.0, ge=0), limit: int 
     return {"ok": True, "count": len(rows), "min_age_min": min_age_min, "rows": rows,
             "watchdog": {"alert_after_min": float(_get_setting("db_txn_alert_after_min", "15") or 15),
                          "terminate_after_min": float(_get_setting("db_txn_terminate_after_min", "0") or 0),
+                         "blocked_client_addrs": _db_blocked_client_addrs(),
                          "interval_sec": _DB_TXN_WATCHDOG_INTERVAL_SEC}}
 
 
