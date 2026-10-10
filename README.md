@@ -4,6 +4,20 @@ An open-source **workflow collector for authorized penetration testing and red t
 
 > **Authorized testing only.** This tool is built for engagements you have written permission to perform. Read [Authorized use](#authorized-use) before running it.
 
+> **New (2026-10-10) — No more four-hour database transactions.**
+> The periodic OSINT rule sweep used to re-scan a *year* of findings in one
+> transaction every cycle (a query-vs-body mismatch on `POST /agent/scan`),
+> and seventeen of them held `assets` locked for hours, queuing every reader
+> behind one `ALTER TABLE`. The sweep now runs **one at a time**, over **24 h
+> unless you ask for `full=true`**, and **commits per finding**. rag-api runs a
+> **db-txn-watchdog**: it emits `db_long_transaction_detected` for any
+> transaction older than `db_txn_alert_after_min` (15) and, when you set
+> `db_txn_terminate_after_min` (0 = alert only), terminates it — Postgres 16
+> cannot cap transaction age itself. `GET /db/long-transactions` shows what is
+> open right now; `post-install-check` fails on anything older than 30 min;
+> `ensure_db_schema.sh` fails fast on a blocked ALTER (10 s), retries once, and
+> skips `ADD COLUMN` locks for columns that already exist.
+>
 > **New (2026-10-09) — Build-PoC remembers errors across builds, and its clocks are yours to set.**
 > Web applications answer the same payload the same way, so every build now
 > records, per failing iteration, the **normalised error it got, the command

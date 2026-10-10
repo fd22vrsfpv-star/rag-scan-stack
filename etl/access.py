@@ -82,7 +82,14 @@ def _is_crypt_hash(secret) -> bool:
 
 def _connect():
     import psycopg2
-    return psycopg2.connect(DB_DSN, connect_timeout=5)
+    # 2026-10-10: refresh() probes each candidate over the network between
+    # statements; the connection used to carry no transaction limits, and an
+    # INSERT INTO obtained_access sat idle-in-transaction while the next probe
+    # ran. Commit per candidate (see refresh) + these session caps.
+    return psycopg2.connect(
+        DB_DSN, connect_timeout=5,
+        options="-c idle_in_transaction_session_timeout=120000 -c lock_timeout=5000",
+    )
 
 
 # ── Transports ─────────────────────────────────────────────────────────────
@@ -892,6 +899,9 @@ def refresh(target: str, *, rounds: int = None,
                     # REVALIDATE: feed a probed credential back into the
                     # credential model (mark valid + log the attempt).
                     _reconcile_credential(cur, cand, result, engagement_id)
+                    # One transaction per candidate: the NEXT probe runs over
+                    # the network, and nothing should be held while it does.
+                    conn.commit()
                     if result["status"] == "live":
                         out["live"] += 1
                     else:
@@ -930,6 +940,7 @@ def refresh(target: str, *, rounds: int = None,
                          result["os_info"], result["probes"], result["probes_ok"],
                          result["last_error"], result["score"], result["status"],
                          target, kind, handle))
+                    conn.commit()
                     if result["status"] != "live":
                         out["dead"] += 1
                         out["reconciled_dead"] = out.get("reconciled_dead", 0) + 1

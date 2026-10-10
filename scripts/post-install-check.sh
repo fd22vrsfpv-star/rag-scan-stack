@@ -295,6 +295,27 @@ else
   fail "ports has $DUP_PORT_ROWS duplicate (ip, proto, port) row(s) — run ./scripts/ensure_db_schema.sh"
 fi
 
+# Long-running transactions (2026-10-10): Postgres 16 cannot cap transaction
+# AGE (only idle time), and a busy multi-hour sweep transaction holding
+# AccessShare on assets queued one ALTER and every reader behind it for hours.
+# rag-api's db-txn-watchdog alerts at db_txn_alert_after_min and terminates at
+# db_txn_terminate_after_min (0 = alert only); this check is the install-time
+# view of the same thing.
+LONG_TXN=$(_run_sql "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND xact_start IS NOT NULL AND now() - xact_start > interval '30 min'")
+if ! _is_num "$LONG_TXN"; then
+  warn "long-transaction check skipped (could not query pg_stat_activity)"
+elif [[ "$LONG_TXN" -eq 0 ]]; then
+  pass "no transaction open longer than 30 min"
+else
+  fail "$LONG_TXN transaction(s) open longer than 30 min — GET /db/long-transactions, then scripts/sql/terminate_long_transactions.sql or set db_txn_terminate_after_min"
+fi
+TXN_TERM=$(_run_sql "SELECT COALESCE((SELECT value FROM app_settings WHERE key='db_txn_terminate_after_min' AND category='config'), '0')")
+if [[ "$TXN_TERM" =~ ^[0-9.]+$ ]] && [[ "${TXN_TERM%.*}" -gt 0 ]]; then
+  pass "db-txn-watchdog terminates transactions older than ${TXN_TERM} min"
+else
+  warn "db-txn-watchdog is alert-only (db_txn_terminate_after_min=${TXN_TERM:-unset}); set it via PUT /settings/config/db_txn_terminate_after_min to auto-terminate"
+fi
+
 # Verified credentials must reach the vault, or the Users page badge stays dark.
 # The bridge runs automatically after a brutus ingest, so a non-zero count here
 # means an upgrade landed on a database that already had credential findings.

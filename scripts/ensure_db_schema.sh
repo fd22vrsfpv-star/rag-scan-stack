@@ -145,12 +145,41 @@ _psql_file() {
         # ALREADY connected to that database; letting psql re-connect would drop
         # the URI's credentials and can block on a password prompt, hanging the
         # whole script with no output.
-        grep -v '^[[:space:]]*\\' "$path" \
+        #
+        # 2026-10-10 (the four-hour-transaction incident), three guards:
+        #  * `SET lock_timeout = '10s'` per session — a blocked ALTER fails fast
+        #    and is retried (see the apply block) instead of queuing every
+        #    reader of that table behind it for the server's 60 s;
+        #  * single-line `DO $$ BEGIN ALTER TABLE t ADD COLUMN IF NOT EXISTS c …`
+        #    blocks are rewritten to look in information_schema first —
+        #    IF NOT EXISTS still takes AccessExclusive on a no-op, and 25 of
+        #    those lines target assets / vulns / ports (_guard_add_column);
+        #  * the inner psql carries SCHEMA_RUN_TAG in its argv so the EXIT trap
+        #    can kill it — killing the host-side `docker exec` does NOT stop a
+        #    psql inside the container, and one kept walking the file for 35 min.
+        { echo "SET lock_timeout = '10s';"
+          grep -v '^[[:space:]]*\\' "$path" | _guard_add_column; } \
           | docker exec -i -e PGDSN="$DB_DSN_VALUE" "$PSQL_CLIENT" \
-                sh -c 'exec psql "$PGDSN" -v ON_ERROR_STOP=0 -f -' ;;
+                sh -c 'exec psql "$PGDSN" -v ON_ERROR_STOP=0 -v "$1" -f -' _ "$SCHEMA_RUN_TAG" ;;
       python) _psql -f "$path" ;;
     esac
 }
+
+# Rewrite `DO $$ BEGIN ALTER TABLE [public.]t ADD COLUMN IF NOT EXISTS c <rest>;
+# EXCEPTION WHEN OTHERS THEN NULL; END $$;` (one line) so the ALTER — and its
+# AccessExclusive lock — only runs when the column is really absent. Anything
+# that does not match that exact single-line shape passes through untouched.
+_guard_add_column() {
+    sed -E 's/^DO \$\$ BEGIN ALTER TABLE (public\.)?([a-z_]+) ADD COLUMN IF NOT EXISTS ([a-z_]+) (.*); EXCEPTION WHEN OTHERS THEN NULL; END \$\$;$/DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='"'"'public'"'"' AND table_name='"'"'\2'"'"' AND column_name='"'"'\3'"'"') THEN ALTER TABLE \1\2 ADD COLUMN IF NOT EXISTS \3 \4; END IF; EXCEPTION WHEN OTHERS THEN NULL; END $$;/'
+}
+
+SCHEMA_RUN_TAG="ensure_db_schema_run=$$_$(date +%s)"
+_kill_inner_psql() {
+    if [ "${DB_BACKEND:-}" = "psql" ] && [ -n "${PSQL_CLIENT:-}" ]; then
+        docker exec "$PSQL_CLIENT" pkill -f "$SCHEMA_RUN_TAG" >/dev/null 2>&1 || true
+    fi
+}
+trap _kill_inner_psql EXIT INT TERM
 
 # Same as _psql but against a DIFFERENT database on the same server. Two checks
 # need this: the `exploits` database (searchsploit/ExploitDB corpus) lives beside
@@ -220,10 +249,32 @@ echo ""
 
 # Apply the schema
 echo "🔧 Applying comprehensive schema..."
+# Who is holding transactions right now? A long one on assets/ports/vulns means
+# the ALTERs below will hit their 10 s lock_timeout; say so up front.
+LONG_TXN_BEFORE=$(_psql -t -c "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND xact_start IS NOT NULL AND now() - xact_start > interval '10 min';" 2>/dev/null | tr -d ' ')
+if [ -n "$LONG_TXN_BEFORE" ] && [ "$LONG_TXN_BEFORE" != "0" ]; then
+    echo "⚠️  ${LONG_TXN_BEFORE} transaction(s) have been open > 10 min — ALTERs may time out and be retried (GET /db/long-transactions to see them)"
+fi
 if _psql_file "${PROJECT_ROOT}/db_init/ensure_all_tables.sql" > /tmp/schema_update.log 2>&1; then
     echo "✓ Schema update completed successfully"
 else
     echo "⚠️  Schema update completed with warnings (see /tmp/schema_update.log)"
+fi
+# Statements that lost the lock race fail fast (lock_timeout) and are retried
+# ONCE after a pause; the file is idempotent, so a second pass is safe.
+LOCK_TIMEOUTS=$(grep -c "canceling statement due to lock timeout" /tmp/schema_update.log 2>/dev/null || true)
+LOCK_TIMEOUTS=${LOCK_TIMEOUTS:-0}
+if [ "$LOCK_TIMEOUTS" -gt 0 ]; then
+    echo "⚠️  ${LOCK_TIMEOUTS} statement(s) hit lock_timeout — retrying once in 20 s"
+    sleep 20
+    _psql_file "${PROJECT_ROOT}/db_init/ensure_all_tables.sql" > /tmp/schema_update_retry.log 2>&1 || true
+    LOCK_TIMEOUTS_RETRY=$(grep -c "canceling statement due to lock timeout" /tmp/schema_update_retry.log 2>/dev/null || true)
+    LOCK_TIMEOUTS_RETRY=${LOCK_TIMEOUTS_RETRY:-0}
+    if [ "$LOCK_TIMEOUTS_RETRY" -gt 0 ]; then
+        echo "❌ ${LOCK_TIMEOUTS_RETRY} statement(s) still blocked after retry (see /tmp/schema_update_retry.log) — clear the long transactions and re-run"
+    else
+        echo "✓ Retry applied the remaining statements"
+    fi
 fi
 echo ""
 

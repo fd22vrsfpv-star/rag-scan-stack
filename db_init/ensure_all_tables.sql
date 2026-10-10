@@ -2661,7 +2661,11 @@ INSERT INTO public.app_settings (key, value, category) VALUES
   ('llm.reasoning_effort.exploit.judge',           'high', 'config'),
   ('llm.reasoning_effort.cve_poc_synth',           'high', 'config'),
   ('llm.reasoning_effort.decomposed_craft',        'high', 'config'),
-  ('llm.reasoning_effort.cve_poc_refine',          'high', 'config')
+  ('llm.reasoning_effort.cve_poc_refine',          'high', 'config'),
+  -- 2026-10-10 db-txn-watchdog (rag-api): alert on transactions older than N min;
+  -- terminate when > 0 (Postgres 16 has no transaction_timeout of its own).
+  ('db_txn_alert_after_min',                       '15',   'config'),
+  ('db_txn_terminate_after_min',                   '0',    'config')
 ON CONFLICT (key) DO NOTHING;
 
 -- ============================================================================

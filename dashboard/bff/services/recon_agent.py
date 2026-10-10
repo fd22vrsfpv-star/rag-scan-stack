@@ -622,9 +622,14 @@ class ReconAgent:
         since_minutes = max(1, interval // 60 + 1)
         try:
             async with httpx.AsyncClient(timeout=60) as c:
+                # Both shapes on purpose: rag-api reads the window from the
+                # query string AND the JSON body (2026-10-10 — when only the
+                # query form was sent, the endpoint read a body default of 0
+                # and swept a year of findings every cycle).
                 resp = await c.post(
                     f"{s.rag_api_url}/agent/scan",
                     params={"since_minutes": since_minutes, "engagement_id": eid},
+                    json={"since_minutes": since_minutes},
                     headers=headers,
                 )
                 if resp.status_code == 200:
