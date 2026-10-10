@@ -15012,6 +15012,7 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
               or (session_info or {}).get("cookie"))
     hdrs = {"Cookie": cookie} if cookie else {}
     items, facts = [], {}
+    facts["product"] = str(product or "").strip().lower()
 
     def add(item, status, value=None, source=None):
         items.append({"item": item, "status": status, "value": value, "source": source})
@@ -15026,6 +15027,7 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
         spec = {"vuln_class": "unknown", "description": details.get("description") or "",
                 "candidate_endpoints": [], "input_source": {}, "_spec_error": str(_se)[:120]}
     vc = (spec.get("vuln_class") or "unknown").lower()
+    facts["vuln_class"] = vc
     ls = _local_source_routes(cve)
 
     # Scan telemetry already on hand for this (ip, port, cve). Pulled once up
@@ -15859,6 +15861,23 @@ def _gather_manifest_text(man: dict) -> str:
             passed = "PASS" if pr.get("passed") else ("FAIL" if pr.get("passed") is False else "?")
             snip = (pr.get("run_snip") or "").replace("\n", " ")[:260]
             lines.append(f"  iter={pr.get('iteration')} phase={pr.get('phase')} [{passed}]  snip: {snip}")
+
+    # Cross-app lessons: "on product X, the CSRF field is Y", "the login
+    # form uses fields A/B", "verified endpoint is /foo". These are learned
+    # from prior builds on the SAME product (any engagement) and injected
+    # so synth starts with real facts instead of guessing.
+    product = (facts.get("product") or man.get("product") or "").strip().lower()
+    vuln_class = (facts.get("vuln_class") or "").strip().lower()
+    if product:
+        try:
+            recalled = _recall_lessons(product, vuln_class=vuln_class)
+            note = _render_lessons_note(recalled)
+            if note:
+                lines.append("")
+                lines.append(note)
+        except Exception:  # noqa: BLE001
+            pass
+
     return "\n".join(lines)
 
 
@@ -28380,6 +28399,271 @@ def list_build_poc_error_memory(signature: Optional[str] = None, cve: Optional[s
             "engagement_id": eid, "all_engagements": bool(all_engagements), "count": len(rows), "rows": rows}
 
 
+# ── Cross-app learning: build_poc_lessons ────────────────────────────────────
+# Structured lessons extracted from completed build-PoC runs. A lesson says
+# "on product X, for vuln_class Y, the Z is V". Reads ACROSS engagements
+# (methodology, not collected data). New lesson_type values are added by
+# adding an extractor clause in _extract_lessons — no schema change needed.
+
+_LESSON_TYPES = (
+    "csrf_field",         # "on Cacti, CSRF field is __csrf_magic at /host.php"
+    "auth_form",          # "on Dolibarr, login form at /index.php uses loginfunction/password"
+    "endpoint",           # "for sqli on Cacti, the endpoint is /host.php"
+    "parameter",          # "for sqli on Cacti, the injectable param is id"
+    "error_pattern",      # "when Cacti returns 'CSRF check failed', re-fetch the token"
+    "precondition",       # "Cacti needs __csrf_magic before any POST"
+    "tool_config",        # "on D-Tale, use -k flag for self-signed TLS"
+    "auth_method",        # "on Zabbix, login requires sid from /api_jsonrpc.php"
+)
+
+
+def _ensure_build_poc_lessons_table():
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS public.build_poc_lessons (
+                id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                lesson_type text NOT NULL,
+                lesson_key text NOT NULL,
+                lesson_value text NOT NULL,
+                product text,
+                framework text,
+                vuln_class text,
+                evidence text,
+                confidence real NOT NULL DEFAULT 0.5,
+                source_run_id text NOT NULL,
+                source_cve text,
+                source_engagement_id uuid,
+                times_confirmed integer NOT NULL DEFAULT 1,
+                times_contradicted integer NOT NULL DEFAULT 0,
+                active boolean NOT NULL DEFAULT true,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now())""")
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_bpl_type_key "
+                        "ON public.build_poc_lessons(lesson_type, lesson_key)")
+            cur.execute("CREATE INDEX IF NOT EXISTS ix_bpl_product ON public.build_poc_lessons(product)")
+            cur.execute("CREATE INDEX IF NOT EXISTS ix_bpl_type ON public.build_poc_lessons(lesson_type)")
+            cur.execute("CREATE INDEX IF NOT EXISTS ix_bpl_vuln ON public.build_poc_lessons(vuln_class)")
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("ensure build_poc_lessons failed: %s", e)
+
+
+def _extract_lessons(run_id, result, state_bits, failure_analysis=None):
+    """Extract structured lessons from a completed build-PoC run. Returns a
+    list of lesson dicts ready to store. Runs for BOTH verified and failed
+    runs: a verified run teaches "this worked"; a failed run teaches "this
+    prerequisite was missing" so the next build on the same product knows to
+    collect it first. Pure — no DB access."""
+    lessons = []
+    sb = state_bits or {}
+    result = result or {}
+    product = str(sb.get("product") or result.get("product") or "").strip().lower()
+    framework = str(sb.get("framework") or "").strip().lower()
+    vuln_class = str(sb.get("vuln_class") or "").strip().lower()
+    cve = str(sb.get("cve") or result.get("cve") or "").upper()
+    eid = sb.get("eid")
+    verified = bool(result.get("verified"))
+    if not product:
+        return lessons
+
+    def _add(ltype, key, value, evidence="", confidence=0.5):
+        lessons.append({"lesson_type": ltype, "lesson_key": key,
+                        "lesson_value": str(value)[:2000], "product": product,
+                        "framework": framework, "vuln_class": vuln_class,
+                        "evidence": str(evidence)[:500], "confidence": confidence,
+                        "source_run_id": run_id, "source_cve": cve,
+                        "source_engagement_id": str(eid) if eid else None})
+
+    # 1. CSRF field lessons (from gather manifest facts)
+    man = sb.get("gather_manifest") or {}
+    facts = man.get("facts") or {}
+    csrf = facts.get("csrf_tokens") or facts.get("wp_nonces") or {}
+    tokens = csrf.get("tokens") or []
+    for tok in tokens[:5]:
+        if "=" in tok:
+            name, val = tok.split("=", 1)
+            _add("csrf_field",
+                 f"{product}:csrf:{name}",
+                 f"CSRF token field '{name}' on {product} at {csrf.get('endpoint', '/')}",
+                 evidence=f"harvested: {tok[:80]}",
+                 confidence=0.8 if verified else 0.5)
+
+    # 2. Auth form lessons (from session_info)
+    si = sb.get("session_info") or {}
+    if si.get("ok") and si.get("method"):
+        login_url = si.get("login_url") or si.get("url") or ""
+        _add("auth_form",
+             f"{product}:auth:{si['method']}",
+             f"Login method '{si['method']}' at {login_url} on {product}",
+             evidence=f"session ok={si.get('ok')}, cookie={'yes' if si.get('cookie_header') else 'no'}",
+             confidence=0.9 if verified else 0.6)
+
+    # 3. Endpoint lessons (from verified runs)
+    if verified and result.get("final_command"):
+        import re as _re
+        cmd = str(result["final_command"])
+        ep_match = _re.search(r"https?://[^/\s]+(/[^\s'\"?#]*)", cmd)
+        if ep_match:
+            ep = ep_match.group(1)
+            _add("endpoint",
+                 f"{product}:{vuln_class}:{ep}",
+                 f"Verified endpoint '{ep}' for {vuln_class} on {product}",
+                 evidence=f"from verified command, CVE={cve}",
+                 confidence=0.95)
+
+    # 4. Parameter lessons (from verified runs — extract the param that was injected)
+    if verified and result.get("final_command"):
+        import re as _re
+        cmd = str(result["final_command"])
+        for pm in _re.finditer(r"[-]d\s+['\"]?([^=&\s'\"]+)=", cmd):
+            pname = pm.group(1)
+            if pname.lower() not in ("cookie", "token", "csrf", "nonce", "_wpnonce", "sid"):
+                _add("parameter",
+                     f"{product}:{vuln_class}:{pname}",
+                     f"Parameter '{pname}' used in verified {vuln_class} on {product}",
+                     evidence=f"from verified command, CVE={cve}",
+                     confidence=0.85)
+                break
+
+    # 5. Precondition lessons (from failure analysis — what was missing)
+    fa = failure_analysis or {}
+    for blocker in (fa.get("blockers") or []):
+        item = blocker.get("item") or ""
+        if item in ("auth", "endpoint", "input_field", "artifact", "method"):
+            _add("precondition",
+                 f"{product}:needs:{item}",
+                 f"{product} requires '{item}' — {blocker.get('why', 'unknown')}",
+                 evidence=blocker.get("what_live_recon_found", "")[:200],
+                 confidence=0.7)
+
+    # 6. Auth method lessons (from research/recon — how to authenticate)
+    auth = sb.get("auth") or {}
+    if auth.get("username") and si.get("ok"):
+        method = si.get("method") or "supplied"
+        _add("auth_method",
+             f"{product}:auth_method",
+             f"Authenticate to {product} via {method} with user '{auth['username']}'",
+             evidence=f"session obtained, method={method}",
+             confidence=0.8 if verified else 0.5)
+
+    return lessons
+
+
+def _store_lessons(lessons, run_id):
+    """Persist extracted lessons. ON CONFLICT bumps times_confirmed (same
+    lesson seen again) or updates if the new evidence is stronger."""
+    if not lessons:
+        return 0
+    _ensure_build_poc_lessons_table()
+    stored = 0
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            for ls in lessons:
+                cur.execute("""INSERT INTO build_poc_lessons
+                    (lesson_type, lesson_key, lesson_value, product, framework,
+                     vuln_class, evidence, confidence, source_run_id, source_cve,
+                     source_engagement_id)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (lesson_type, lesson_key) DO UPDATE SET
+                        times_confirmed = build_poc_lessons.times_confirmed + 1,
+                        confidence = GREATEST(build_poc_lessons.confidence, EXCLUDED.confidence),
+                        evidence = CASE WHEN EXCLUDED.confidence > build_poc_lessons.confidence
+                                        THEN EXCLUDED.evidence ELSE build_poc_lessons.evidence END,
+                        lesson_value = CASE WHEN EXCLUDED.confidence > build_poc_lessons.confidence
+                                            THEN EXCLUDED.lesson_value ELSE build_poc_lessons.lesson_value END,
+                        updated_at = now()""",
+                    (ls["lesson_type"], ls["lesson_key"], ls["lesson_value"],
+                     ls.get("product"), ls.get("framework"), ls.get("vuln_class"),
+                     ls.get("evidence"), ls.get("confidence", 0.5),
+                     ls.get("source_run_id") or run_id,
+                     ls.get("source_cve"), ls.get("source_engagement_id")))
+                stored += 1
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("store lessons failed: %s", e)
+    return stored
+
+
+def _recall_lessons(product, vuln_class=None, framework=None, limit=20):
+    """Retrieve relevant lessons for a new build. Lessons are cross-engagement
+    methodology — "on Cacti, the CSRF field is __csrf_magic". Returns a list
+    of lesson dicts ranked by confidence and confirmation count."""
+    _ensure_build_poc_lessons_table()
+    product = str(product or "").strip().lower()
+    if not product:
+        return []
+    where = ["active = true", "product = %s"]
+    params = [product]
+    if vuln_class:
+        where.append("(vuln_class = %s OR vuln_class = '' OR vuln_class IS NULL)")
+        params.append(str(vuln_class).strip().lower())
+    if framework:
+        where.append("(framework = %s OR framework = '' OR framework IS NULL)")
+        params.append(str(framework).strip().lower())
+    params.append(max(1, min(int(limit or 20), 100)))
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(f"""SELECT lesson_type, lesson_key, lesson_value, product,
+                    framework, vuln_class, evidence, confidence, times_confirmed,
+                    times_contradicted, source_cve, created_at, updated_at
+                FROM build_poc_lessons
+                WHERE {' AND '.join(where)}
+                ORDER BY confidence DESC, times_confirmed DESC, updated_at DESC
+                LIMIT %s""", params)
+            return [dict(r) for r in cur.fetchall()]
+    except Exception as e:  # noqa: BLE001
+        logging.debug("recall lessons failed: %s", e)
+        return []
+
+
+def _render_lessons_note(lessons, max_items=12):
+    """Synth/refine prompt block from recalled lessons. Pure."""
+    lessons = [l for l in (lessons or []) if isinstance(l, dict)][:max_items]
+    if not lessons:
+        return ""
+    lines = ["\nLESSONS FROM PRIOR BUILDS ON THIS PRODUCT (use these facts — they were "
+             "confirmed on real targets; higher confidence = more reliable):"]
+    for l in lessons:
+        conf = f"{l.get('confidence', 0):.0%}" if l.get("confidence") else "?"
+        confirmed = l.get("times_confirmed", 1)
+        lines.append(f"  [{l['lesson_type']}] {l['lesson_value']} "
+                     f"(confidence={conf}, confirmed={confirmed}x"
+                     + (f", from {l.get('source_cve')}" if l.get("source_cve") else "") + ")")
+    return "\n".join(lines)
+
+
+@app.get("/build-poc/lessons", tags=["Assets"])
+def list_build_poc_lessons(product: Optional[str] = None, vuln_class: Optional[str] = None,
+                           lesson_type: Optional[str] = None, limit: int = 100,
+                           authorized: bool = Depends(auth)):
+    """List cross-app lessons. These are methodology (cross-engagement by design)."""
+    _ensure_build_poc_lessons_table()
+    where, params = ["active = true"], []
+    if product:
+        where.append("product = %s"); params.append(product.strip().lower())
+    if vuln_class:
+        where.append("vuln_class = %s"); params.append(vuln_class.strip().lower())
+    if lesson_type:
+        where.append("lesson_type = %s"); params.append(lesson_type.strip().lower())
+    params.append(max(1, min(int(limit or 100), 500)))
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"""SELECT * FROM build_poc_lessons
+            WHERE {' AND '.join(where)}
+            ORDER BY confidence DESC, times_confirmed DESC, updated_at DESC
+            LIMIT %s""", params)
+        rows = [dict(r) for r in cur.fetchall()]
+    return {"ok": True, "scope": "all_engagements", "count": len(rows), "rows": rows}
+
+
+@app.delete("/build-poc/lessons/{lesson_id}", tags=["Assets"])
+def deactivate_lesson(lesson_id: str, authorized: bool = Depends(auth)):
+    _ensure_build_poc_lessons_table()
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE build_poc_lessons SET active=false, updated_at=now() WHERE id=%s", (lesson_id,))
+        conn.commit()
+    return {"ok": True}
+
+
 _FA_STAGES = ("recon", "gather", "synth", "run", "refine", "verified", "crash")
 
 
@@ -30830,6 +31114,7 @@ _KEY_TRACE_PHASES = {
     "judge_near_miss", "judge_pass_error", "auto_hint_saved",
     "failure_analysis", "failure_analysis_error",
     "refine_similar_errors", "error_memory_recorded", "prerun_tool_check",
+    "lessons_extracted",
     "synth_skipped_gather_incomplete", "run_refine_skipped_gather_incomplete",
     "run_refine_skipped_blocked", "run_refine_skipped_artifact_required",
 }
