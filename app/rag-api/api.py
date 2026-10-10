@@ -5395,7 +5395,7 @@ def _store_sast_findings(findings: list, scan_id: str, source_type: str,
                     f["line_start"], f["line_end"],
                     f["col_start"], f["col_end"],
                     f["matched_code"], f["message"], f.get("fix"),
-                    f["cwe"], f["owasp"],
+                    as_text_array(f["cwe"]), as_text_array(f["owasp"]),
                     Json(f.get("metadata") or {}),
                     f["fingerprint"], f.get("semgrep_version"),
                 ))
