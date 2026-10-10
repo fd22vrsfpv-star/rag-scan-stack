@@ -35,12 +35,30 @@ def _get_conn():
     # execution does per-row HTTP/embedding work between statements), so
     # dozens of idle-in-transaction sessions stacked up and nine
     # follow_up_items INSERTs from other writers queued on one of them for
-    # 2 h+. The server ends a transaction idle for 5 min and any lock wait
-    # over 15 s — regardless of which code path is holding it.
+    # 2 h+. 2026-10-10: the sweep now commits per match (see
+    # scan_new_findings), so a 2-minute idle cap and a 5 s lock wait are
+    # enough — the sweep yields to DDL instead of the other way round.
     return psycopg2.connect(
         DB_DSN,
-        options="-c idle_in_transaction_session_timeout=300000 -c lock_timeout=15000",
+        options="-c idle_in_transaction_session_timeout=120000 -c lock_timeout=5000",
     )
+
+
+#: pg_advisory_lock key for "an OSINT sweep is running" (session-level; released
+#: on unlock or when the connection closes, so a crashed sweep cannot wedge it).
+SWEEP_ADVISORY_LOCK_KEY = 0x05C4A7
+#: The periodic trigger may never ask for more than this window unless the
+#: caller says `full=True` explicitly (POST /agent/scan?full=true).
+SWEEP_MAX_MINUTES = int(os.environ.get("OSINT_SWEEP_MAX_MINUTES", "1440") or "1440")
+
+
+def _emit(event_type: str, data: dict) -> None:
+    """Best-effort webhook; logged, never raised (an emit failure must not fail a sweep)."""
+    try:
+        from webhooks import emit_webhook
+        emit_webhook(event_type, "rag-api", data)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("webhook emit failed for %s: %s", event_type, exc)
 
 
 def _get_or_create_unknown_scope_engagement(cur):
@@ -389,11 +407,20 @@ _last_scan_time = 0.0
 _MIN_SCAN_INTERVAL = 30  # seconds — don't run more often than this
 
 
-def scan_new_findings(tool: str = None, since_minutes: int = 60):
+def scan_new_findings(tool: str = None, since_minutes: int = 60, full: bool = False):
     """
     Run all detection rules against recent findings.
     Called after ingest or manually via POST /agent/scan.
     Rate-limited to once per 30 seconds to prevent DB flooding.
+
+    Transaction discipline (2026-10-10, the four-hour-transaction incident):
+      * ONE sweep at a time — a session advisory lock; an overlapping trigger
+        is skipped and reported, never queued behind the running one.
+      * the window is clamped to SWEEP_MAX_MINUTES unless `full=True`; the
+        periodic trigger used to arrive as 0 → "a year" on every cycle.
+      * the rule pass commits as soon as the matches are read (it is the part
+        that holds AccessShare on `assets`), and every follow-up insert is its
+        own transaction — nothing is held across the whole sweep.
     """
     global _last_scan_time
     import time
@@ -401,31 +428,50 @@ def scan_new_findings(tool: str = None, since_minutes: int = 60):
     if now - _last_scan_time < _MIN_SCAN_INTERVAL:
         log.info("OSINT agent skipped — last scan was %ds ago (min interval %ds)",
                  int(now - _last_scan_time), _MIN_SCAN_INTERVAL)
-        return {"flagged": 0, "skipped": True}
+        return {"flagged": 0, "skipped": True, "reason": "rate_limited"}
     _last_scan_time = now
 
-    log.info("OSINT agent scanning findings (last %d min, tool=%s)", since_minutes, tool)
+    requested = int(since_minutes or 0)
+    if not full and requested > SWEEP_MAX_MINUTES:
+        log.warning("OSINT agent window %d min clamped to %d (pass full=True to sweep everything)",
+                    requested, SWEEP_MAX_MINUTES)
+        since_minutes = SWEEP_MAX_MINUTES
+
+    log.info("OSINT agent scanning findings (last %d min, tool=%s, full=%s)", since_minutes, tool, full)
     conn = _get_conn()
     total = 0
+    matches = []
+    t0 = time.time()
 
     engine = get_engine()
 
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s) AS got", (SWEEP_ADVISORY_LOCK_KEY,))
+            row = cur.fetchone()
+            got = row["got"] if isinstance(row, dict) else row[0]
+            conn.commit()
+            if not got:
+                log.warning("OSINT agent skipped — another sweep holds the advisory lock")
+                _emit("osint_sweep_skipped_overlap",
+                      {"since_minutes": since_minutes, "tool": tool, "full": full})
+                return {"flagged": 0, "skipped": True, "reason": "sweep_already_running"}
+
             # Ensure rules are loaded (with DB state merge)
             if not engine._loaded:
                 engine.load_rules(cur)
 
-            # Execute all enabled rules
+            # Execute all enabled rules, then END that transaction: the rule
+            # SQL is what takes AccessShare on assets/ports/vulns, and holding
+            # it across the inserts below is what blocked every ALTER TABLE
+            # (and every reader queued behind the ALTER) for hours.
             matches = engine.execute_all(cur, since_minutes)
+            conn.commit()
 
-            # Create follow-up items for each match.
-            # Each insert is wrapped in a SAVEPOINT so one failure
-            # doesn't poison the transaction and cascade to all remaining items.
+            # Create follow-up items for each match — ONE transaction per
+            # match, so a conflict wait or a failure costs that match only.
             for match in matches:
                 try:
-                    cur.execute("SAVEPOINT followup_insert")
-
                     # Check if VulnX has already flagged this software/CVE combination to avoid duplicates
                     if match["rule_id"] == "software_known_cve":
                         # Extract product name from metadata or title for VulnX deduplication check
@@ -451,7 +497,7 @@ def scan_new_findings(tool: str = None, since_minutes: int = 60):
 
                             if cur.fetchone():
                                 # VulnX already flagged this asset/product combination - skip
-                                cur.execute("RELEASE SAVEPOINT followup_insert")
+                                conn.commit()
                                 continue
 
                     _create_follow_up(
@@ -467,19 +513,30 @@ def scan_new_findings(tool: str = None, since_minutes: int = 60):
                         tags=match.get("tags"),
                         metadata=match.get("metadata"),
                     )
-                    cur.execute("RELEASE SAVEPOINT followup_insert")
+                    conn.commit()
                     total += 1
                 except Exception as e:
                     log.warning("Failed to create follow-up for %s: %s", match.get("title"), e)
                     try:
-                        cur.execute("ROLLBACK TO SAVEPOINT followup_insert")
+                        conn.rollback()
                     except Exception:
                         pass
 
-            conn.commit()
+            try:
+                cur.execute("SELECT pg_advisory_unlock(%s)", (SWEEP_ADVISORY_LOCK_KEY,))
+                conn.commit()
+            except Exception:  # noqa: BLE001 — closing the connection releases it anyway
+                pass
+        _emit("osint_sweep_completed",
+              {"since_minutes": since_minutes, "tool": tool, "full": full,
+               "matches": len(matches), "flagged": total,
+               "seconds": round(time.time() - t0, 1)})
     except Exception as e:
         log.error("OSINT agent scan failed: %s", e)
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001
+            pass
     finally:
         conn.close()
 
