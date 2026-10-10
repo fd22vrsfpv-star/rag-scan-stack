@@ -356,19 +356,52 @@ ALTER queued readers for up to the 60 s lock timeout: rag-api logged
 `/api/settings/llm/routes` and `/api/software`. Stop it with
 `docker exec kali-listener pkill -x psql`. The operator-run terminate for the
 long sweeps is `scripts/sql/terminate_long_transactions.sql`.
-**Where:** `ssh-tunnel/` (`rag-db-tunnel`), the remote Postgres server config,
-`app/rag-api/osint_agent.py`, `app/rag-api/rule_engine.py::_already_flagged`
-(and whichever sweep loop holds the cursor open across findings),
-`app/rag-api/api.py::_get_pool`, `scripts/ensure_db_schema.sh`.
+**Root cause + fix (PR `fix/db-transaction-hygiene`, 2026-10-10):** the BFF
+recon agent sent `?since_minutes=N` while `POST /agent/scan` read a JSON body,
+so every cycle swept a YEAR of findings (`since_minutes=0 → 525600`) in ONE
+transaction, and overlapping cycles contended on the same `follow_up_items`
+rows. Fixed: the endpoint honours query + body with a 24 h cap unless
+`full=true`; one sweep at a time (`pg_try_advisory_lock`); the rule pass
+commits before the inserts and every follow-up is its own transaction; 5 s
+lock / 2 min idle caps on the sweep connection; `db-txn-watchdog` in rag-api
+(`db_txn_alert_after_min`=15 alerts via `db_long_transaction_detected`,
+`db_txn_terminate_after_min`=0 terminates when set) + `GET /db/long-transactions`
++ a `post-install-check` line; `ensure_db_schema.sh` fails fast (`lock_timeout`
+10 s, one retry), guards single-line `ADD COLUMN` behind `information_schema`,
+and kills its own in-container psql on exit. Same class fixed in
+`etl/access.py::refresh` and `scan_recommender/exploits_rag.py` (commit per
+probe / per record).
+**Where:** (remaining) `ssh-tunnel/` (`rag-db-tunnel`), the remote Postgres
+server config, the second installation at `107.205.216.218` (runs the OLD
+sweep until it pulls this change).
 **Done when:** the tunnel carries TCP keepalives (`ServerAliveInterval` on the
 ssh side and/or `tcp_keepalives_idle` on the server) so a dead local socket ends
-its backend within minutes rather than at the 10-min cap; the rule-engine sweep
-and the osint agent commit per finding (or per rule) instead of holding one
-transaction across a whole multi-hour sweep, so no backend holds a table lock
-for hours and DDL can get in; the second client at `107.205.216.218` is
-identified and stopped or upgraded; a `pg_stat_activity` check after a rag-api
-restart shows no backend older than the cap; `scripts/ensure_db_schema.sh`
-completes and `post-install-check` shows 0 duplicate `ports` rows.
+its backend within minutes rather than at the 10-min cap; the second client at
+`107.205.216.218` runs the fixed sweep (or is stopped); `GET
+/db/long-transactions?min_age_min=30` returns 0 rows for a full day with both
+installations running; `scripts/ensure_db_schema.sh` completes with 0 lock
+timeouts and `post-install-check` shows 0 duplicate `ports` rows.
+**Enforced by:** `tests/test_db_transaction_hygiene.py` (the five fixes),
+`tests/test_db_long_transactions_endpoint.py` (the read path executes);
+the keepalive / second-host parts are not enforced.
+
+### Two more one-transaction-per-batch loops (ingest paths, not live services)
+**Found:** 2026-10-10, auditing the codebase for the sweep's transaction shape
+after the four-hour-transaction incident.
+**Evidence:** an AST pass over every `*.py` for "connection held across a loop
+that does network / embedding / DNS work between statements, commit only at
+the end" flagged 5 sites; 3 were fixed in the PR above (`osint_agent`,
+`etl/access.py::refresh`, `scan_recommender/exploits_rag.py` ×2). Two remain:
+`app/load_all.py:41-43 backfill_findings_into_rag` (embeds inside one
+transaction; a one-off backfill that has never run in production) and
+`etl/parse_httpx.py:36 parse_httpx` (`socket.gethostbyname` per record inside
+one transaction with per-record savepoints; an upload parser, bounded by the
+file size).
+**Where:** `app/load_all.py`, `etl/parse_httpx.py`.
+**Done when:** both commit per record (or resolve / embed before opening the
+transaction) and their connections carry the same
+`idle_in_transaction_session_timeout` / `lock_timeout` options as
+`etl/access.py::_connect`.
 **Enforced by:** not enforced
 
 ### BFF polls of autogen-agents time out at connect while a session is scanning
