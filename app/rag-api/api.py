@@ -15605,6 +15605,35 @@ def _scan_evidence_for_target(cve, ip, port, eid, vc) -> dict:
                         "verb_sweep": lr.get("verb_sweep") or {}})
             except Exception as e:  # noqa: BLE001
                 logging.debug("scan_evidence prior_live_recon failed: %s", e)
+
+            # 8. SAST findings — source-code-level injection points that focus
+            #    the network attack. Application-area data until promoted.
+            try:
+                _ensure_sast_tables()
+                _sast_where = "target_host = %s"
+                _sast_args = [ip_s]
+                if eid_s:
+                    _sast_where += " AND (engagement_id = %s OR engagement_id IS NULL)"
+                    _sast_args.append(eid_s)
+                cur.execute(f"""
+                    SELECT vuln_class, rule_id, file_path, line_start,
+                           matched_code, message, cwe, severity
+                    FROM sast_findings
+                    WHERE {_sast_where}
+                    ORDER BY CASE severity WHEN 'critical' THEN 0
+                        WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END
+                    LIMIT 30
+                """, _sast_args)
+                sast_rows = cur.fetchall()
+                if sast_rows:
+                    out["sast_findings"] = [{
+                        "vuln_class": r[0], "rule": r[1], "file": r[2],
+                        "line": r[3], "code": (r[4] or "")[:300],
+                        "message": (r[5] or "")[:200],
+                        "cwe": r[6] or [], "severity": r[7],
+                    } for r in sast_rows]
+            except Exception as e:  # noqa: BLE001
+                logging.debug("scan_evidence sast failed: %s", e)
     except Exception as e:  # noqa: BLE001
         logging.debug("_scan_evidence_for_target top-level failed cve=%s: %s", cve, e)
     return out
@@ -16476,6 +16505,20 @@ def _gather_manifest_text(man: dict) -> str:
             passed = "PASS" if pr.get("passed") else ("FAIL" if pr.get("passed") is False else "?")
             snip = (pr.get("run_snip") or "").replace("\n", " ")[:260]
             lines.append(f"  iter={pr.get('iteration')} phase={pr.get('phase')} [{passed}]  snip: {snip}")
+
+    sast = ev.get("sast_findings") or []
+    if sast:
+        lines.append("")
+        lines.append("SAST_EVIDENCE — source-code findings from Semgrep (application-level, "
+                     "exact injection points with file/line/code):")
+        for sf in sast[:12]:
+            cwes = ",".join(sf.get("cwe") or [])
+            lines.append(f"  [{sf.get('severity','?')}] {sf.get('vuln_class','')} {sf.get('rule','')}"
+                         f"  {sf.get('file','')}:{sf.get('line','?')}  cwe={cwes or '-'}")
+            if sf.get("code"):
+                lines.append(f"    code: {sf['code'][:200]}")
+            if sf.get("message"):
+                lines.append(f"    msg: {sf['message'][:150]}")
     return "\n".join(lines)
 
 
