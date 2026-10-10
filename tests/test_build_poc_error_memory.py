@@ -124,6 +124,14 @@ def test_redaction_before_storage(fx):
     red = fx["_redact_command_for_memory"]("curl -H 'Cookie: zbx_session=abc123' -d 'password=hunter2&user=x' http://h/")
     assert "abc123" not in red and "hunter2" not in red
     assert "Cookie: REDACTED" in red and "password=REDACTED" in red and "user=x" in red
+    # 2026-10-10: a `$`-value is a shell variable / substitution, not a secret.
+    # The memory held `SESSION=REDACTED zbx_session "$COOKIE_JAR"` — an
+    # unrunnable next_command — because `SESSION=$(grep` matched the session rule.
+    red2 = fx["_redact_command_for_memory"](
+        'SESSION=$(grep zbx_session "$J" | awk \'{print $NF}\') && curl -b "zbx_session=$SESSION" '
+        "-d 'password=$PW&sid=abcd1234' http://h/")
+    assert 'SESSION=$(grep zbx_session "$J"' in red2 and 'zbx_session=$SESSION' in red2
+    assert "password=$PW" in red2 and "sid=REDACTED" in red2 and "abcd1234" not in red2
 
 
 def test_prompt_note_is_bounded_and_actionable(fx):
