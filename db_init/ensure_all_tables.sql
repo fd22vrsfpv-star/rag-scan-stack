@@ -2754,6 +2754,8 @@ ALTER TABLE public.vulns ADD COLUMN IF NOT EXISTS verified_at timestamptz;
 ALTER TABLE public.vulns ADD COLUMN IF NOT EXISTS tester_notes text;
 ALTER TABLE public.vulns ADD COLUMN IF NOT EXISTS original_severity text;
 ALTER TABLE public.vulns ADD COLUMN IF NOT EXISTS report_ready boolean DEFAULT false;
+ALTER TABLE public.vulns ADD COLUMN IF NOT EXISTS cwe text[] DEFAULT '{}';
+CREATE INDEX IF NOT EXISTS idx_vulns_cwe_gin ON public.vulns USING GIN (cwe);
 
 ALTER TABLE public.web_findings ADD COLUMN IF NOT EXISTS workflow_status text DEFAULT 'new'
     CHECK (workflow_status IN ('new','triaging','confirmed','false_positive','accepted_risk','in_report','deferred'));

@@ -377,13 +377,15 @@ def parse_nessus(path: str, profile: str = "upload", job_id: str = None, target:
                     vuln_id = str(uuid.uuid4())
                     try:
                         cur.execute("SAVEPOINT vuln_sp")
+                        cwe_arr = [f"CWE-{c}" for c in cwes] if cwes else []
                         cur.execute(
                             """INSERT INTO vulns
-                               (id, asset_id, port_id, script, output, severity, cve, cvss, refs, metadata, fingerprint)
-                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                               (id, asset_id, port_id, script, output, severity, cve, cvss, cwe, refs, metadata, fingerprint)
+                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                                ON CONFLICT (fingerprint) DO UPDATE SET
                                    updated_at = now(),
                                    severity   = EXCLUDED.severity,
+                                   cwe        = EXCLUDED.cwe,
                                    output     = COALESCE(EXCLUDED.output, vulns.output)""",
                             (
                                 vuln_id,
@@ -394,6 +396,7 @@ def parse_nessus(path: str, profile: str = "upload", job_id: str = None, target:
                                 severity,
                                 as_text_array(cves),
                                 cvss,
+                                as_text_array(cwe_arr),
                                 Json(refs) if refs else Json({}),
                                 Json(metadata),
                                 fp,
