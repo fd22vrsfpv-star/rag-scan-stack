@@ -347,6 +347,15 @@ within 7 min (`199.168.198.186`, `SAVEPOINT already_flagged_check`, xact 8 min).
 Schema repair was therefore NOT completed on this deploy; `post-install-check`
 reports `[FAIL] ports has 398 duplicate (ip, proto, port) row(s) — run
 ./scripts/ensure_db_schema.sh`, which is the repair that could not get the lock.
+Gotcha that prolonged it by 30 min: killing the host-side `docker exec … psql`
+does NOT kill the psql inside `kali-listener` — it kept walking the DDL file
+(`ALTER TABLE public.vulns …` at 00:46 UTC, 35 min after the "kill"), and every
+ALTER queued readers for up to the 60 s lock timeout: rag-api logged
+`LockNotAvailable` at 00:27, 00:37, 00:41 (×3) on plain SELECTs
+(`get_detected_software`, `get_setting`), which the BFF surfaced as 400s on
+`/api/settings/llm/routes` and `/api/software`. Stop it with
+`docker exec kali-listener pkill -x psql`. The operator-run terminate for the
+long sweeps is `scripts/sql/terminate_long_transactions.sql`.
 **Where:** `ssh-tunnel/` (`rag-db-tunnel`), the remote Postgres server config,
 `app/rag-api/osint_agent.py`, `app/rag-api/rule_engine.py::_already_flagged`
 (and whichever sweep loop holds the cursor open across findings),
