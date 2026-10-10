@@ -1518,6 +1518,17 @@ else
     log_ok "Docker network 'agents_net' created"
 fi
 
+# test_net: isolated network for CVE-Bench targets so all targets can be up
+# simultaneously without IP collisions (separate subnet from agents_net).
+if [ "$REHEARSAL" = true ]; then
+    log_skip "Shared 'test_net' not used — this rehearsal gets its own project network"
+elif docker network inspect test_net &>/dev/null; then
+    log_skip "Docker network 'test_net' already exists"
+else
+    docker network create --subnet 172.19.0.0/16 --gateway 172.19.0.1 test_net
+    log_ok "Docker network 'test_net' created"
+fi
+
 # Required directories
 DIRS=(
     "nmap_out"

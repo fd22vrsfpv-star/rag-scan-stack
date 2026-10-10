@@ -243,3 +243,42 @@ def test_node_gather_check_passes_segments():
 def test_manifest_text_renders_live_recon_block():
     src = _func_src("_gather_manifest_text")
     assert src and "LIVE RECON (this run):" in src
+
+
+# ── Alt-port product extraction ───────────────────────────────────────
+
+def test_product_identification_extracts_alt_port_server_headers():
+    """node_product_identification must parse Server= headers from alt-port
+    banners in the port_sweep segment and add them as secondary_products.
+    This is the shared extractor: port_sweep discovers, product_identification
+    normalizes, product_cve_enumeration enumerates CVEs for each."""
+    src = _func_src("node_product_identification", GRAPH)
+    assert src, "node_product_identification not found in graph"
+    # Must parse Server= lines from segments (port_sweep format)
+    assert "port_sweep" in src, "must reference port_sweep as the source"
+    assert "Server=" in src, "must parse Server= headers from banner lines"
+    assert "secondary_products" in src, "must add to secondary_products"
+
+
+def test_product_cve_enum_uses_state_secondary_products():
+    """node_product_cve_enumeration must merge state secondary_products
+    (which include alt-port discoveries) with the re-fetched info."""
+    src = _func_src("node_product_cve_enumeration", GRAPH)
+    assert src, "node_product_cve_enumeration not found in graph"
+    assert 'state.get("secondary_products")' in src or \
+           'state_sp' in src, \
+        "must read secondary_products from state, not only from re-fetch"
+
+
+def test_state_carries_secondary_products():
+    """BuildPocState must include secondary_products so product identification
+    results flow to product_cve_enumeration through the graph state."""
+    src = GRAPH.read_text()
+    tree = _ast.parse(src)
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.ClassDef) and node.name == "BuildPocState":
+            cls_src = _ast.get_source_segment(src, node)
+            assert "secondary_products" in cls_src, \
+                "BuildPocState must declare secondary_products"
+            return
+    pytest.fail("BuildPocState class not found")

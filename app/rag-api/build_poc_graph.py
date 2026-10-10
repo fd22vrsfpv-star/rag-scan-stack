@@ -68,6 +68,7 @@ class BuildPocState(TypedDict, total=False):
     detected_frameworks: List[str]
     waf_family: Optional[str]
     waf_characterization: Dict[str, Any]
+    secondary_products: List[Dict[str, Any]]
 
     # Hint / auth / research
     auth: Dict[str, Any]
@@ -288,6 +289,35 @@ def node_product_identification(state: BuildPocState) -> Dict[str, Any]:
         cve=state.get("cve"), eid=state.get("eid"), model=state.get("model"))
     upd: Dict[str, Any] = {}
     seg = []
+    # Extract Server headers from alt ports discovered by port_sweep.
+    # Port sweep stores banners like "9090: HTTP 302 Server=Werkzeug/3.0.6"
+    # in segments. Product identification only checks the primary port, so
+    # alt-port products (Werkzeug on :9090, etc.) were invisible to the
+    # product enumeration pipeline. This shared extractor feeds both the
+    # build-PoC pipeline and the exploit workbench.
+    import re as _re_ps
+    _existing_sp = {s["product"].lower() for s in (info.get("secondary_products") or [])}
+    _primary_prod = (info.get("product") or "").lower()
+    for _seg_text in (state.get("segments") or []):
+        for _m in _re_ps.finditer(
+            r"^\s*(\d+)(?:\s*\(requested\))?:\s*HTTP\s+\d+\s+Server=([^\s]+)",
+            _seg_text, _re_ps.MULTILINE,
+        ):
+            _alt_port = int(_m.group(1))
+            if _alt_port == int(state.get("port") or 0):
+                continue  # primary port already handled
+            _srv_raw = _m.group(2)
+            _vm = _re_ps.match(r"([A-Za-z][A-Za-z0-9._-]*?)[/ ]([0-9]+\.[0-9][0-9.]*)", _srv_raw)
+            if _vm:
+                _sp_name, _sp_ver = _vm.group(1), _vm.group(2)
+                if _sp_name.lower() not in _existing_sp and _sp_name.lower() != _primary_prod:
+                    if info.get("secondary_products") is None:
+                        info["secondary_products"] = []
+                    info["secondary_products"].append({
+                        "product": _sp_name, "version": _sp_ver,
+                        "source": f"port_sweep:{_alt_port}",
+                    })
+                    _existing_sp.add(_sp_name.lower())
     if info.get("product") and not had_product:
         upd["product"] = info["product"]
         if info.get("version") and not state.get("version"):
@@ -364,6 +394,7 @@ def node_product_identification(state: BuildPocState) -> Dict[str, Any]:
         "chars_added": len("\n".join(bits)),
         "signal": f"product={info.get('product')} version={info.get('version')}"}}
     upd["segments"] = seg
+    upd["secondary_products"] = info.get("secondary_products") or []
     upd["recon_metrics"] = {**state.get("recon_metrics", {}), **metrics}
     return upd
 
@@ -394,13 +425,26 @@ def node_product_cve_enumeration(state: BuildPocState) -> Dict[str, Any]:
     # possible; otherwise identify now.
     primary = state.get("product")
     primary_ver = state.get("version")
-    # Pull the full identification (secondary + plugins) — cheap, cached HTML
+    # Pull the full identification (secondary + plugins) — cheap, cached HTML.
+    # Prefer state-propagated secondary_products (which include alt-port
+    # discoveries from port_sweep) over a fresh re-fetch that only sees the
+    # primary port.
     info = {}
     try:
         info = _identify_product_from_target(state["ip"], state["port"],
                                               run_deep_dive=False)
     except Exception as e:  # noqa: BLE001
         logging.debug("product enumeration identify failed: %s", e)
+    state_sp = state.get("secondary_products") or []
+    info_sp = info.get("secondary_products") or []
+    # Merge: state takes priority (has alt-port products), then info
+    _seen_sp = set()
+    merged_sp = []
+    for s in state_sp + info_sp:
+        key = s["product"].lower()
+        if key not in _seen_sp:
+            merged_sp.append(s)
+            _seen_sp.add(key)
     # Build the ordered work list: primary first, then secondary, then plugins.
     targets = []
     if primary:
@@ -408,7 +452,7 @@ def node_product_cve_enumeration(state: BuildPocState) -> Dict[str, Any]:
     elif info.get("product"):
         targets.append({"product": info["product"], "version": info.get("version"),
                         "tier": "primary"})
-    for s in info.get("secondary_products") or []:
+    for s in merged_sp:
         targets.append({"product": s["product"], "version": s.get("version"),
                         "tier": "secondary"})
     for p in info.get("plugins") or []:
