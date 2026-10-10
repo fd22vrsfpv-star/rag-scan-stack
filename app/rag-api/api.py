@@ -24784,7 +24784,33 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             if _oob.get("unreachable"):
                 metrics.setdefault("oob_sinks_unreachable_total", 0)
                 metrics["oob_sinks_unreachable_total"] += len(_oob["unreachable"])
-            if _probe.get("ok") is False:
+            # Tool-availability pre-check — same block as the endpoint probe
+            # and the sink check (operator, 2026-10-10: "part of a precheck,
+            # just like checking network connectivity"). A command that calls
+            # a program the runner lacks is NOT sent: the short-circuit output
+            # names the missing program(s) and what IS installed so the next
+            # iteration rewrites instead of re-discovering `bc: not found`.
+            try:
+                _tools = _prerun_tool_check(ip, port, command, timeout=15)
+            except Exception as _tce:  # noqa: BLE001 — the check never breaks dispatch
+                _tools = {"ok": True, "skipped": True, "reason": f"tool check raised {type(_tce).__name__}"}
+            _poc_trace(run_id, "prerun_tool_check", iteration=it,
+                       extra={"ok": _tools.get("ok"), "binaries": _tools.get("binaries", []),
+                              "missing": _tools.get("missing", []),
+                              "unchecked": _tools.get("unchecked", []),
+                              "reason": _tools.get("reason"),
+                              "skipped": _tools.get("skipped", False)})
+            if _tools.get("missing"):
+                _alts = ", ".join(_tools.get("available_alternatives") or [])
+                output = ("PRERUN_TOOL_MISSING: " + ", ".join(_tools["missing"])
+                          + " — not installed on the runner; the command was NOT sent to the target."
+                          + (f"\nPRERUN_TOOL_AVAILABLE: {_alts}" if _alts else "")
+                          + "\nRewrite without the missing program(s): python3 -c for arithmetic, "
+                            "awk/sed/grep for text, curl -w for timings.")
+                ec = 45  # 45 = pre-run tool check failed (program not installed on the runner)
+                metrics.setdefault("skipped_runs_prerun_tool_missing", 0)
+                metrics["skipped_runs_prerun_tool_missing"] += 1
+            elif _probe.get("ok") is False:
                 # Short-circuit — 404-on-method is deterministic; no point
                 # burning a 60 s listener call on it. Record the probe output
                 # as the run's output so the refine loop sees the real
@@ -28188,10 +28214,16 @@ def _redact_command_for_memory(cmd):
     s = str(cmd or "")
     s = _re.sub(r"(?i)(cookie:\s*)[^'\"]+", r"\1REDACTED", s)
     s = _re.sub(r"(?i)(authorization:\s*)[^'\"]+", r"\1REDACTED", s)
-    s = _re.sub(r"(?i)(?<![\w-])(-b|--cookie)(\s+|=)(['\"]?)[^'\"\s]+", r"\1\2\3REDACTED", s)   # curl -b 'name=value'
-    s = _re.sub(r"(?i)\b(password|passwd|pwd|pass|token|_wpnonce|nonce|api_key|apikey|secret)=([^&\s'\"]+)",
+    # curl -b 'name=value' — unless the value carries a `$` (a variable reference such as
+    # -b "zbx_session=$SESSION" or -b "$COOKIE" must stay runnable)
+    s = _re.sub(r"(?i)(?<![\w-])(-b|--cookie)(\s+|=)(['\"]?)(?![^'\"\s]*\$)[^'\"\s]+", r"\1\2\3REDACTED", s)
+    # A value that starts with `$` is a shell variable / substitution
+    # (`SESSION=$(grep zbx_session …)`, `password=$PW`), not a secret — leave
+    # it, or the stored command is no longer runnable (2026-10-10: the memory
+    # held `SESSION=REDACTED zbx_session "$COOKIE_JAR"`).
+    s = _re.sub(r"(?i)\b(password|passwd|pwd|pass|token|_wpnonce|nonce|api_key|apikey|secret)=(?!\$)([^&\s'\"]+)",
                 r"\1=REDACTED", s)
-    s = _re.sub(r"(?i)\b([a-z_]*sess(?:ion)?[a-z_]*|sid|phpsessid|jsessionid|csrf[a-z_]*)=([^;&\s'\"]+)",
+    s = _re.sub(r"(?i)\b([a-z_]*sess(?:ion)?[a-z_]*|sid|phpsessid|jsessionid|csrf[a-z_]*)=(?!\$)([^;&\s'\"]+)",
                 r"\1=REDACTED", s)
     return s[:1500]
 
@@ -29271,6 +29303,150 @@ def _prerun_oob_check(ip, port, command: str, timeout: int = 3) -> dict:
                 "reason": "sink poll URL(s) unreachable — exploit may land but proof mechanism broken: "
                           + "; ".join(unreachable[:3])}
     return {"ok": True, "urls": classified, "reason": "all sink URLs reachable or informational"}
+
+
+# ── Pre-run tool-availability check ──────────────────────────────────────────
+# Operator ask (2026-10-10): "we need to run a precheck to make sure commands
+# are installed before trying them to run local … that should be part of a
+# precheck, just like checking network connectivity." CVE-2024-22120 burned a
+# refine iteration (and a listener slot) on `/bin/sh: 1: bc: not found`.
+_SHELL_KEYWORDS = {
+    "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "in",
+    "case", "esac", "function", "select", "!", "[", "[[", "]]", "]",
+}
+_SHELL_BUILTINS = {
+    "echo", "printf", "test", "export", "cd", "set", "unset", "read", "exit", "return",
+    "true", "false", "eval", "source", ".", "shift", "local", "let", "wait", "trap",
+    "type", "hash", "ulimit", "umask", "pwd", "declare", "typeset", "readonly", "alias",
+    "break", "continue", "getopts", "jobs", "bg", "fg", "times", "command", "builtin",
+}
+#: wrappers whose real program is the NEXT token
+_CMD_WRAPPERS = {"sudo", "env", "time", "nohup", "timeout", "exec", "nice", "stdbuf", "xargs", "doas"}
+#: probed alongside the command's own programs so the short-circuit message can
+#: name what IS there (the model rewrites with these instead of guessing)
+_COMMON_RUNNER_TOOLS = ("curl", "python3", "bash", "sed", "awk", "grep", "jq", "nc",
+                        "openssl", "wget", "base64", "xxd", "sqlmap", "nmap")
+_RUNNER_BIN_CACHE: dict = {}          # name -> (bool|None, epoch)
+_RUNNER_BIN_CACHE_TTL = 3600
+
+
+def _command_binaries(command: str) -> list:
+    """Names of the external programs a shell command invokes, first-seen order.
+
+    Pure text analysis, no execution. Quoted strings are blanked first (the
+    payloads carry `|`, `;`, `&&` inside quotes), heredoc bodies are dropped,
+    then the first word of every simple command (split on `|| && | ; newline
+    $( \\` ( ) { }`) is taken, skipping env assignments, redirections, shell
+    keywords/builtins and the `sudo`/`env`/`timeout` style wrappers. A `/usr/
+    bin/curl` becomes `curl`. Anything that is not a plain program name
+    (variables, digits, options) is ignored — a false "missing" would block a
+    valid command, so the parser errs towards fewer names.
+    """
+    import re as _re
+    s = (command or "").split("<<", 1)[0]
+    s = _re.sub(r"'[^']*'", " ", s)
+    s = _re.sub(r'"(?:\\.|[^"\\])*"', " ", s)
+    segs = _re.split(r"\|\||&&|[|;\n]|\$\(|`|[(){}]", s)
+    out, seen = [], set()
+    for seg in segs:
+        toks = seg.strip().split()
+        skip_next = False
+        for t in toks:
+            if skip_next:
+                skip_next = False
+                continue
+            if _re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t):
+                continue                                   # VAR=value prefix
+            if _re.match(r"^[0-9]*[<>]", t) or t.startswith("&>"):
+                if t.rstrip("&") in (">", ">>", "<", "2>", "&>", "1>", "2>>"):
+                    skip_next = True                       # bare redirection: skip its file
+                continue
+            if t.startswith("-") or t.startswith("$"):
+                continue
+            name = t.lstrip("\\").rsplit("/", 1)[-1]
+            if name in _SHELL_KEYWORDS:
+                continue                                   # `if curl …`: the program follows
+            if name in _SHELL_BUILTINS:
+                break                                      # `echo hi`: the whole simple command is builtin
+            if name in _CMD_WRAPPERS:
+                continue                                   # the real program follows
+            if not _re.match(r"^[A-Za-z][A-Za-z0-9_.+-]*$", name):
+                continue
+            if name not in seen:
+                seen.add(name); out.append(name)
+            break                                          # one program per simple command
+    return out
+
+
+def _runner_has_binaries(names, ip, port, timeout: int = 15) -> dict:
+    """{name: True|False|None} — is each program installed on the kali-listener
+    runner (the host that actually executes PoC commands)? One listener call
+    for every uncached name; answers cached for `_RUNNER_BIN_CACHE_TTL` s
+    (the runner's toolset changes only on a rebuild). None = could not check.
+    """
+    import time as _t
+    import httpx as _hx
+    now = _t.time()
+    res, need = {}, []
+    for n in dict.fromkeys(names or []):
+        hit = _RUNNER_BIN_CACHE.get(n)
+        if hit and hit[0] is not None and now - hit[1] < _RUNNER_BIN_CACHE_TTL:
+            res[n] = hit[0]
+        else:
+            need.append(n)
+    if need:
+        listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+        probe = " ; ".join(f'command -v {n} >/dev/null 2>&1 && echo "HAVE {n}" || echo "MISSING {n}"'
+                           for n in need)
+        got = {}
+        try:
+            r = _hx.post(f"{listener.rstrip('/')}/vectors/run",
+                         json={"command": probe, "target": str(ip), "port": port, "timeout": timeout},
+                         headers={"x-api-key": API_KEY}, verify=False, timeout=timeout + 15)
+            d = r.json() if r.status_code < 400 else {}
+            for line in ((d.get("output") or "") if isinstance(d, dict) else "").splitlines():
+                parts = line.strip().split(" ", 1)
+                if len(parts) == 2 and parts[0] in ("HAVE", "MISSING"):
+                    got[parts[1].strip()] = (parts[0] == "HAVE")
+        except Exception as e:  # noqa: BLE001 — the check never breaks dispatch
+            logging.warning("runner tool check failed: %s", e)
+        for n in need:
+            res[n] = got.get(n)
+            _RUNNER_BIN_CACHE[n] = (res[n], now)
+    return res
+
+
+def _prerun_tool_check(ip, port, command: str, timeout: int = 15) -> dict:
+    """Pre-run check: are the programs this command calls installed on the
+    runner? Sits beside `_prerun_payload_probe` (endpoint reachable/method)
+    and `_prerun_oob_check` (sink reachable). Never raises.
+
+    Returns {"ok": bool, "binaries": [...], "missing": [...], "unchecked": [...],
+             "available_alternatives": [...], "reason": str, "skipped": bool}.
+    `ok` is False only on a CONFIRMED missing program; an unanswered probe is
+    reported as `unchecked` and the run proceeds (unreachable is not absent).
+    """
+    try:
+        bins = _command_binaries(command)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": True, "skipped": True, "binaries": [], "missing": [], "unchecked": [],
+                "available_alternatives": [], "reason": f"parser raised {type(e).__name__}"}
+    if not bins:
+        return {"ok": True, "skipped": True, "binaries": [], "missing": [], "unchecked": [],
+                "available_alternatives": [], "reason": "no external programs in command"}
+    have = _runner_has_binaries(list(bins) + [t for t in _COMMON_RUNNER_TOOLS if t not in bins],
+                                ip, port, timeout=timeout)
+    missing = [b for b in bins if have.get(b) is False]
+    unchecked = [b for b in bins if have.get(b) is None]
+    alts = [t for t in _COMMON_RUNNER_TOOLS if have.get(t) is True and t not in missing]
+    if missing:
+        reason = ", ".join(missing) + " not installed on the runner"
+    elif unchecked:
+        reason = "could not confirm " + ", ".join(unchecked) + " (runner did not answer); run proceeds"
+    else:
+        reason = "all programs present on the runner"
+    return {"ok": not missing, "skipped": False, "binaries": bins, "missing": missing,
+            "unchecked": unchecked, "available_alternatives": alts, "reason": reason}
 
 
 def _poc_precheck_model(model: str) -> dict:
@@ -30653,7 +30829,7 @@ _KEY_TRACE_PHASES = {
     "synthesize", "run", "refine", "reflection_check", "result",
     "judge_near_miss", "judge_pass_error", "auto_hint_saved",
     "failure_analysis", "failure_analysis_error",
-    "refine_similar_errors", "error_memory_recorded",
+    "refine_similar_errors", "error_memory_recorded", "prerun_tool_check",
     "synth_skipped_gather_incomplete", "run_refine_skipped_gather_incomplete",
     "run_refine_skipped_blocked", "run_refine_skipped_artifact_required",
 }
