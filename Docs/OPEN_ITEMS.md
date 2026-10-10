@@ -327,13 +327,63 @@ applied and persisted (`pg_db_role_setting`); 26 orphaned backends + the stale
 waiter chain terminated — `lock_waiters=0 idle_in_tx=0`. Client-side guards:
 `osint_agent._get_conn()` (5 min / 15 s), rag-api pool (`lock_timeout=15s`),
 the attempts upsert + failure-analysis follow-up (`SET LOCAL lock_timeout='5s'`).
+**Update 2026-10-10 00:10 UTC (rebuild deploy):** the 10-min idle cap does not
+cover the second shape of this problem, because these backends are not idle.
+`scripts/ensure_db_schema.sh` blocked for 6+ min on `ALTER TABLE public.assets
+ADD COLUMN IF NOT EXISTS env` behind **17** `idle in transaction` backends from
+client `107.205.216.218` — NOT this host, whose own psql/rag-api connections
+show `199.168.198.186`, and no proxy env is set — each sitting in ONE
+transaction for 0.3–4.5 h (`xact_age` 04:32:25 at the top, a new backend every
+~15 min since 19:51 UTC) while `state_change` was < 1 s old: they keep issuing
+`SAVEPOINT already_flagged_check` (`rule_engine._already_flagged`) and
+`SAVEPOINT host_aliases` / `engagement_lookup` / `any_scope`
+(`osint_agent._host_aliases` …) statements, so the idle timeout never fires.
+Each holds `AccessShareLock` on `assets` + `RowExclusiveLock` on
+`follow_up_items`; the ALTER's AccessExclusive request queued behind them and
+**16** live rag-api reads (`ports`, `assets`, `scan_recommendations`) queued
+behind the ALTER until the ALTER was cancelled (`pg_cancel_backend` on the
+script's own psql). The freshly restarted LOCAL rag-api opened the same shape
+within 7 min (`199.168.198.186`, `SAVEPOINT already_flagged_check`, xact 8 min).
+Schema repair was therefore NOT completed on this deploy; `post-install-check`
+reports `[FAIL] ports has 398 duplicate (ip, proto, port) row(s) — run
+./scripts/ensure_db_schema.sh`, which is the repair that could not get the lock.
 **Where:** `ssh-tunnel/` (`rag-db-tunnel`), the remote Postgres server config,
-`app/rag-api/osint_agent.py`, `app/rag-api/api.py::_get_pool`.
+`app/rag-api/osint_agent.py`, `app/rag-api/rule_engine.py::_already_flagged`
+(and whichever sweep loop holds the cursor open across findings),
+`app/rag-api/api.py::_get_pool`, `scripts/ensure_db_schema.sh`.
 **Done when:** the tunnel carries TCP keepalives (`ServerAliveInterval` on the
 ssh side and/or `tcp_keepalives_idle` on the server) so a dead local socket ends
-its backend within minutes rather than at the 10-min cap, and a
-`pg_stat_activity` check after a rag-api restart shows no backend older than
-that cap.
+its backend within minutes rather than at the 10-min cap; the rule-engine sweep
+and the osint agent commit per finding (or per rule) instead of holding one
+transaction across a whole multi-hour sweep, so no backend holds a table lock
+for hours and DDL can get in; the second client at `107.205.216.218` is
+identified and stopped or upgraded; a `pg_stat_activity` check after a rag-api
+restart shows no backend older than the cap; `scripts/ensure_db_schema.sh`
+completes and `post-install-check` shows 0 duplicate `ports` rows.
+**Enforced by:** not enforced
+
+### BFF polls of autogen-agents time out at connect while a session is scanning
+**Found:** 2026-10-10 00:10–00:31 UTC, reading the dashboard log after the rebuild deploy.
+**Evidence:** `docker logs pentest-dashboard` shows `httpx.ConnectTimeout` at a
+steady **~6 per minute for 21 minutes** (90 tracebacks), every one from
+`routers/agent_sessions.py` — 30× `get_session_scans` (line 220) and 15×
+`list_sessions` (line 92) — i.e. the Agents page polling
+`https://autogen-agents:8015/pentest/sessions` and `/pentest/<id>/scans`. The
+BFF access log has 47 matching `500` rows on `/api/agent-sessions` and
+`/api/agent-sessions/<id>/scans`. autogen-agents was `Up (healthy)` the whole
+time and its own log shows the same calls answered `200 OK` in between, while it
+was driving a `scanning` session (`resample CVE-2024-25641`, polling
+`web-scanner:8010/jobs/*`). A TCP connect that times out against a healthy
+single-process service points at a blocked accept loop (sync I/O on the event
+loop during the session), not at the BFF. rag-api connected in < 1 ms from the
+same container throughout.
+**Where:** `autogen_agents/` HTTP server (whatever runs the session loop on the
+same event loop as uvicorn), `dashboard/bff/routers/agent_sessions.py` (30 s
+client timeout, no retry, surfaces as a 500 on the Agents page).
+**Done when:** `/pentest/sessions` answers within 1 s while a session is in
+`scanning` (session work moved off the request loop or into a thread), and a
+10-minute BFF log during an active session contains 0 `ConnectTimeout` from
+`agent_sessions.py`.
 **Enforced by:** not enforced
 
 ### api.py has 27 undefined-name sites (27 bare `emit_webhook` calls)
