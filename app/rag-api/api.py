@@ -7192,7 +7192,7 @@ def search_findings(
             COALESCE(v.title, v.script) as title,
             LEFT(v.output, 500) as evidence,
             COALESCE(v.cve, ARRAY[]::text[]) as cve,
-            ARRAY[]::text[] as cwe,
+            COALESCE(v.cwe, ARRAY[]::text[]) as cwe,
             v.cvss,
             NULL::text as method,
             NULL::text as description,
