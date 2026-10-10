@@ -166,6 +166,8 @@ EXPECTED_TABLES=(
   # schema since 2026-09-09 — it used to be created in the `n8n` database while
   # its writer connected to `scans`, so it existed nowhere the code could see.
   rag_documents
+  # TIER 30: SAST / Semgrep static analysis
+  sast_findings sast_scans
 )
 
 # Views that reports and the spray list depend on. A missing view fails only when

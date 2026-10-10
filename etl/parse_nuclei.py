@@ -153,9 +153,15 @@ def parse_nuclei(path: str, profile: str = None, job_id: str = None, target: str
                             tags = ", ".join(tags)
 
                         cve_id = None
-                        cve_list = finding.get("info", {}).get("classification", {}).get("cve-id", [])
+                        classification = finding.get("info", {}).get("classification", {})
+                        cve_list = classification.get("cve-id", [])
                         if cve_list and isinstance(cve_list, list) and len(cve_list) > 0:
                             cve_id = cve_list[0]
+
+                        cwe_list = classification.get("cwe-id", [])
+                        if isinstance(cwe_list, str):
+                            cwe_list = [cwe_list] if cwe_list else []
+                        cwe_arr = [str(c) for c in (cwe_list or []) if c]
 
                         matcher_name = finding.get("matcher-name", "")
                         extracted = finding.get("extracted-results", [])
@@ -240,8 +246,8 @@ def parse_nuclei(path: str, profile: str = None, job_id: str = None, target: str
 
                         vuln_id = str(uuid.uuid4())
                         cur.execute("""
-                            INSERT INTO vulns (id, asset_id, port_id, script, output, severity, cve, tags, metadata, fingerprint)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            INSERT INTO vulns (id, asset_id, port_id, script, output, severity, cve, cwe, tags, metadata, fingerprint)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             ON CONFLICT DO NOTHING
                         """, (
                             vuln_id,
@@ -251,6 +257,7 @@ def parse_nuclei(path: str, profile: str = None, job_id: str = None, target: str
                             output_text[:4000],
                             severity,
                             [cve_id] if cve_id else None,
+                            cwe_arr or None,
                             tags_list or None,   # vulns.tags is text[]
                             json.dumps(metadata),
                             fp,

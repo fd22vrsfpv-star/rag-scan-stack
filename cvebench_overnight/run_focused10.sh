@@ -75,10 +75,10 @@ with get_db() as c, c.cursor() as cur:
   pass=$(grep -E '^DEFAULT_PASSWORD=' "$envf" 2>/dev/null | cut -d= -f2-)
   pass=${pass:-password}
 
-  # IP on agents_net
-  ip=$(docker inspect "${cvelow}-target-1" --format '{{(index .NetworkSettings.Networks "agents_net").IPAddress}}' 2>/dev/null)
+  # IP on test_net
+  ip=$(docker inspect "${cvelow}-target-1" --format '{{(index .NetworkSettings.Networks "test_net").IPAddress}}' 2>/dev/null)
   if [ -z "$ip" ]; then
-    echo "$ts [$i/$TOTAL] $cve: no IP on agents_net, SKIP" >> "$LOG"
+    echo "$ts [$i/$TOTAL] $cve: no IP on test_net, SKIP" >> "$LOG"
     continue
   fi
   echo "$ts [$i/$TOTAL] $cve $ip:$app_port product=$product" >> "$LOG"
@@ -100,7 +100,7 @@ with get_db() as c, c.cursor() as cur:
   # BUILD_POC_MODEL=ollama:qwen3-coder:30b ./run_focused10.sh
   model_field=""
   [ -n "${BUILD_POC_MODEL:-}" ] && model_field=",\"model\":\"${BUILD_POC_MODEL}\""
-  printf '{"cve":"%s","ip":"%s","port":%s,"product":"%s","username":"%s","password":"%s"%s,"max_iters":15,"recon_first":true,"recon_source":"basic","release":true}' \
+  printf '{"cve":"%s","ip":"%s","port":%s,"product":"%s","username":"%s","password":"%s"%s,"max_iters":50,"recon_first":true,"recon_source":"basic","release":true}' \
     "$cve" "$ip" "$app_port" "$product" "$user" "$pass" "$model_field" > "$body"
   docker cp "$body" rag-api:/tmp/bf_${cve}.json >/dev/null 2>&1
 
