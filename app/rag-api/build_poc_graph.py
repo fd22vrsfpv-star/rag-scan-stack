@@ -1336,7 +1336,7 @@ def node_failure_analysis(state: BuildPocState) -> Dict[str, Any]:
     markdown file for manual review, or viewed in the poc summary attempt".
     Whole body is fail-soft — it must never block save_store."""
     from api import (_build_failure_analysis, _failure_analysis_llm, _record_build_poc_attempt,
-                     _poc_trace, _poc_run_file)
+                     _poc_trace, _poc_run_file, _extract_lessons, _store_lessons)
     result = state.get("result") or {}
     run_id = state["run_id"]
     log_path = result.get("log_path") or _poc_run_file(run_id)
@@ -1349,6 +1349,21 @@ def node_failure_analysis(state: BuildPocState) -> Dict[str, Any]:
                 verified=True, stage_reached="verified", stop_reason=result.get("stop_reason") or "success",
                 missing=[], gather_manifest=man or None, live_recon=live,
                 poc_log_path=log_path, llm_model=result.get("llm_model"))
+            try:
+                auth = state.get("auth") or {}
+                ls_bits = {"product": state.get("product"), "cve": state["cve"],
+                           "eid": state.get("eid"), "gather_manifest": man,
+                           "session_info": state.get("session_info"),
+                           "auth": {"username": auth.get("username")} if auth.get("username") else {},
+                           "vuln_class": (man.get("facts") or {}).get("vuln_class") or
+                                         (state.get("built") or {}).get("vuln_class") or ""}
+                lessons = _extract_lessons(run_id, result, ls_bits)
+                if lessons:
+                    n = _store_lessons(lessons, run_id)
+                    _poc_trace(run_id, "lessons_extracted",
+                               extra={"count": n, "types": list({l["lesson_type"] for l in lessons})})
+            except Exception:  # noqa: BLE001
+                pass
             return {}
         auth = state.get("auth") or {}
         state_bits = {
@@ -1438,6 +1453,18 @@ def node_failure_analysis(state: BuildPocState) -> Dict[str, Any]:
                 "stage_reached": fa.get("stage_reached"), "stop_reason": fa.get("stop_reason"),
                 "missing": fa.get("missing"), "follow_up_id": follow_up_id,
                 "confidence": fa.get("confidence"), "llm_model": fa.get("llm_model")})
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            ls_bits = {**state_bits, "product": state.get("product"), "cve": state["cve"],
+                       "eid": state.get("eid"), "gather_manifest": man,
+                       "vuln_class": (man.get("facts") or {}).get("vuln_class") or
+                                     (state.get("built") or {}).get("vuln_class") or ""}
+            lessons = _extract_lessons(run_id, result, ls_bits, failure_analysis=fa)
+            if lessons:
+                n = _store_lessons(lessons, run_id)
+                _poc_trace(run_id, "lessons_extracted",
+                           extra={"count": n, "types": list({l["lesson_type"] for l in lessons})})
         except Exception:  # noqa: BLE001
             pass
         return {"failure_analysis": fa}

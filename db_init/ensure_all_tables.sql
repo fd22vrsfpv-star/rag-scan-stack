@@ -1624,6 +1624,37 @@ CREATE TABLE IF NOT EXISTS public.build_poc_error_memory (
 CREATE INDEX IF NOT EXISTS ix_bpem_sig ON public.build_poc_error_memory(signature);
 CREATE INDEX IF NOT EXISTS ix_bpem_eng ON public.build_poc_error_memory(engagement_id);
 CREATE INDEX IF NOT EXISTS ix_bpem_sig_trgm ON public.build_poc_error_memory USING gin (signature gin_trgm_ops);
+
+-- Cross-app learning: structured lessons extracted from completed build-PoC runs.
+-- A lesson records "on product X, for vuln_class Y, the Z is V" — e.g. "on Cacti,
+-- the CSRF token field is __csrf_magic at /cacti/host.php". Reads ACROSS engagements
+-- (methodology, not collected data). Extensible: new lesson_type values are added by
+-- adding an extractor function, no schema change needed.
+-- mirror: api.py::_ensure_build_poc_lessons_table.
+CREATE TABLE IF NOT EXISTS public.build_poc_lessons (
+    id                   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    lesson_type          text NOT NULL,
+    lesson_key           text NOT NULL,
+    lesson_value         text NOT NULL,
+    product              text,
+    framework            text,
+    vuln_class           text,
+    evidence             text,
+    confidence           real NOT NULL DEFAULT 0.5,
+    source_run_id        text NOT NULL,
+    source_cve           text,
+    source_engagement_id uuid,
+    times_confirmed      integer NOT NULL DEFAULT 1,
+    times_contradicted   integer NOT NULL DEFAULT 0,
+    active               boolean NOT NULL DEFAULT true,
+    created_at           timestamptz NOT NULL DEFAULT now(),
+    updated_at           timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_bpl_type_key ON public.build_poc_lessons(lesson_type, lesson_key);
+CREATE INDEX IF NOT EXISTS ix_bpl_product ON public.build_poc_lessons(product);
+CREATE INDEX IF NOT EXISTS ix_bpl_type ON public.build_poc_lessons(lesson_type);
+CREATE INDEX IF NOT EXISTS ix_bpl_vuln ON public.build_poc_lessons(vuln_class);
+
 CREATE UNIQUE INDEX IF NOT EXISTS ux_exploit_versions_num ON public.exploit_store_versions(exploit_id, version);
 
 CREATE TABLE IF NOT EXISTS public.security_test_runs (
