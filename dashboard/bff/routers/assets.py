@@ -269,6 +269,53 @@ async def update_cve_tuning(request: Request):
         return safe_json(resp)
 
 
+@router.get("/api/software/poc-hints")
+async def list_poc_hints(cve: str = None, target_host: str = None):
+    s = get_settings()
+    params = {}
+    if cve:
+        params["cve"] = cve
+    if target_host:
+        params["target_host"] = target_host
+    async with httpx.AsyncClient(timeout=10) as c:
+        resp = await c.get(
+            f"{s.rag_api_url}/software/poc-hints",
+            params=params,
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        return safe_json(resp)
+
+
+@router.post("/api/software/poc-hints")
+async def add_poc_hint(request: Request):
+    s = get_settings()
+    body = await request.json()
+    async with httpx.AsyncClient(timeout=10) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/software/poc-hints",
+            json=body,
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            from fastapi import HTTPException
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.delete("/api/software/poc-hints/{hint_id}")
+async def delete_poc_hint(hint_id: str):
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=10) as c:
+        resp = await c.delete(
+            f"{s.rag_api_url}/software/poc-hints/{hint_id}",
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            from fastapi import HTTPException
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
 @router.post("/api/software/bulk-dismiss")
 async def bulk_dismiss_software(request: Request):
     s = get_settings()
