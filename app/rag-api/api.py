@@ -20454,16 +20454,32 @@ def _poc_shell_syntax_check(command):
     if refused:
         return (False, "llm refusal detected (not a shell command)")
     try:
-        _sh.split(command, posix=True)
+        _tokens = _sh.split(command, posix=True)
     except ValueError as e:
         return (False, str(e))
     except Exception:  # noqa: BLE001
         # Unknown error — don't block dispatch over a false positive
         return (True, "")
-    # Secondary heuristic: unbalanced parentheses count (shlex ignores these)
-    opens = command.count("(") - command.count(")")
-    if opens != 0:
-        return (False, f"unbalanced parentheses (depth={opens})")
+    # Secondary heuristic: unbalanced parentheses — but SKIP curl data args.
+    # SQL injection payloads legitimately have unbalanced parens inside -d body
+    # (e.g. "locations_ids[]=1') UNION SELECT...") — those are HTTP data, not
+    # shell syntax.
+    _data_flags = {"-d", "--data", "--data-urlencode", "--data-raw",
+                   "--data-binary", "--data-ascii"}
+    _skip_next = False
+    _shell_parens = 0
+    for _tok in _tokens:
+        if _skip_next:
+            _skip_next = False
+            continue
+        if _tok in _data_flags:
+            _skip_next = True
+            continue
+        if any(_tok.startswith(f + "=") for f in _data_flags):
+            continue
+        _shell_parens += _tok.count("(") - _tok.count(")")
+    if _shell_parens != 0:
+        return (False, f"unbalanced parentheses (depth={_shell_parens})")
     return (True, "")
 
 
@@ -20557,22 +20573,46 @@ def _poc_assertion_verdict(assertion, output, exit_code=None,
                         "reason": "assertion requires min_seconds but caller "
                                   "did not supply elapsed_seconds"}
             e_f = float(elapsed_seconds)
+            # CONNECTION TIMEOUT ≠ SLEEP SUCCESS: curl exit code 28 means the
+            # TCP connection itself timed out — the server never received the
+            # payload. A 135s connection timeout looks identical to SLEEP(5)
+            # succeeding when only elapsed >= min_seconds is checked. Parse the
+            # exit code AND the output for connection-error signatures.
+            _conn_timeout = (exit_code == 28
+                             or "curl: (28)" in out
+                             or "Failed to connect" in out
+                             or "Connection timed out" in out
+                             or "ConnectError" in out
+                             or "No route to host" in out)
+            if _conn_timeout:
+                return {"passed": False, "method": "latency_connection_error",
+                        "confidence": 1.0,
+                        "reason": f"elapsed {e_f:.1f}s but output contains a "
+                                  "connection error (curl exit 28 / Failed to "
+                                  "connect / No route to host) — the target "
+                                  "never received the payload; this is "
+                                  "infrastructure failure, not SLEEP success"}
             if e_f < float(min_s):
                 return {"passed": False, "method": "latency_too_fast",
                         "confidence": 1.0,
                         "reason": f"elapsed {e_f:.1f}s below min_seconds {min_s} "
                                   "(timing payload did not block the server)"}
-            if max_s is not None and e_f > float(max_s):
+            # Default max_seconds cap: without an explicit upper bound, a
+            # 135s connection timeout "passes" (135 > 5). Apply min_s * 4
+            # when the operator didn't set max_seconds explicitly.
+            _eff_max = float(max_s) if max_s is not None else float(min_s) * 4
+            if e_f > _eff_max:
                 return {"passed": False, "method": "latency_too_slow",
                         "confidence": 1.0,
-                        "reason": f"elapsed {e_f:.1f}s above max_seconds {max_s} "
+                        "reason": f"elapsed {e_f:.1f}s above max_seconds "
+                                  f"{_eff_max} "
                                   "(request may be timing out, not sleeping)"}
             # Timing matched. If anchored to canary, canary MUST also appear.
             if a.get("canary_in_timing") and a.get("canary"):
                 if a["canary"] in out:
                     return {"passed": True, "method": "latency_anchored",
                             "confidence": 0.95,
-                            "reason": f"elapsed {e_f:.1f}s in [{min_s},{max_s}] "
+                            "reason": f"elapsed {e_f:.1f}s in [{min_s},{_eff_max}] "
                                       "AND canary present"}
                 return {"passed": False, "method": "latency_unanchored",
                         "confidence": 1.0,
@@ -25045,8 +25085,39 @@ def _assemble_from_cve_spec(cve, ip, port, canary):
     if canary:
         payload = payload + f" -- {canary}" if "--" not in payload else payload.replace(
             "-- -", f"-- {canary}")
+    # Resolve template vars ({hostid}, {scriptid}, {sessionid}, {N}, etc.)
+    # from confirmed_facts before passing to _curl_from_cve_spec.
+    import copy as _copy
+    req = _copy.deepcopy(spec.get("request") or {})
+    _tgt = f"{ip}:{port or 80}"
+    _resolved = {}
     try:
-        cmd = _curl_from_cve_spec(ip, port, spec.get("request") or {}, payload)
+        with get_db() as _c, _c.cursor() as _cur:
+            _cur.execute("SELECT claim_type, claim_key, claim_value "
+                         "FROM confirmed_facts WHERE target=%s "
+                         "AND status='confirmed' AND claim_value IS NOT NULL",
+                         (_tgt,))
+            for _ct, _ck, _cv in _cur.fetchall():
+                if _ct == "object_id":
+                    _resolved[_ck] = _cv
+                elif _ct == "token_valid":
+                    _resolved.setdefault(_ck, _cv)
+    except Exception:  # noqa: BLE001
+        pass
+    def _resolve_vars(v):
+        if isinstance(v, str):
+            for k, rv in _resolved.items():
+                v = v.replace("{" + k + "}", rv)
+            v = v.replace("{N}", "5")
+            return v
+        if isinstance(v, dict):
+            return {k: _resolve_vars(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [_resolve_vars(x) for x in v]
+        return v
+    req = _resolve_vars(req)
+    try:
+        cmd = _curl_from_cve_spec(ip, port, req, payload)
     except Exception:  # noqa: BLE001
         return None
     a = dict(spec.get("assertion") or {"min_seconds": 5, "max_seconds": 30})
@@ -25350,6 +25421,12 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         s = _re_dup.sub(r"'[a-f0-9]{32,}'", "'{HEX}'", s)       # hex blobs
         return s[:300]
     _stop_reason = None
+    # TARGET-UNREACHABLE EARLY EXIT: after N consecutive connection timeouts
+    # (curl exit 28, "Failed to connect", "No route to host"), stop the loop
+    # instead of burning the full iteration budget on a dead target. The
+    # pipeline was spending 50 × 135s = 112 minutes on targets that were down.
+    _CONN_FAIL_EXIT_AT = int(os.environ.get("REFINE_CONN_FAIL_EXIT_AT", "3") or "3")
+    _consecutive_conn_fails = 0
     # Cross-run error memory (2026-10-09): one row per iteration, flushed at
     # the end by _record_error_memory; the refine prompt consults
     # _similar_prior_errors when the loop is stuck (bounded lookups per build).
@@ -25368,6 +25445,27 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         _si = (metrics or {}).get("_session_cookie_header") if isinstance(metrics, dict) else None
         if _si:
             _known_cred_values.append(str(_si))
+    except Exception:  # noqa: BLE001
+        pass
+    # Build a KNOWN-BAD block from refuted confirmed_facts so the LLM
+    # doesn't retry endpoints/sids that were already proven wrong.
+    _refuted_note = ""
+    try:
+        _tgt = f"{ip}:{port or 80}"
+        with get_db() as _c, _c.cursor() as _cur:
+            _cur.execute("""SELECT claim_type, claim_key, evidence
+                           FROM confirmed_facts
+                           WHERE target=%s AND status='refuted'
+                           ORDER BY confirmed_at DESC LIMIT 15""",
+                         (_tgt,))
+            _refuted = _cur.fetchall()
+        if _refuted:
+            _lines = []
+            for _ct, _ck, _ev in _refuted:
+                _short = (_ev or "")[:120]
+                _lines.append(f"  - [{_ct}] {_ck}: {_short}")
+            _refuted_note = ("\nKNOWN-BAD (refuted — do NOT retry these):\n"
+                             + "\n".join(_lines[:10]))
     except Exception:  # noqa: BLE001
         pass
     for it in range(1, max(1, max_iters) + 1):
@@ -25727,6 +25825,32 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         else:
             for k in _status_tier_streak:
                 _status_tier_streak[k] = 0
+        # TARGET-UNREACHABLE EARLY EXIT: detect connection failures and stop
+        # before burning the full iteration budget on a dead target.
+        _is_conn_fail = bool(
+            ec == 28
+            or "curl: (28)" in (output or "")
+            or "Failed to connect" in (output or "")
+            or "Connection timed out" in (output or "")
+            or "ConnectError" in (output or "")
+            or "No route to host" in (output or "")
+            or verification_method == "latency_connection_error")
+        if _is_conn_fail:
+            _consecutive_conn_fails += 1
+        else:
+            _consecutive_conn_fails = 0
+        if _consecutive_conn_fails >= _CONN_FAIL_EXIT_AT and not success:
+            _stop_reason = "target_unreachable"
+            metrics["target_unreachable_exit"] = _consecutive_conn_fails
+            _poc_trace(run_id, "target_unreachable_exit", iteration=it,
+                       response=(f"{_consecutive_conn_fails} consecutive connection "
+                                 f"failures — target {ip}:{port} is unreachable; "
+                                 "stopping to avoid wasting iterations on a dead target"),
+                       extra={"consecutive": _consecutive_conn_fails,
+                              "threshold": _CONN_FAIL_EXIT_AT,
+                              "iterations_saved": max_iters - it,
+                              "last_output_preview": (output or "")[:300]})
+            break
         if success or it >= max_iters:
             break
         # Status-cluster escalation: 2+ iters in a row returned the same
@@ -25760,6 +25884,26 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                         path_block = (
                             f"\nLIVE PATHS on {ip}:{port} (status != 404, from a "
                             f"listener probe just now — these are REAL):\n{rendered}")
+                    # Also surface crawl_urls from gather manifest
+                    _gf = gather_facts or ""
+                    import re as _re_esc
+                    _crawl_from_gather = [
+                        m.group(1) for m in _re_esc.finditer(
+                            r"(?:crawl_url|endpoint|candidate)[^:]*:\s*(\S+)", _gf)
+                        if m.group(1).startswith("/")][:10]
+                    if _crawl_from_gather and _tripped_tier == "all_404":
+                        _dedup = {p for p, _ in live} if live else set()
+                        _extra_paths = [p for p in _crawl_from_gather if p not in _dedup]
+                        if _extra_paths:
+                            path_block += (
+                                f"\nGATHER-DISCOVERED ENDPOINTS (from this run's recon — "
+                                f"not yet probed, try these too):\n"
+                                + "\n".join(f"  ???  {p}" for p in _extra_paths[:8]))
+                    if _tripped_tier == "all_404":
+                        path_block += (
+                            "\nIMPORTANT: Your current endpoint returns 404. You MUST "
+                            "switch to one of the LIVE PATHS above. Do NOT retry the "
+                            "same 404 endpoint.")
                 else:
                     _poc_trace(run_id, f"escalation:{_tripped_tier}",
                                iteration=it, response="text-only remediation",
@@ -26031,6 +26175,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                         + str(gather_facts)[:1500]) if gather_facts else "")
         rprompt = (f"AUTHORIZED lab pentest. The PoC for {cve} on http://{ip}:{port} did NOT "
                    f"succeed.\nCommand: {command}\nOutput:\n{(output or '')[:1500]}{precond}{gather_note}"
+                   f"{_refuted_note}"
                    f"{shell_syntax_note}{refusal_note}{rag_pattern_notes}{regress_note}{model_switch_note}{path_discovery_note}{waf_hit_note}{similar_note}{escalation_guidance}{anchor_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
                    f"appear. Return ONE JSON object only: {{\"command\": \"<better command, may "
                    f"chain curl calls with ; and shell vars to fetch a token first>\", "
@@ -29734,6 +29879,42 @@ def _post_run_review(run_id, cve, ip, port, product, result, fa, session_info,
         "prior_learnings_count": len(prior_learnings),
         "criteria_count": len(criteria),
     }
+    # Cross-attempt repeated-strategy detection: if prior attempts on the same
+    # CVE hit the same stop_reason at the same stage, flag it — the build is
+    # repeating a failing strategy instead of adapting.
+    try:
+        with get_db() as _c, _c.cursor() as _cur:
+            _cur.execute("""
+                SELECT run_id, stage_reached, stop_reason, summary
+                FROM build_poc_attempts
+                WHERE cve = %s AND run_id != %s AND verified = false
+                ORDER BY created_at DESC LIMIT 5
+            """, (cve, run_id))
+            _prior = _cur.fetchall()
+        if _prior and fa:
+            _this_stage = fa.get("stage_reached", "")
+            _this_stop = res.get("stop_reason", "")
+            _same_strategy = [
+                p for p in _prior
+                if p[1] == _this_stage and p[2] == _this_stop]
+            if _same_strategy:
+                findings.append({
+                    "criterion_id": "repeated_strategy",
+                    "severity": "high",
+                    "question": "Is this attempt using a different strategy than prior failures?",
+                    "status": "fail",
+                    "evidence": (f"{len(_same_strategy)} prior attempt(s) also "
+                                 f"stopped at stage='{_this_stage}' with "
+                                 f"stop_reason='{_this_stop}'"),
+                    "recommendation": (
+                        "The same strategy is failing repeatedly. "
+                        "A different approach is needed — try a different "
+                        "endpoint, injection point, or auth method. "
+                        "Prior run IDs: " +
+                        ", ".join(p[0] for p in _same_strategy[:3]))
+                })
+    except Exception:  # noqa: BLE001
+        pass
     model_used = None
     try:
         llm_summary = _review_llm_synthesis(cve, ip, product, findings,
