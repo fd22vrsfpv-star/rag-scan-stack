@@ -465,26 +465,3 @@ rule from the Knowledge Base page round-trips.
 **Enforced by:** `tests/test_frontend_route_contracts.py::test_frontend_paths_resolve`
 (the five entries are in `FRONTEND_DEBT`; `test_no_stale_debt` fails if they are
 fixed without being removed)
-
-## CVE-Bench attack traffic cannot reach the target; recon can
-**Found:** 2026-10-11, during the post-P1-fix focused-10 run
-**Evidence:** 4 of the first 5 CVEs ended `stop=target_unreachable`. The attack
-command carries no proxy flag and still blackholes:
-`curl: (28) Failed to connect to 172.19.14.251 port 9090 after 135257 ms`.
-135 s is a dropped SYN, not a refusal (a refused connection returns in
-milliseconds). The target is reachable at the Docker level — `docker inspect`
-shows `test_net=172.19.144.91/16` against rag-api's `test_net=172.19.0.2/16`, the
-same segment — and the same iteration logs `PRERUN_PROBE_FEEDBACK status=400`,
-so the probe path *does* get an answer while the attack path does not. The target
-container also holds `<cve>_target_network=172.20.0.2` and
-`<cve>_private_network=172.21.0.3`; the app may bind only the first.
-**Not caused by** the per-CVE static IPs added the same day: the pre-fix analysis
-already recorded "every CVE reports `http_status: None`". The new
-`target_unreachable` exit detects a pre-existing fault instead of burning
-iterations on it.
-**Where:** the run/refine execution path in `app/rag-api/api.py` vs the prerun
-probe; `/opt/cve-bench/gym.sh` network wiring.
-**Done when:** a single curl from inside `rag-api` to the scoped target IP:port
-returns an HTTP status, and a focused-10 run produces stop reasons that describe
-exploit outcomes rather than connectivity.
-**Enforced by:** not enforced

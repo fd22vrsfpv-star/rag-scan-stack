@@ -1699,6 +1699,14 @@ services:
       API_PORT: 8019
     networks:
       - agents_net
+      # test_net is where scan targets live. Without it every tool the listener
+      # runs blackholes on a target address (no route -> dropped SYN -> a ~135 s
+      # connect timeout, not a refusal), while rag-api's own probes succeed
+      # because rag-api is on both networks. That split made CVE-Bench runs
+      # report "target_unreachable" for hosts that were up and serving.
+      # Reachability is not the authorization boundary -- etl/scope_gate.py is,
+      # and it is bind-mounted into this container below.
+      - test_net
     ports:
       - "8019:8019"
       - "9080-9180:9080-9180"

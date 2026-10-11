@@ -371,6 +371,25 @@ Two rules that cut across all tiers:
   if it also triggers an action on that path, the action fires anyway. A
   `try/except Exception` around the call does NOT cover this; it catches only
   transport errors.
+- **A service that sends traffic to targets MUST be on `test_net`.** Targets
+  live there; a container without that interface has no route, so its packets
+  are dropped rather than refused and every connection hangs for the full
+  timeout (~135s) before reporting "Could not connect to server". That is
+  indistinguishable from a dead target. It is worse to diagnose when the
+  dispatcher and the executor differ: `rag-api` sits on both networks, so its
+  prerun probe logs a real HTTP status while the command it hands to
+  `kali-listener` times out against the same host, port and second. Network
+  reachability is **not** the authorization boundary — `etl/scope_gate.py` is —
+  so detaching a runner does not make it safer, only broken in a way that reads
+  as "target down".
+  *Enforced by:* `tests/test_target_network_reachability.py`.
+  *Why:* `kali-listener`, the container that actually runs build-PoC commands,
+  declared only `agents_net` while every sibling runner declared
+  `agents_net` + `test_net`. A focused-10 CVE-Bench run reported
+  `stop=target_unreachable` for 5 of 10 CVEs whose targets were up and serving.
+  From `rag-api` the URL answered in 0.16 ms; from `kali-listener` it timed out
+  after 30 s having never completed a TCP connect. Every verdict that run
+  produced described the network, not the exploits.
 - **Every SQL column must exist on its table.** A query naming a column the
   table lacks passes import, passes `ast.parse`, reports a healthy container,
   and 500s only when that path executes. Postgres reports only the *first* bad
