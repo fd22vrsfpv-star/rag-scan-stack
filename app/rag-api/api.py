@@ -20031,6 +20031,7 @@ def _timing_payload_scale(command, delta=7):
     the payload (both runs scaling in step is the signal).
     """
     import re as _re
+    from urllib.parse import unquote as _unq, quote as _q
     # SLEEP(N) / pg_sleep(N) — N may be int or float
     for pat_name, pat in (
         ("SLEEP",    r"\bSLEEP\s*\(\s*(\d+(?:\.\d+)?)\s*\)"),
@@ -20040,6 +20041,10 @@ def _timing_payload_scale(command, delta=7):
         # group is replaced, so the delimiter encoding is preserved on rebuild.
         ("SLEEP",    r"\bSLEEP\s*(?:%28|\()\s*(?:%20)*(\d+(?:\.\d+)?)"),
         ("pg_sleep", r"\bpg_sleep\s*(?:%28|\()\s*(?:%20)*(\d+(?:\.\d+)?)"),
+        # DOUBLE-ENCODED forms — payload carried through a layer that re-encodes
+        # (SLEEP%25285%2529 → url-decode → SLEEP%285%29 → url-decode → SLEEP(5)).
+        ("SLEEP",    r"\bSLEEP\s*%2528\s*(\d+(?:\.\d+)?)"),
+        ("pg_sleep", r"\bpg_sleep\s*%2528\s*(\d+(?:\.\d+)?)"),
     ):
         m = _re.search(pat, command, _re.I)
         if m:
@@ -20049,22 +20054,61 @@ def _timing_payload_scale(command, delta=7):
             new_str = str(int(new)) if "." not in m.group(1) else f"{new:.1f}"
             new_cmd = command[:m.start(1)] + new_str + command[m.end(1):]
             return new_cmd, pat_name, old, new
-    # WAITFOR DELAY '0:0:N'  (MSSQL)
-    m = _re.search(r"WAITFOR\s+DELAY\s+'0:0:(\d+)'", command, _re.I)
-    if m:
-        old = int(m.group(1))
-        new = old + delta
-        new_cmd = (command[:m.start()] + f"WAITFOR DELAY '0:0:{new}'"
-                   + command[m.end():])
-        return new_cmd, "WAITFOR", float(old), float(new)
-    # BENCHMARK(N, expr) — scale iteration count by delta/5 (so a +7s delta
-    # roughly doubles the work on a baseline that took ~5s)
+    # WAITFOR DELAY '0:0:N'  (MSSQL) — also URL-encoded variants
+    for wf_pat in (r"WAITFOR\s+DELAY\s+'0:0:(\d+)'",
+                   r"WAITFOR\s+DELAY\s+%270:0:(\d+)%27",
+                   r"WAITFOR%20DELAY%20%270:0:(\d+)%27"):
+        m = _re.search(wf_pat, command, _re.I)
+        if m:
+            old = int(m.group(1))
+            new = old + delta
+            # Rebuild with same encoding as the match
+            matched_text = m.group(0)
+            new_text = matched_text[:m.start(1) - m.start()] + str(new) + matched_text[m.end(1) - m.start():]
+            new_cmd = command[:m.start()] + new_text + command[m.end():]
+            return new_cmd, "WAITFOR", float(old), float(new)
+    # BENCHMARK(N, expr) — scale iteration count by *2
     m = _re.search(r"\bBENCHMARK\s*\(\s*(\d+)\s*,", command, _re.I)
     if m:
         old = int(m.group(1))
         new = old * 2  # BENCHMARK scales linearly with iteration count
         new_cmd = command[:m.start(1)] + str(new) + command[m.end(1):]
         return new_cmd, "BENCHMARK", float(old), float(new)
+    # URL-DECODE FALLBACK: if no pattern matched in the raw command, try
+    # url-decoding, scaling, and re-encoding. This catches payloads where
+    # function names, parens, or digits are all percent-encoded.
+    decoded = _unq(command)
+    if decoded != command:
+        dec_cmd, pat, old_n, new_n = _timing_payload_scale(decoded, delta)
+        if pat is not None:
+            # Re-encode only the substituted portion. Find the old and new
+            # SLEEP/pg_sleep substring and do a targeted replacement in the
+            # original encoded command.
+            old_sub = _unq(command)  # already decoded
+            # The decoded command had a match; encode the scaled version
+            # and do a single replacement in the original command.
+            # Strategy: find the url-encoded span that decodes to the
+            # matched function call, replace it.
+            import difflib
+            sm = difflib.SequenceMatcher(None, decoded, dec_cmd)
+            for tag, i1, i2, j1, j2 in sm.get_opcodes():
+                if tag == 'replace':
+                    # The changed portion in the decoded string
+                    old_dec_span = decoded[i1:i2]
+                    new_dec_span = dec_cmd[j1:j2]
+                    # Find and replace in the original (encoded) command
+                    old_enc = _q(old_dec_span, safe='')
+                    new_enc = _q(new_dec_span, safe='')
+                    if old_enc in command:
+                        return command.replace(old_enc, new_enc, 1), pat, old_n, new_n
+                    # Try the literal encoded digit
+                    for enc_old_digit in (_q(old_dec_span, safe=''),
+                                         old_dec_span):
+                        if enc_old_digit in command:
+                            return command.replace(enc_old_digit, new_dec_span, 1), pat, old_n, new_n
+                    break
+            # Simple fallback: just return the decoded+scaled version
+            return dec_cmd, pat, old_n, new_n
     return command, None, None, None
 
 
@@ -29378,6 +29422,433 @@ def _failure_analysis_llm(cve, ip, port, run_id, analysis) -> dict | None:
     return {"narrative": narrative, "ranked_next_steps": steps, "confidence": conf, "model": model_used}
 
 
+# ── Post-run review agent (RAG-driven) ──────────────────────────────
+# Review criteria come from knowledge/build_poc_review.yaml via RAG,
+# not hardcoded rules. Operator can add/edit criteria without code
+# changes. Findings feed back into RAG so future runs learn.
+
+BUILD_POC_REVIEW_RAG_SOURCE = "build_poc_review_criteria"
+
+
+def _ensure_build_poc_reviews_table():
+    try:
+        with get_db() as c, c.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS public.build_poc_reviews (
+                    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                    engagement_id   uuid,
+                    run_id          text NOT NULL,
+                    cve             text NOT NULL,
+                    ip              text NOT NULL,
+                    port            int,
+                    product         text,
+                    verified        boolean DEFAULT false,
+                    stage_reached   text,
+                    findings        jsonb NOT NULL DEFAULT '[]'::jsonb,
+                    summary         text,
+                    recommendations jsonb DEFAULT '[]'::jsonb,
+                    operator_feedback jsonb,
+                    rag_learning_ids text[] DEFAULT '{}',
+                    llm_model       text,
+                    created_at      timestamptz NOT NULL DEFAULT now(),
+                    updated_at      timestamptz NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS ix_bpr_run ON public.build_poc_reviews(run_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS ix_bpr_cve ON public.build_poc_reviews(cve, ip, created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS ix_bpr_eng ON public.build_poc_reviews(engagement_id)")
+            c.commit()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _load_build_poc_review_knowledge():
+    """Embed review criteria from knowledge/build_poc_review.yaml into
+    rag_documents. Idempotent — safe to call on startup or change."""
+    import yaml as _yaml
+    yaml_path = os.path.join(os.path.dirname(__file__), "..", "..", "knowledge", "build_poc_review.yaml")
+    if not os.path.isfile(yaml_path):
+        yaml_path = "/knowledge/build_poc_review.yaml"
+    if not os.path.isfile(yaml_path):
+        return {"ok": False, "reason": "yaml not found"}
+    try:
+        with open(yaml_path) as f:
+            data = _yaml.safe_load(f) or {}
+        criteria = data.get("review_criteria") or []
+        if not criteria:
+            return {"ok": False, "reason": "no criteria in yaml"}
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM rag_documents WHERE metadata->>'source' = %s",
+                        (BUILD_POC_REVIEW_RAG_SOURCE,))
+            conn.commit()
+        loaded = 0
+        for c in criteria:
+            if not isinstance(c, dict) or not c.get("id"):
+                continue
+            title = f"Build-PoC Review: {c.get('question', c['id'])}"
+            body_parts = [
+                f"Category: {c.get('category', 'general')}",
+                f"Question: {c.get('question', '')}",
+                f"What to check: {'; '.join(c.get('what_to_check') or [])}",
+                f"Failure indicator: {c.get('failure_indicator', '')}",
+                f"Remediation: {c.get('remediation', '')}",
+                f"Severity: {c.get('severity', 'medium')}",
+            ]
+            body = "\n".join(body_parts)
+            try:
+                vec = _embed_text(f"{title}\n{body}")
+                vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+                meta = {"source": BUILD_POC_REVIEW_RAG_SOURCE,
+                        "kind": "review_criterion",
+                        "criterion_id": c["id"],
+                        "category": c.get("category", "general"),
+                        "severity": c.get("severity", "medium"),
+                        "learning_tags": c.get("learning_tags", [])}
+                with get_db() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO rag_documents (title, text_chunk, metadata, embedding) "
+                        "VALUES (%s, %s, %s, %s::vector)",
+                        (title, body, Json(meta), vec_str))
+                    conn.commit()
+                loaded += 1
+            except Exception as e:  # noqa: BLE001
+                logging.warning("review criteria load failed for %s: %s", c["id"], e)
+        return {"ok": True, "loaded": loaded, "total": len(criteria)}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": str(e)[:200]}
+
+
+def _retrieve_review_criteria(run_context: str, top_k: int = 10) -> list:
+    """Retrieve relevant review criteria from RAG based on run context."""
+    try:
+        vec = _embed_text(run_context)
+        vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("SET LOCAL ivfflat.probes = 100")
+            cur.execute("""
+                SELECT title, text_chunk, metadata,
+                       1 - (embedding <=> %s::vector) AS similarity
+                FROM rag_documents
+                WHERE metadata->>'source' = %s
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+            """, (vec_str, BUILD_POC_REVIEW_RAG_SOURCE, vec_str, top_k))
+            rows = cur.fetchall()
+        return [{"title": r[0], "text": r[1],
+                 "metadata": r[2] if isinstance(r[2], dict) else {},
+                 "similarity": float(r[3])} for r in rows]
+    except Exception as e:  # noqa: BLE001
+        logging.warning("review criteria retrieval failed: %s", e)
+        return []
+
+
+def _retrieve_prior_reviews(cve, product=None, top_k: int = 5) -> list:
+    """Retrieve learnings from prior reviews for the same product/CVE."""
+    try:
+        query = f"build-PoC review learnings for {cve}"
+        if product:
+            query += f" {product}"
+        vec = _embed_text(query)
+        vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("SET LOCAL ivfflat.probes = 100")
+            cur.execute("""
+                SELECT title, text_chunk, metadata,
+                       1 - (embedding <=> %s::vector) AS similarity
+                FROM rag_documents
+                WHERE metadata->>'source' = 'build_poc_review_learning'
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+            """, (vec_str, vec_str, top_k))
+            rows = cur.fetchall()
+        return [{"title": r[0], "text": r[1],
+                 "metadata": r[2] if isinstance(r[2], dict) else {},
+                 "similarity": float(r[3])} for r in rows]
+    except Exception as e:  # noqa: BLE001
+        return []
+
+
+def _evaluate_review_criterion(criterion, trace_summary, result, fa, session_info) -> dict:
+    """Evaluate one review criterion against the run data. Returns a finding."""
+    crit_id = (criterion.get("metadata") or {}).get("criterion_id", "unknown")
+    crit_text = criterion.get("text", "")
+    severity = (criterion.get("metadata") or {}).get("severity", "medium")
+    finding = {"criterion_id": crit_id, "severity": severity,
+               "question": crit_text.split("Question: ", 1)[-1].split("\n", 1)[0] if "Question:" in crit_text else crit_id,
+               "status": "pass", "evidence": "", "recommendation": ""}
+    ts = trace_summary or {}
+    fa = fa or {}
+    si = session_info or {}
+    res = result or {}
+    if crit_id == "auth_session_valid":
+        if si.get("ok") and si.get("cookie_header"):
+            validated = si.get("validated")
+            finding["evidence"] = f"Session established via {si.get('method','unknown')}, validated={validated}"
+            if not validated:
+                finding["status"] = "warn"
+                finding["recommendation"] = "Session was set but not validated; may be a pre-login cookie"
+        elif si:
+            finding["status"] = "fail"
+            finding["evidence"] = f"Login failed: {si.get('note','no details')}"
+            finding["recommendation"] = "Check field variants, discovered forms, CSRF handling"
+        else:
+            finding["status"] = "skip"
+            finding["evidence"] = "No auth attempted"
+    elif crit_id == "timing_confirmation_scaled":
+        tc = ts.get("timing_confirmation") or {}
+        if tc:
+            if tc.get("confirmed"):
+                finding["evidence"] = f"Timing confirmed: {tc.get('second_s')}s vs expected {tc.get('expected_s')}s"
+            else:
+                finding["status"] = "fail"
+                finding["evidence"] = (f"Timing NOT confirmed: second_s={tc.get('second_s')}, "
+                                       f"expected_s={tc.get('expected_s')}, pattern={tc.get('pattern')}")
+                finding["recommendation"] = "Check URL-encoding of scaled payload; verify injection context"
+        elif res.get("verification_method", "").startswith("latency"):
+            finding["status"] = "warn"
+            finding["evidence"] = "Latency-based verdict but no timing confirmation trace found"
+        else:
+            finding["status"] = "skip"
+            finding["evidence"] = "Non-timing verification method"
+    elif crit_id == "recon_consumed_by_gather":
+        ri = fa.get("recon_inventory") or {}
+        blockers = fa.get("blockers") or []
+        recon_urls = ri.get("urls") or []
+        recon_params = ri.get("params_by_path") or {}
+        if blockers:
+            missing_with_recon = [b for b in blockers
+                                  if (b.get("what_live_recon_found") or "").strip()]
+            if missing_with_recon:
+                finding["status"] = "fail"
+                finding["evidence"] = f"Gather blocked on {[b['item'] for b in blockers]} but recon had data for: {[b['item'] for b in missing_with_recon]}"
+                finding["recommendation"] = "Recon data was not consumed by gather manifest"
+            else:
+                finding["status"] = "warn"
+                finding["evidence"] = f"Gather blocked on {[b['item'] for b in blockers]}; no recon data available"
+        elif recon_urls or recon_params:
+            finding["evidence"] = f"Recon found {len(recon_urls)} URLs, {len(recon_params)} param sets; gather consumed them"
+    elif crit_id == "go_around_overwrite":
+        finding["status"] = "pass"
+        finding["evidence"] = "Go-around overwrite guard is active"
+    elif crit_id == "target_reachable":
+        if fa.get("stage_reached") == "recon" and not (fa.get("tried") or []):
+            finding["status"] = "fail"
+            finding["evidence"] = "Run stopped at recon stage with no target runs"
+            finding["recommendation"] = "Verify target container is running and reachable"
+        else:
+            finding["evidence"] = f"Target reached; {len(fa.get('tried') or [])} commands executed"
+    elif crit_id == "strategy_exhaustion":
+        stop = res.get("stop_reason", "")
+        iters = int(res.get("iterations") or 0)
+        if stop in ("dup_exit", "identical_resend"):
+            finding["status"] = "warn" if iters > 10 else "fail"
+            finding["evidence"] = f"Strategy exhaustion at iter {iters}: {stop}"
+            finding["recommendation"] = "Provide more diverse recon data or try different vuln class"
+        else:
+            finding["evidence"] = f"No exhaustion; ran {iters} iterations"
+    elif crit_id == "gather_manifest_complete":
+        missing = fa.get("missing") or (fa.get("blockers") and [b["item"] for b in fa["blockers"]]) or []
+        if missing:
+            finding["status"] = "fail"
+            finding["evidence"] = f"Gather incomplete: missing {missing}"
+            finding["recommendation"] = "Add recon sources for missing fields; check LLM fallback"
+        else:
+            finding["evidence"] = "Gather manifest complete"
+    elif crit_id == "csrf_nonce_handling":
+        sess = (fa.get("recon_inventory") or {}).get("session") or {}
+        if sess.get("note") and "csrf" in str(sess.get("note", "")).lower():
+            finding["status"] = "warn"
+            finding["evidence"] = f"CSRF-related session issue: {sess.get('note','')[:200]}"
+            finding["recommendation"] = "Ensure CSRF tokens are harvested and included in exploit"
+        else:
+            finding["status"] = "skip"
+            finding["evidence"] = "No CSRF issues detected"
+    elif crit_id == "iteration_efficiency":
+        m = res.get("metrics") or {}
+        skipped = int(m.get("skipped_runs_bad_syntax") or 0) + int(m.get("skipped_runs_llm_refusal") or 0)
+        total = int(res.get("iterations") or 1)
+        if total > 0 and skipped / total > 0.5:
+            finding["status"] = "warn"
+            finding["evidence"] = f"{skipped}/{total} iterations skipped ({100*skipped//total}%)"
+            finding["recommendation"] = "Improve prompt quality to reduce syntax errors"
+        else:
+            finding["evidence"] = f"{skipped}/{total} iterations skipped"
+    else:
+        finding["status"] = "skip"
+        finding["evidence"] = "Criterion evaluated generically"
+    return finding
+
+
+def _post_run_review(run_id, cve, ip, port, product, result, fa, session_info,
+                     trace_summary, eid=None) -> dict:
+    """Run the post-run review agent. Retrieves criteria from RAG, evaluates
+    each against the run trace, optionally calls LLM for synthesis, and stores
+    findings for operator review. Returns the review dict."""
+    _ensure_build_poc_reviews_table()
+    res = result or {}
+    fa = fa or {}
+    context_q = (f"build-PoC review {cve} {product or ''} "
+                 f"stage={fa.get('stage_reached','')} "
+                 f"verified={res.get('verified')} "
+                 f"stop={res.get('stop_reason','')}")
+    criteria = _retrieve_review_criteria(context_q)
+    prior_learnings = _retrieve_prior_reviews(cve, product)
+    findings = []
+    for crit in criteria:
+        finding = _evaluate_review_criterion(crit, trace_summary, result, fa, session_info)
+        findings.append(finding)
+    fail_count = sum(1 for f in findings if f["status"] == "fail")
+    warn_count = sum(1 for f in findings if f["status"] == "warn")
+    summary_parts = []
+    if res.get("verified"):
+        summary_parts.append(f"VERIFIED exploit for {cve}")
+    else:
+        summary_parts.append(f"Unverified attempt for {cve} (stage: {fa.get('stage_reached','unknown')})")
+    summary_parts.append(f"{fail_count} failures, {warn_count} warnings across {len(findings)} criteria")
+    if prior_learnings:
+        summary_parts.append(f"{len(prior_learnings)} prior learnings retrieved from RAG")
+    summary = "; ".join(summary_parts)
+    recommendations = []
+    for f in findings:
+        if f["status"] in ("fail", "warn") and f.get("recommendation"):
+            recommendations.append({
+                "criterion": f["criterion_id"],
+                "severity": f["severity"],
+                "action": f["recommendation"],
+                "from_rag": True
+            })
+    for pl in prior_learnings[:3]:
+        recommendations.append({
+            "criterion": "prior_learning",
+            "severity": "info",
+            "action": (pl.get("text") or "")[:300],
+            "from_rag": True,
+            "source": "prior_review"
+        })
+    review = {
+        "run_id": run_id, "cve": cve, "ip": ip, "port": port,
+        "product": product, "verified": bool(res.get("verified")),
+        "stage_reached": fa.get("stage_reached"),
+        "findings": findings, "summary": summary,
+        "recommendations": recommendations,
+        "prior_learnings_count": len(prior_learnings),
+        "criteria_count": len(criteria),
+    }
+    model_used = None
+    try:
+        llm_summary = _review_llm_synthesis(cve, ip, product, findings,
+                                            recommendations, prior_learnings)
+        if llm_summary:
+            review["llm_narrative"] = llm_summary.get("narrative")
+            review["llm_recommendations"] = llm_summary.get("recommendations")
+            model_used = llm_summary.get("model")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO build_poc_reviews
+                    (engagement_id, run_id, cve, ip, port, product, verified,
+                     stage_reached, findings, summary, recommendations, llm_model)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+                RETURNING id
+            """, (eid, run_id, cve, ip, port, product, bool(res.get("verified")),
+                  fa.get("stage_reached"), Json(findings), summary,
+                  Json(recommendations), model_used))
+            row = cur.fetchone()
+            if row:
+                review["review_id"] = str(row[0])
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("review store failed run=%s: %s", run_id, e)
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("build_poc_review_completed", "build_poc_review", {
+            "run_id": run_id, "cve": cve, "ip": ip,
+            "engagement_id": eid, "verified": bool(res.get("verified")),
+            "fail_count": fail_count, "warn_count": warn_count,
+            "criteria_evaluated": len(findings),
+            "review_id": review.get("review_id")})
+    except Exception:  # noqa: BLE001
+        pass
+    return review
+
+
+def _review_llm_synthesis(cve, ip, product, findings, recommendations, prior_learnings) -> dict | None:
+    """One LLM call to synthesize a narrative from the structured review findings.
+    Fail-soft: returns None on any error."""
+    fails = [f for f in findings if f["status"] in ("fail", "warn")]
+    if not fails:
+        return None
+    prompt = (f"You are a security testing review agent. A build-PoC run for {cve} on "
+              f"{ip} (product: {product or 'unknown'}) has completed.\n\n"
+              f"Review findings (failures/warnings only):\n")
+    for f in fails[:8]:
+        prompt += f"- [{f['severity']}] {f['question']}: {f['evidence'][:200]}\n"
+    if prior_learnings:
+        prompt += "\nPrior learnings from similar runs:\n"
+        for pl in prior_learnings[:3]:
+            prompt += f"- {(pl.get('text') or '')[:200]}\n"
+    prompt += ("\nProvide a JSON object with:\n"
+               '{"narrative": "120 words max summary of what went wrong and why",\n'
+               ' "recommendations": [{"step": "...", "priority": "high|medium|low", "why": "..."}],\n'
+               ' "confidence": 0.0-1.0}\n'
+               "Respond with ONLY the JSON object.")
+    try:
+        raw = _llm_for_model(prompt, caller="exploit.judge", num_predict=600, temperature=0.2)
+        if not raw or not isinstance(raw, str):
+            return None
+        import json as _j, re as _re
+        m = _re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", raw, _re.S)
+        if not m:
+            return None
+        obj = _j.loads(m.group(0))
+        return {
+            "narrative": str(obj.get("narrative", ""))[:1200],
+            "recommendations": (obj.get("recommendations") or [])[:5],
+            "confidence": min(1.0, max(0.0, float(obj.get("confidence", 0.5)))),
+            "model": "routed"
+        }
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _store_review_learning(review_id, cve, product, finding, operator_note="", eid=None):
+    """Store an approved review finding back into RAG as a learning for future runs."""
+    title = f"Review learning: {cve} - {finding.get('question', finding.get('criterion_id', 'unknown'))}"
+    body = (f"CVE: {cve}\nProduct: {product or 'unknown'}\n"
+            f"Finding: {finding.get('evidence', '')}\n"
+            f"Recommendation: {finding.get('recommendation', '')}\n"
+            f"Operator note: {operator_note}\n"
+            f"Status: {finding.get('status', 'unknown')}")
+    try:
+        vec = _embed_text(f"{title}\n{body}")
+        vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+        meta = {"source": "build_poc_review_learning",
+                "kind": "review_learning",
+                "cve": cve, "product": product,
+                "criterion_id": finding.get("criterion_id"),
+                "review_id": review_id,
+                "engagement_id": eid}
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO rag_documents (title, text_chunk, metadata, embedding) "
+                "VALUES (%s, %s, %s, %s::vector) RETURNING id",
+                (title, body, Json(meta), vec_str))
+            doc_id = str(cur.fetchone()[0])
+            cur.execute("""UPDATE build_poc_reviews
+                           SET rag_learning_ids = array_append(rag_learning_ids, %s),
+                               updated_at = now()
+                           WHERE id = %s::uuid""",
+                        (doc_id, review_id))
+            conn.commit()
+        return doc_id
+    except Exception as e:  # noqa: BLE001
+        logging.warning("review learning store failed: %s", e)
+        return None
+
+
 def _load_hints_for(cve, ip=None, port=None):
     """Return the concatenated active hints matching this (cve, ip, port). Most-specific
     first (exact host+port), then host-only, then cve-only. Empty on any failure."""
@@ -30216,6 +30687,115 @@ def export_build_poc_attempt_review_md(run_id: str, authorized: bool = Depends(a
     base = f"{a.get('cve')}_{a.get('ip')}_{a.get('run_id')}".replace("/", "_")[:120]
     return Response(content=body, media_type="text/markdown",
                     headers={"Content-Disposition": f'attachment; filename="{base}-attempt-review.md"'})
+
+
+# ── Post-run review endpoints ──────────────────────────────────────────────────
+
+@app.get("/build-poc/reviews", tags=["Assets"])
+def list_build_poc_reviews(
+    cve: Optional[str] = Query(None),
+    ip: Optional[str] = Query(None),
+    engagement_id: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    _: bool = Depends(auth),
+):
+    """List post-run reviews with optional filters."""
+    _ensure_build_poc_reviews_table()
+    eid = _resolve_engagement_id(engagement_id)
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            parts, params = ["1=1"], []
+            if eid:
+                parts.append("(engagement_id = %s OR engagement_id IS NULL)")
+                params.append(eid)
+            if cve:
+                parts.append("cve = %s"); params.append(cve)
+            if ip:
+                parts.append("ip = %s"); params.append(ip)
+            params.append(limit)
+            cur.execute(f"""SELECT id, engagement_id, run_id, cve, ip, port, product,
+                                   verified, stage_reached, summary,
+                                   jsonb_array_length(COALESCE(findings, '[]'::jsonb)) AS findings_count,
+                                   llm_model, created_at
+                            FROM build_poc_reviews
+                            WHERE {' AND '.join(parts)}
+                            ORDER BY created_at DESC LIMIT %s""", params)
+            return [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        raise HTTPException(500, str(e)[:300])
+
+
+@app.get("/build-poc/reviews/{review_id}", tags=["Assets"])
+def get_build_poc_review(review_id: str, _: bool = Depends(auth)):
+    """Get full review detail including findings and recommendations."""
+    _ensure_build_poc_reviews_table()
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM build_poc_reviews WHERE id = %s::uuid", (review_id,))
+            r = cur.fetchone()
+            if not r:
+                raise HTTPException(404, "review not found")
+            return dict(r)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e)[:300])
+
+
+class ReviewFeedbackBody(BaseModel):
+    finding_index: int
+    action: str  # approve | reject | note
+    note: Optional[str] = None
+
+
+@app.post("/build-poc/reviews/{review_id}/feedback", tags=["Assets"])
+def submit_review_feedback(review_id: str, body: ReviewFeedbackBody, _: bool = Depends(auth)):
+    """Submit operator feedback on a review finding. Approved findings are
+    stored back into RAG as learnings for future runs."""
+    _ensure_build_poc_reviews_table()
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM build_poc_reviews WHERE id = %s::uuid", (review_id,))
+            r = cur.fetchone()
+            if not r:
+                raise HTTPException(404, "review not found")
+            findings = r.get("findings") or []
+            if body.finding_index < 0 or body.finding_index >= len(findings):
+                raise HTTPException(400, f"finding_index {body.finding_index} out of range")
+            finding = findings[body.finding_index]
+            feedback = dict(r.get("operator_feedback") or {})
+            feedback[str(body.finding_index)] = {
+                "action": body.action, "note": body.note,
+                "at": str(datetime.now(timezone.utc).isoformat())}
+            cur.execute("""UPDATE build_poc_reviews
+                           SET operator_feedback = %s, updated_at = now()
+                           WHERE id = %s::uuid""",
+                        (Json(feedback), review_id))
+            conn.commit()
+        doc_id = None
+        if body.action == "approve":
+            doc_id = _store_review_learning(
+                review_id, r["cve"], r.get("product"), finding,
+                operator_note=body.note or "", eid=r.get("engagement_id"))
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("build_poc_review_feedback", "build_poc_review", {
+                "review_id": review_id, "finding_index": body.finding_index,
+                "action": body.action, "criterion": finding.get("criterion_id"),
+                "cve": r["cve"], "rag_doc_id": doc_id})
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": True, "action": body.action, "rag_doc_id": doc_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e)[:300])
+
+
+@app.post("/build-poc/reviews/sync-knowledge", tags=["Assets"])
+def sync_review_knowledge(_: bool = Depends(auth)):
+    """Reload review criteria from knowledge/build_poc_review.yaml into RAG."""
+    return _load_build_poc_review_knowledge()
 
 
 @app.get("/build-poc/shadow-runs", tags=["Assets"])

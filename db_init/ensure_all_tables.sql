@@ -1596,6 +1596,33 @@ CREATE TABLE IF NOT EXISTS public.build_poc_attempts (
 CREATE INDEX IF NOT EXISTS ix_bpa_cve_ip ON public.build_poc_attempts(cve, ip, created_at DESC);
 CREATE INDEX IF NOT EXISTS ix_bpa_eng ON public.build_poc_attempts(engagement_id);
 
+-- 2026-10-10: post-run review agent results. Each row is a structured review
+-- of a build-PoC run, with findings evaluated against RAG-stored criteria.
+-- Operator feedback (approve/reject/note) feeds back into rag_documents so
+-- future runs learn from past reviews.
+CREATE TABLE IF NOT EXISTS public.build_poc_reviews (
+    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id   uuid,
+    run_id          text NOT NULL,
+    cve             text NOT NULL,
+    ip              text NOT NULL,
+    port            int,
+    product         text,
+    verified        boolean DEFAULT false,
+    stage_reached   text,
+    findings        jsonb NOT NULL DEFAULT '[]'::jsonb,
+    summary         text,
+    recommendations jsonb DEFAULT '[]'::jsonb,
+    operator_feedback jsonb,
+    rag_learning_ids text[] DEFAULT '{}',
+    llm_model       text,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    updated_at      timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_bpr_run ON public.build_poc_reviews(run_id);
+CREATE INDEX IF NOT EXISTS ix_bpr_cve ON public.build_poc_reviews(cve, ip, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_bpr_eng ON public.build_poc_reviews(engagement_id);
+
 -- 2026-10-09: cross-run error memory. One row per FAILING build-PoC iteration:
 -- the normalised error signature, the command that produced it, what the next
 -- command changed and whether a later iteration passed. The refine loop reads
