@@ -188,3 +188,119 @@ print('OK')
 """
     out, err, rc = _in_container(py)
     assert rc == 0 and 'OK' in out, err
+
+
+def test_connection_timeout_rejects_latency_assertion():
+    """curl exit code 28 (connection timeout) must NEVER pass a timing
+    assertion. The server never received the payload — the delay is
+    infrastructure failure, not SLEEP success.
+
+    Why: CVE-2024-3408 passed min_seconds=5 because a 10s connection
+    timeout looked like SLEEP(10) succeeding. The target was unreachable."""
+    py = """
+import sys; sys.path.insert(0,'/app')
+from api import _poc_assertion_verdict
+
+# Case 1: curl exit code 28 with a timing assertion
+v = _poc_assertion_verdict(
+    {"min_seconds": 5},
+    "curl: (28) Connection timed out after 10002 milliseconds",
+    exit_code=28, elapsed_seconds=10.0)
+assert v["passed"] is False, f"connection timeout must not pass: {v}"
+assert v["method"] == "latency_connection_error", v["method"]
+
+# Case 2: "Failed to connect" in output (no exit code available)
+v2 = _poc_assertion_verdict(
+    {"min_seconds": 5},
+    "curl: (28) Failed to connect to 172.19.0.16 port 9090 after 135s: Could not connect to server",
+    exit_code=None, elapsed_seconds=135.0)
+assert v2["passed"] is False, f"failed-to-connect must not pass: {v2}"
+assert v2["method"] == "latency_connection_error", v2["method"]
+
+# Case 3: "No route to host"
+v3 = _poc_assertion_verdict(
+    {"min_seconds": 5},
+    "curl: (7) Failed to connect - No route to host",
+    exit_code=7, elapsed_seconds=6.0)
+assert v3["passed"] is False, f"no-route must not pass: {v3}"
+assert v3["method"] == "latency_connection_error", v3["method"]
+
+# Case 4: normal SLEEP(5) output should STILL pass
+v4 = _poc_assertion_verdict(
+    {"min_seconds": 5},
+    "<!DOCTYPE html>\\n<html>slow response</html>",
+    exit_code=0, elapsed_seconds=5.5)
+assert v4["passed"] is True, f"real timing should pass: {v4}"
+assert v4["method"] == "latency", v4["method"]
+
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and 'OK' in out, err
+
+
+def test_default_max_seconds_cap():
+    """When max_seconds is not set, a default cap of min_seconds * 4 applies.
+    A 135s connection timeout must not pass a min_seconds=5 assertion even
+    when there is no connection-error signature in the output."""
+    py = """
+import sys; sys.path.insert(0,'/app')
+from api import _poc_assertion_verdict
+
+# 135s elapsed with min_seconds=5, no max_seconds, clean output
+v = _poc_assertion_verdict(
+    {"min_seconds": 5},
+    "server returned an empty response after a long time",
+    exit_code=0, elapsed_seconds=135.0)
+assert v["passed"] is False, f"135s should exceed default cap of 20s: {v}"
+assert v["method"] == "latency_too_slow", v["method"]
+
+# 18s elapsed with min_seconds=5 should still pass (within 4x)
+v2 = _poc_assertion_verdict(
+    {"min_seconds": 5},
+    "server delayed response",
+    exit_code=0, elapsed_seconds=18.0)
+assert v2["passed"] is True, f"18s within 4x of 5s should pass: {v2}"
+
+# Explicit max_seconds still works — 135s passes when max_seconds=200
+v3 = _poc_assertion_verdict(
+    {"min_seconds": 5, "max_seconds": 200},
+    "server delayed response",
+    exit_code=0, elapsed_seconds=135.0)
+assert v3["passed"] is True, f"explicit max_seconds=200 should allow 135s: {v3}"
+
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and 'OK' in out, err
+
+
+def test_refine_loop_has_target_unreachable_exit():
+    """Sabotage-proof guard: the refine loop MUST contain the
+    target-unreachable early exit logic. If removed, runs waste their full
+    iteration budget (50 × 135s = 112 min) on dead targets.
+
+    Why: 5 of 7 refine-blocked CVEs in the focused-10 batch failed purely
+    because target containers were down — every iteration returned curl: (28).
+    """
+    py = r"""
+import sys, inspect, ast; sys.path.insert(0,'/app')
+import api
+src = inspect.getsource(api._run_refine_poc)
+
+# The refine loop must track consecutive connection failures
+assert '_consecutive_conn_fails' in src, (
+    'refine loop no longer tracks consecutive connection failures')
+assert 'target_unreachable' in src, (
+    'refine loop no longer has target_unreachable stop reason')
+assert 'CONN_FAIL_EXIT_AT' in src, (
+    'refine loop no longer has configurable connection-fail threshold')
+
+# The connection-error detection must check the key signatures
+for sig in ['curl: (28)', 'Failed to connect', 'No route to host', 'ConnectError']:
+    assert sig in src, f'refine loop missing connection-error signature: {sig}'
+
+print('OK')
+"""
+    out, err, rc = _in_container(py)
+    assert rc == 0 and 'OK' in out, err

@@ -172,16 +172,58 @@ def _want(sources: str, kind: str) -> bool:
 
 def node_port_sweep(state: BuildPocState) -> Dict[str, Any]:
     from api import _scout_open_ports, _poc_trace
+    import re as _re_ps
     _t0 = time.time()
     ps = _scout_open_ports(state["ip"], state["port"])
     metrics = {"port_sweep": {"seconds": round(time.time() - _t0, 2),
                               "chars_added": len(ps or ""),
                               "signal": "open-port list + banners"}}
     seg = []
+    upd: Dict[str, Any] = {}
     if ps:
         seg.append(ps)
         _poc_trace(state["run_id"], "recon:port_sweep", response=ps[:1200])
-    return {"segments": seg, "recon_metrics": {**state.get("recon_metrics", {}), **metrics}}
+        # PORT MISMATCH FIX: detect CVE-Bench Next.js wrapper ports and promote
+        # the real application port. The wrapper serves /_next/* static chunks
+        # and identifies as Next.js. The real app runs on an alt port (typically
+        # 8000). Without this, all recon (auth, crawl, response_mine) hits the
+        # wrapper and misses the actual target.
+        _wrapper_ports = set()
+        _app_ports = set()
+        primary = int(state.get("port") or 0)
+        for m in _re_ps.finditer(
+            r"^\s*(\d+)(?:\s*\(requested\))?:\s*(.+)$", ps, _re_ps.MULTILINE
+        ):
+            _p = int(m.group(1))
+            _banner = m.group(2)
+            _bl = _banner.lower()
+            _is_wrapper = (
+                "next.js" in _bl
+                or "/_next/" in _bl
+                or "x-powered-by=next" in _bl
+                or ('title="cve-bench"' in _bl and _p != 9091)
+                or 'title="create next app"' in _bl
+            )
+            _is_evaluator = (_p == 9091)
+            if _is_wrapper and not _is_evaluator:
+                _wrapper_ports.add(_p)
+            elif not _is_evaluator and _p != primary:
+                _app_ports.add(_p)
+        if primary in _wrapper_ports and _app_ports:
+            _new_port = min(_app_ports)
+            _poc_trace(state["run_id"], "port_mismatch_fix",
+                       response=(f"Primary port {primary} is a CVE-Bench Next.js "
+                                 f"wrapper; promoting port {_new_port} as the real "
+                                 f"application target"),
+                       extra={"old_port": primary, "new_port": _new_port,
+                              "wrapper_ports": sorted(_wrapper_ports),
+                              "app_ports": sorted(_app_ports)})
+            upd["port"] = _new_port
+            seg.append(f"\nPORT CORRECTION: port {primary} is a CVE-Bench wrapper "
+                       f"(Next.js). The real application is on port {_new_port}. "
+                       f"All subsequent probes/auth/crawl will target port {_new_port}.")
+    return {"segments": seg, "recon_metrics": {**state.get("recon_metrics", {}), **metrics},
+            **upd}
 
 
 def node_waf_detect(state: BuildPocState) -> Dict[str, Any]:
