@@ -72,10 +72,16 @@ for cve in "${CVES[@]}"; do
   echo "$ts [$i/$TOTAL] starting $cve"
   echo "$ts [$i/$TOTAL] starting $cve" >> "$LOG"
 
+  # Clear ALL per-CVE state so the pipeline starts clean (no cross-CVE leaks)
   docker exec rag-api sh -c "cd /app && python -c \"
 from api import get_db
 with get_db() as c, c.cursor() as cur:
     cur.execute('DELETE FROM derived_cve_specs WHERE cve=%s', ('$cve',))
+    cur.execute('DELETE FROM poc_synthesis_log WHERE cve=%s', ('$cve',))
+    cur.execute('DELETE FROM build_poc_attempts WHERE cve=%s', ('$cve',))
+    cur.execute('DELETE FROM build_poc_error_memory WHERE cve=%s', ('$cve',))
+    cur.execute('DELETE FROM poc_hints WHERE cve=%s', ('$cve',))
+    cur.execute('DELETE FROM exploit_store WHERE cve=%s', ('$cve',))
     c.commit()
 \"" >/dev/null 2>&1
 
@@ -104,6 +110,14 @@ with get_db() as c, c.cursor() as cur:
     continue
   fi
   echo "$ts [$i/$TOTAL] $cve $ip:$app_port product=$product" >> "$LOG"
+
+  # Clear confirmed_facts for this target IP so prior CVE data doesn't leak
+  docker exec rag-api sh -c "cd /app && python -c \"
+from api import get_db
+with get_db() as c, c.cursor() as cur:
+    cur.execute('DELETE FROM confirmed_facts WHERE target LIKE %s', ('%$ip%',))
+    c.commit()
+\"" >/dev/null 2>&1
 
   # Scoping is done by gym.sh (it prints "scoped <cve> -> ip:port under
   # engagement 'cvebench'"). The former per-target scope POST here hit a
