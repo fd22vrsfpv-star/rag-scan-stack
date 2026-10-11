@@ -19,7 +19,10 @@
 #                     Windows (WSL2 NAT mode) needs to reach this; WSL's own
 #                     localhost-forwarding then makes Windows 127.0.0.1 resolve
 #   SOCKS_IMAGE      (default: serjs/go-socks5-proxy)
-#   SOCKS_BASE_NET   (default: agents_net) — always kept attached
+#   SOCKS_BASE_NET   (default: "agents_net test_net") — space-separated; ALL are
+#                     always kept attached. test_net is where CVE-Bench targets
+#                     are scoped, so dropping it leaves the proxy unable to reach
+#                     them (hangs until timeout, looks like a dead target).
 #   SOCKS_NET_PATTERN (default: ^cve-.*_target_network$) — which nets to reconcile
 #
 # "Bounce safe": every call recomputes live CVE target networks from docker
@@ -33,7 +36,15 @@ SOCKS_NAME="${SOCKS_NAME:-socks-cve}"
 SOCKS_PORT="${SOCKS_PORT:-1080}"
 SOCKS_BIND="${SOCKS_BIND:-127.0.0.1}"
 SOCKS_IMAGE="${SOCKS_IMAGE:-serjs/go-socks5-proxy}"
-BASE_NET="${SOCKS_BASE_NET:-agents_net}"
+# Space-separated list, ALL kept attached and never disconnected by reconcile.
+# test_net is load-bearing: CVE-Bench targets are scoped by their test_net
+# address (gym.sh assigns a static one per CVE), so a proxy without it has no
+# route to the host it is meant to reach — packets are dropped, not refused, so
+# the symptom is a full-timeout hang that looks like a dead target rather than a
+# connection error. agents_net alone is NOT enough.
+BASE_NETS="${SOCKS_BASE_NET:-agents_net test_net}"
+# First entry is the creation network; the rest are connected right after.
+BASE_NET="${BASE_NETS%% *}"
 PATTERN="${SOCKS_NET_PATTERN:-^cve-.*_target_network$}"
 
 usage() {
@@ -77,11 +88,33 @@ ensure_running() {
         # REQUIRE_AUTH=false: open SOCKS. SOCKS_BIND defaults to 127.0.0.1
         # (loopback-only); set it to 0.0.0.0 when a Burp on Windows (WSL2 NAT
         # mode) needs to reach it via WSL's own localhost-forwarding.
-        docker run -d --name "$SOCKS_NAME" --restart=unless-stopped \
+        # A failed `docker run` (most often: the published port is already
+        # taken) still leaves a created-but-unnetworked container behind. The
+        # `elif` below would then `docker start` that husk — it comes up with no
+        # port binding and none of the base networks, which looks like a running
+        # proxy but reaches nothing. Remove it and fail loudly instead.
+        if ! docker run -d --name "$SOCKS_NAME" --restart=unless-stopped \
             --network "$BASE_NET" -p "${SOCKS_BIND}:${SOCKS_PORT}:1080" \
             -e REQUIRE_AUTH=false \
-            "$SOCKS_IMAGE" >/dev/null
+            "$SOCKS_IMAGE" >/dev/null; then
+            docker rm -f "$SOCKS_NAME" >/dev/null 2>&1 || true
+            echo "failed to start $SOCKS_NAME on ${SOCKS_BIND}:${SOCKS_PORT}." >&2
+            echo "if the port is already allocated, pick another:" >&2
+            echo "  SOCKS_PORT=3003 $0 up" >&2
+            exit 4
+        fi
         echo "started $SOCKS_NAME on ${SOCKS_BIND}:${SOCKS_PORT} (base: $BASE_NET)"
+        # Attach the remaining base networks. Done here rather than via repeated
+        # --network because `docker run` accepts only one at creation.
+        for n in $BASE_NETS; do
+            [ "$n" = "$BASE_NET" ] && continue
+            if docker network inspect "$n" >/dev/null 2>&1; then
+                docker network connect "$n" "$SOCKS_NAME" 2>/dev/null \
+                    && echo "  + $n (base)"
+            else
+                echo "  ! base network '$n' does not exist — skipped" >&2
+            fi
+        done
     elif ! docker ps --format '{{.Names}}' | grep -qx "$SOCKS_NAME"; then
         docker start "$SOCKS_NAME" >/dev/null
         echo "restarted $SOCKS_NAME"
@@ -94,8 +127,11 @@ reconcile() {
     local want have want_all
     want=$(live_cve_nets | sort -u)
     have=$(current_attachments | sort -u)
-    # BASE_NET is always wanted; never disconnect it.
-    want_all=$(printf '%s\n%s\n' "$BASE_NET" "$want" | sort -u | sed '/^$/d')
+    # Every base network is always wanted; never disconnect one. This is what
+    # re-attaches test_net if something detached it, so a reconcile repairs the
+    # "proxy cannot reach the target" state rather than only reporting it.
+    want_all=$(printf '%s\n%s\n' "$(printf '%s\n' $BASE_NETS)" "$want" \
+        | sort -u | sed '/^$/d')
     # Connect missing
     comm -23 <(printf '%s\n' "$want_all") <(printf '%s\n' "$have") | while read -r n; do
         [ -z "$n" ] && continue
