@@ -1520,8 +1520,33 @@ def node_save_store(state: BuildPocState) -> Dict[str, Any]:
         metrics["recon_seconds_total"] = round(
             sum(v.get("seconds", 0) for v in recon_metrics.values()), 2)
     store_id = None
+    # Do NOT overwrite a verified exploit_store row with an unverified one.
+    # The deep-recon go-around can produce a second pass whose unverified
+    # result shadows the first pass's verified entry (CVE-2024-36412).
+    _skip_unverified = False
+    if not result.get("verified"):
+        try:
+            from api import get_db
+            with get_db() as _sc, _sc.cursor() as _scur:
+                _scur.execute(
+                    """SELECT id FROM exploit_store
+                       WHERE verified = true
+                         AND (metadata->>'attempt_run_id' = %s
+                              OR (cve = %s AND target_host = %s))
+                       LIMIT 1""",
+                    (state.get("run_id") or '', state.get("cve") or '',
+                     str(state.get("ip") or '')))
+                _vrow = _scur.fetchone()
+                if _vrow:
+                    store_id = str(_vrow[0])
+                    _skip_unverified = True
+                    _poc_trace(state.get("run_id"), "save_store_skip",
+                               response=f"verified entry {store_id} exists; "
+                                        f"not overwriting with unverified")
+        except Exception:  # noqa: BLE001
+            pass
     try:
-        if result.get("final_command"):
+        if result.get("final_command") and not _skip_unverified:
             store_id = _save_exploit_store(
                 name=f"PoC {state['cve']} on {state['ip']}"
                      + (" (verified)" if result.get("verified") else " (unverified)"),
@@ -1545,7 +1570,7 @@ def node_save_store(state: BuildPocState) -> Dict[str, Any]:
                           "research_sources": (research_out or {}).get("sources"),
                           "failure_analysis": state.get("failure_analysis") or None,
                           "attempt_run_id": state.get("run_id")})
-        elif state.get("failure_analysis"):
+        elif state.get("failure_analysis") and not _skip_unverified:
             # No final command — the run FAILED (blocked, gather-incomplete, or
             # every iteration unverified). Operator (2026-10-10): "at the end of
             # failed runs ... add the analysis ... stored with the exploit
@@ -1729,6 +1754,48 @@ def node_tool_handoff(state: BuildPocState) -> Dict[str, Any]:
     return {"tool_handoff": handoff}
 
 
+def node_post_run_review(state: BuildPocState) -> Dict[str, Any]:
+    """RAG-driven post-run review agent. Retrieves review criteria from RAG,
+    evaluates each against the run trace, stores findings for operator approval,
+    and feeds learnings back into RAG for future runs."""
+    from api import (_post_run_review, _poc_trace, _read_trace_entries,
+                     _summarize_build_trace, _trace_extra)
+    result = state.get("result") or {}
+    fa = state.get("failure_analysis") or {}
+    session_info = state.get("session_info") or {}
+    trace_summary = {}
+    try:
+        store_id = state.get("exploit_store_id")
+        if store_id:
+            entries = _read_trace_entries(store_id)
+            trace_summary = _summarize_build_trace(entries)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        review = _post_run_review(
+            run_id=state.get("run_id"),
+            cve=state.get("cve"),
+            ip=state.get("ip"),
+            port=state.get("port"),
+            product=state.get("product"),
+            result=result,
+            fa=fa,
+            session_info=session_info,
+            trace_summary=trace_summary,
+            eid=state.get("eid"))
+        _poc_trace(state.get("run_id"), "post_run_review",
+                   response=(f"review completed: {review.get('summary', '')[:300]}"),
+                   extra={"review_id": review.get("review_id"),
+                          "findings_count": len(review.get("findings", [])),
+                          "fail_count": sum(1 for f in review.get("findings", [])
+                                           if f.get("status") == "fail"),
+                          "prior_learnings": review.get("prior_learnings_count", 0)})
+        return {"review": review}
+    except Exception as e:  # noqa: BLE001
+        logging.warning("post_run_review failed run=%s: %s", state.get("run_id"), e)
+        return {}
+
+
 # ── conditional edges (routers) ────────────────────────────────────────────────
 def _route_after_start(state: BuildPocState) -> str:
     """recon_first? -> port_sweep, else -> auth_establish (skip recon)."""
@@ -1847,6 +1914,7 @@ def build_graph():
     _add_node(g, "failure_analysis", node_failure_analysis)
     _add_node(g, "save_store", node_save_store)
     _add_node(g, "tool_handoff", node_tool_handoff)
+    _add_node(g, "post_run_review", node_post_run_review)
 
     # Edges — the spine
     g.add_conditional_edges(START, _route_after_start,
@@ -1931,8 +1999,33 @@ def build_graph():
     g.add_edge("synth", "run_refine")
 
     def _route_after_refine(state):
-        from api import _BUILD_POC_DEEP_RECON, _BUILD_POC_EARLY_STOP_ITERS
+        from api import _BUILD_POC_DEEP_RECON, _BUILD_POC_EARLY_STOP_ITERS, get_db
         res = state.get("result") or {}
+        # GUARD: if this run already produced a verified exploit, do NOT
+        # route to deep_recon for a go-around — the second pass would
+        # write an unverified entry that shadows the verified one.
+        # CVE-2024-36412: verified at iter 3, go-around overwrote with
+        # verified=False at iter 19. This single bug cost the only
+        # success in the focused-10 benchmark.
+        if res.get("verified"):
+            return "save_store"
+        try:
+            run_id = state.get("run_id")
+            cve = state.get("cve")
+            ip = state.get("ip")
+            if run_id or (cve and ip):
+                with get_db() as c, c.cursor() as cur:
+                    cur.execute(
+                        """SELECT 1 FROM exploit_store
+                           WHERE verified = true
+                             AND (metadata->>'attempt_run_id' = %s
+                                  OR (cve = %s AND target_host = %s))
+                           LIMIT 1""",
+                        (run_id or '', cve or '', str(ip or '')))
+                    if cur.fetchone():
+                        return "save_store"
+        except Exception:  # noqa: BLE001
+            pass
         gave_up = (res.get("stop_reason") in ("identical_resend", "dup_exit")
                    or bool((res.get("metrics") or {}).get("identical_resend_stop"))
                    or bool((res.get("metrics") or {}).get("refine_dup_exit")))
@@ -1949,7 +2042,8 @@ def build_graph():
                             {"deep_recon": "deep_recon", "save_store": "failure_analysis"})
     g.add_edge("failure_analysis", "save_store")
     g.add_edge("save_store", "tool_handoff")
-    g.add_edge("tool_handoff", END)
+    g.add_edge("tool_handoff", "post_run_review")
+    g.add_edge("post_run_review", END)
 
     return g.compile()
 

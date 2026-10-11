@@ -1,0 +1,142 @@
+# build_poc_review.yaml — RAG-retrievable review criteria for post-run analysis.
+# Operators can add/edit criteria here; changes take effect after re-embedding
+# (the loader in api.py::_load_build_poc_review_knowledge).
+# The review agent retrieves these by tag 'build_poc_review_criteria' and
+# evaluates each criterion against the run trace.
+
+review_criteria:
+
+  - id: auth_session_valid
+    category: authentication
+    question: "Did the login produce a valid authenticated session?"
+    what_to_check:
+      - "Was _establish_session_for_build called?"
+      - "Did _probe_session_valid confirm the session?"
+      - "Were credentials supplied but the session was not validated?"
+    severity: critical
+    failure_indicator: "cookie_header is empty OR session not validated"
+    remediation: "Check login field variants, discovered forms, and CSRF token handling"
+    learning_tags: ["auth", "login", "session"]
+
+  - id: timing_confirmation_scaled
+    category: verification
+    question: "Did the timing confirmation correctly scale and execute the payload?"
+    what_to_check:
+      - "Was the SLEEP value actually changed in the scaled command?"
+      - "Did the scaled command execute (second_s roughly matches expected_s)?"
+      - "Was the payload URL-encoded and did scaling preserve the encoding?"
+    severity: critical
+    failure_indicator: "second_s << expected_s OR second_s ≈ first_s"
+    remediation: "Check URL-encoding of scaled payload; verify injection context survived"
+    learning_tags: ["timing", "blind_sqli", "verification"]
+
+  - id: recon_consumed_by_gather
+    category: reconnaissance
+    question: "Were the live recon segments consumed by the gather manifest?"
+    what_to_check:
+      - "Did arjun/verb-sweep/crawl/form data reach the gather manifest?"
+      - "Are discovered endpoints in the probe list?"
+      - "Are discovered parameters in the input_field chain?"
+    severity: high
+    failure_indicator: "recon segments present but gather manifest missing input_field/endpoint"
+    remediation: "Ensure _parse_recon_segments output feeds into _gather_manifest"
+    learning_tags: ["recon", "gather", "arjun", "crawl"]
+
+  - id: go_around_overwrite
+    category: pipeline
+    question: "Did the deep-recon go-around overwrite a verified result?"
+    what_to_check:
+      - "Are there multiple exploit_store entries for the same CVE+IP?"
+      - "Is the earliest entry verified=True but a later one verified=False?"
+      - "Did _route_after_refine correctly detect the existing verified entry?"
+    severity: critical
+    failure_indicator: "verified=True entry exists but final result shows verified=False"
+    remediation: "The go-around guard should have prevented this"
+    learning_tags: ["pipeline", "verified", "overwrite"]
+
+  - id: target_reachable
+    category: infrastructure
+    question: "Was the target actually reachable during the run?"
+    what_to_check:
+      - "Did the initial probe return a non-error HTTP status?"
+      - "Were there connection timeouts in the trace?"
+      - "Did the target container survive the full run?"
+    severity: high
+    failure_indicator: "connection refused/timeout in early iterations"
+    remediation: "Check target health, network connectivity, port mapping"
+    learning_tags: ["target", "reachable", "infrastructure"]
+
+  - id: strategy_exhaustion
+    category: synthesis
+    question: "Did the refine loop exhaust strategies without finding new approaches?"
+    what_to_check:
+      - "Was dup_exit triggered? How many iterations before exhaustion?"
+      - "Did the LLM keep generating the same command?"
+      - "Were escalation hooks (path discovery, status-tier) triggered?"
+    severity: medium
+    failure_indicator: "dup_exit at low iteration count or identical_resend_stop"
+    remediation: "Provide more diverse recon data, try different vuln class"
+    learning_tags: ["synthesis", "dedup", "strategy"]
+
+  - id: gather_manifest_complete
+    category: prerequisites
+    question: "Did the gather manifest have all required fields?"
+    what_to_check:
+      - "Which fields were missing (endpoint, input_field, method, auth)?"
+      - "Were there recon segments that could have filled the missing fields?"
+      - "Did the LLM fallback fire and succeed?"
+    severity: high
+    failure_indicator: "gather_blocked=True with missing fields"
+    remediation: "Add recon sources for missing fields; check LLM fallback"
+    learning_tags: ["gather", "manifest", "prerequisites"]
+
+  - id: csrf_nonce_handling
+    category: authentication
+    question: "Were CSRF tokens or nonces correctly harvested and included?"
+    what_to_check:
+      - "Does the target require CSRF tokens?"
+      - "Were tokens harvested from the form page?"
+      - "Were tokens included in the exploit command?"
+    severity: high
+    failure_indicator: "403/CSRF error in exploit output"
+    remediation: "Add pre-request to harvest CSRF token; include in exploit payload"
+    learning_tags: ["csrf", "nonce", "token"]
+
+  - id: waf_detection
+    category: evasion
+    question: "Was a WAF detected and were evasion techniques applied?"
+    what_to_check:
+      - "Were 403/406 responses consistent with WAF blocking?"
+      - "Did the refine loop try encoding/obfuscation variants?"
+      - "Was the waf_proven flag set?"
+    severity: medium
+    failure_indicator: "consistent 403s without WAF evasion attempts"
+    remediation: "Apply WAF bypass techniques from the evasion knowledge base"
+    learning_tags: ["waf", "evasion", "bypass"]
+
+  - id: iteration_efficiency
+    category: performance
+    question: "How efficiently were iterations used?"
+    what_to_check:
+      - "What fraction of iterations were skipped (bad syntax, LLM refusal)?"
+      - "How many iterations reached the target?"
+      - "Was the best result achieved early but not preserved?"
+    severity: low
+    failure_indicator: ">50% iterations skipped or best result in first 5 iters"
+    remediation: "Improve prompt quality, reduce syntax errors in synthesis"
+    learning_tags: ["efficiency", "iterations", "performance"]
+
+  - id: error_memory_used
+    category: learning
+    question: "Were past failures for this product/CVE retrieved and applied?"
+    what_to_check:
+      - "Was build_poc_error_memory consulted?"
+      - "Were learned hints from prior runs retrieved?"
+      - "Did the review findings from prior runs inform this attempt?"
+    severity: medium
+    failure_indicator: "Same failure mode as a prior run without applying its learnings"
+    remediation: "Check error memory retrieval; ensure prior review findings are in RAG"
+    learning_tags: ["learning", "memory", "prior_runs"]
+
+# Operator-editable: add new criteria here. They will be embedded into RAG
+# on the next loader run and picked up by the review agent automatically.
