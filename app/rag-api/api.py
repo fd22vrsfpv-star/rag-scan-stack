@@ -2581,9 +2581,17 @@ def _select_open_ports_without_recs(window_minutes: int = None, limit: int = 200
                    ) AS banner
             FROM public.ports p
             JOIN public.assets a ON a.id = p.asset_id
+            -- Coverage is per (ip, service, PORT). Keyed on (ip, service)
+            -- alone, a host with several ports running the same service --
+            -- an app on 9090 plus harness ports on 8000/9091, all 'http' --
+            -- counted as fully covered the moment any ONE of them got a
+            -- recommendation, and the rest were never scanned.
+            -- sr.port IS NULL matches anything so pre-column rows still
+            -- suppress: this must not re-queue work already done.
             LEFT JOIN public.scan_recommendations sr
               ON sr.ip = a.ip
              AND COALESCE(sr.service, '') = COALESCE(p.service, '')
+             AND (sr.port IS NULL OR sr.port = p.port)
             WHERE {where_sql}
             ORDER BY p.last_seen DESC
             LIMIT %(limit)s

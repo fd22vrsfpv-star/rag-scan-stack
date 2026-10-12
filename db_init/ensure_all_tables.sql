@@ -426,6 +426,12 @@ CREATE TABLE IF NOT EXISTS public.scan_recommendations (
     asset_id    uuid REFERENCES public.assets(id) ON DELETE CASCADE,
     ip          inet,
     service     text,
+    -- The port this recommendation is aimed at. Without it, dedup had to key on
+    -- (ip, service), so a host with four `http` ports (an app on 9090 plus
+    -- harness ports) counted as covered the moment ANY one of them got a
+    -- recommendation — the other three were never scanned. The value was
+    -- already being carried in extra->>'port'; this makes it queryable.
+    port        integer,
     banner      text,
     scanner     text NOT NULL,
     action      text,
@@ -461,6 +467,19 @@ DO $$ BEGIN
     ALTER TABLE public.scan_recommendations
         ADD COLUMN IF NOT EXISTS target_kind text NOT NULL DEFAULT 'service';
 EXCEPTION WHEN OTHERS THEN NULL; END $$;
+-- Existing installs: add port, and backfill it from where it was already being
+-- written so the dedup key is correct for rows created before the column.
+DO $$ BEGIN
+    ALTER TABLE public.scan_recommendations ADD COLUMN IF NOT EXISTS port integer;
+EXCEPTION WHEN OTHERS THEN NULL; END $$;
+DO $$ BEGIN
+    UPDATE public.scan_recommendations
+       SET port = NULLIF(extra->>'port', '')::integer
+     WHERE port IS NULL AND extra ? 'port'
+       AND NULLIF(extra->>'port', '') ~ '^[0-9]+$';
+EXCEPTION WHEN OTHERS THEN NULL; END $$;
+CREATE INDEX IF NOT EXISTS idx_scan_recommendations_ip_service_port
+    ON public.scan_recommendations(ip, service, port);
 DO $$ BEGIN
     ALTER TABLE public.scan_recommendations
         ADD CONSTRAINT scan_recommendations_target_kind_check
