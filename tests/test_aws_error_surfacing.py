@@ -31,7 +31,10 @@ NM = REPO / "node_manager" / "node_manager.py"
 def test_client_error_to_http_extracts_aws_message():
     """The helper lives in node_manager.node_manager; stand it up in a thin
     namespace so this test can run without pulling the full service."""
-    from botocore.exceptions import ClientError
+    # botocore is optional here (the module docstring documents installing it
+    # explicitly). A missing optional dep must SKIP, not fail — CLAUDE.md:
+    # "a skip says cannot run here; an error says broken".
+    ClientError = pytest.importorskip("botocore.exceptions").ClientError
 
     # Reproduce the helper's logic by importing it from source. Avoid importing
     # the full module (it opens DB connections at import time).
