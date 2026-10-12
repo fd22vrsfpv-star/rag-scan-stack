@@ -355,3 +355,46 @@ def test_chain_excludes_the_primary_and_unknown_classes():
     assert "in _CRAFT_CLASS_GUIDANCE" in window, (
         "a class with no guidance entry would KeyError when rendered"
     )
+
+
+# -------- F6b: the comment-canary rule applies ONLY to reflected assertions
+#
+# Regression caused by F6 itself and caught on the 2026-10-12 F2b run.
+# CVE-2024-22120 is blind time-based SQLi: there is nothing for the canary to
+# reflect into, so the model put it in a trailing SQL comment to tag the
+# request. F6 refused that, the model had nowhere else to put the marker, and
+# every rewrite was refused too — 14 refusals, and the CVE finished with
+# target_runs=0 (versus 2-3 in the two preceding runs). Not one command
+# reached the target. A correct rule applied to the wrong case is still a
+# broken build.
+
+
+def test_comment_canary_rule_is_opt_in_on_reflection():
+    fn = _func(_src(), "_poc_shell_syntax_check")
+    assert re.search(r"def _poc_shell_syntax_check\(command,\s*canary[^)]*assertion", fn), (
+        "_poc_shell_syntax_check must receive the assertion to know whether "
+        "the canary is even supposed to be reflected"
+    )
+    assert "_wants_reflection" in fn, "the comment rule must be gated"
+    i = fn.find("_wants_reflection = ")
+    window = fn[i:i + 260]
+    assert 'min_seconds") is None' in window, (
+        "a timing assertion has nothing to reflect into — the comment rule "
+        "must not fire for it"
+    )
+    assert "isinstance(assertion, dict)" in window, (
+        "an ABSENT assertion must not satisfy the condition; this check is "
+        "opt-in, because its failure mode is a build that cannot dispatch"
+    )
+
+
+def test_placeholder_rule_stays_unconditional():
+    """An unsubstituted {CANARY} is always wrong, timing or not."""
+    fn = _func(_src(), "_poc_shell_syntax_check")
+    ph = fn.find("unsubstituted canary placeholder")
+    gate = fn.find("_wants_reflection = ")
+    assert ph != -1 and gate != -1
+    assert ph < gate, (
+        "the placeholder check must run BEFORE (and outside) the reflection "
+        "gate — a literal {CANARY} is a defect under any assertion kind"
+    )
