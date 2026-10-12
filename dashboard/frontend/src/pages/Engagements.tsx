@@ -5,13 +5,13 @@ import {
   usePurgeEngagementData,
   useCampaignEvents, useCreateCampaignEvent, useUpdateCampaignEvent, useCampaignSummary,
   useEngagementScopes, useEngagementScopeTargets, useAddScopeTargets, useDeleteScope,
-  useRenameScope, useMoveTargets, useMoveEntireScope,
+  useRenameScope, useMoveTargets, useMoveEntireScope, downloadScopeTargetsCsv,
   type EngagementScope, type ScopeTarget, type EngagementDeleteResult,
 } from '@/api/engagements'
 import { useScopeNames } from '@/api/scope'
 import { cn } from '@/lib/utils'
 import type { Engagement, CampaignEvent, KillChainPhase } from '@/lib/types'
-import { Briefcase, Plus, X, ChevronRight, Eye, Trash2, Pencil, ArrowRight, Loader2, Upload, FileText } from 'lucide-react'
+import { Briefcase, Plus, X, ChevronRight, Eye, Trash2, Pencil, ArrowRight, Loader2, Upload, FileText, Download } from 'lucide-react'
 import { ReconAgentPanel } from '@/components/common/ReconAgentPanel'
 import { GapAnalysisAgentPanel } from '@/components/common/GapAnalysisPanel'
 import { ScopePivotPanel } from '@/components/ScopePivotPanel'
@@ -330,6 +330,7 @@ function ScopeTab({ engagementId }: { engagementId: string }) {
   const [renaming, setRenaming] = useState<string | null>(null)
   const [renameVal, setRenameVal] = useState('')
   const [showMove, setShowMove] = useState(false)
+  const [exportErr, setExportErr] = useState<string | null>(null)
   const [moveToEng, setMoveToEng] = useState('')
   const [moveToScope, setMoveToScope] = useState('')
   const [moveNewScope, setMoveNewScope] = useState('')
@@ -454,6 +455,18 @@ function ScopeTab({ engagementId }: { engagementId: string }) {
                 </>
               )}
               <div className="flex-1" />
+              <button
+                onClick={async () => {
+                  setExportErr(null)
+                  try { await downloadScopeTargetsCsv({ name: activeScope }) }
+                  catch (e) { setExportErr(String(e)) }
+                }}
+                disabled={!activeScope}
+                title={`Export every field of "${activeScope}" as CSV`}
+                className="flex items-center gap-1 px-2 py-1 text-xs rounded border border-border hover:bg-muted disabled:opacity-50"
+              >
+                <Download className="h-3 w-3" /> Export CSV
+              </button>
               {selected.size > 0 && (
                 <div className="flex items-center gap-2">
                   <span className="text-xs text-muted-foreground">{selected.size} selected</span>
@@ -464,6 +477,12 @@ function ScopeTab({ engagementId }: { engagementId: string }) {
                 </div>
               )}
             </div>
+
+            {exportErr && (
+              <div className="text-xs px-3 py-2 rounded border border-red-500/50 text-red-400 bg-red-500/10">
+                CSV export failed: {exportErr}
+              </div>
+            )}
 
             {/* Move entire scope dialog */}
             {showMoveScope && activeScope && (

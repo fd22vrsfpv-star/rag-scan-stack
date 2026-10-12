@@ -39752,6 +39752,93 @@ def _infer_target_type(target: str) -> str:
         return "domain"
 
 
+#: Every column of a scope target, in export order. `engagement_name` is
+#: joined, not stored — an export keyed only by a uuid is not usable in a
+#: spreadsheet, which is the whole point of the format.
+SCOPE_EXPORT_COLUMNS = [
+    "id", "name", "target", "target_type", "source", "added_at",
+    "engagement_id", "engagement_name",
+]
+
+
+@app.get("/scope/export.csv", tags=["Scope"])
+def export_scope_csv(
+    name: Optional[str] = Query(None, description="One scope name; omit for every scope the engagement can see"),
+    engagement_id: Optional[str] = Query(None, description="Overrides the X-Engagement-Id header"),
+    all_engagements: bool = Query(False, description="Cross-engagement export; the caller must label this in the UI"),
+    include_placeholders: bool = Query(False, description="Include the empty placeholder rows list_scope_names hides"),
+    _: bool = Depends(auth),
+):
+    """Scope targets as CSV, with every field.
+
+    Deterministic: ordered by (name, target) rather than added_at, so two
+    exports of unchanged data are byte-identical and diffable — CLAUDE.md
+    requires exports to be deterministic and documented.
+
+    Engagement-filtered like every other listing endpoint: the active
+    X-Engagement-Id plus NULL-engagement rows (legacy/global, intentionally
+    visible in every engagement). `all_engagements=true` is the explicit
+    operator override for a cross-engagement audit.
+    """
+    import csv as _csv
+    import datetime as _dt
+    import io as _io
+
+    eid = None if all_engagements else _resolve_engagement_id(engagement_id)
+    where, args = ["TRUE"], []
+    if not include_placeholders:
+        where.append("st.target <> '' AND st.source IS DISTINCT FROM %s")
+        args.append(_SCOPE_PLACEHOLDER_SOURCE)
+    if name:
+        where.append("LOWER(st.name) = LOWER(%s)")
+        args.append(name)
+    if eid:
+        where.append("(st.engagement_id = %s OR st.engagement_id IS NULL)")
+        args.append(eid)
+
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""SELECT st.id::text AS id, st.name, st.target,
+                       COALESCE(st.target_type, '') AS target_type,
+                       COALESCE(st.source, '')      AS source,
+                       st.added_at,
+                       COALESCE(st.engagement_id::text, '') AS engagement_id,
+                       COALESCE(e.name, '')                 AS engagement_name
+                  FROM scope_targets st
+                  LEFT JOIN engagements e ON e.id = st.engagement_id
+                 WHERE {' AND '.join(where)}
+                 ORDER BY st.name, st.target""",
+            args,
+        )
+        rows = cur.fetchall()
+
+    buf = _io.StringIO()
+    w = _csv.DictWriter(buf, fieldnames=SCOPE_EXPORT_COLUMNS,
+                        extrasaction="ignore", lineterminator="\n")
+    w.writeheader()
+    for r in rows:
+        d = dict(r)
+        # ISO-8601 so a spreadsheet and a diff both read it the same way.
+        d["added_at"] = r["added_at"].isoformat() if r.get("added_at") else ""
+        w.writerow(d)
+
+    stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
+    fname = f"scope-targets-{(name or 'all').replace('/', '_')}-{stamp}.csv"
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("scope_targets_exported", "scope", {
+            "scope_name": name or "(all)", "rows": len(rows),
+            "engagement_id": eid, "all_engagements": bool(all_engagements),
+        })
+    except Exception:  # noqa: BLE001
+        pass
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
 @app.get("/scope/conflicts", tags=["Scope"])
 def list_scope_conflicts(include_resolved: bool = Query(False),
                          _: bool = Depends(auth)):

@@ -1,9 +1,10 @@
 import { useState, useMemo } from 'react'
 import { useScopeIntelligence, useScopeAnalysis, useExcludeFromScope, useTagSuggestions, type ScopeIntelligenceData, type ScopeIntelDnsEntry, type ScopeAnalysisData } from '@/api/findings'
 import { useScopeNames, useAddToScope } from '@/api/scope'
+import { downloadScopeTargetsCsv } from '@/api/engagements'
 import { useScreenshots, useAllScreenshotMetadata, useScreenshotMetadata, useUpdateScreenshotMetadata } from '@/api/recon'
 import { apiUrl } from '@/api/client'
-import { Crosshair, Wifi, Server, Globe, Lock, FileText, ChevronRight, Cpu, Network, Layers, MapPin, Camera, X, Tag, Shield, Target, Eye, LogIn, Ban, Zap, AlertTriangle, Plus } from 'lucide-react'
+import { Crosshair, Wifi, Server, Globe, Lock, FileText, ChevronRight, Cpu, Network, Layers, MapPin, Camera, X, Tag, Shield, Target, Eye, LogIn, Ban, Zap, AlertTriangle, Plus, Download } from 'lucide-react'
 import { cn, formatDate } from '@/lib/utils'
 import { PREDEFINED_TAGS, TAG_COLORS, TAG_COLOR_DEFAULT } from '@/lib/constants'
 import { useUIStore } from '@/stores/ui'
@@ -28,10 +29,16 @@ export default function ScopeIntelligence() {
   const [showAutoClassify, setShowAutoClassify] = useState(false)
   const { data: analysis, isLoading: analysisLoading } = useScopeAnalysis(showAnalysis ? selected : undefined)
   const [techFilter, setTechFilter] = useState<string | null>(null)
+  const [exportErr, setExportErr] = useState<string | null>(null)
 
   return (
     <div className="space-y-4">
       <ScopeConflictsBanner />
+      {exportErr && (
+        <div className="text-xs px-3 py-2 rounded border border-red-500/50 text-red-400 bg-red-500/10">
+          CSV export failed: {exportErr}
+        </div>
+      )}
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-semibold flex items-center gap-2">
           <Crosshair className="h-5 w-5" /> Scope Intelligence
@@ -42,6 +49,17 @@ export default function ScopeIntelligence() {
             {scopes.map((s: string) => <option key={s} value={s}>{s}</option>)}
             {scopes.length === 0 && <option value="default">default</option>}
           </select>
+          <button
+            onClick={async () => {
+              setExportErr(null)
+              try { await downloadScopeTargetsCsv({ name: selected }) }
+              catch (e) { setExportErr(String(e)) }
+            }}
+            title={`Export every field of scope "${selected}" as CSV`}
+            className="px-3 py-1.5 text-xs rounded flex items-center gap-1.5 border border-border hover:bg-muted"
+          >
+            <Download className="h-3.5 w-3.5" /> Export CSV
+          </button>
           <button
             onClick={() => setShowAutoClassify(!showAutoClassify)}
             className={cn(

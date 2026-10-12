@@ -1,6 +1,7 @@
 from typing import Optional
 import httpx
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import Response
 from pydantic import BaseModel
 from config import get_settings
 from engagement import engagement_headers
@@ -33,6 +34,41 @@ async def get_scope(
             headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
+
+
+@router.get("/api/scope/export.csv")
+async def export_scope_csv(
+    name: Optional[str] = Query(None),
+    all_engagements: bool = Query(False),
+    include_placeholders: bool = Query(False),
+):
+    """Stream the scope-targets CSV through from rag-api.
+
+    NOT safe_json: the upstream body is text/csv, and the browser needs the
+    Content-Disposition filename to survive so "Save as" offers the right name.
+    """
+    s = get_settings()
+    params = {"all_engagements": str(all_engagements).lower(),
+              "include_placeholders": str(include_placeholders).lower()}
+    if name:
+        params["name"] = name
+    async with httpx.AsyncClient(timeout=60) as c:
+        resp = await c.get(
+            f"{s.rag_api_url}/scope/export.csv",
+            params=params,
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+    if resp.status_code >= 400:
+        # An HTTP status is not an exception (CLAUDE.md): httpx does not raise
+        # on 4xx/5xx, so without this the operator downloads a file containing
+        # the error body and reads it as an empty scope.
+        raise HTTPException(resp.status_code, resp.text[:500])
+    return Response(
+        content=resp.content,
+        media_type="text/csv",
+        headers={"Content-Disposition":
+                 resp.headers.get("content-disposition", 'attachment; filename="scope-targets.csv"')},
+    )
 
 
 class AddToScopeBody(BaseModel):
