@@ -24,8 +24,11 @@ import pytest
 import requests
 
 
-RAG_API_URL = os.environ.get("RAG_API_URL",
-                              "https://localhost:8000").rstrip("/")
+from conftest import RAG_API
+
+# Legacy env var still wins; the shared endpoint is the fallback so the literal
+# lives in exactly one place (tests/conftest.py).
+RAG_API_URL = (os.environ.get("RAG_API_URL") or RAG_API).rstrip("/")
 API_KEY = os.environ.get("API_KEY") or os.environ.get("RAG_API_KEY") or ""
 SEED_DOMAIN = os.environ.get("TEST_PIVOT_SEED", "examplecorp.com")
 

@@ -60,6 +60,18 @@ CONTAINER_INTERNAL = {
     "test_scan_parameters.py": "curl run via `docker exec rag-api sh -c`",
     "test_target_wordlists.py": "curl run via `docker exec rag-api sh -c`",
     "test_tool_command_check.py": "curl run via `docker exec kali-listener`",
+    # Migrated 2026-10-12 from private `subprocess.run(["docker","exec",...])`
+    # copies to _container.container_sh / container_python. The URLs run INSIDE
+    # rag-api, where localhost:8000 is the service's own endpoint.
+    "test_build_poc_handoff.py": "curl run via `container_sh` inside rag-api",
+    "test_news_engagement_matcher.py": "curl run via `container_sh` inside rag-api",
+    "test_poc_hints_and_port_sweep.py": "curl run via `container_sh` inside rag-api",
+    "test_rag_observed_facts.py": "curl run via `container_sh` inside rag-api",
+    # Not an endpoint at all: REAL_LLM_TAIL is captured PoC COMMAND TEXT, run
+    # inside kali-listener against a lab target. Pinning it is the point of
+    # the fixture — rewriting it to a variable would stop it matching what the
+    # model actually emitted.
+    "test_build_poc_python_exec_lane.py": "captured PoC command text, executed inside kali-listener",
 }
 
 
