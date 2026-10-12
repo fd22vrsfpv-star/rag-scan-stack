@@ -14350,6 +14350,36 @@ def _fetch_cve_cwes(cve: str) -> list:
     return []
 
 
+def _vuln_classes_from_cve(cve: str, details: dict) -> list:
+    """EVERY mapped vuln class for this CVE, in NVD's CWE order, deduped.
+
+    `_vuln_class_from_cve` returns one string, so a CVE that is genuinely two
+    things keeps only the first. CVE-2024-3408 is ['CWE-798', 'CWE-94'] — an
+    authentication bypass AND a remote code execution — and the advisory says
+    so in those words. Returning only `auth-bypass` meant the crafter was
+    handed auth-bypass guidance for an exploit whose payoff is code execution,
+    and `cmdi` guidance was discarded. That CVE has never landed in any
+    archived run.
+
+    The primary (element 0) is deliberately the SAME value
+    `_vuln_class_from_cve` returns, so nothing that reads the single class
+    changes behaviour; this only recovers what used to be thrown away.
+    """
+    out, seen = [], set()
+    try:
+        for _c in _cwe_ids_from_details(details):
+            _cls = _CWE_TO_VULN_CLASS.get(_c)
+            if _cls and _cls not in seen:
+                seen.add(_cls)
+                out.append(_cls)
+    except Exception:  # noqa: BLE001
+        pass
+    if not out:
+        _single = _vuln_class_from_cve(cve, details)
+        return [_single] if _single and _single != "unknown" else []
+    return out
+
+
 def _vuln_class_from_cve(cve: str, details: dict) -> str:
     """Classify a CVE into a vulnerability class the crafter understands.
 
@@ -16781,6 +16811,12 @@ def _extract_target_spec(cve: str, ip, port, product, version, eid,
     port = int(port or 80)
     details = details or _fetch_cve_details(cve)
     vuln_class = _vuln_class_from_cve(cve, details)
+    # Every OTHER mapped class this CVE also is — see _vuln_classes_from_cve.
+    # The primary is unchanged; this only recovers what used to be discarded.
+    try:
+        vuln_class_chain = _vuln_classes_from_cve(cve, details)
+    except Exception:  # noqa: BLE001
+        vuln_class_chain = []
     spec = {
         "ip": str(ip),
         "port": port,
@@ -16838,6 +16874,7 @@ def _extract_target_spec(cve: str, ip, port, product, version, eid,
         diff_text = ""
     spec["input_source"] = _classify_input_source(details, diff_text)
     spec["artifact_required"] = bool(spec["input_source"].get("artifact_required"))
+    spec["vuln_class_chain"] = vuln_class_chain
     # Recall research hints from RAG for this CVE / class so the crafter sees
     # operator-authored guidance, not only the hard-coded class text.
     spec["rag_hints"] = _rag_hints_for(
@@ -16932,6 +16969,25 @@ def _llm_craft_payload(target_spec: dict, canary: str, model=None) -> dict:
     """
     vuln_class = target_spec.get("vuln_class") or "unknown"
     class_guidance = _CRAFT_CLASS_GUIDANCE.get(vuln_class, _CRAFT_CLASS_GUIDANCE["unknown"])
+    # A CVE that is genuinely two things gets BOTH sets of guidance. The
+    # primary still leads (nothing about the single-class path changes); the
+    # extra classes are appended as the chain to carry out, because an
+    # auth-bypass that exists to reach an RCE sink needs the RCE guidance too.
+    try:
+        _chain = [c for c in (target_spec.get("vuln_class_chain") or [])
+                  if c != vuln_class and c in _CRAFT_CLASS_GUIDANCE]
+    except Exception:  # noqa: BLE001
+        _chain = []
+    if _chain:
+        class_guidance += (
+            "\n\nTHIS CVE IS ALSO: " + ", ".join(_chain) + ". The advisory describes "
+            "more than one weakness, and the exploit must chain them — typically the "
+            "access/bypass step FIRST to reach the vulnerable sink, THEN the payload "
+            "step that produces the observable effect. Guidance for the other "
+            "step(s):\n"
+            + "\n".join(f"  [{c}] {_CRAFT_CLASS_GUIDANCE[c]}" for c in _chain)
+            + "\nPlace the canary so it proves the FINAL step, not merely that you "
+              "authenticated.")
     spec_block = (
         f"  endpoint-base: {target_spec.get('scheme')}://{target_spec.get('ip')}:{target_spec.get('port')}\n"
         f"  product+version: {target_spec.get('product')} {target_spec.get('version')}\n"
@@ -30977,6 +31033,17 @@ _RUNNER_BIN_CACHE_TTL = 3600
 def _command_binaries(command: str) -> list:
     """Names of the external programs a shell command invokes, first-seen order.
 
+    A `#` token starts a shell COMMENT and ends the simple command: the words
+    after it are prose, not programs. Without this the tail that
+    `_augment_with_sink_verification` auto-adds for every blind/OOB class —
+    whose first line is `# sink-verification tail (auto-added for blind/OOB
+    class):` — yielded the "programs" `sink-verification` and `auto-added`.
+    `_prerun_tool_check` then found them missing on the runner, returned
+    ok=False, and the command was NEVER DISPATCHED. Observed on CVE-2024-22120,
+    2026-10-12: "PRERUN_TOOL_MISSING: sink-verification — not installed on the
+    runner; the command was NOT sent to the target." Every command carrying
+    that auto-added tail was unrunnable for the same reason.
+
     Pure text analysis, no execution. Quoted strings are blanked first (the
     payloads carry `|`, `;`, `&&` inside quotes), heredoc bodies are dropped,
     then the first word of every simple command (split on `|| && | ; newline
@@ -30990,6 +31057,13 @@ def _command_binaries(command: str) -> list:
     s = (command or "").split("<<", 1)[0]
     s = _re.sub(r"'[^']*'", " ", s)
     s = _re.sub(r'"(?:\\.|[^"\\])*"', " ", s)
+    # Strip comments BEFORE segmenting. The segment splitter breaks on "(" and
+    # ")", so "# sink-verification tail (auto-added for blind/OOB class):"
+    # becomes two segments and only the first still carries the "#" — the
+    # per-token guard below would let "auto-added" through as a program name.
+    # Quotes are already blanked above, so a surviving "#" at the start of a
+    # word is a real comment (a "#" inside a URL is mid-word and is kept).
+    s = _re.sub(r"(?m)(?:(?<=\s)|^)#[^\n]*", " ", s)
     segs = _re.split(r"\|\||&&|[|;\n]|\$\(|`|[(){}]", s)
     out, seen = [], set()
     for seg in segs:
@@ -30999,6 +31073,8 @@ def _command_binaries(command: str) -> list:
             if skip_next:
                 skip_next = False
                 continue
+            if t.startswith("#"):
+                break                                      # comment: rest of the line is prose
             if _re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t):
                 continue                                   # VAR=value prefix
             if _re.match(r"^[0-9]*[<>]", t) or t.startswith("&>"):

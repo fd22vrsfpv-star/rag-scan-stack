@@ -257,3 +257,101 @@ def test_refine_call_site_passes_the_canary():
     assert re.search(r"_poc_shell_syntax_check\(command,\s*canary=", fn), (
         "_run_refine_poc must pass canary= to the syntax check"
     )
+
+
+# ------------------ F7: a shell comment is not a command (sink-verification)
+#
+# _augment_with_sink_verification auto-adds a tail to every blind/OOB command
+# whose first line is "# sink-verification tail (auto-added for blind/OOB
+# class):". _command_binaries did not understand `#`, so it extracted
+# "sink-verification" and "auto-added" as PROGRAM NAMES. _prerun_tool_check
+# found them missing on the runner and refused to dispatch. Every command
+# carrying that tail was unrunnable. Observed on CVE-2024-22120, 2026-10-12:
+# "PRERUN_TOOL_MISSING: sink-verification ... the command was NOT sent to the
+# target."
+
+
+def test_command_binaries_stops_at_a_comment():
+    fn = _func(_src(), "_command_binaries")
+    assert 't.startswith("#")' in fn.replace("'", '"'), (
+        "_command_binaries must treat a `#` token as starting a comment"
+    )
+    i = fn.find('startswith("#")')
+    assert "break" in fn[i:i + 120], (
+        "a comment must BREAK the simple command (the words after it are "
+        "prose); `continue` would still take the next word as the program"
+    )
+
+
+def test_comments_are_stripped_before_segmentation():
+    """The per-token guard alone is NOT enough, and this is the case that
+    proved it: the segment splitter breaks on "(" and ")", so
+    "# sink-verification tail (auto-added for blind/OOB class):" splits into
+    two segments and only the first still carries the "#". With a token-level
+    guard only, "auto-added" was still returned as a program name."""
+    fn = _func(_src(), "_command_binaries")
+    strip = fn.find('#[^\\n]*')
+    split = fn.find("_re.split(")
+    assert strip != -1, (
+        "_command_binaries must strip whole comments with a regex, not only "
+        "guard individual tokens"
+    )
+    assert strip < split, (
+        "the comment strip must run BEFORE the segment split, or a comment "
+        "containing parentheses leaks its words as program names"
+    )
+
+
+def test_sink_verification_tail_is_still_auto_added():
+    """The fix must be in the parser, not by removing the tail."""
+    fn = _func(_src(), "_augment_with_sink_verification")
+    assert "sink-verification tail" in fn, (
+        "the auto-added tail is the feature; the bug was parsing its comment"
+    )
+
+
+# ------------------------------- F8: a multi-CWE CVE keeps every mapped class
+
+
+def test_vuln_classes_returns_every_mapped_class():
+    fn = _func(_src(), "_vuln_classes_from_cve")
+    assert "_CWE_TO_VULN_CLASS" in fn and "_cwe_ids_from_details" in fn
+    assert "seen" in fn, "must dedupe while preserving NVD order"
+
+
+def test_chain_primary_matches_the_single_class_function():
+    """Behaviour of every existing single-class reader must be unchanged."""
+    fn = _func(_src(), "_vuln_classes_from_cve")
+    assert "_vuln_class_from_cve" in fn, (
+        "the no-CWE fallback must defer to the existing classifier so the "
+        "primary never disagrees with it"
+    )
+
+
+def test_spec_carries_the_chain():
+    fn = _func(_src(), "_extract_target_spec")
+    assert '"vuln_class_chain"' in fn, "_extract_target_spec must expose the chain"
+
+
+def test_crafter_appends_guidance_for_the_other_classes():
+    fn = _func(_src(), "_llm_craft_payload")
+    assert "vuln_class_chain" in fn, "the crafter must read the chain"
+    assert "THIS CVE IS ALSO" in fn, (
+        "the extra classes must reach the prompt; computing a chain and not "
+        "rendering it changes nothing"
+    )
+    i = fn.find("THIS CVE IS ALSO")
+    window = fn[i:i + 900]
+    assert "_CRAFT_CLASS_GUIDANCE[c]" in window, (
+        "must include the OTHER classes' actual guidance text, not just names"
+    )
+
+
+def test_chain_excludes_the_primary_and_unknown_classes():
+    fn = _func(_src(), "_llm_craft_payload")
+    i = fn.find("vuln_class_chain")
+    window = fn[i:i + 400]
+    assert "c != vuln_class" in window, "the primary must not be repeated"
+    assert "in _CRAFT_CLASS_GUIDANCE" in window, (
+        "a class with no guidance entry would KeyError when rendered"
+    )
