@@ -15258,7 +15258,35 @@ def _parse_openapi_paths_line(recon_text: str) -> list:
 _BUILD_POC_DEEP_RECON = (os.environ.get("BUILD_POC_DEEP_RECON") or "on").strip().lower()
 _BUILD_POC_EARLY_STOP_ITERS = int(os.environ.get("BUILD_POC_EARLY_STOP_ITERS") or "2")
 _BUILD_POC_DEEP_RECON_BUDGET_SEC = int(os.environ.get("BUILD_POC_DEEP_RECON_BUDGET_SEC") or "480")
-_BUILD_POC_SECOND_PASS_ITERS = int(os.environ.get("BUILD_POC_SECOND_PASS_ITERS") or "10")
+# Compiled fallback only. Read `_build_poc_second_pass_iters()` instead — the
+# live value comes from Settings so it changes without a rebuild.
+_BUILD_POC_SECOND_PASS_ITERS = int(os.environ.get("BUILD_POC_SECOND_PASS_ITERS") or "50")
+
+
+def _build_poc_second_pass_iters() -> int:
+    """Iteration budget for the deep-recon GO-AROUND (the second pass).
+
+    Operator-adjustable from Settings → Scan Timeouts (`app_settings` category
+    'config', key `build_poc_second_pass_iters`, written by the BFF
+    `/api/settings/build-poc-limits`). Env `BUILD_POC_SECOND_PASS_ITERS` is the
+    fallback; 0 / blank / non-numeric means "use the compiled default".
+
+    Was a hard 10, with the rationale "the go-around is a SECOND chance, not a
+    second budget". In practice it is the binding limit on any CVE that needs
+    deep recon: a request asking for 50 was clamped to 10 by the min() below,
+    and CVE-2024-22120 stopped at exactly 10 with stop_reason=max_iters while
+    every one of its 10 iterations was genuinely reaching the target. Operator
+    raised it to 50 (2026-10-12) and asked for it to be adjustable rather than
+    compiled in. Bounded at 200 so a typo cannot start an unbounded loop.
+    """
+    raw = _get_setting("build_poc_second_pass_iters", "")
+    try:
+        val = int(str(raw).strip())
+    except (TypeError, ValueError):
+        val = 0
+    if val <= 0:
+        val = _BUILD_POC_SECOND_PASS_ITERS
+    return max(1, min(int(val), 200))
 
 
 def _deep_recon_plan(missing: list, has_session: bool, vuln_class: str = "") -> list:

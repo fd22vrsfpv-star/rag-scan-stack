@@ -1790,6 +1790,21 @@ SCAN_TIMEOUT_KEYS = [
 ]
 
 
+# Build-PoC LIMITS are counts, not seconds, so they get their own key list and
+# endpoint rather than riding on scan-timeouts (whose validator says "seconds"
+# and whose UI labels everything as a duration).
+BUILD_POC_LIMIT_KEYS = [
+    "build_poc_second_pass_iters",   # deep-recon go-around iteration budget
+]
+
+
+def _build_poc_limit_defaults() -> Dict[str, int]:
+    """Match the compiled fallbacks in rag-api (_build_poc_second_pass_iters)."""
+    return {
+        "build_poc_second_pass_iters": 50,   # was a hard 10 until 2026-10-12
+    }
+
+
 def _scan_timeout_defaults() -> Dict[str, int]:
     """Match the env defaults compiled into nmap-api.py / rag-api."""
     return {
@@ -1859,6 +1874,65 @@ async def put_scan_timeouts(body: ScanTimeoutsBody):
                 raise HTTPException(resp.status_code,
                                     f"Failed to write {key}: {resp.text}")
     return {"ok": True, "updated": list(body.timeouts.keys())}
+
+
+@router.get("/api/settings/build-poc-limits")
+async def get_build_poc_limits():
+    """Build-PoC iteration limits (counts). Falls back to defaults when unset."""
+    s = get_settings()
+    defaults = _build_poc_limit_defaults()
+    out: Dict[str, int] = {}
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        for key in BUILD_POC_LIMIT_KEYS:
+            try:
+                resp = await c.get(
+                    f"{s.rag_api_url}/settings/config/{key}",
+                    headers={"x-api-key": s.api_key, **engagement_headers()},
+                )
+                if resp.status_code == 200:
+                    try:
+                        out[key] = int(resp.json().get("value", ""))
+                        continue
+                    except (TypeError, ValueError):
+                        pass
+            except Exception:
+                pass
+            out[key] = defaults.get(key, 0)
+    return {"limits": out, "defaults": defaults}
+
+
+class BuildPocLimitsBody(BaseModel):
+    limits: Dict[str, int] = Field(..., description="Map of build_poc_* key → count (1..200)")
+
+
+@router.put("/api/settings/build-poc-limits")
+async def put_build_poc_limits(body: BuildPocLimitsBody):
+    """Bulk-upsert build-PoC limits. Unknown keys rejected; values 1..200.
+
+    The upper bound mirrors the clamp in rag-api's _build_poc_second_pass_iters
+    so a typo here cannot start an effectively unbounded refine loop; rejecting
+    it at the edge gives the operator an error instead of a silent clamp.
+    """
+    invalid = [k for k in body.limits if k not in BUILD_POC_LIMIT_KEYS]
+    if invalid:
+        raise HTTPException(400, f"Unknown build-poc limit keys: {invalid}")
+    bad = {k: v for k, v in body.limits.items()
+           if not isinstance(v, int) or v < 1 or v > 200}
+    if bad:
+        raise HTTPException(400, f"Limit values must be int between 1 and 200: {bad}")
+
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        for key, count in body.limits.items():
+            resp = await c.put(
+                f"{s.rag_api_url}/settings/config/{key}",
+                json={"value": str(count)},
+                headers={"x-api-key": s.api_key, **engagement_headers()},
+            )
+            if resp.status_code >= 400:
+                raise HTTPException(resp.status_code,
+                                    f"Failed to write {key}: {resp.text}")
+    return {"ok": True, "updated": list(body.limits.keys())}
 
 
 # ── LLM Tuning (reduce hallucination) ──

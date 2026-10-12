@@ -1288,10 +1288,17 @@ def node_deep_recon(state: BuildPocState) -> Dict[str, Any]:
                         f"paths={len(res.get('candidate_paths') or [])} session={bool((res.get('auth') or {}).get('_auto_cookie'))} "
                         f"seconds={res.get('seconds')} skipped={res.get('skipped')}",
                extra={"deep_recon": {k: v for k, v in res.items() if k != "segments"}})
-    from api import _BUILD_POC_SECOND_PASS_ITERS
+    from api import _build_poc_second_pass_iters
+    _second_pass_cap = _build_poc_second_pass_iters()
     upd: Dict[str, Any] = {"deep_recon_done": True, "deep_recon": {k: v for k, v in res.items() if k != "segments"},
-                           # the go-around is a SECOND chance, not a second budget (round 11: 50 more iterations)
-                           "max_iters": min(int(state.get("max_iters") or 0) or _BUILD_POC_SECOND_PASS_ITERS, _BUILD_POC_SECOND_PASS_ITERS),
+                           # The go-around is a SECOND chance, not a second budget — but the
+                           # cap is now the operator's (Settings → Scan Timeouts →
+                           # "Build-PoC second-pass iterations", default 50). At the old
+                           # hard 10 this clamp was the binding limit on every CVE that
+                           # needed deep recon: a request for 50 became 10, and
+                           # CVE-2024-22120 stopped at exactly 10 on max_iters with all 10
+                           # iterations genuinely reaching the target.
+                           "max_iters": min(int(state.get("max_iters") or 0) or _second_pass_cap, _second_pass_cap),
                            "segments": res.get("segments") or [],
                            "id_pool": {**(state.get("id_pool") or {}), **(res.get("id_pool") or {})},
                            "gather_blocked": False,

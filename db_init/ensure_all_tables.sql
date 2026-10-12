@@ -2708,6 +2708,12 @@ INSERT INTO public.app_settings (key, value, category) VALUES
   ('llm.reasoning_effort.cve_poc_synth',           'high', 'config'),
   ('llm.reasoning_effort.decomposed_craft',        'high', 'config'),
   ('llm.reasoning_effort.cve_poc_refine',          'high', 'config'),
+  -- 2026-10-12 build-PoC limits (counts, not seconds). Read by rag-api
+  -- _build_poc_second_pass_iters(), written by the BFF
+  -- /api/settings/build-poc-limits (Settings -> Scan Timeouts). The deep-recon
+  -- go-around used to be a hard 10, which was the binding cap on every CVE
+  -- that needed deep recon: a request for 50 was clamped to 10.
+  ('build_poc_second_pass_iters',                  '50',   'config'),
   -- 2026-10-10 db-txn-watchdog (rag-api): alert on transactions older than N min;
   -- terminate when > 0 (Postgres 16 has no transaction_timeout of its own).
   ('db_txn_alert_after_min',                       '15',   'config'),
