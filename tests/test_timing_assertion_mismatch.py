@@ -271,3 +271,55 @@ def test_not_executed_reason_redirects_away_from_the_payload():
     assert "measures nothing" in window, (
         "the reason must say plainly that the elapsed time is not evidence"
     )
+
+
+# ------- F10: a confirmed timing proof is not invalidated by a stray echo
+#
+# CVE-2024-3552, 2026-10-12: latency_confirmed at 0.98 — the scaled-payload
+# re-run passed, so the server demonstrably executed the SLEEP — and `verified`
+# still flipped to False because the command happened to print its own canary
+# into stdout. The reflection guard ran a control token, saw it echo too, and
+# downgraded. It was right that the canary proved nothing; it was wrong that
+# this mattered, because in a blind-timing proof the canary is a request TAG
+# and the evidence is the timing. The same CVE verified in the three prior runs
+# whose command happened not to echo it.
+#
+# This is the same SHAPE as the F6 regression: a correct rule applied where its
+# premise does not hold.
+
+
+def test_reflection_guard_has_a_confirmed_timing_exception():
+    fn = _func(_src(), "_run_refine_poc")
+    i = fn.find('"reflection_check"')
+    assert i != -1, "the reflection guard is gone"
+    window = fn[i:i + 4000]
+    assert "latency_confirmed" in window, (
+        "the reflection guard must not downgrade a CONFIRMED timing verdict — "
+        "the canary is not the evidence in that mode"
+    )
+
+
+def test_exception_is_scoped_to_confirmed_methods_only():
+    """Bare `latency` / `latency_anchored` are UNCONFIRMED and must keep the
+    downgrade: there, a reflected canary may be the only thing that looked
+    like proof."""
+    fn = _func(_src(), "_run_refine_poc")
+    i = fn.find('verification_method in (\n                    "latency_confirmed"')
+    if i == -1:
+        i = fn.find('"latency_confirmed", "latency_confirmed_anchored"')
+    assert i != -1, "the exception's method tuple was not found"
+    window = fn[max(0, i - 200):i + 200]
+    assert '"latency"' not in window and '"latency_anchored"' not in window, (
+        "an unconfirmed latency verdict must still be downgraded by reflection"
+    )
+
+
+def test_exception_runs_before_the_downgrade():
+    fn = _func(_src(), "_run_refine_poc")
+    exc = fn.find('"latency_confirmed", "latency_confirmed_anchored"')
+    dow = fn.find("if reflection:\n                verified = False")
+    assert exc != -1 and dow != -1
+    assert exc < dow, (
+        "the confirmed-timing exception must clear `reflection` BEFORE the "
+        "downgrade, or it has no effect"
+    )
