@@ -13034,6 +13034,16 @@ def port_scan_summary(engagement_id: Optional[str] = None,
     # host/service rollups are what the UI renders, so filtering only the counts
     # would leave the visible lists global.
     where_a = "" if eid is None else " AND (a.engagement_id = %s OR a.engagement_id IS NULL)"
+    # Addresses that are not hosts. `0.0.0.0` is this codebase's deliberate
+    # sentinel for "hostname known, IP unresolvable" (see the resolve fallbacks
+    # in /findings/credential and etl/parse_httpx.py), so many rows legitimately
+    # carry it. Grouping by ip then collapses every unresolvable hostname onto
+    # one pseudo-host: the UI reported `224.0.0.1 thankyou4caring.org — 4 ports`
+    # as if a single host had been scanned, when those ports came from several
+    # different domains. Multicast and broadcast cannot be scan targets either.
+    where_a += (" AND host(a.ip)::text <> '0.0.0.0'"
+                " AND NOT (a.ip << '224.0.0.0/4'::inet)"
+                " AND host(a.ip)::text <> '255.255.255.255'")
     args: tuple = () if eid is None else (eid,)
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(

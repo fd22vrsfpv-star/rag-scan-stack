@@ -466,22 +466,27 @@ rule from the Knowledge Base page round-trips.
 (the five entries are in `FRONTEND_DEBT`; `test_no_stale_debt` fails if they are
 fixed without being removed)
 
-## Unresolvable hostnames are stored as assets under placeholder IPs
-**Found:** 2026-10-11, while fixing the engagement filter on `/ports/summary`
-**Evidence:** 41 `assets` rows hold a non-unicast address:
-`SELECT host(ip)::text, hostname FROM assets WHERE host(ip)::text LIKE '224.%'
-OR host(ip)::text = '0.0.0.0'` returns rows such as
-`0.0.0.0 | umn-live.legacycorp.net`, `0.0.0.0 | ijmca.legacycorp.net`,
-`224.0.0.1 | thankyou4caring.org`. Because the port summary groups by
-`a.ip`, every unresolvable hostname collapses onto the same pseudo-host, so the
-UI reported `224.0.0.1 thankyou4caring.org — 4 ports` as if one host had been
-scanned on 80/443/8080/8443. The ports attributed to it belong to several
-different domains.
-**Where:** whichever ingest path resolves a hostname to an asset — the writer
-accepts the resolver's failure value instead of refusing the row. `assets.ip`
-has no constraint rejecting `0.0.0.0`, multicast (224/4) or broadcast.
-**Done when:** a hostname that does not resolve is either stored with a NULL ip
-(keyed by hostname) or not stored at all; the 41 existing rows are cleaned up;
-and a check constraint or ingest guard rejects non-unicast addresses so the
-class cannot return.
+## `0.0.0.0` is an undeclared sentinel, and host views must exclude it
+**Found:** 2026-10-11 (corrected from an earlier, partly wrong reading of the same
+evidence)
+**Evidence:** 40 live `assets` rows in the **redteam3** engagement carry
+`ip = 0.0.0.0` with a real hostname (`umn-live.legacycorp.net`, `ijmca.legacycorp.net`, …),
+`last_seen` today. This is NOT corruption: `0.0.0.0` is a deliberate convention
+meaning "hostname known, IP unresolvable" — see `app/rag-api/api.py:1908`
+("Can't resolve — store as 0.0.0.0, keep hostname in metadata"), the branch at
+`api.py:1596`, and the fallback in `etl/parse_httpx.py`. The defect is that the
+convention is **undeclared** (no constant, no column comment, no schema note) and
+that any view grouping by `ip` presents the sentinel as a scanned host. Fixed in
+`/ports/summary`; other host-grouped views have not been audited.
+**Where:** `assets.ip` (NOT NULL inet, so a hostname-only asset is not
+representable); every reader that groups or lists by `a.ip`.
+**Done when:** the sentinel is named in one place both writers and readers import
+rather than being a bare literal in at least four files; every host-grouped view
+excludes it (audit `assets`/host listings beyond `/ports/summary`); and the
+decision is recorded on whether `assets.ip` should become nullable so an
+unresolved hostname needs no sentinel at all. The nullable-ip migration was NOT
+attempted here: `ip` is NOT NULL with a unique index on
+`(ip, COALESCE(hostname,''))`, and changing it on a live engagement's data
+without auditing every reader that assumes non-null is a larger change than the
+bug warrants.
 **Enforced by:** not enforced

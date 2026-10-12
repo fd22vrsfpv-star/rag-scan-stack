@@ -88,6 +88,23 @@ def parse_httpx(path: str, profile: str = "upload", job_id: str = None):
                                     resolved_ip = _socket.gethostbyname(host)
                                 except _socket.gaierror:
                                     resolved_ip = "0.0.0.0"
+                                # A resolver can hand back something that is not
+                                # a host — a multicast/broadcast address from a
+                                # bad DNS record, or an all-zeros answer. Storing
+                                # it makes the address look like a scanned host
+                                # and, because host views group by ip, collapses
+                                # every such hostname onto one pseudo-host. Fall
+                                # back to the documented 0.0.0.0 "unresolved"
+                                # sentinel instead of inventing a target.
+                                try:
+                                    import ipaddress as _ipa
+                                    _r = _ipa.ip_address(resolved_ip)
+                                    if (_r.is_multicast or _r.is_reserved
+                                            or _r.is_unspecified
+                                            or resolved_ip == "255.255.255.255"):
+                                        resolved_ip = "0.0.0.0"
+                                except ValueError:
+                                    resolved_ip = "0.0.0.0"
                                 asset_id = str(uuid.uuid4())
                                 cur.execute("""INSERT INTO assets (id, ip, hostname)
                                               VALUES (%s, %s::inet, %s)

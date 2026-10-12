@@ -1,7 +1,7 @@
 import logging
 from typing import Any, Dict
 import httpx
-from fastapi import APIRouter, HTTPException, Body
+from fastapi import APIRouter, HTTPException, Body, Header
 from utils import safe_json
 
 from config import get_settings
@@ -378,6 +378,80 @@ async def convert_url(body: Dict[str, Any] = Body(...)):
             504, "Import timed out — try a single page (depth 0), or narrow it with a focus.")
     except httpx.HTTPError as e:
         raise HTTPException(502, f"Knowledge service unreachable: {e}")
+    if resp.status_code >= 400:
+        raise HTTPException(resp.status_code, _kb_detail(resp))
+    return safe_json(resp)
+
+
+# ── Flow rules (enumeration dispatch) ───────────────────────────────────────
+# The Flow-authoring UI in KnowledgeBase.tsx calls these through apiFetch, which
+# prepends /api. rag-api declares all five, but NO BFF router proxied them, so
+# every call 404'd — listing, dry-run, create, delete and the RAG sync were all
+# dead from the UI while looking fine from the backend. Found by
+# tests/test_frontend_route_contracts.py.
+
+@router.get("/api/rules")
+async def list_flow_rules():
+    """Every enumeration rule: the YAML catalogue plus the DB overlay."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=20) as c:
+        resp = await c.get(f"{s.rag_api_url}/rules",
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+    if resp.status_code >= 400:
+        raise HTTPException(resp.status_code, _kb_detail(resp))
+    return safe_json(resp)
+
+
+@router.post("/api/rules/test")
+async def test_flow_rule(body: Dict[str, Any] = Body(...)):
+    """DRY-RUN a flow against a host's real facts. Never queues or dispatches."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=60) as c:
+        resp = await c.post(f"{s.rag_api_url}/rules/test", json=body,
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
+    if resp.status_code >= 400:
+        raise HTTPException(resp.status_code, _kb_detail(resp))
+    return safe_json(resp)
+
+
+@router.post("/api/rules")
+async def add_flow_rule(body: Dict[str, Any] = Body(...),
+                        x_operator: str = Header("dashboard", alias="X-Operator")):
+    """Add a custom flow to the DB overlay.
+
+    X-Operator is forwarded so rag-api can record who authored the rule; the
+    upstream handler reads it.
+    """
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=30) as c:
+        resp = await c.post(f"{s.rag_api_url}/rules", json=body,
+                            headers={"x-api-key": s.api_key,
+                                     "X-Operator": x_operator or "dashboard",
+                                     **engagement_headers()})
+    if resp.status_code >= 400:
+        raise HTTPException(resp.status_code, _kb_detail(resp))
+    return safe_json(resp)
+
+
+@router.post("/api/rules/sync-rag")
+async def sync_flows_to_rag():
+    """Embed every flow into rag_documents so the planner can retrieve them."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=180) as c:
+        resp = await c.post(f"{s.rag_api_url}/rules/sync-rag",
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
+    if resp.status_code >= 400:
+        raise HTTPException(resp.status_code, _kb_detail(resp))
+    return safe_json(resp)
+
+
+@router.delete("/api/rules/{rule_id}")
+async def delete_flow_rule(rule_id: str):
+    """Remove a custom flow from the DB overlay (YAML rules are unaffected)."""
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=20) as c:
+        resp = await c.delete(f"{s.rag_api_url}/rules/{rule_id}",
+                              headers={"x-api-key": s.api_key, **engagement_headers()})
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, _kb_detail(resp))
     return safe_json(resp)
