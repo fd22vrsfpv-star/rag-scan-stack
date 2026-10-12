@@ -156,12 +156,64 @@ THIRD_PARTY_PASSIVE_TYPES = {
 }
 
 
-def _check_proxy_required(proxy: str | None, scan_type: str, allow_local: bool = False):
+#: Networks this stack is itself attached to, where a proxy protects nothing.
+#:
+#: The block exists so an active scan cannot disclose the operator's real source
+#: IP to a target. A host on one of the stack's own Docker bridges observes a
+#: bridge address and nothing else — there is no public IP to leak and no third
+#: party in the path — so requiring a proxy there blocks lab work while
+#: protecting no one.
+#:
+#: Deliberately NOT all of RFC1918: a client's internal 10.x reached over a VPN
+#: is private but very much somewhere a proxy still matters. Only the stack's
+#: own bridges, overridable for a differently-addressed deployment.
+LOCAL_SCAN_EXEMPT_CIDRS = [
+    c.strip() for c in os.environ.get(
+        "LOCAL_SCAN_EXEMPT_CIDRS",
+        "172.18.0.0/16,172.19.0.0/16,127.0.0.0/8",
+    ).split(",") if c.strip()
+]
+
+
+def _is_stack_local_target(target: str | None) -> bool:
+    """True when `target` is on a network this stack is directly attached to.
+
+    Accepts a bare IP, host:port, or a URL. A hostname that does not parse as an
+    IP returns False — resolving it here would be a DNS lookup that itself
+    discloses the target, which is the thing the block is protecting.
+    """
+    import ipaddress
+    from urllib.parse import urlsplit
+    s = (target or "").strip()
+    if not s:
+        return False
+    if "://" in s:
+        s = urlsplit(s).hostname or ""
+    elif s.count(":") == 1:          # host:port (IPv6 has more colons)
+        s = s.split(":", 1)[0]
+    s = s.strip("[]")
+    try:
+        ip = ipaddress.ip_address(s)
+    except ValueError:
+        return False
+    for cidr in LOCAL_SCAN_EXEMPT_CIDRS:
+        try:
+            if ip in ipaddress.ip_network(cidr, strict=False):
+                return True
+        except ValueError:
+            log.warning("LOCAL_SCAN_EXEMPT_CIDRS: ignoring bad entry %r", cidr)
+    return False
+
+
+def _check_proxy_required(proxy: str | None, scan_type: str, allow_local: bool = False,
+                          target: str | None = None):
     """Decide whether this scan may run without a proxy.
 
-    Three outcomes, because "passive" is not one thing:
+    Four outcomes, because neither "passive" nor "local" is one thing:
 
       NO_EGRESS_TYPES            run; nothing about the target leaves this host.
+      stack-local target         run; the target is on one of our own Docker
+                                 bridges, so there is no source IP to hide.
       THIRD_PARTY_PASSIVE_TYPES  run WITH a proxy, or locally once the caller has
                                  explicitly accepted that (allow_local). Asking is
                                  the point: these disclose the target to someone.
@@ -170,6 +222,8 @@ def _check_proxy_required(proxy: str | None, scan_type: str, allow_local: bool =
     if not _is_local_blocked():
         return
     if scan_type in NO_EGRESS_TYPES:
+        return
+    if _is_stack_local_target(target):
         return
     if proxy:
         return
@@ -1430,8 +1484,16 @@ async def launch_scan(scan_type: str, req: ScanRequest):
     # Block local scans if the safety switch is on
     # allow_local rides on ScanRequest's extra="allow", so the client can re-send
     # the SAME body with one field added after answering the 409.
+    # Pass EVERY target: the stack-local exemption must hold for all of them, or
+    # a single external host in a list would ride along unproxied behind one
+    # lab address.
+    _targets = [t for t in ([req.target, req.target_url]
+                            + list(req.targets or [])
+                            + list(req.target_urls or [])) if t]
+    _all_local = bool(_targets) and all(_is_stack_local_target(t) for t in _targets)
     _check_proxy_required(req.proxy, scan_type,
-                          allow_local=bool(getattr(req, "allow_local", False)))
+                          allow_local=bool(getattr(req, "allow_local", False)),
+                          target=(_targets[0] if _all_local else None))
     # Consumed here, like web_profile above: it is an answer to a BFF prompt, not
     # a scan parameter, and forwarding it would put an unknown field in the
     # runner's request body.
