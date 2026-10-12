@@ -6,19 +6,22 @@ import os
 import subprocess
 import pytest
 
+from _container import container_python, service_healthy
+
+class _TUPLE3:
+    """Adapts container_sh/container_python's (out, err, rc) tuple to the
+    CompletedProcess attribute shape these assertions already use."""
+    def __init__(self, t):
+        self.stdout, self.stderr, self.returncode = t
+
+
 ENDPOINT = "/software/poc-hints"
 
 
 def _rag_api_up():
-    try:
-        r = subprocess.run(
-            ["docker", "exec", "rag-api", "sh", "-lc",
-             "curl -sk https://localhost:8000/health -o /dev/null -w '%{http_code}'"],
-            capture_output=True, text=True, timeout=6,
-        )
-        return r.returncode == 0 and r.stdout.strip() == "200"
-    except Exception:
-        return False
+    # Shared probe — see tests/_container.py. Was a private
+    # subprocess.run(['docker','exec',...]) copy in nine modules.
+    return service_healthy("rag-api")
 
 
 pytestmark = pytest.mark.skipif(not _rag_api_up(), reason="rag-api container not reachable")
@@ -63,10 +66,7 @@ def test_port_sweep_helper_directly():
         "from api import _scout_open_ports; "
         "print(_scout_open_ports('127.0.0.1', 8000))"
     )
-    r = subprocess.run(
-        ["docker", "exec", "rag-api", "python3", "-c", py],
-        capture_output=True, text=True, timeout=15,
-    )
+    r = _TUPLE3(container_python(py, container="rag-api", timeout=15))
     assert r.returncode == 0, r.stderr
     out = r.stdout or ""
     assert "8000" in out, f"expected port 8000 in output: {out[:400]}"

@@ -15,17 +15,20 @@ import json
 import subprocess
 import pytest
 
+from _container import container_python, service_healthy
+
+class _TUPLE3:
+    """Adapts container_sh/container_python's (out, err, rc) tuple to the
+    CompletedProcess attribute shape these assertions already use."""
+    def __init__(self, t):
+        self.stdout, self.stderr, self.returncode = t
+
+
 
 def _rag_api_up():
-    try:
-        r = subprocess.run(
-            ["docker", "exec", "rag-api", "sh", "-lc",
-             "curl -sk https://localhost:8000/health -o /dev/null -w '%{http_code}'"],
-            capture_output=True, text=True, timeout=6,
-        )
-        return r.returncode == 0 and r.stdout.strip() == "200"
-    except Exception:
-        return False
+    # Shared probe — see tests/_container.py. Was a private
+    # subprocess.run(['docker','exec',...]) copy in nine modules.
+    return service_healthy("rag-api")
 
 
 pytestmark = pytest.mark.skipif(not _rag_api_up(),
@@ -33,11 +36,8 @@ pytestmark = pytest.mark.skipif(not _rag_api_up(),
 
 
 def _in_container(py_snippet):
-    r = subprocess.run(
-        ["docker", "exec", "rag-api", "python3", "-c", py_snippet],
-        capture_output=True, text=True, timeout=20,
-    )
-    return r.stdout.strip(), r.stderr.strip(), r.returncode
+    # Shared runner — see tests/_container.py::container_python.
+    return container_python(py_snippet)
 
 
 def test_matcher_helper_returns_shape():
@@ -135,12 +135,8 @@ with get_db() as c, c.cursor() as cur:
     ids = json.loads(out.splitlines()[-1])
     if not ids["eid"] or not ids["nid"]:
         pytest.skip("no engagement or news items in DB")
-    r = subprocess.run(
-        ["docker", "exec", "rag-api", "sh", "-lc",
-         f'curl -sk -H "x-api-key: $API_KEY" -H "X-Engagement-Id: {ids["eid"]}" '
-         f'-X POST https://localhost:8000/news/items/{ids["nid"]}/match-engagement'],
-        capture_output=True, text=True, timeout=30,
-    )
+    r = _TUPLE3(container_sh(f'curl -sk -H "x-api-key: $API_KEY" -H "X-Engagement-Id: {ids["eid"]}" '
+         f'-X POST https://localhost:8000/news/items/{ids["nid"]}/match-engagement', container="rag-api", timeout=30))
     assert r.returncode == 0, r.stderr
     body = json.loads(r.stdout)
     assert body["ok"] is True
@@ -167,12 +163,8 @@ with get_db() as c, c.cursor() as cur:
     if rc != 0 or not out.strip():
         pytest.skip("no engagement with assets available")
     eid = out.strip()
-    r1 = subprocess.run(
-        ["docker", "exec", "rag-api", "sh", "-lc",
-         f'curl -sk -H "x-api-key: $API_KEY" -H "X-Engagement-Id: {eid}" '
-         f'-X POST "https://localhost:8000/news/items/match-engagement?limit=5&max_age_hours=0"'],
-        capture_output=True, text=True, timeout=60,
-    )
+    r1 = _TUPLE3(container_sh(f'curl -sk -H "x-api-key: $API_KEY" -H "X-Engagement-Id: {eid}" '
+         f'-X POST "https://localhost:8000/news/items/match-engagement?limit=5&max_age_hours=0"', container="rag-api", timeout=60))
     assert r1.returncode == 0, r1.stderr
     body = json.loads(r1.stdout)
     assert body["ok"] is True
@@ -182,13 +174,9 @@ with get_db() as c, c.cursor() as cur:
 
 def test_affects_engagement_filter_requires_eid():
     """affects_engagement=true without X-Engagement-Id must return 400."""
-    r = subprocess.run(
-        ["docker", "exec", "rag-api", "sh", "-lc",
-         'curl -sk -H "x-api-key: $API_KEY" '
+    r = _TUPLE3(container_sh('curl -sk -H "x-api-key: $API_KEY" '
          '-o /dev/null -w "%{http_code}" '
-         '"https://localhost:8000/news/items?affects_engagement=true&limit=1"'],
-        capture_output=True, text=True, timeout=10,
-    )
+         '"https://localhost:8000/news/items?affects_engagement=true&limit=1"', container="rag-api", timeout=10))
     assert r.stdout.strip() == "400", (
         f"expected 400 when affects_engagement=true without X-Engagement-Id, "
         f"got {r.stdout.strip()}: {r.stderr}")

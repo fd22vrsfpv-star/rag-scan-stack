@@ -11,17 +11,20 @@ import subprocess
 import uuid
 import pytest
 
+from _container import container_python, service_healthy
+
+class _TUPLE3:
+    """Adapts container_sh/container_python's (out, err, rc) tuple to the
+    CompletedProcess attribute shape these assertions already use."""
+    def __init__(self, t):
+        self.stdout, self.stderr, self.returncode = t
+
+
 
 def _rag_api_up():
-    try:
-        r = subprocess.run(
-            ["docker", "exec", "rag-api", "sh", "-lc",
-             "curl -sk https://localhost:8000/health -o /dev/null -w '%{http_code}'"],
-            capture_output=True, text=True, timeout=6,
-        )
-        return r.returncode == 0 and r.stdout.strip() == "200"
-    except Exception:
-        return False
+    # Shared probe — see tests/_container.py. Was a private
+    # subprocess.run(['docker','exec',...]) copy in nine modules.
+    return service_healthy("rag-api")
 
 
 pytestmark = pytest.mark.skipif(not _rag_api_up(), reason="rag-api container not reachable")
@@ -40,12 +43,8 @@ def _call(method, path, body=None):
 
 
 def _in_container(py_snippet):
-    """Run a python snippet inside rag-api and return stdout."""
-    r = subprocess.run(
-        ["docker", "exec", "-e", "RAG_OBSERVED_FACTS=1", "rag-api", "python3", "-c", py_snippet],
-        capture_output=True, text=True, timeout=30,
-    )
-    return r.stdout.strip(), r.stderr.strip(), r.returncode
+    # Shared runner — see tests/_container.py::container_python.
+    return container_python(py_snippet)
 
 
 def test_observed_fact_load_dedup_and_recall():
@@ -84,10 +83,7 @@ r = _load_observed_fact_into_rag(RAG_OBSERVED_FACTS_SOURCE, '192.0.2.99',
                                   'framework', 'Test', product='Test')
 print(r)
 """
-    r = subprocess.run(
-        ["docker", "exec", "rag-api", "python3", "-c", py],
-        capture_output=True, text=True, timeout=10,
-    )
+    r = _TUPLE3(container_python(py, container="rag-api", timeout=10))
     assert r.returncode == 0
     assert r.stdout.strip() == "False", f"expected False (flag off), got {r.stdout!r}"
 
@@ -203,12 +199,8 @@ print(loaded, len(r) >= 1, has_admin)
 def test_backfill_endpoint_returns_counts():
     """POST /rag/backfill-credentials returns credentials_embedded + identities_embedded
     counts (may be 0 if the tables are empty for this engagement) and requires the flag."""
-    r = subprocess.run(
-        ["docker", "exec", "-e", "RAG_OBSERVED_FACTS=1", "rag-api", "sh", "-lc",
-         'curl -sk -X POST https://localhost:8000/rag/backfill-credentials '
-         '-H "x-api-key: $API_KEY"'],
-        capture_output=True, text=True, timeout=30,
-    )
+    r = _TUPLE3(container_sh('curl -sk -X POST https://localhost:8000/rag/backfill-credentials '
+         '-H "x-api-key: $API_KEY"', container="rag-api", timeout=30, env={"RAG_OBSERVED_FACTS": "1"}))
     assert r.returncode == 0
     try:
         d = json.loads(r.stdout)

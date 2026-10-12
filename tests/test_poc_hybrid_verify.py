@@ -8,31 +8,21 @@ import json
 import subprocess
 import pytest
 
+from _container import container_python, service_healthy
+
 
 def _rag_api_up():
-    try:
-        r = subprocess.run(
-            ["docker", "exec", "rag-api", "sh", "-lc",
-             "curl -sk https://localhost:8000/health -o /dev/null -w '%{http_code}'"],
-            capture_output=True, text=True, timeout=6,
-        )
-        return r.returncode == 0 and r.stdout.strip() == "200"
-    except Exception:
-        return False
+    # Shared probe — see tests/_container.py. Was a private
+    # subprocess.run(['docker','exec',...]) copy in nine modules.
+    return service_healthy("rag-api")
 
 
 pytestmark = pytest.mark.skipif(not _rag_api_up(), reason="rag-api container not reachable")
 
 
-def _in_container(py_snippet, env=None):
-    env_args = []
-    for k, v in (env or {}).items():
-        env_args.extend(["-e", f"{k}={v}"])
-    r = subprocess.run(
-        ["docker", "exec"] + env_args + ["rag-api", "python3", "-c", py_snippet],
-        capture_output=True, text=True, timeout=15,
-    )
-    return r.stdout.strip(), r.stderr.strip(), r.returncode
+def _in_container(py_snippet):
+    # Shared runner — see tests/_container.py::container_python.
+    return container_python(py_snippet)
 
 
 def test_regex_match_tier():
