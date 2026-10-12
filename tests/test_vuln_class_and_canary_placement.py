@@ -334,8 +334,10 @@ def test_spec_carries_the_chain():
 
 
 def test_crafter_appends_guidance_for_the_other_classes():
-    fn = _func(_src(), "_llm_craft_payload")
-    assert "vuln_class_chain" in fn, "the crafter must read the chain"
+    """The chain composition moved into the SHARED helper (F9) so both synth
+    paths get it; assert it there, and that the crafter still feeds it."""
+    src = _src()
+    fn = _func(src, "_class_guidance_block")
     assert "THIS CVE IS ALSO" in fn, (
         "the extra classes must reach the prompt; computing a chain and not "
         "rendering it changes nothing"
@@ -345,14 +347,14 @@ def test_crafter_appends_guidance_for_the_other_classes():
     assert "_CRAFT_CLASS_GUIDANCE[c]" in window, (
         "must include the OTHER classes' actual guidance text, not just names"
     )
+    crafter = _func(src, "_llm_craft_payload")
+    assert "vuln_class_chain" in crafter, "the crafter must still pass the chain"
 
 
 def test_chain_excludes_the_primary_and_unknown_classes():
-    fn = _func(_src(), "_llm_craft_payload")
-    i = fn.find("vuln_class_chain")
-    window = fn[i:i + 400]
-    assert "c != vuln_class" in window, "the primary must not be repeated"
-    assert "in _CRAFT_CLASS_GUIDANCE" in window, (
+    fn = _func(_src(), "_class_guidance_block")
+    assert "c != vc" in fn, "the primary must not be repeated in the chain"
+    assert "in _CRAFT_CLASS_GUIDANCE" in fn, (
         "a class with no guidance entry would KeyError when rendered"
     )
 
@@ -397,4 +399,60 @@ def test_placeholder_rule_stays_unconditional():
     assert ph < gate, (
         "the placeholder check must run BEFORE (and outside) the reflection "
         "gate — a literal {CANARY} is a defect under any assertion kind"
+    )
+
+
+# ---------- F9: class guidance must reach BOTH synth paths, not just one
+#
+# _CRAFT_CLASS_GUIDANCE was referenced only from _llm_craft_payload, which is
+# reached only from _decomposed_synthesize_cve_poc. Every CVE in the focused-10
+# benchmark synthesises as llm_poc / llm_poc_with_sink_verify — the MONOLITHIC
+# path — so the rewritten sqli guidance (F3) and the multi-CWE chain (F8) were
+# in practice reaching nothing. Confirmed live 2026-10-12: CVE-2024-3408 is the
+# CVE the chain was built for, and its prompts contained no chain at all.
+
+
+def test_shared_guidance_helper_exists():
+    fn = _func(_src(), "_class_guidance_block")
+    assert "_CRAFT_CLASS_GUIDANCE" in fn, "the helper must read the guidance table"
+    assert "THIS CVE IS ALSO" in fn, "the chain text must live in the shared helper"
+
+
+def test_both_synth_paths_use_the_shared_helper():
+    """One implementation, so the two paths cannot drift."""
+    src = _src()
+    for name in ("_llm_craft_payload", "_synthesize_cve_poc"):
+        fn = _func(src, name)
+        assert "_class_guidance_block" in fn, (
+            f"{name} must compose its class guidance through the shared helper"
+        )
+
+
+def test_monolithic_prompt_interpolates_the_block():
+    """Computing a block and not rendering it changes nothing."""
+    fn = _func(_src(), "_synthesize_cve_poc")
+    assert "_class_block" in fn, "the monolithic path must build the block"
+    assert "{_class_block}" in fn, (
+        "the block must be interpolated into the monolithic prompt f-string — "
+        "this is exactly the bug it is fixing, one level up"
+    )
+
+
+def test_monolithic_guidance_is_fail_soft():
+    """This path synthesised fine without the block for its whole life; a
+    classifier error must not now break it."""
+    fn = _func(_src(), "_synthesize_cve_poc")
+    i = fn.find("_class_block")
+    window = fn[max(0, i - 400):i + 500]
+    assert "except" in window, (
+        "the classifier call on the monolithic path must be wrapped"
+    )
+
+
+def test_unknown_class_contributes_nothing_without_a_chain():
+    """The 'unknown' entry tells the model to start from 'the spec', which does
+    not exist on the monolithic path."""
+    fn = _func(_src(), "_class_guidance_block")
+    assert '!= "unknown"' in fn or "!= 'unknown'" in fn, (
+        "the helper must skip the decomposed-only 'unknown' guidance text"
     )

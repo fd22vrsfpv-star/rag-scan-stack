@@ -16987,6 +16987,49 @@ _CRAFT_CLASS_GUIDANCE = {
 }
 
 
+def _class_guidance_block(vuln_class: str, chain=None) -> str:
+    """Payload-family guidance for a CVE's class, plus every OTHER mapped class.
+
+    Shared by BOTH synth paths. It used to live inline in `_llm_craft_payload`,
+    which is reached only from `_decomposed_synthesize_cve_poc` — so the class
+    guidance (including the rewritten sqli text that puts a reflected canary
+    ahead of a stopwatch, and the multi-CWE chain) never reached the
+    MONOLITHIC path. Every CVE in the focused-10 benchmark synthesises as
+    `llm_poc` / `llm_poc_with_sink_verify`, i.e. the monolithic path, so in
+    practice that guidance was reaching nothing. Observed 2026-10-12:
+    CVE-2024-3408 is the CVE the chain was built for and its prompts contained
+    no chain at all.
+
+    Returns "" when the class is unknown and there is no chain, so a caller can
+    interpolate it unconditionally.
+    """
+    vc = (vuln_class or "unknown").strip().lower()
+    # The "unknown" entry is deliberately NOT used here: its text tells the
+    # model to start from "the advisory_poc from the spec", which is
+    # decomposed-path language — there is no spec on the monolithic path.
+    # _llm_craft_payload still falls back to it for its own prompt.
+    base = _CRAFT_CLASS_GUIDANCE.get(vc) if vc != "unknown" else None
+    out = ""
+    if base:
+        out = f"VULN-CLASS GUIDANCE ({vc}):\n{base}\n"
+    try:
+        extra = [c for c in (chain or [])
+                 if c != vc and c in _CRAFT_CLASS_GUIDANCE]
+    except Exception:  # noqa: BLE001
+        extra = []
+    if extra:
+        out += (
+            "\nTHIS CVE IS ALSO: " + ", ".join(extra) + ". The advisory describes "
+            "more than one weakness, and the exploit must chain them — typically the "
+            "access/bypass step FIRST to reach the vulnerable sink, THEN the payload "
+            "step that produces the observable effect. Guidance for the other "
+            "step(s):\n"
+            + "\n".join(f"  [{c}] {_CRAFT_CLASS_GUIDANCE[c]}" for c in extra)
+            + "\nPlace the canary so it proves the FINAL step, not merely that you "
+              "authenticated.\n")
+    return out
+
+
 def _llm_craft_payload(target_spec: dict, canary: str, model=None) -> dict:
     """Narrow LLM call: craft only the exploit payload (method, path, body,
     headers) for the target_spec's vuln_class + endpoint. ~500-800 tokens
@@ -16996,26 +17039,13 @@ def _llm_craft_payload(target_spec: dict, canary: str, model=None) -> dict:
     unparseable JSON.
     """
     vuln_class = target_spec.get("vuln_class") or "unknown"
-    class_guidance = _CRAFT_CLASS_GUIDANCE.get(vuln_class, _CRAFT_CLASS_GUIDANCE["unknown"])
-    # A CVE that is genuinely two things gets BOTH sets of guidance. The
-    # primary still leads (nothing about the single-class path changes); the
-    # extra classes are appended as the chain to carry out, because an
-    # auth-bypass that exists to reach an RCE sink needs the RCE guidance too.
-    try:
-        _chain = [c for c in (target_spec.get("vuln_class_chain") or [])
-                  if c != vuln_class and c in _CRAFT_CLASS_GUIDANCE]
-    except Exception:  # noqa: BLE001
-        _chain = []
-    if _chain:
-        class_guidance += (
-            "\n\nTHIS CVE IS ALSO: " + ", ".join(_chain) + ". The advisory describes "
-            "more than one weakness, and the exploit must chain them — typically the "
-            "access/bypass step FIRST to reach the vulnerable sink, THEN the payload "
-            "step that produces the observable effect. Guidance for the other "
-            "step(s):\n"
-            + "\n".join(f"  [{c}] {_CRAFT_CLASS_GUIDANCE[c]}" for c in _chain)
-            + "\nPlace the canary so it proves the FINAL step, not merely that you "
-              "authenticated.")
+    # Composed by the SHARED helper so the monolithic path gets byte-identical
+    # guidance; the prompt template below already prints its own
+    # "VULN-CLASS GUIDANCE (...)" header, so strip the helper's.
+    _blk = _class_guidance_block(vuln_class, target_spec.get("vuln_class_chain"))
+    _hdr = f"VULN-CLASS GUIDANCE ({vuln_class}):\n"
+    class_guidance = (_blk[len(_hdr):] if _blk.startswith(_hdr) else _blk) \
+        or _CRAFT_CLASS_GUIDANCE["unknown"]
     spec_block = (
         f"  endpoint-base: {target_spec.get('scheme')}://{target_spec.get('ip')}:{target_spec.get('port')}\n"
         f"  product+version: {target_spec.get('product')} {target_spec.get('version')}\n"
@@ -19539,11 +19569,27 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
             f"invent a different endpoint — the advisory one is proven to land.\n"
             f"```\n{_adv_poc[:1500]}\n```\n"
         )
+    # PAYLOAD-FAMILY GUIDANCE on the monolithic path too. This prompt had none:
+    # _CRAFT_CLASS_GUIDANCE was reachable only from the decomposed path, and
+    # every CVE in the focused-10 benchmark synthesises as llm_poc /
+    # llm_poc_with_sink_verify — i.e. here. So the rewritten sqli guidance
+    # (reflected canary before the stopwatch) and the multi-CWE chain were
+    # reaching nothing in practice. Fail-soft: a classifier error must not stop
+    # a synthesis that worked without this block for its whole life.
+    try:
+        _vc = _vuln_class_from_cve(cve, details)
+        _class_block = _class_guidance_block(_vc, _vuln_classes_from_cve(cve, details))
+    except Exception as _cge:  # noqa: BLE001
+        logging.debug("class guidance failed for %s: %s", cve, _cge)
+        _class_block = ""
+    if _class_block:
+        _poc_trace(run_id, "class_guidance", response=_class_block[:400])
     prompt = (f"AUTHORIZED lab pentest. Build a proof-of-concept for {cve} on {tgt} "
               f"({product or ''} {version or ''}).\n"
               f"CVE description: {details.get('description') or '(none)'}\n"
               f"References: {', '.join(details.get('refs') or [])}\n"
               f"{_adv_poc_block}{guidance_extra}\n"
+              f"{_class_block}"
               f"{listener_hint}\n"
               f"CRITICAL — anchor the proof to THIS exploit's effect, not pre-existing state. "
               f"Make the PoC CAUSE the exact marker '{canary}' to appear as a DIRECT RESULT of "
