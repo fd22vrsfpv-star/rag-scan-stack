@@ -14829,35 +14829,42 @@ def _gather_mine_sources(advisory_poc: str = "", derived_vector: str = "", descr
     # ("is an artifact required"), and the miner never saw it. Across 37
     # gather-incomplete runs the missing items were endpoint x22, method x22,
     # input_field x14; this is the highest-authority source for all three.
+    ext = ""
     if fix_diff:
-        dv += "\n" + fix_diff
+        ext += "\n" + fix_diff
     # OUR OWN RECON of this host. When the advisory is vague we have often
     # already crawled the endpoint: discovered_params carries url_pattern,
     # param_name, param_location and http_method for the target.
     if recon_text:
-        dv += "\n" + recon_text
+        ext += "\n" + recon_text
+    # `ext` is scanned by the URL and FIELD patterns below as well as the prose
+    # ones. Appending it to `dv` alone was almost inert: `dv` is only read by
+    # the quoted-path and "'x' parameter" prose patterns, and neither a diff
+    # hunk nor a recon line is written that way — a raw URL or a $_POST['name']
+    # would have been invisible.
     paths, fields, methods, headers = [], [], [], []
     # URLs → paths (advisory first: it is a literal PoC)
-    for m in _re.finditer(r"https?://[^/\s\"'`]+(/[^\s\"'`?#]+)", adv):
-        paths.append(m.group(1))
+    for _src in (adv, ext):
+        for m in _re.finditer(r"https?://[^/\s\"'`]+(/[^\s\"'`?#]+)", _src):
+            paths.append(m.group(1))
     # quoted or backticked path tokens near "endpoint"/"route"/"url"
-    for text in (adv, dv):
+    for text in (adv, dv, ext):
         for m in _re.finditer(r"['\"`](/[A-Za-z0-9_./-]{2,})['\"`]", text):
             paths.append(m.group(1))
         for m in _re.finditer(r"(?:endpoint|route|path|url)\s*[=:]\s*['\"`]?(/[A-Za-z0-9_./-]{2,})", text, _re.I):
             paths.append(m.group(1))
     # form/query params: --data="a=1&b=2", ?a=1&b=2, -d 'a=1'
-    for m in _re.finditer(r"(?:--data(?:-raw|-binary)?|-d)\s*=?\s*['\"]([^'\"]+)['\"]", adv):
+    for m in _re.finditer(r"(?:--data(?:-raw|-binary)?|-d)\s*=?\s*['\"]([^'\"]+)['\"]", adv + ext):
         for kv in m.group(1).split("&"):
             if "=" in kv:
                 fields.append(kv.split("=", 1)[0].strip())
-    for m in _re.finditer(r"[?&]([A-Za-z_][\w\[\]]*)=", adv):
+    for m in _re.finditer(r"[?&]([A-Za-z_][\w\[\]]*)=", adv + ext):
         fields.append(m.group(1))
     # JSON keys in a literal body
-    for m in _re.finditer(r"[{,]\s*\"([A-Za-z_]\w*)\"\s*:", adv):
+    for m in _re.finditer(r"[{,]\s*\"([A-Za-z_]\w*)\"\s*:", adv + ext):
         fields.append(m.group(1))
     # prose: the 'name' parameter / `id` param / "file" field / key
-    for text in (adv, dv):
+    for text in (adv, dv, ext):
         # `'name' parameter` — the keyword must follow on the SAME line and the
         # quoted token must not be an assigned value (`SECRET_KEY = "Dtale"`)
         for m in _re.finditer(r"(?<![=:]\s)(?<![=:])['\"`]([A-Za-z_][\w\[\]-]*)['\"`][ \t]+(?:parameter|param|field|key|argument)\b", text, _re.I):
@@ -14881,6 +14888,13 @@ def _gather_mine_sources(advisory_poc: str = "", derived_vector: str = "", descr
                 seen.add(x); out.append(x)
         return out
     bad_fields = {"http", "https", "localhost", "target"}
+    # A fix diff names the tainted parameter in the language's own accessor —
+    # $_POST['x'], request.GET["x"], params[:x], req.body.x — which none of the
+    # advisory-shaped patterns above match.
+    for m in _re.finditer(
+            r"(?:\$_(?:POST|GET|REQUEST)|request\.(?:GET|POST|args|form|json)|params|req\.(?:body|query|params))"
+            r"\s*[\[\.]\s*['\"`:]?([A-Za-z_]\w{1,40})", ext):
+        fields.append(m.group(1))
     return {"paths": _uniq(p for p in paths if p not in ("/", "/.", "/..")),
             "fields": _uniq(f for f in fields if f.lower() not in bad_fields),
             "methods": _uniq(methods), "headers": _uniq(headers)}
