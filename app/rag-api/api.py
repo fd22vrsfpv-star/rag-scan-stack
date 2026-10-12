@@ -26827,6 +26827,27 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                 reflection = False
                 _poc_trace(run_id, "reflection_check", iteration=iters,
                            response="reflected match is inside an execution/error context -> primitive confirmed, not reflection")
+            # CONFIRMED-TIMING EXCEPTION. In a blind time-based proof the canary
+            # is a request TAG, not the evidence — CLAUDE.md: "a visible marker
+            # usually isn't possible in blind SQLi". The proof is the scaled
+            # payload re-run (SLEEP(N) -> SLEEP(N+7)) showing the server's
+            # elapsed time scale with it, which is deterministic, inline and
+            # already confidence 0.98. If the model ALSO happens to echo the
+            # canary, reflection says nothing about that proof, and downgrading
+            # on it discards a verdict that never depended on the canary.
+            #
+            # Observed on CVE-2024-3552, 2026-10-12: latency_confirmed at 0.98
+            # with the timing re-run passed, and verified flipped to False
+            # purely because the command printed its own canary. The same CVE
+            # verified in the three prior runs whose command happened not to
+            # echo it. Scoped to the CONFIRMED methods only — bare `latency` /
+            # `latency_anchored` are unconfirmed and keep the downgrade.
+            if reflection and verification_method in (
+                    "latency_confirmed", "latency_confirmed_anchored"):
+                reflection = False
+                _poc_trace(run_id, "reflection_check", iteration=iters,
+                           response=f"method={verification_method}: the proof is the scaled-payload "
+                                    "timing re-run, not the canary -> reflection does not apply")
             if reflection:
                 verified = False
     off_target = bool(success and not verified)

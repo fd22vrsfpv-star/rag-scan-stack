@@ -183,12 +183,24 @@ def test_scout_recon_retains_json_self_documentation():
                 return _R(404, "", "text/html")
             return _R(200, json.dumps(landing), "application/json")
     hx = types.ModuleType("httpx"); hx.Client = _Cli
-    sys.modules.setdefault("httpx", hx)  # the function does `import httpx as _hx` locally; sidecar has none
+    # FORCE the stub, do not setdefault. `setdefault` is a no-op when another
+    # test has already imported the real httpx, so this passed in isolation and
+    # failed in the full suite — the function then made a real request to
+    # 127.0.0.1:8000 and returned "". Saved and restored so the real module is
+    # not left shadowed for whatever runs next.
+    _saved_httpx = sys.modules.get("httpx")
+    sys.modules["httpx"] = hx
     ns = {"_json": json, "json": json, "_re": __import__("re"), "re": __import__("re"), "httpx": hx, "_hx": hx,
           "os": os, "time": __import__("time")}
     # import stubs for whatever the function imports locally
     exec(body, ns)
-    out = ns["_scout_url_recon"]("127.0.0.1", 8000, timeout=1)
+    try:
+        out = ns["_scout_url_recon"]("127.0.0.1", 8000, timeout=1)
+    finally:
+        if _saved_httpx is not None:
+            sys.modules["httpx"] = _saved_httpx
+        else:
+            sys.modules.pop("httpx", None)
     assert "JSON body at /" in out, out
     assert "/model" in out and "/completion" in out, out
 
