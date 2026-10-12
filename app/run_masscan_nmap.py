@@ -66,12 +66,17 @@ def get_open_ports_by_host():
                 "check.", _SCOPE_GATE_ERROR)
             return []
 
-        scope_rows = load_dispatch_scope(cur)
+        # load_dispatch_scope returns (rows, source) — unpack it. Assigning the
+        # whole tuple made `is_in_scope` iterate over [rows_list, source_str]
+        # and raise "too many values to unpack", killing the masscan->nmap run
+        # before it scanned anything. It also made the guard below dead: a
+        # 2-tuple is always truthy, so "no scope configured" never fired.
+        scope_rows, scope_source = load_dispatch_scope(cur)
         if not scope_rows:
             logger.error(
-                "[nmap_enrichment] no scope configured — refusing to enrich. An "
-                "unconfigured scope is a setup problem, not permission to scan "
-                "everything on record.")
+                "[nmap_enrichment] no scope configured (source=%s) — refusing to "
+                "enrich. An unconfigured scope is a setup problem, not permission "
+                "to scan everything on record.", scope_source)
             return []
 
     allowed, refused = [], []

@@ -19,6 +19,7 @@ import { useCreateFollowUp, useCreateAdhocRule } from '@/api/followups'
 import { useAssetPorts, useAssetVulns } from '@/api/assets'
 import { SeverityBadge } from '@/components/common/SeverityBadge'
 import { SourceBadge } from '@/components/common/SourceBadge'
+import { CweBadges } from '@/components/common/CweBadges'
 import { CustomerBadge } from '@/components/common/CustomerBadge'
 import { SEVERITY_LEVELS, PREDEFINED_TAGS, TAG_COLORS, TAG_COLOR_DEFAULT } from '@/lib/constants'
 import type { Finding, WorkflowStatus } from '@/lib/types'
@@ -561,6 +562,7 @@ export default function FindingsExplorer() {
                   <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground" style={{ width: 80 }}>Source</th>
                   <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground" style={{ width: 160 }}>Tags</th>
                   <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground" style={{ width: 120 }}>CVE</th>
+                  <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground" style={{ width: 100 }}>CWE</th>
                   <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground" style={{ width: 140 }}>Date</th>
                   <th className="px-2 py-2 w-8"></th>
                 </tr>
@@ -613,6 +615,7 @@ export default function FindingsExplorer() {
                           <td className="px-3 py-2"></td>
                           <td className="px-3 py-2"></td>
                           <td className="px-3 py-2"></td>
+                          <td className="px-3 py-2"></td>
                           <td className="px-2 py-2" onClick={e => e.stopPropagation()}>
                             <FindingQuickActions
                               title={item.title}
@@ -658,6 +661,7 @@ export default function FindingsExplorer() {
                               </div>
                             </td>
                             <td className="px-3 py-2 text-xs">{f.cve ?? ''}</td>
+                            <td className="px-3 py-2"><CweBadges cwe={f.cwe} /></td>
                             <td className="px-3 py-2">
                               <span className="text-xs text-muted-foreground">{f.created_at ? formatDate(f.created_at) : ''}</span>
                             </td>
@@ -702,6 +706,7 @@ export default function FindingsExplorer() {
                         </div>
                       </td>
                       <td className="px-3 py-2 text-xs">{f.cve ?? ''}</td>
+                      <td className="px-3 py-2"><CweBadges cwe={f.cwe} /></td>
                       <td className="px-3 py-2">
                         <span className="text-xs text-muted-foreground">{f.created_at ? formatDate(f.created_at) : ''}</span>
                       </td>
@@ -721,7 +726,7 @@ export default function FindingsExplorer() {
                 })}
                 {grouped.length === 0 && (
                   <tr>
-                    <td colSpan={9} className="px-3 py-8 text-center text-muted-foreground text-sm">
+                    <td colSpan={10} className="px-3 py-8 text-center text-muted-foreground text-sm">
                       No data
                     </td>
                   </tr>
@@ -1323,7 +1328,7 @@ function FindingDetailPanel({
           <div><span className="text-muted-foreground">IP:</span> <span className="font-mono">{cleanIp(finding.ip)}</span></div>
           <div><span className="text-muted-foreground">Port:</span> {finding.port}</div>
           {finding.cve && <div><span className="text-muted-foreground">CVE:</span> {finding.cve}</div>}
-          {finding.cwe && <div><span className="text-muted-foreground">CWE:</span> {finding.cwe}</div>}
+          {finding.cwe && <div className="col-span-2"><span className="text-muted-foreground">CWE:</span> <CweBadges cwe={finding.cwe} inline /></div>}
           {finding.cvss != null && <div><span className="text-muted-foreground">CVSS:</span> {finding.cvss}</div>}
           {finding.confidence && <div><span className="text-muted-foreground">Confidence:</span> {finding.confidence}</div>}
           {finding.method && <div><span className="text-muted-foreground">Method:</span> {finding.method}</div>}

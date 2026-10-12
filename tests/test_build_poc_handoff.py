@@ -9,28 +9,28 @@
 import subprocess
 import pytest
 
+from _container import container_python, service_healthy
+
+class _TUPLE3:
+    """Adapts container_sh/container_python's (out, err, rc) tuple to the
+    CompletedProcess attribute shape these assertions already use."""
+    def __init__(self, t):
+        self.stdout, self.stderr, self.returncode = t
+
+
 
 def _rag_api_up():
-    try:
-        r = subprocess.run(
-            ["docker", "exec", "rag-api", "sh", "-lc",
-             "curl -sk https://localhost:8000/health -o /dev/null -w '%{http_code}'"],
-            capture_output=True, text=True, timeout=6,
-        )
-        return r.returncode == 0 and r.stdout.strip() == "200"
-    except Exception:
-        return False
+    # Shared probe — see tests/_container.py. Was a private
+    # subprocess.run(['docker','exec',...]) copy in nine modules.
+    return service_healthy("rag-api")
 
 
 pytestmark = pytest.mark.skipif(not _rag_api_up(), reason="rag-api container not reachable")
 
 
 def _in_container(py_snippet):
-    r = subprocess.run(
-        ["docker", "exec", "rag-api", "python3", "-c", py_snippet],
-        capture_output=True, text=True, timeout=15,
-    )
-    return r.stdout.strip(), r.stderr.strip(), r.returncode
+    # Shared runner — see tests/_container.py::container_python.
+    return container_python(py_snippet)
 
 
 def test_resolve_target_url_parses_full_url():
@@ -78,12 +78,8 @@ print('OK')
 def test_cves_without_poc_endpoint_shape():
     """Live endpoint smoke: returns the shape the UI needs. Allowed to be
     empty (zero rows is a real state); only the SHAPE is pinned."""
-    r = subprocess.run(
-        ["docker", "exec", "rag-api", "sh", "-lc",
-         'curl -sk -H "x-api-key: $API_KEY" '
-         '"https://localhost:8000/software/cves-without-poc?limit=3"'],
-        capture_output=True, text=True, timeout=12,
-    )
+    r = _TUPLE3(container_sh('curl -sk -H "x-api-key: $API_KEY" '
+         '"https://localhost:8000/software/cves-without-poc?limit=3"', container="rag-api", timeout=12))
     assert r.returncode == 0, r.stderr
     import json
     d = json.loads(r.stdout)
@@ -97,13 +93,15 @@ def test_cves_without_poc_endpoint_shape():
 
 
 # ─── CVE-optional path ────────────────────────────────────────────────────
-# BuildPocBody.cve is Optional[str]; the endpoint synthesizes NOCVE-<ts>
-# when absent so run_id/hints stay unique. Validation still rejects a
-# non-CVE string and requires some signal (product/url/hint) alongside.
+# BuildPocBody.cve is Optional[str]; the endpoint synthesizes
+# POC-<ip>-<port>[-<product>]-NNN when absent so run_id/hints stay unique.
+# (Rows created before 2026-10-11 carry the older NOCVE-<epoch> form; both are
+# recognised by _is_synthetic_cve.) Validation still rejects a non-CVE string
+# and requires some signal (product/url/hint) alongside.
 
 def test_build_poc_cve_optional_in_pydantic_model():
     """BuildPocBody.cve is Optional[str]; empty is OK — endpoint synthesizes
-    NOCVE-<ts>. Verifies the Pydantic field is actually optional (not a
+    the POC- token. Verifies the Pydantic field is actually optional (not a
     required field we claim is optional in the docstring)."""
     py = """
 import sys; sys.path.insert(0,'/app')
@@ -121,17 +119,13 @@ print('OK')
 
 
 def test_build_poc_rejects_non_cve_string():
-    """A malformed CVE string must 400, not quietly fall through to NOCVE
+    """A malformed CVE string must 400, not quietly fall through to token
     synthesis. Guards against operator typos (e.g. 'CVE2024-X') landing
-    as a NOCVE-prefixed build."""
-    r = subprocess.run(
-        ["docker", "exec", "rag-api", "sh", "-lc",
-         'curl -sk -o /dev/null -w "%{http_code}" -X POST '
+    as a synthesized build."""
+    r = _TUPLE3(container_sh('curl -sk -o /dev/null -w "%{http_code}" -X POST '
          '-H "x-api-key: $API_KEY" -H "Content-Type: application/json" '
          '-d \'{"cve":"BAD","target_url":"http://172.18.0.32/"}\' '
-         '"https://localhost:8000/software/build-poc"'],
-        capture_output=True, text=True, timeout=12,
-    )
+         '"https://localhost:8000/software/build-poc"', container="rag-api", timeout=12))
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "400", f"expected 400 on bad cve, got {r.stdout}"
 
@@ -139,14 +133,10 @@ def test_build_poc_rejects_non_cve_string():
 def test_build_poc_rejects_missing_target():
     """No ip + no target_url → 400 — fail-fast rather than running a build
     without a target to aim at."""
-    r = subprocess.run(
-        ["docker", "exec", "rag-api", "sh", "-lc",
-         'curl -sk -o /dev/null -w "%{http_code}" -X POST '
+    r = _TUPLE3(container_sh('curl -sk -o /dev/null -w "%{http_code}" -X POST '
          '-H "x-api-key: $API_KEY" -H "Content-Type: application/json" '
          '-d \'{}\' '
-         '"https://localhost:8000/software/build-poc"'],
-        capture_output=True, text=True, timeout=12,
-    )
+         '"https://localhost:8000/software/build-poc"', container="rag-api", timeout=12))
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "400", f"expected 400 on missing target, got {r.stdout}"
 
@@ -240,10 +230,7 @@ def test_cves_without_poc_accepts_scope_params():
     )
     for q in ("?limit=1", "?limit=1&scope_only=false",
               "?limit=1&scope_only=true&all_engagements=true"):
-        r = subprocess.run(
-            ["docker", "exec", "rag-api", "sh", "-lc", f'{base}{q}"'],
-            capture_output=True, text=True, timeout=12,
-        )
+        r = _TUPLE3(container_sh(f'{base}{q}"', container="rag-api", timeout=12))
         assert r.returncode == 0 and r.stdout.strip() == "200", \
             f"query {q!r} → {r.stdout} / {r.stderr}"
 

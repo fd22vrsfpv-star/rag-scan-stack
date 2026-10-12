@@ -22,6 +22,46 @@ log = logging.getLogger("assets")
 
 router = APIRouter()
 
+#: Cache for the intrusive-nuclei setting so a dispatch loop does not hit the
+#: settings endpoint once per recommendation.
+_intrusive_cache: dict = {"val": None, "ts": 0.0}
+
+
+def _intrusive_nuclei_allowed() -> bool:
+    """May a tag-filtered nuclei dispatch include `intrusive` templates?
+
+    OFF by default, and deliberately so. An `intrusive` template does not probe
+    — it exploits. The CVE-2024-5084 template uploads a file to the target, and
+    a verified match means a web shell's worth of primitive was actually
+    written. That is the right thing to do on an authorised engagement and the
+    wrong thing to do by surprise, so the operator opts in:
+
+        Settings -> General -> 'Allow intrusive nuclei templates'
+        or NUCLEI_ALLOW_INTRUSIVE=true
+
+    Scope is unaffected either way: the gate decides WHICH hosts may be
+    touched, this decides how hard. Fails closed on any error.
+    """
+    import os as _os
+    import time as _time
+    if str(_os.environ.get("NUCLEI_ALLOW_INTRUSIVE", "")).lower() in ("1", "true", "yes"):
+        return True
+    now = _time.time()
+    if _intrusive_cache["ts"] > now - 60:
+        return bool(_intrusive_cache["val"])
+    val = False
+    try:
+        import httpx as _hx
+        s = get_settings()
+        r = _hx.get(f"{s.rag_api_url}/settings/config/nuclei_allow_intrusive",
+                    headers={"x-api-key": s.api_key}, timeout=3, verify=False)
+        if r.status_code == 200:
+            val = str((r.json() or {}).get("value", "")).lower() in ("1", "true", "yes")
+    except Exception as e:  # noqa: BLE001
+        log.debug("intrusive-nuclei setting lookup failed (%s) — staying off", e)
+    _intrusive_cache.update({"val": val, "ts": now})
+    return val
+
 
 @router.post("/api/credentials")
 async def create_credential(request: Request):
@@ -266,6 +306,53 @@ async def update_cve_tuning(request: Request):
     body = await request.json()
     async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.put(f"{s.rag_api_url}/software/cve-tuning", json=body, headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
+@router.get("/api/software/poc-hints")
+async def list_poc_hints(cve: str = None, target_host: str = None):
+    s = get_settings()
+    params = {}
+    if cve:
+        params["cve"] = cve
+    if target_host:
+        params["target_host"] = target_host
+    async with httpx.AsyncClient(timeout=10) as c:
+        resp = await c.get(
+            f"{s.rag_api_url}/software/poc-hints",
+            params=params,
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        return safe_json(resp)
+
+
+@router.post("/api/software/poc-hints")
+async def add_poc_hint(request: Request):
+    s = get_settings()
+    body = await request.json()
+    async with httpx.AsyncClient(timeout=10) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/software/poc-hints",
+            json=body,
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            from fastapi import HTTPException
+            raise HTTPException(resp.status_code, resp.text)
+        return safe_json(resp)
+
+
+@router.delete("/api/software/poc-hints/{hint_id}")
+async def delete_poc_hint(hint_id: str):
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=10) as c:
+        resp = await c.delete(
+            f"{s.rag_api_url}/software/poc-hints/{hint_id}",
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            from fastapi import HTTPException
+            raise HTTPException(resp.status_code, resp.text)
         return safe_json(resp)
 
 
@@ -1781,10 +1868,25 @@ async def run_scan_recommendations(body: RunRecommendationsRequest):
                     r = await client.post(f"{service_url}/jobs/masscan-then-nmap", json=payload, headers=headers)
                 elif scanner == "nuclei":
                     template = rec.get("template") or ""
-                    payload = {"targets": [f"http://{ip}"]}
+                    # Target the port the recommendation names. Without it this
+                    # always scanned http://<ip> — port 80 — so a finding on any
+                    # other port could not be reached. A WordPress app on 9090
+                    # with a critical CVE was scanned on a closed port 80 and
+                    # reported nothing. Scheme follows the port.
+                    _rp = rec.get("port")
+                    _scheme = "https" if str(_rp) in ("443", "8443", "4443", "9443") else "http"
+                    _tgt = f"{_scheme}://{ip}:{_rp}" if _rp else f"{_scheme}://{ip}"
+                    payload = {"targets": [_tgt]}
                     if template:
                         tags = [t.strip() for t in template.split(",") if t.strip()]
                         payload["tags"] = ",".join(tags)
+                        # An explicit tag filter is the operator asking for those
+                        # templates specifically. nuclei's .nuclei-ignore still
+                        # holds back `intrusive` ones (they exploit rather than
+                        # probe), and a CVE check is often tagged that way, so
+                        # allow them only when the operator has opted in.
+                        if _intrusive_nuclei_allowed():
+                            payload["include_tags"] = "intrusive"
                     if proxy_url:
                         payload["proxy"] = proxy_url
                     r = await client.post(f"{service_url}/jobs/nuclei-scan", json=payload, headers=headers)

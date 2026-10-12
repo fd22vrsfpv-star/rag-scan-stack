@@ -49,8 +49,12 @@ def _undefined_names(path: Path) -> list[str]:
 # now takes `ip=`, which also made tests/test_fstring_placeholders.py green).
 # Recorded in Docs/OPEN_ITEMS.md. A NEW undefined name fails by name even while
 # the count is under the baseline.
-BASELINE_COUNT = {"app/rag-api/api.py": 27}
-BASELINE_NAMES = {"app/rag-api/api.py": {"emit_webhook"}}
+# DEBT PAID 2026-10-12: all 27 were `emit_webhook` call sites missing their
+# local `from webhooks import emit_webhook`, each swallowed by an enclosing
+# `except` — so 21 webhook events had never once fired. Baseline lowered to 0,
+# which is what makes this a ratchet rather than a permanent allowance.
+BASELINE_COUNT = {"app/rag-api/api.py": 0}
+BASELINE_NAMES = {}
 
 
 @pytest.mark.parametrize("rel", FILES)
@@ -66,8 +70,21 @@ def test_no_undefined_names(rel):
 
 
 def test_baseline_is_not_stale():
-    # When the debt is paid down, lower the baseline — a loose ratchet hides regressions.
+    """The baseline must match reality EXACTLY, in both directions.
+
+    It used to allow a 10-slack window below the baseline, which is how 27
+    fixed names could sit unnoticed. At 0 that window would also make this
+    assertion vacuously true forever — a guard that cannot fail is worse than
+    none (CLAUDE.md). Pin it exactly instead: raising the number fails
+    test_no_undefined_names, lowering it fails here until the baseline is
+    updated to match.
+    """
     p = REPO / "app/rag-api/api.py"
+    if not p.exists():
+        pytest.skip("api.py not present")
     bad = _undefined_names(p)
-    assert len(bad) >= BASELINE_COUNT["app/rag-api/api.py"] - 10, (
-        "api.py undefined names dropped to %d — lower BASELINE_COUNT" % len(bad))
+    expected = BASELINE_COUNT["app/rag-api/api.py"]
+    assert len(bad) == expected, (
+        "api.py has %d undefined names but BASELINE_COUNT says %d — "
+        "update the baseline to match (down when debt is paid, and never up "
+        "without a stated reason)." % (len(bad), expected))

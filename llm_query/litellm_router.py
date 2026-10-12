@@ -415,11 +415,17 @@ def litellm_completion_for(backend: str,
     Raises on provider errors so the caller can decide between
     propagate-vs-fallback.
     """
-    import litellm  # local import — the module is heavy, don't pay import cost unused
+    # Resolve the backend BEFORE importing litellm. The documented contract is
+    # "unknown backend -> None so the caller falls back to the hand-rolled
+    # dispatch", and _build_litellm_kwargs is pure — it needs no litellm. With
+    # the import first, an environment without the package raised
+    # ModuleNotFoundError instead of returning None, which is exactly the
+    # fallback path the kill-switch depends on.
     lmodel, kwargs = _build_litellm_kwargs(
         backend, model, options, endpoint, api_key, max_tokens, api_version)
     if lmodel is None:
         return None
+    import litellm  # local import — the module is heavy, don't pay import cost unused
     # Single-prompt → wrap as one user message. For multi-turn, use
     # `litellm_chat_completion_for()` which takes messages directly.
     kwargs["messages"] = [{"role": "user", "content": prompt}]
@@ -534,11 +540,17 @@ def litellm_chat_completion_for(backend: str,
     shape change applied to one must land in the other — the shape
     picker is extracted into `_build_litellm_kwargs()` below.
     """
-    import litellm
+    # Resolve the backend BEFORE importing litellm. The documented contract is
+    # "unknown backend -> None so the caller falls back to the hand-rolled
+    # dispatch", and _build_litellm_kwargs is pure — it needs no litellm. With
+    # the import first, an environment without the package raised
+    # ModuleNotFoundError instead of returning None, which is exactly the
+    # fallback path the kill-switch depends on.
     lmodel, kwargs = _build_litellm_kwargs(
         backend, model, options, endpoint, api_key, max_tokens, api_version)
     if lmodel is None:
         return None
+    import litellm
     # Chat takes `messages` instead of a wrapped single-user prompt.
     kwargs["messages"] = messages
     resp = _litellm_completion_with_azure_shape_retry(litellm, backend, model, lmodel, kwargs)

@@ -31,7 +31,10 @@ NM = REPO / "node_manager" / "node_manager.py"
 def test_client_error_to_http_extracts_aws_message():
     """The helper lives in node_manager.node_manager; stand it up in a thin
     namespace so this test can run without pulling the full service."""
-    from botocore.exceptions import ClientError
+    # botocore is optional here (the module docstring documents installing it
+    # explicitly). A missing optional dep must SKIP, not fail — CLAUDE.md:
+    # "a skip says cannot run here; an error says broken".
+    ClientError = pytest.importorskip("botocore.exceptions").ClientError
 
     # Reproduce the helper's logic by importing it from source. Avoid importing
     # the full module (it opens DB connections at import time).
@@ -161,10 +164,18 @@ def test_do_options_is_live_not_hardcoded():
 def test_bff_safe_json_unwraps_upstream_detail():
     """safe_json must extract `detail` from the upstream FastAPI error body so
     the frontend sees a single-level string, not nested JSON."""
-    import importlib
-    import sys as _sys
-    _sys.path.insert(0, str(REPO / "dashboard" / "bff"))
-    utils = importlib.import_module("utils")
+    # Load dashboard/bff/utils.py BY PATH. `import_module("utils")` after a
+    # sys.path.insert is order-dependent: the repo also has a top-level
+    # `utils/` package, and once anything else has imported that, the cached
+    # module wins and this test sees a namespace package with none of the
+    # helpers. It passed alone and failed in the full suite for that reason.
+    import importlib.util
+    _p = REPO / "dashboard" / "bff" / "utils.py"
+    if not _p.exists():
+        pytest.skip(f"{_p} not present")
+    _spec = importlib.util.spec_from_file_location("bff_utils_under_test", _p)
+    utils = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(utils)
     assert hasattr(utils, "_upstream_detail"), "_upstream_detail helper missing"
     assert hasattr(utils, "raise_upstream"), "raise_upstream convenience missing"
 

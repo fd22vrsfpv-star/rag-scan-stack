@@ -1,0 +1,105 @@
+{
+  "version": "1.96.0",
+  "results": [
+    {
+      "check_id": "python.lang.security.audit.dangerous-system-call.dangerous-system-call",
+      "path": "app/views/admin.py",
+      "start": {"line": 42, "col": 5, "offset": 1200},
+      "end": {"line": 42, "col": 55, "offset": 1250},
+      "extra": {
+        "message": "Detected dynamic command execution via os.system(). This can lead to command injection.",
+        "severity": "ERROR",
+        "lines": "os.system(f'ping -c 1 {request.args.get(\"host\")}')",
+        "metadata": {
+          "cwe": ["CWE-78: Improper Neutralization of Special Elements used in an OS Command"],
+          "owasp": ["A03:2021 - Injection"],
+          "confidence": "HIGH",
+          "impact": "HIGH"
+        },
+        "fix": "Use subprocess.run with shell=False"
+      }
+    },
+    {
+      "check_id": "python.django.security.injection.sql.sql-injection-using-raw.sql-injection-using-raw",
+      "path": "app/views/search.py",
+      "start": {"line": 88, "col": 12, "offset": 3100},
+      "end": {"line": 90, "col": 5, "offset": 3250},
+      "extra": {
+        "message": "Detected SQL query built with string formatting. Use parameterized queries instead.",
+        "severity": "ERROR",
+        "lines": "cursor.execute(f\"SELECT * FROM users WHERE name = '{request.GET.get('q')}'\")",
+        "metadata": {
+          "cwe": ["CWE-89: Improper Neutralization of Special Elements used in an SQL Command"],
+          "owasp": ["A03:2021 - Injection"],
+          "confidence": "HIGH"
+        }
+      }
+    },
+    {
+      "check_id": "javascript.express.security.audit.xss.mustache-escape.template-unescaped-with-var",
+      "path": "frontend/views/profile.ejs",
+      "start": {"line": 15, "col": 10, "offset": 400},
+      "end": {"line": 15, "col": 45, "offset": 435},
+      "extra": {
+        "message": "Unescaped variable in template. This is a cross-site scripting (XSS) vulnerability.",
+        "severity": "WARNING",
+        "lines": "<%- user.bio %>",
+        "metadata": {
+          "cwe": ["CWE-79"],
+          "owasp": ["A03:2021 - Injection"],
+          "confidence": "MEDIUM"
+        }
+      }
+    },
+    {
+      "check_id": "generic.secrets.security.detected-generic-api-key.detected-generic-api-key",
+      "path": "config/settings.py",
+      "start": {"line": 7, "col": 1, "offset": 100},
+      "end": {"line": 7, "col": 60, "offset": 160},
+      "extra": {
+        "message": "Hardcoded API key detected.",
+        "severity": "WARNING",
+        "lines": "API_KEY = 'sk-REDACTED-test-fixture-not-a-real-key-000'",
+        "metadata": {
+          "cwe": ["CWE-798"],
+          "confidence": "LOW"
+        }
+      }
+    },
+    {
+      "check_id": "python.flask.security.injection.ssrf-requests.ssrf-requests",
+      "path": "app/controllers/proxy.py",
+      "start": {"line": 23, "col": 8, "offset": 750},
+      "end": {"line": 23, "col": 60, "offset": 802},
+      "extra": {
+        "message": "Detected SSRF via requests library with user-controlled URL.",
+        "severity": "ERROR",
+        "lines": "resp = requests.get(request.args.get('url'))",
+        "metadata": {
+          "cwe": ["CWE-918"],
+          "owasp": ["A10:2021 - Server-Side Request Forgery"],
+          "confidence": "HIGH"
+        }
+      }
+    },
+    {
+      "check_id": "python.lang.security.deserialization.avoid-pyyaml-load.avoid-pyyaml-load",
+      "path": "app/utils/config_loader.py",
+      "start": {"line": 12, "col": 5, "offset": 300},
+      "end": {"line": 12, "col": 35, "offset": 330},
+      "extra": {
+        "message": "Detected yaml.load() without safe loader. Use yaml.safe_load().",
+        "severity": "WARNING",
+        "lines": "data = yaml.load(f.read())",
+        "metadata": {
+          "cwe": ["CWE-502"],
+          "confidence": "MEDIUM"
+        }
+      }
+    }
+  ],
+  "errors": [],
+  "paths": {
+    "scanned": ["app/", "frontend/", "config/"]
+  }
+}

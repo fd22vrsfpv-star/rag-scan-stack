@@ -113,7 +113,7 @@ EXPECTED_TABLES=(
   checkpoints checkpoint_blobs checkpoint_writes checkpoint_migrations
   # TIER 8: Exploit management
   pending_exploits exploit_results exploit_chunks
-  lateral_movement credential_spray_attempts credential_spray_approvals password_policies platform_control security_tests security_test_runs custom_vuln_skills poc_synthesis_log poc_grants exploit_store exploit_store_versions build_poc_attempts build_poc_error_memory learned_postex_overlays
+  lateral_movement credential_spray_attempts credential_spray_approvals password_policies platform_control security_tests security_test_runs custom_vuln_skills poc_synthesis_log poc_grants exploit_store exploit_store_versions build_poc_attempts build_poc_error_memory build_poc_reviews learned_postex_overlays
   exploit_approval_rules
   msf_modules active_listeners exploit_callbacks tool_executions
   # TIER 9: Webhooks
@@ -166,6 +166,8 @@ EXPECTED_TABLES=(
   # schema since 2026-09-09 — it used to be created in the `n8n` database while
   # its writer connected to `scans`, so it existed nowhere the code could see.
   rag_documents
+  # TIER 30: SAST / Semgrep static analysis
+  sast_findings sast_scans
 )
 
 # Views that reports and the spray list depend on. A missing view fails only when

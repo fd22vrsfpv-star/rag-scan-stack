@@ -68,6 +68,7 @@ class BuildPocState(TypedDict, total=False):
     detected_frameworks: List[str]
     waf_family: Optional[str]
     waf_characterization: Dict[str, Any]
+    secondary_products: List[Dict[str, Any]]
 
     # Hint / auth / research
     auth: Dict[str, Any]
@@ -171,16 +172,58 @@ def _want(sources: str, kind: str) -> bool:
 
 def node_port_sweep(state: BuildPocState) -> Dict[str, Any]:
     from api import _scout_open_ports, _poc_trace
+    import re as _re_ps
     _t0 = time.time()
     ps = _scout_open_ports(state["ip"], state["port"])
     metrics = {"port_sweep": {"seconds": round(time.time() - _t0, 2),
                               "chars_added": len(ps or ""),
                               "signal": "open-port list + banners"}}
     seg = []
+    upd: Dict[str, Any] = {}
     if ps:
         seg.append(ps)
         _poc_trace(state["run_id"], "recon:port_sweep", response=ps[:1200])
-    return {"segments": seg, "recon_metrics": {**state.get("recon_metrics", {}), **metrics}}
+        # PORT MISMATCH FIX: detect CVE-Bench Next.js wrapper ports and promote
+        # the real application port. The wrapper serves /_next/* static chunks
+        # and identifies as Next.js. The real app runs on an alt port (typically
+        # 8000). Without this, all recon (auth, crawl, response_mine) hits the
+        # wrapper and misses the actual target.
+        _wrapper_ports = set()
+        _app_ports = set()
+        primary = int(state.get("port") or 0)
+        for m in _re_ps.finditer(
+            r"^\s*(\d+)(?:\s*\(requested\))?:\s*(.+)$", ps, _re_ps.MULTILINE
+        ):
+            _p = int(m.group(1))
+            _banner = m.group(2)
+            _bl = _banner.lower()
+            _is_wrapper = (
+                "next.js" in _bl
+                or "/_next/" in _bl
+                or "x-powered-by=next" in _bl
+                or ('title="cve-bench"' in _bl and _p != 9091)
+                or 'title="create next app"' in _bl
+            )
+            _is_evaluator = (_p == 9091)
+            if _is_wrapper and not _is_evaluator:
+                _wrapper_ports.add(_p)
+            elif not _is_evaluator and _p != primary:
+                _app_ports.add(_p)
+        if primary in _wrapper_ports and _app_ports:
+            _new_port = min(_app_ports)
+            _poc_trace(state["run_id"], "port_mismatch_fix",
+                       response=(f"Primary port {primary} is a CVE-Bench Next.js "
+                                 f"wrapper; promoting port {_new_port} as the real "
+                                 f"application target"),
+                       extra={"old_port": primary, "new_port": _new_port,
+                              "wrapper_ports": sorted(_wrapper_ports),
+                              "app_ports": sorted(_app_ports)})
+            upd["port"] = _new_port
+            seg.append(f"\nPORT CORRECTION: port {primary} is a CVE-Bench wrapper "
+                       f"(Next.js). The real application is on port {_new_port}. "
+                       f"All subsequent probes/auth/crawl will target port {_new_port}.")
+    return {"segments": seg, "recon_metrics": {**state.get("recon_metrics", {}), **metrics},
+            **upd}
 
 
 def node_waf_detect(state: BuildPocState) -> Dict[str, Any]:
@@ -274,20 +317,51 @@ def node_product_identification(state: BuildPocState) -> Dict[str, Any]:
     looking through the html, pull possible dates for versions, and kick off
     the ai deep dive — earlier in the process, right after scans and recon.'
     """
-    from api import _identify_product_from_target, _poc_trace
+    from api import _identify_product_from_target, _poc_trace, _is_synthetic_cve
     _t0 = time.time()
     had_product = bool(state.get("product"))
     # Only run the (slower) deep dive when we DON'T already have research in
-    # hand and the build carries a real CVE to research.
+    # hand and the build carries a real CVE to research. _is_synthetic_cve
+    # covers both synthesized prefixes (POC- now, NOCVE- on older rows) — a
+    # single literal here would send old builds researching a nonexistent CVE.
     want_deep = (bool(state.get("research", True))
                  and bool(state.get("cve"))
-                 and not str(state.get("cve", "")).startswith("NOCVE-"))
+                 and not _is_synthetic_cve(state.get("cve")))
     info = _identify_product_from_target(
         state["ip"], state["port"],
         run_deep_dive=want_deep,
         cve=state.get("cve"), eid=state.get("eid"), model=state.get("model"))
     upd: Dict[str, Any] = {}
     seg = []
+    # Extract Server headers from alt ports discovered by port_sweep.
+    # Port sweep stores banners like "9090: HTTP 302 Server=Werkzeug/3.0.6"
+    # in segments. Product identification only checks the primary port, so
+    # alt-port products (Werkzeug on :9090, etc.) were invisible to the
+    # product enumeration pipeline. This shared extractor feeds both the
+    # build-PoC pipeline and the exploit workbench.
+    import re as _re_ps
+    _existing_sp = {s["product"].lower() for s in (info.get("secondary_products") or [])}
+    _primary_prod = (info.get("product") or "").lower()
+    for _seg_text in (state.get("segments") or []):
+        for _m in _re_ps.finditer(
+            r"^\s*(\d+)(?:\s*\(requested\))?:\s*HTTP\s+\d+\s+Server=([^\s]+)",
+            _seg_text, _re_ps.MULTILINE,
+        ):
+            _alt_port = int(_m.group(1))
+            if _alt_port == int(state.get("port") or 0):
+                continue  # primary port already handled
+            _srv_raw = _m.group(2)
+            _vm = _re_ps.match(r"([A-Za-z][A-Za-z0-9._-]*?)[/ ]([0-9]+\.[0-9][0-9.]*)", _srv_raw)
+            if _vm:
+                _sp_name, _sp_ver = _vm.group(1), _vm.group(2)
+                if _sp_name.lower() not in _existing_sp and _sp_name.lower() != _primary_prod:
+                    if info.get("secondary_products") is None:
+                        info["secondary_products"] = []
+                    info["secondary_products"].append({
+                        "product": _sp_name, "version": _sp_ver,
+                        "source": f"port_sweep:{_alt_port}",
+                    })
+                    _existing_sp.add(_sp_name.lower())
     if info.get("product") and not had_product:
         upd["product"] = info["product"]
         if info.get("version") and not state.get("version"):
@@ -364,6 +438,7 @@ def node_product_identification(state: BuildPocState) -> Dict[str, Any]:
         "chars_added": len("\n".join(bits)),
         "signal": f"product={info.get('product')} version={info.get('version')}"}}
     upd["segments"] = seg
+    upd["secondary_products"] = info.get("secondary_products") or []
     upd["recon_metrics"] = {**state.get("recon_metrics", {}), **metrics}
     return upd
 
@@ -394,13 +469,26 @@ def node_product_cve_enumeration(state: BuildPocState) -> Dict[str, Any]:
     # possible; otherwise identify now.
     primary = state.get("product")
     primary_ver = state.get("version")
-    # Pull the full identification (secondary + plugins) — cheap, cached HTML
+    # Pull the full identification (secondary + plugins) — cheap, cached HTML.
+    # Prefer state-propagated secondary_products (which include alt-port
+    # discoveries from port_sweep) over a fresh re-fetch that only sees the
+    # primary port.
     info = {}
     try:
         info = _identify_product_from_target(state["ip"], state["port"],
                                               run_deep_dive=False)
     except Exception as e:  # noqa: BLE001
         logging.debug("product enumeration identify failed: %s", e)
+    state_sp = state.get("secondary_products") or []
+    info_sp = info.get("secondary_products") or []
+    # Merge: state takes priority (has alt-port products), then info
+    _seen_sp = set()
+    merged_sp = []
+    for s in state_sp + info_sp:
+        key = s["product"].lower()
+        if key not in _seen_sp:
+            merged_sp.append(s)
+            _seen_sp.add(key)
     # Build the ordered work list: primary first, then secondary, then plugins.
     targets = []
     if primary:
@@ -408,7 +496,7 @@ def node_product_cve_enumeration(state: BuildPocState) -> Dict[str, Any]:
     elif info.get("product"):
         targets.append({"product": info["product"], "version": info.get("version"),
                         "tier": "primary"})
-    for s in info.get("secondary_products") or []:
+    for s in merged_sp:
         targets.append({"product": s["product"], "version": s.get("version"),
                         "tier": "secondary"})
     for p in info.get("plugins") or []:
@@ -981,6 +1069,32 @@ def node_research(state: BuildPocState) -> Dict[str, Any]:
         except Exception as e:  # noqa: BLE001
             logging.debug("build research step failed: %s", e)
             research_out = None
+    # Does projectdiscovery already ship a check for this CVE? Worth knowing
+    # before synthesising anything: a VERIFIED upstream template is a faster and
+    # far more reliable answer than a from-scratch PoC, and when one exists and
+    # the build still fails, "a working check existed and we did not use it" is
+    # the single most useful line in the review.
+    #
+    # Advisory only — never gates the build, and every failure is swallowed.
+    try:
+        import requests as _rq
+        from api import _poc_trace
+        _nu = os.environ.get("NUCLEI_URL", "https://nuclei-runner:8011")
+        _tr = _rq.get(f"{_nu}/templates/for-cve/{state['cve']}",
+                      timeout=10, verify=False).json()
+        if _tr.get("found"):
+            _poc_trace(
+                state["run_id"], "nuclei_template_available",
+                response=(f"{_tr.get('template_id')} severity={_tr.get('severity')} "
+                          f"verified={_tr.get('verified')} intrusive={_tr.get('intrusive')} "
+                          f"path={_tr.get('template_path')}"),
+                extra={"nuclei_template": _tr})
+        else:
+            _poc_trace(state["run_id"], "nuclei_template_available",
+                       response=f"none for {state['cve']} ({_tr.get('reason')})",
+                       extra={"nuclei_template": _tr})
+    except Exception as e:  # noqa: BLE001
+        logging.debug("nuclei template check skipped for %s: %s", state.get("cve"), e)
     # Agent-driven spec derivation. Skip if a hand-curated YAML spec already exists
     # or env BUILD_POC_AUTO_DERIVE=off.
     if (os.environ.get("BUILD_POC_AUTO_DERIVE", "on") or "on").lower() != "off":
@@ -1174,10 +1288,17 @@ def node_deep_recon(state: BuildPocState) -> Dict[str, Any]:
                         f"paths={len(res.get('candidate_paths') or [])} session={bool((res.get('auth') or {}).get('_auto_cookie'))} "
                         f"seconds={res.get('seconds')} skipped={res.get('skipped')}",
                extra={"deep_recon": {k: v for k, v in res.items() if k != "segments"}})
-    from api import _BUILD_POC_SECOND_PASS_ITERS
+    from api import _build_poc_second_pass_iters
+    _second_pass_cap = _build_poc_second_pass_iters()
     upd: Dict[str, Any] = {"deep_recon_done": True, "deep_recon": {k: v for k, v in res.items() if k != "segments"},
-                           # the go-around is a SECOND chance, not a second budget (round 11: 50 more iterations)
-                           "max_iters": min(int(state.get("max_iters") or 0) or _BUILD_POC_SECOND_PASS_ITERS, _BUILD_POC_SECOND_PASS_ITERS),
+                           # The go-around is a SECOND chance, not a second budget — but the
+                           # cap is now the operator's (Settings → Scan Timeouts →
+                           # "Build-PoC second-pass iterations", default 50). At the old
+                           # hard 10 this clamp was the binding limit on every CVE that
+                           # needed deep recon: a request for 50 became 10, and
+                           # CVE-2024-22120 stopped at exactly 10 on max_iters with all 10
+                           # iterations genuinely reaching the target.
+                           "max_iters": min(int(state.get("max_iters") or 0) or _second_pass_cap, _second_pass_cap),
                            "segments": res.get("segments") or [],
                            "id_pool": {**(state.get("id_pool") or {}), **(res.get("id_pool") or {})},
                            "gather_blocked": False,
@@ -1476,8 +1597,33 @@ def node_save_store(state: BuildPocState) -> Dict[str, Any]:
         metrics["recon_seconds_total"] = round(
             sum(v.get("seconds", 0) for v in recon_metrics.values()), 2)
     store_id = None
+    # Do NOT overwrite a verified exploit_store row with an unverified one.
+    # The deep-recon go-around can produce a second pass whose unverified
+    # result shadows the first pass's verified entry (CVE-2024-36412).
+    _skip_unverified = False
+    if not result.get("verified"):
+        try:
+            from api import get_db
+            with get_db() as _sc, _sc.cursor() as _scur:
+                _scur.execute(
+                    """SELECT id FROM exploit_store
+                       WHERE verified = true
+                         AND (metadata->>'attempt_run_id' = %s
+                              OR (cve = %s AND target_host = %s))
+                       LIMIT 1""",
+                    (state.get("run_id") or '', state.get("cve") or '',
+                     str(state.get("ip") or '')))
+                _vrow = _scur.fetchone()
+                if _vrow:
+                    store_id = str(_vrow[0])
+                    _skip_unverified = True
+                    _poc_trace(state.get("run_id"), "save_store_skip",
+                               response=f"verified entry {store_id} exists; "
+                                        f"not overwriting with unverified")
+        except Exception:  # noqa: BLE001
+            pass
     try:
-        if result.get("final_command"):
+        if result.get("final_command") and not _skip_unverified:
             store_id = _save_exploit_store(
                 name=f"PoC {state['cve']} on {state['ip']}"
                      + (" (verified)" if result.get("verified") else " (unverified)"),
@@ -1501,7 +1647,7 @@ def node_save_store(state: BuildPocState) -> Dict[str, Any]:
                           "research_sources": (research_out or {}).get("sources"),
                           "failure_analysis": state.get("failure_analysis") or None,
                           "attempt_run_id": state.get("run_id")})
-        elif state.get("failure_analysis"):
+        elif state.get("failure_analysis") and not _skip_unverified:
             # No final command — the run FAILED (blocked, gather-incomplete, or
             # every iteration unverified). Operator (2026-10-10): "at the end of
             # failed runs ... add the analysis ... stored with the exploit
@@ -1685,6 +1831,48 @@ def node_tool_handoff(state: BuildPocState) -> Dict[str, Any]:
     return {"tool_handoff": handoff}
 
 
+def node_post_run_review(state: BuildPocState) -> Dict[str, Any]:
+    """RAG-driven post-run review agent. Retrieves review criteria from RAG,
+    evaluates each against the run trace, stores findings for operator approval,
+    and feeds learnings back into RAG for future runs."""
+    from api import (_post_run_review, _poc_trace, _read_trace_entries,
+                     _summarize_build_trace, _trace_extra)
+    result = state.get("result") or {}
+    fa = state.get("failure_analysis") or {}
+    session_info = state.get("session_info") or {}
+    trace_summary = {}
+    try:
+        store_id = state.get("exploit_store_id")
+        if store_id:
+            entries = _read_trace_entries(store_id)
+            trace_summary = _summarize_build_trace(entries)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        review = _post_run_review(
+            run_id=state.get("run_id"),
+            cve=state.get("cve"),
+            ip=state.get("ip"),
+            port=state.get("port"),
+            product=state.get("product"),
+            result=result,
+            fa=fa,
+            session_info=session_info,
+            trace_summary=trace_summary,
+            eid=state.get("eid"))
+        _poc_trace(state.get("run_id"), "post_run_review",
+                   response=(f"review completed: {review.get('summary', '')[:300]}"),
+                   extra={"review_id": review.get("review_id"),
+                          "findings_count": len(review.get("findings", [])),
+                          "fail_count": sum(1 for f in review.get("findings", [])
+                                           if f.get("status") == "fail"),
+                          "prior_learnings": review.get("prior_learnings_count", 0)})
+        return {"review": review}
+    except Exception as e:  # noqa: BLE001
+        logging.warning("post_run_review failed run=%s: %s", state.get("run_id"), e)
+        return {}
+
+
 # ── conditional edges (routers) ────────────────────────────────────────────────
 def _route_after_start(state: BuildPocState) -> str:
     """recon_first? -> port_sweep, else -> auth_establish (skip recon)."""
@@ -1803,6 +1991,7 @@ def build_graph():
     _add_node(g, "failure_analysis", node_failure_analysis)
     _add_node(g, "save_store", node_save_store)
     _add_node(g, "tool_handoff", node_tool_handoff)
+    _add_node(g, "post_run_review", node_post_run_review)
 
     # Edges — the spine
     g.add_conditional_edges(START, _route_after_start,
@@ -1887,8 +2076,33 @@ def build_graph():
     g.add_edge("synth", "run_refine")
 
     def _route_after_refine(state):
-        from api import _BUILD_POC_DEEP_RECON, _BUILD_POC_EARLY_STOP_ITERS
+        from api import _BUILD_POC_DEEP_RECON, _BUILD_POC_EARLY_STOP_ITERS, get_db
         res = state.get("result") or {}
+        # GUARD: if this run already produced a verified exploit, do NOT
+        # route to deep_recon for a go-around — the second pass would
+        # write an unverified entry that shadows the verified one.
+        # CVE-2024-36412: verified at iter 3, go-around overwrote with
+        # verified=False at iter 19. This single bug cost the only
+        # success in the focused-10 benchmark.
+        if res.get("verified"):
+            return "save_store"
+        try:
+            run_id = state.get("run_id")
+            cve = state.get("cve")
+            ip = state.get("ip")
+            if run_id or (cve and ip):
+                with get_db() as c, c.cursor() as cur:
+                    cur.execute(
+                        """SELECT 1 FROM exploit_store
+                           WHERE verified = true
+                             AND (metadata->>'attempt_run_id' = %s
+                                  OR (cve = %s AND target_host = %s))
+                           LIMIT 1""",
+                        (run_id or '', cve or '', str(ip or '')))
+                    if cur.fetchone():
+                        return "save_store"
+        except Exception:  # noqa: BLE001
+            pass
         gave_up = (res.get("stop_reason") in ("identical_resend", "dup_exit")
                    or bool((res.get("metrics") or {}).get("identical_resend_stop"))
                    or bool((res.get("metrics") or {}).get("refine_dup_exit")))
@@ -1905,7 +2119,8 @@ def build_graph():
                             {"deep_recon": "deep_recon", "save_store": "failure_analysis"})
     g.add_edge("failure_analysis", "save_store")
     g.add_edge("save_store", "tool_handoff")
-    g.add_edge("tool_handoff", END)
+    g.add_edge("tool_handoff", "post_run_review")
+    g.add_edge("post_run_review", END)
 
     return g.compile()
 

@@ -910,10 +910,17 @@ def scan(state: PentestState) -> dict:
         # by design — "recommended but not run" is the BFF loop's job, not a gap.
         if creds_enabled and "start_credential_check" not in used:
             try:
-                _auth_svcs = _discovered_auth_services(target)
+                # `target` was a bare undefined name here (F821): the enclosing
+                # scan() reads it as state["target"] everywhere else. Every run
+                # that reached this branch raised NameError, was swallowed by
+                # the except below, and logged "credential testing skipped" —
+                # so the deterministic credential dispatch this block exists to
+                # guarantee has never once fired.
+                _cred_target = state.get("target", "")
+                _auth_svcs = _discovered_auth_services(_cred_target)
                 if _auth_svcs:
                     scan_tools.start_credential_check(
-                        targets=target, services=",".join(_auth_svcs))
+                        targets=_cred_target, services=",".join(_auth_svcs))
                     dispatched = sorted(set(dispatched) | {"start_credential_check"})
                     _msg(sid, "Scanner",
                          f"[credential testing] Authorised ({_creds_auth}); "

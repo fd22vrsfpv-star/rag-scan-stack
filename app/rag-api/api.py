@@ -2581,9 +2581,17 @@ def _select_open_ports_without_recs(window_minutes: int = None, limit: int = 200
                    ) AS banner
             FROM public.ports p
             JOIN public.assets a ON a.id = p.asset_id
+            -- Coverage is per (ip, service, PORT). Keyed on (ip, service)
+            -- alone, a host with several ports running the same service --
+            -- an app on 9090 plus harness ports on 8000/9091, all 'http' --
+            -- counted as fully covered the moment any ONE of them got a
+            -- recommendation, and the rest were never scanned.
+            -- sr.port IS NULL matches anything so pre-column rows still
+            -- suppress: this must not re-queue work already done.
             LEFT JOIN public.scan_recommendations sr
               ON sr.ip = a.ip
              AND COALESCE(sr.service, '') = COALESCE(p.service, '')
+             AND (sr.port IS NULL OR sr.port = p.port)
             WHERE {where_sql}
             ORDER BY p.last_seen DESC
             LIMIT %(limit)s
@@ -5311,6 +5319,623 @@ def ingest_microburst(
             "poll": f"/jobs/{job_id}"}
 
 
+# ── SAST / Semgrep scanning ──────────────────────────────────────────────────
+# Static-analysis findings from source code. Three input modes:
+#   1. Upload pre-run Semgrep JSON results
+#   2. Point at a GitHub URL — clone + scan
+#   3. Fetch web-app page source (JS/HTML) and scan inline
+# Findings land in sast_findings (all source code) and, when web-relevant,
+# also cross-feed into web_findings so the exploit workbench can use them.
+
+def _ensure_sast_tables():
+    """Runtime DDL for sast_findings + sast_scans (idempotent)."""
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS public.sast_findings (
+                id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                engagement_id uuid, scan_id text,
+                source_type text NOT NULL DEFAULT 'upload',
+                source_url text, target_host text, target_port integer,
+                rule_id text NOT NULL, severity text, confidence text,
+                vuln_class text, file_path text,
+                line_start integer, line_end integer,
+                col_start integer, col_end integer,
+                matched_code text, message text, fix text,
+                cwe text[] DEFAULT '{}', owasp text[] DEFAULT '{}',
+                metadata jsonb DEFAULT '{}'::jsonb,
+                fingerprint text NOT NULL,
+                semgrep_version text,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now()
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_sast_fingerprint
+                ON public.sast_findings(fingerprint);
+            CREATE INDEX IF NOT EXISTS ix_sast_eng ON public.sast_findings(engagement_id);
+            CREATE INDEX IF NOT EXISTS ix_sast_vuln ON public.sast_findings(vuln_class);
+            CREATE TABLE IF NOT EXISTS public.sast_scans (
+                id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                engagement_id uuid, scan_id text NOT NULL UNIQUE,
+                source_type text NOT NULL, source_url text,
+                target_host text, target_port integer,
+                status text NOT NULL DEFAULT 'pending',
+                findings_count integer DEFAULT 0,
+                high_count integer DEFAULT 0, medium_count integer DEFAULT 0,
+                error_message text,
+                metadata jsonb DEFAULT '{}'::jsonb,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now()
+            );
+        """)
+        conn.commit()
+
+
+def _store_sast_findings(findings: list, scan_id: str, source_type: str,
+                         source_url: str = None, target_host: str = None,
+                         target_port: int = None, eid: str = None) -> dict:
+    """Insert parsed SAST findings into the application-level sast_findings
+    table. Findings stay here until a network path is established, at which
+    point the operator promotes web-relevant ones via POST /sast/promote."""
+    from psycopg2.extras import Json
+    _ensure_sast_tables()
+    stored = 0
+    dupes = 0
+    with get_db() as conn, conn.cursor() as cur:
+        for f in findings:
+            try:
+                cur.execute("""
+                    INSERT INTO sast_findings
+                        (engagement_id, scan_id, source_type, source_url,
+                         target_host, target_port, rule_id, severity, confidence,
+                         vuln_class, file_path, line_start, line_end,
+                         col_start, col_end, matched_code, message, fix,
+                         cwe, owasp, metadata, fingerprint, semgrep_version)
+                    VALUES (%s,%s,%s,%s, %s,%s,%s,%s,%s, %s,%s,%s,%s, %s,%s,%s,%s,%s,
+                            %s,%s,%s,%s,%s)
+                    ON CONFLICT (fingerprint) DO UPDATE SET
+                        updated_at = now(),
+                        scan_id = EXCLUDED.scan_id
+                    RETURNING (xmax = 0) AS inserted
+                """, (
+                    eid, scan_id, source_type, source_url,
+                    target_host, target_port,
+                    f["rule_id"], f["severity"], f["confidence"],
+                    f["vuln_class"], f["file_path"],
+                    f["line_start"], f["line_end"],
+                    f["col_start"], f["col_end"],
+                    f["matched_code"], f["message"], f.get("fix"),
+                    as_text_array(f["cwe"]), as_text_array(f["owasp"]),
+                    Json(f.get("metadata") or {}),
+                    f["fingerprint"], f.get("semgrep_version"),
+                ))
+                row = cur.fetchone()
+                if row and row[0]:
+                    stored += 1
+                else:
+                    dupes += 1
+            except Exception as e:
+                logging.warning(f"sast_findings insert: {e}")
+                conn.rollback()
+                continue
+        conn.commit()
+    return {"stored": stored, "duplicates": dupes}
+
+
+class SastUploadBody(BaseModel):
+    """Upload pre-run Semgrep JSON results."""
+    results: Any
+    target_host: Optional[str] = None
+    target_port: Optional[int] = None
+    source_url: Optional[str] = None
+    engagement_id: Optional[str] = None
+
+
+@app.post("/sast/upload", tags=["SAST"])
+def sast_upload_results(body: SastUploadBody, authorized: bool = Depends(auth)):
+    """Ingest pre-run Semgrep JSON results. The operator ran semgrep
+    locally and uploads the output. Findings go into sast_findings
+    and web-relevant ones cross-feed into web_findings."""
+    import sys
+    sys.path.insert(0, "/app")
+    from etl.parse_semgrep import parse_semgrep_json, findings_to_attack_surface
+
+    scan_id = f"sast-upload-{uuid.uuid4().hex[:12]}"
+    eid = _resolve_engagement_id(body.engagement_id)
+    findings = parse_semgrep_json(body.results)
+    if not findings:
+        return {"ok": False, "error": "No findings parsed from input", "scan_id": scan_id}
+
+    counts = _store_sast_findings(
+        findings, scan_id, "upload",
+        source_url=body.source_url,
+        target_host=body.target_host,
+        target_port=body.target_port,
+        eid=eid,
+    )
+    surface = findings_to_attack_surface(findings)
+
+    # Record scan
+    _ensure_sast_tables()
+    with get_db() as conn, conn.cursor() as cur:
+        from psycopg2.extras import Json
+        cur.execute("""
+            INSERT INTO sast_scans
+                (scan_id, engagement_id, source_type, source_url,
+                 target_host, target_port, status,
+                 findings_count, high_count, medium_count, metadata)
+            VALUES (%s,%s,'upload',%s,%s,%s,'completed',%s,%s,%s,%s)
+            ON CONFLICT (scan_id) DO NOTHING
+        """, (scan_id, eid, body.source_url,
+              body.target_host, body.target_port,
+              len(findings),
+              sum(1 for f in findings if f["severity"] in ("high", "critical")),
+              sum(1 for f in findings if f["severity"] == "medium"),
+              Json({"attack_surface": surface})))
+        conn.commit()
+
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("sast_scan_completed", "sast", {
+            "scan_id": scan_id, "source_type": "upload",
+            "target_host": body.target_host,
+            "findings": len(findings), **counts,
+            "engagement_id": eid,
+        })
+    except Exception:
+        pass
+
+    return {"ok": True, "scan_id": scan_id, "findings": len(findings),
+            **counts, "attack_surface": surface}
+
+
+class SastGithubBody(BaseModel):
+    """Scan a GitHub repository with Semgrep."""
+    url: str
+    branch: Optional[str] = None
+    target_host: Optional[str] = None
+    target_port: Optional[int] = None
+    engagement_id: Optional[str] = None
+    rulesets: Optional[List[str]] = None
+
+
+@app.post("/sast/github", tags=["SAST"])
+def sast_scan_github(body: SastGithubBody, background_tasks: BackgroundTasks = None,
+                     authorized: bool = Depends(auth)):
+    """Clone a GitHub repo and run Semgrep against it. Runs in background.
+    Poll GET /sast/scans/{scan_id} for status."""
+    scan_id = f"sast-gh-{uuid.uuid4().hex[:12]}"
+    eid = _resolve_engagement_id(body.engagement_id)
+
+    _ensure_sast_tables()
+    with get_db() as conn, conn.cursor() as cur:
+        from psycopg2.extras import Json
+        cur.execute("""
+            INSERT INTO sast_scans
+                (scan_id, engagement_id, source_type, source_url,
+                 target_host, target_port, status, metadata)
+            VALUES (%s,%s,'github',%s,%s,%s,'running',%s)
+        """, (scan_id, eid, body.url,
+              body.target_host, body.target_port,
+              Json({"branch": body.branch, "rulesets": body.rulesets})))
+        conn.commit()
+
+    if background_tasks:
+        background_tasks.add_task(_run_semgrep_github, scan_id, body.url,
+                                  body.branch, body.target_host, body.target_port,
+                                  eid, body.rulesets)
+    return {"ok": True, "scan_id": scan_id, "status": "running",
+            "poll": f"/sast/scans/{scan_id}"}
+
+
+def _run_semgrep_github(scan_id: str, url: str, branch: str,
+                        target_host: str, target_port: int,
+                        eid: str, rulesets: list):
+    """Background: clone repo + run semgrep + ingest."""
+    import subprocess, tempfile, shutil
+    clone_dir = tempfile.mkdtemp(prefix="sast-")
+    try:
+        cmd = ["git", "clone", "--depth", "1"]
+        if branch:
+            cmd += ["-b", branch]
+        cmd += [url, clone_dir + "/repo"]
+        subprocess.run(cmd, capture_output=True, timeout=120, check=True)
+
+        semgrep_cmd = ["semgrep", "--json", "--config", "auto"]
+        if rulesets:
+            semgrep_cmd = ["semgrep", "--json"]
+            for rs in rulesets:
+                semgrep_cmd += ["--config", rs]
+        semgrep_cmd.append(clone_dir + "/repo")
+
+        result = subprocess.run(semgrep_cmd, capture_output=True, timeout=600, text=True)
+        if result.returncode not in (0, 1):
+            _update_sast_scan(scan_id, "failed", error=result.stderr[:2000])
+            return
+
+        import sys
+        sys.path.insert(0, "/app")
+        from etl.parse_semgrep import parse_semgrep_json, findings_to_attack_surface
+
+        findings = parse_semgrep_json(result.stdout)
+        counts = _store_sast_findings(
+            findings, scan_id, "github",
+            source_url=url, target_host=target_host,
+            target_port=target_port, eid=eid,
+        )
+        surface = findings_to_attack_surface(findings)
+        _update_sast_scan(scan_id, "completed",
+                          findings_count=len(findings),
+                          high_count=sum(1 for f in findings if f["severity"] in ("high", "critical")),
+                          medium_count=sum(1 for f in findings if f["severity"] == "medium"),
+                          metadata={"attack_surface": surface})
+
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("sast_scan_completed", "sast", {
+                "scan_id": scan_id, "source_type": "github", "source_url": url,
+                "target_host": target_host,
+                "findings": len(findings), **counts,
+                "engagement_id": eid,
+            })
+        except Exception:
+            pass
+    except subprocess.TimeoutExpired:
+        _update_sast_scan(scan_id, "failed", error="Timeout cloning or scanning")
+    except Exception as e:
+        _update_sast_scan(scan_id, "failed", error=str(e)[:2000])
+    finally:
+        shutil.rmtree(clone_dir, ignore_errors=True)
+
+
+class SastWebSourceBody(BaseModel):
+    """Scan web-app page source (JS/HTML) with Semgrep."""
+    url: str
+    target_host: Optional[str] = None
+    target_port: Optional[int] = None
+    engagement_id: Optional[str] = None
+    fetch_linked_js: bool = True
+
+
+@app.post("/sast/web-source", tags=["SAST"])
+def sast_scan_web_source(body: SastWebSourceBody,
+                         background_tasks: BackgroundTasks = None,
+                         authorized: bool = Depends(auth)):
+    """Fetch a web page's source (HTML + linked JS files), save to a temp
+    dir, and run Semgrep on it. Ideal for SPAs where the source is
+    available in the browser."""
+    scan_id = f"sast-web-{uuid.uuid4().hex[:12]}"
+    eid = _resolve_engagement_id(body.engagement_id)
+    host = body.target_host
+    port = body.target_port
+    if not host:
+        parsed = urlparse(body.url)
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+    _ensure_sast_tables()
+    with get_db() as conn, conn.cursor() as cur:
+        from psycopg2.extras import Json
+        cur.execute("""
+            INSERT INTO sast_scans
+                (scan_id, engagement_id, source_type, source_url,
+                 target_host, target_port, status, metadata)
+            VALUES (%s,%s,'web_source',%s,%s,%s,'running',%s)
+        """, (scan_id, eid, body.url, host, port,
+              Json({"fetch_linked_js": body.fetch_linked_js})))
+        conn.commit()
+
+    if background_tasks:
+        background_tasks.add_task(_run_semgrep_web_source, scan_id, body.url,
+                                  host, port, eid, body.fetch_linked_js)
+    return {"ok": True, "scan_id": scan_id, "status": "running",
+            "poll": f"/sast/scans/{scan_id}"}
+
+
+def _run_semgrep_web_source(scan_id: str, url: str, target_host: str,
+                            target_port: int, eid: str, fetch_linked_js: bool):
+    """Background: fetch page source + JS, run semgrep."""
+    import subprocess, tempfile, shutil, re as _re
+    scan_dir = tempfile.mkdtemp(prefix="sast-web-")
+    try:
+        import httpx
+        client = httpx.Client(verify=False, timeout=30, follow_redirects=True)
+        resp = client.get(url)
+        page_html = resp.text
+
+        with open(os.path.join(scan_dir, "index.html"), "w") as f:
+            f.write(page_html)
+
+        if fetch_linked_js:
+            js_urls = _re.findall(r'src=["\']([^"\']+\.js(?:\?[^"\']*)?)["\']', page_html)
+            from urllib.parse import urljoin
+            for i, js_url in enumerate(js_urls[:30]):
+                abs_url = urljoin(url, js_url)
+                try:
+                    js_resp = client.get(abs_url)
+                    fname = f"script_{i}.js"
+                    with open(os.path.join(scan_dir, fname), "w") as f:
+                        f.write(js_resp.text)
+                except Exception:
+                    pass
+
+        semgrep_cmd = ["semgrep", "--json", "--config", "auto", scan_dir]
+        result = subprocess.run(semgrep_cmd, capture_output=True, timeout=300, text=True)
+
+        import sys
+        sys.path.insert(0, "/app")
+        from etl.parse_semgrep import parse_semgrep_json, findings_to_attack_surface
+
+        findings = parse_semgrep_json(result.stdout)
+        counts = _store_sast_findings(
+            findings, scan_id, "web_source",
+            source_url=url, target_host=target_host,
+            target_port=target_port, eid=eid,
+        )
+        surface = findings_to_attack_surface(findings)
+        _update_sast_scan(scan_id, "completed",
+                          findings_count=len(findings),
+                          high_count=sum(1 for f in findings if f["severity"] in ("high", "critical")),
+                          medium_count=sum(1 for f in findings if f["severity"] == "medium"),
+                          metadata={"attack_surface": surface})
+
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("sast_scan_completed", "sast", {
+                "scan_id": scan_id, "source_type": "web_source", "source_url": url,
+                "target_host": target_host,
+                "findings": len(findings), **counts,
+                "engagement_id": eid,
+            })
+        except Exception:
+            pass
+    except Exception as e:
+        _update_sast_scan(scan_id, "failed", error=str(e)[:2000])
+    finally:
+        shutil.rmtree(scan_dir, ignore_errors=True)
+
+
+def _update_sast_scan(scan_id: str, status: str, error: str = None,
+                      findings_count: int = None, high_count: int = None,
+                      medium_count: int = None, metadata: dict = None):
+    with get_db() as conn, conn.cursor() as cur:
+        sets = ["status = %s", "updated_at = now()"]
+        args: list = [status]
+        if error:
+            sets.append("error_message = %s"); args.append(error[:2000])
+        if findings_count is not None:
+            sets.append("findings_count = %s"); args.append(findings_count)
+        if high_count is not None:
+            sets.append("high_count = %s"); args.append(high_count)
+        if medium_count is not None:
+            sets.append("medium_count = %s"); args.append(medium_count)
+        if metadata:
+            from psycopg2.extras import Json
+            sets.append("metadata = %s"); args.append(Json(metadata))
+        args.append(scan_id)
+        cur.execute(f"UPDATE sast_scans SET {', '.join(sets)} WHERE scan_id = %s", args)
+        conn.commit()
+
+
+@app.get("/sast/scans", tags=["SAST"])
+def list_sast_scans(engagement_id: Optional[str] = None,
+                    all_engagements: bool = False,
+                    limit: int = 50,
+                    authorized: bool = Depends(auth)):
+    """List SAST scan runs."""
+    _ensure_sast_tables()
+    eid = _resolve_engagement_id(engagement_id)
+    where, args = [], []
+    if eid and not all_engagements:
+        where.append("(engagement_id = %s OR engagement_id IS NULL)")
+        args.append(eid)
+    sql = "SELECT * FROM sast_scans"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created_at DESC LIMIT %s"
+    args.append(max(1, min(200, limit)))
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, args)
+        return {"scans": [dict(r) for r in cur.fetchall()]}
+
+
+@app.get("/sast/scans/{scan_id}", tags=["SAST"])
+def get_sast_scan(scan_id: str, authorized: bool = Depends(auth)):
+    """Get a single SAST scan run with its attack surface summary."""
+    _ensure_sast_tables()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM sast_scans WHERE scan_id = %s", (scan_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Scan not found")
+        return dict(row)
+
+
+@app.get("/sast/findings", tags=["SAST"])
+def list_sast_findings(scan_id: Optional[str] = None,
+                       vuln_class: Optional[str] = None,
+                       severity: Optional[str] = None,
+                       target_host: Optional[str] = None,
+                       engagement_id: Optional[str] = None,
+                       all_engagements: bool = False,
+                       limit: int = 100,
+                       authorized: bool = Depends(auth)):
+    """List SAST findings with filters. Web-relevant findings are also
+    in web_findings for the exploit workbench."""
+    _ensure_sast_tables()
+    eid = _resolve_engagement_id(engagement_id)
+    where, args = [], []
+    if scan_id:
+        where.append("scan_id = %s"); args.append(scan_id)
+    if vuln_class:
+        where.append("vuln_class = %s"); args.append(vuln_class)
+    if severity:
+        where.append("severity = %s"); args.append(severity)
+    if target_host:
+        where.append("target_host = %s"); args.append(target_host)
+    if eid and not all_engagements:
+        where.append("(engagement_id = %s OR engagement_id IS NULL)")
+        args.append(eid)
+    sql = ("SELECT id, scan_id, source_type, source_url, target_host, target_port, "
+           "rule_id, severity, confidence, vuln_class, file_path, line_start, line_end, "
+           "matched_code, message, cwe, fingerprint, created_at "
+           "FROM sast_findings")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
+    sql += "WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END, created_at DESC "
+    sql += "LIMIT %s"
+    args.append(max(1, min(500, limit)))
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, args)
+        return {"findings": [dict(r) for r in cur.fetchall()]}
+
+
+@app.get("/sast/findings/{finding_id}", tags=["SAST"])
+def get_sast_finding(finding_id: str, authorized: bool = Depends(auth)):
+    """Get a single SAST finding with full detail."""
+    _ensure_sast_tables()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM sast_findings WHERE id = %s", (finding_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Finding not found")
+        return dict(row)
+
+
+@app.get("/sast/attack-surface", tags=["SAST"])
+def sast_attack_surface(target_host: Optional[str] = None,
+                        engagement_id: Optional[str] = None,
+                        authorized: bool = Depends(auth)):
+    """Get the aggregated attack surface from all SAST findings for a target.
+    This is what the build-PoC gather phase reads to focus attacks."""
+    _ensure_sast_tables()
+    import sys
+    sys.path.insert(0, "/app")
+    from etl.parse_semgrep import findings_to_attack_surface
+
+    eid = _resolve_engagement_id(engagement_id)
+    where, args = [], []
+    if target_host:
+        where.append("target_host = %s"); args.append(target_host)
+    if eid:
+        where.append("(engagement_id = %s OR engagement_id IS NULL)")
+        args.append(eid)
+    sql = "SELECT * FROM sast_findings"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created_at DESC LIMIT 500"
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, args)
+        rows = [dict(r) for r in cur.fetchall()]
+    surface = findings_to_attack_surface(rows)
+    return {"target_host": target_host, "engagement_id": eid, **surface}
+
+
+_WEB_VULN_CLASSES = {"sqli", "xss", "cmdi", "lfi", "ssrf", "xxe", "ssti",
+                     "csrf", "idor", "auth-bypass", "upload", "nosql-injection",
+                     "ldap-injection", "deserialization", "prototype-pollution"}
+
+
+class SastPromoteBody(BaseModel):
+    """Promote SAST findings to web_findings after a network path is confirmed."""
+    finding_ids: Optional[List[str]] = None
+    scan_id: Optional[str] = None
+    target_host: Optional[str] = None
+    target_port: Optional[int] = None
+    base_url: Optional[str] = None
+    engagement_id: Optional[str] = None
+
+
+@app.post("/sast/promote", tags=["SAST"])
+def sast_promote_to_web(body: SastPromoteBody, authorized: bool = Depends(auth)):
+    """Promote SAST findings to web_findings once a network path is
+    established. Only web-relevant vuln classes are promoted. The operator
+    calls this after confirming the application is reachable — source code
+    findings stay in the application area until then.
+
+    Supply either finding_ids (specific findings) or scan_id (all web-relevant
+    findings from that scan). target_host/target_port/base_url are used to
+    construct the web_findings URL if the findings don't already have them."""
+    _ensure_sast_tables()
+    eid = _resolve_engagement_id(body.engagement_id)
+
+    where, args = [], []
+    if body.finding_ids:
+        where.append("id = ANY(%s)")
+        args.append(body.finding_ids)
+    elif body.scan_id:
+        where.append("scan_id = %s")
+        args.append(body.scan_id)
+    else:
+        return {"ok": False, "error": "Provide finding_ids or scan_id"}
+
+    sql = "SELECT * FROM sast_findings"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+
+    promoted = 0
+    skipped = 0
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, args)
+        rows = [dict(r) for r in cur.fetchall()]
+
+        for f in rows:
+            vc = f.get("vuln_class") or "other"
+            if vc not in _WEB_VULN_CLASSES:
+                skipped += 1
+                continue
+
+            host = body.target_host or f.get("target_host")
+            port = body.target_port or f.get("target_port") or 443
+            if not host:
+                skipped += 1
+                continue
+
+            if body.base_url:
+                _url = f"{body.base_url.rstrip('/')}{f.get('file_path') or '/'}"
+            else:
+                _url = f"https://{host}:{port}{f.get('file_path') or '/'}"
+
+            try:
+                cur.execute("""
+                    INSERT INTO web_findings
+                        (engagement_id, url, source, issue_type, name,
+                         severity, evidence, method, param, description,
+                         cwe, port, first_seen, last_seen)
+                    VALUES (%s,%s,'semgrep',%s,%s, %s,%s,'GET',%s,%s,
+                            %s,%s,now(),now())
+                    ON CONFLICT DO NOTHING
+                """, (
+                    eid or f.get("engagement_id"),
+                    _url, vc,
+                    f"[SAST] {f['rule_id']}",
+                    f["severity"],
+                    f"Source: {f['file_path']}:{f['line_start']} — {str(f.get('matched_code') or '')[:500]}",
+                    (f.get("metadata") or {}).get("param_hint") if isinstance(f.get("metadata"), dict) else None,
+                    str(f.get("message") or "")[:1000],
+                    f.get("cwe") or [],
+                    port,
+                ))
+                promoted += 1
+            except Exception as e:
+                logging.warning(f"sast promote: {e}")
+                conn.rollback()
+                continue
+        conn.commit()
+
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("sast_findings_promoted", "sast", {
+            "promoted": promoted, "skipped": skipped,
+            "target_host": body.target_host,
+            "engagement_id": eid,
+        })
+    except Exception:
+        pass
+
+    return {"ok": True, "promoted": promoted, "skipped_non_web": skipped,
+            "total": len(rows)}
+
+
 # ── Cloud Scan Suggestor ──
 
 def _refresh_cloud_suggestions():
@@ -6575,7 +7200,7 @@ def search_findings(
             COALESCE(v.title, v.script) as title,
             LEFT(v.output, 500) as evidence,
             COALESCE(v.cve, ARRAY[]::text[]) as cve,
-            ARRAY[]::text[] as cwe,
+            COALESCE(v.cwe, ARRAY[]::text[]) as cwe,
             v.cvss,
             NULL::text as method,
             NULL::text as description,
@@ -12400,12 +13025,43 @@ def get_domain_overview(
 # ── Sitemap ──────────────────────────────────────────────────────────────────
 
 @app.get("/ports/summary", tags=["Ports"])
-def port_scan_summary(authorized: bool = Depends(auth)):
-    """Return a summary of all open ports: hosts with ports, total ports, grouped by service."""
+def port_scan_summary(engagement_id: Optional[str] = None,
+                      all_engagements: bool = False,
+                      authorized: bool = Depends(auth)):
+    """Open-port summary for the ACTIVE engagement: hosts, totals, by service.
+
+    Engagement-filtered on the read path (CLAUDE.md): ports are collected target
+    data, so a global listing shown under a per-engagement header tells the
+    operator they scanned hosts belonging to another engagement. NULL-engagement
+    assets are included, as everywhere else, so pre-attribution rows stay
+    reachable. `?all_engagements=true` is the explicit cross-engagement view.
+    """
+    eid = None if all_engagements else _validate_engagement_uuid(
+        _resolve_engagement_id(engagement_id))
+    # Applied to every query below, including the two that JOIN assets: the
+    # host/service rollups are what the UI renders, so filtering only the counts
+    # would leave the visible lists global.
+    where_a = "" if eid is None else " AND (a.engagement_id = %s OR a.engagement_id IS NULL)"
+    # Addresses that are not hosts. `0.0.0.0` is this codebase's deliberate
+    # sentinel for "hostname known, IP unresolvable" (see the resolve fallbacks
+    # in /findings/credential and etl/parse_httpx.py), so many rows legitimately
+    # carry it. Grouping by ip then collapses every unresolvable hostname onto
+    # one pseudo-host: the UI reported `224.0.0.1 thankyou4caring.org — 4 ports`
+    # as if a single host had been scanned, when those ports came from several
+    # different domains. Multicast and broadcast cannot be scan targets either.
+    where_a += (" AND host(a.ip)::text <> '0.0.0.0'"
+                " AND NOT (a.ip << '224.0.0.0/4'::inet)"
+                " AND host(a.ip)::text <> '255.255.255.255'")
+    args: tuple = () if eid is None else (eid,)
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("SELECT COUNT(DISTINCT asset_id) as hosts_with_ports FROM ports WHERE is_open = true")
+        cur.execute(
+            "SELECT COUNT(DISTINCT p.asset_id) as hosts_with_ports "
+            "FROM ports p JOIN assets a ON a.id = p.asset_id "
+            "WHERE p.is_open = true" + where_a, args)
         hosts = cur.fetchone()["hosts_with_ports"]
-        cur.execute("SELECT COUNT(*) as total FROM ports WHERE is_open = true")
+        cur.execute(
+            "SELECT COUNT(*) as total FROM ports p JOIN assets a ON a.id = p.asset_id "
+            "WHERE p.is_open = true" + where_a, args)
         total = cur.fetchone()["total"]
 
         # Group by service
@@ -12413,9 +13069,9 @@ def port_scan_summary(authorized: bool = Depends(auth)):
             SELECT service, COUNT(*) as cnt,
                    array_agg(DISTINCT host(a.ip)::text) as hosts
             FROM ports p JOIN assets a ON a.id = p.asset_id
-            WHERE p.is_open = true
+            WHERE p.is_open = true""" + where_a + """
             GROUP BY service ORDER BY cnt DESC LIMIT 20
-        """)
+        """, args)
         by_service = [{"service": r["service"] or "unknown", "count": r["cnt"],
                        "hosts": r["hosts"][:5]} for r in cur.fetchall()]
 
@@ -12424,15 +13080,18 @@ def port_scan_summary(authorized: bool = Depends(auth)):
             SELECT host(a.ip)::text as ip, a.hostname, COUNT(*) as open_ports,
                    array_agg(DISTINCT p.port ORDER BY p.port) as ports
             FROM ports p JOIN assets a ON a.id = p.asset_id
-            WHERE p.is_open = true
+            WHERE p.is_open = true""" + where_a + """
             GROUP BY a.ip, a.hostname ORDER BY open_ports DESC LIMIT 20
-        """)
+        """, args)
         by_host = [{"ip": r["ip"], "hostname": r["hostname"] or "",
                      "open_ports": r["open_ports"], "ports": r["ports"][:20]} for r in cur.fetchall()]
 
     return {
         "hosts_with_ports": hosts, "total_open_ports": total,
         "by_service": by_service, "by_host": by_host,
+        # So the UI can label which view it is showing rather than guessing.
+        "engagement_id": str(eid) if eid else None,
+        "all_engagements": bool(all_engagements),
     }
 
 
@@ -13055,6 +13714,7 @@ def bridge_scanner_cves(authorized: bool = Depends(auth)):
         result = promote_scanner_cves(cur, eid)
         conn.commit()
     try:
+        from webhooks import emit_webhook
         emit_webhook("scanner_cves_bridged", "software", {
             "engagement_id": eid, "scanned": result["scanned"],
             "created": result["created"]})
@@ -13577,18 +14237,182 @@ def _execute_curl_chain_in_python(command: str, chain_timeout: int = 180) -> dic
 # Phase 1 scaffold stub so shadow comparison still records something.
 
 
+def _poc_command_not_executed(output, exit_code=None):
+    """Did this 'run' never actually reach the target? Returns a short reason
+    string, or None when the command really was dispatched.
+
+    Several refine paths short-circuit BEFORE dispatch and synthesise an
+    `output` so the loop still gets feedback. Those carry `elapsed = 0.0`,
+    which is not a measurement of anything — the target never saw a request.
+    A latency assertion that compares 0.0s against min_seconds therefore
+    reports "timing payload did not block the server" about a server that was
+    never contacted, and that false reason reaches both the refine prompt and
+    cross-run error memory.
+
+    Keyed on the explicit markers each path writes plus its sentinel exit
+    code, never on `elapsed == 0` (a real request CAN return that fast) and
+    never on a bare exit code 2 (a genuinely dispatched command may exit 2).
+    """
+    out = output or ""
+    if "pre-dispatch dry-parse refused to run" in out:
+        return ("the command was REFUSED BEFORE DISPATCH by the pre-dispatch "
+                "check and never reached the target")
+    if exit_code == 45 or "the command was NOT sent to the target" in out:
+        return ("a required program is missing on the runner, so the command "
+                "was never sent to the target")
+    if out.startswith("REFUSE: I cannot provide (pre-dispatch detected LLM refusal"):
+        return ("the model returned refusal prose instead of a shell command; "
+                "nothing was dispatched")
+    return None
+
+
+# CWE -> crafter vuln class. Only unambiguous mappings belong here: a CWE that
+# could reasonably drive two different payload families (e.g. CWE-20 "Improper
+# Input Validation", which covers everything from SQLi to buffer overflow) is
+# deliberately ABSENT so the description decides. Being silent is correct for
+# those; guessing from a vague CWE would be worse than the prose it overrides.
+_CWE_TO_VULN_CLASS = {
+    "CWE-89":  "sqli",            # SQL injection
+    "CWE-918": "ssrf",            # Server-Side Request Forgery
+    "CWE-1336": "ssti",           # Server-Side Template Injection
+    "CWE-94":  "cmdi",            # Code injection
+    "CWE-77":  "cmdi",            # Command injection
+    "CWE-78":  "cmdi",            # OS command injection
+    "CWE-88":  "cmdi",            # Argument injection
+    "CWE-98":  "lfi",             # PHP remote/local file inclusion
+    "CWE-22":  "lfi",             # Path traversal
+    "CWE-23":  "lfi",             # Relative path traversal
+    "CWE-36":  "lfi",             # Absolute path traversal
+    "CWE-73":  "lfi",             # External control of filename/path
+    "CWE-611": "xxe",             # XML external entity
+    "CWE-502": "deserialization", # Deserialization of untrusted data
+    "CWE-434": "upload",          # Unrestricted upload of dangerous file type
+    "CWE-269": "auth-bypass",     # Improper privilege management
+    "CWE-285": "auth-bypass",     # Improper authorization
+    "CWE-287": "auth-bypass",     # Improper authentication
+    "CWE-306": "auth-bypass",     # Missing authentication for critical function
+    "CWE-639": "auth-bypass",     # Authorization bypass through user-controlled key (IDOR)
+    "CWE-862": "auth-bypass",     # Missing authorization
+    "CWE-863": "auth-bypass",     # Incorrect authorization
+    "CWE-798": "auth-bypass",     # Hard-coded credentials
+    "CWE-79":  "xss",             # Cross-site scripting
+}
+
+
+def _cwe_ids_from_details(details: dict | None) -> list:
+    """Normalised CWE ids from a details dict, best-effort and order-preserving.
+
+    Tolerates every shape this codebase stores: a list of ids, a list of dicts,
+    a comma-joined string, or a raw NVD `weaknesses` block. Returns [] when
+    nothing parseable is present, which is the signal to fall back to prose.
+    """
+    import re as _re
+    d = details or {}
+    raw = d.get("cwe") or d.get("cwes") or d.get("weaknesses") or []
+    if isinstance(raw, (dict, list)):
+        try:
+            blob = json.dumps(raw)
+        except Exception:  # noqa: BLE001
+            blob = str(raw)
+    else:
+        blob = str(raw)
+    seen, out = set(), []
+    for m in _re.findall(r"CWE[-_ ]?(\d+)", blob, _re.I):
+        cid = f"CWE-{m}"
+        if cid not in seen:
+            seen.add(cid)
+            out.append(cid)
+    return out
+
+
+def _fetch_cve_cwes(cve: str) -> list:
+    """One bounded NVD lookup for a CVE's weaknesses. Fail-soft: [] on any
+    error, so a classifier never blocks on the network."""
+    import requests as _rq
+    try:
+        key = os.environ.get("NVD_API_KEY", "")
+        if not key:
+            try:
+                with get_db() as conn, conn.cursor() as cur:
+                    cur.execute("SELECT value FROM app_settings WHERE key='nvd_api_key'")
+                    rr = cur.fetchone(); key = rr[0] if rr else ""
+            except Exception:  # noqa: BLE001
+                pass
+        h = {"apiKey": key} if key else {}
+        resp = _rq.get("https://services.nvd.nist.gov/rest/json/cves/2.0",
+                       params={"cveId": cve}, headers=h, timeout=20)
+        if resp.ok:
+            vulns = (resp.json() or {}).get("vulnerabilities") or []
+            if vulns:
+                return _cwe_ids_from_details(
+                    {"weaknesses": (vulns[0].get("cve") or {}).get("weaknesses") or []})
+    except Exception as e:  # noqa: BLE001
+        logging.debug("nvd cwe fetch failed for %s: %s", cve, e)
+    return []
+
+
+def _vuln_classes_from_cve(cve: str, details: dict) -> list:
+    """EVERY mapped vuln class for this CVE, in NVD's CWE order, deduped.
+
+    `_vuln_class_from_cve` returns one string, so a CVE that is genuinely two
+    things keeps only the first. CVE-2024-3408 is ['CWE-798', 'CWE-94'] — an
+    authentication bypass AND a remote code execution — and the advisory says
+    so in those words. Returning only `auth-bypass` meant the crafter was
+    handed auth-bypass guidance for an exploit whose payoff is code execution,
+    and `cmdi` guidance was discarded. That CVE has never landed in any
+    archived run.
+
+    The primary (element 0) is deliberately the SAME value
+    `_vuln_class_from_cve` returns, so nothing that reads the single class
+    changes behaviour; this only recovers what used to be thrown away.
+    """
+    out, seen = [], set()
+    try:
+        for _c in _cwe_ids_from_details(details):
+            _cls = _CWE_TO_VULN_CLASS.get(_c)
+            if _cls and _cls not in seen:
+                seen.add(_cls)
+                out.append(_cls)
+    except Exception:  # noqa: BLE001
+        pass
+    if not out:
+        _single = _vuln_class_from_cve(cve, details)
+        return [_single] if _single and _single != "unknown" else []
+    return out
+
+
 def _vuln_class_from_cve(cve: str, details: dict) -> str:
     """Classify a CVE into a vulnerability class the crafter understands.
 
     Returns one of: ssrf, sqli, ssti, lfi, cmdi, xss, auth-bypass, path-traversal,
     xxe, deserialization, upload, unknown.
 
-    Fail-soft: returns "unknown" rather than raising. Reads from NVD
-    description + any CWE references. Deterministic.
+    Fail-soft: returns "unknown" rather than raising. Deterministic.
+
+    CWE OUTRANKS PROSE. The docstring used to claim this read "NVD description
+    + any CWE references" while the code only ever built `text` from the
+    description — CWE was never consulted. A CWE id is a curated, unambiguous
+    classification; the description is prose that may never contain the phrase
+    being matched. CVE-2024-36675 carries CWE-918 and the description
+    "vulnerable to Server-Side Request Forgery (SSRF) via the get_head
+    function" — it still classified as `unknown` and was never attempted,
+    the only misclassification in the 2026-10-12 focused-10 run.
+
+    So: when a mapped CWE is present it decides, and the description is only
+    the fallback for an absent or unmapped CWE.
     """
     import re as _re
     desc = ((details or {}).get("description") or "").lower()
     text = f"{cve.lower()} {desc}"
+    # --- CWE first (authoritative when mapped) --------------------------------
+    try:
+        cwes = _cwe_ids_from_details(details)
+    except Exception:  # noqa: BLE001
+        cwes = []
+    for _c in cwes:
+        _cls = _CWE_TO_VULN_CLASS.get(_c)
+        if _cls:
+            return _cls
     # Order matters — more specific classes first.
     checks = [
         ("ssti", r"\b(server[-\s]?side template injection|ssti|jinja2 injection|template injection|velocity injection)\b"),
@@ -14435,7 +15259,35 @@ def _parse_openapi_paths_line(recon_text: str) -> list:
 _BUILD_POC_DEEP_RECON = (os.environ.get("BUILD_POC_DEEP_RECON") or "on").strip().lower()
 _BUILD_POC_EARLY_STOP_ITERS = int(os.environ.get("BUILD_POC_EARLY_STOP_ITERS") or "2")
 _BUILD_POC_DEEP_RECON_BUDGET_SEC = int(os.environ.get("BUILD_POC_DEEP_RECON_BUDGET_SEC") or "480")
-_BUILD_POC_SECOND_PASS_ITERS = int(os.environ.get("BUILD_POC_SECOND_PASS_ITERS") or "10")
+# Compiled fallback only. Read `_build_poc_second_pass_iters()` instead — the
+# live value comes from Settings so it changes without a rebuild.
+_BUILD_POC_SECOND_PASS_ITERS = int(os.environ.get("BUILD_POC_SECOND_PASS_ITERS") or "50")
+
+
+def _build_poc_second_pass_iters() -> int:
+    """Iteration budget for the deep-recon GO-AROUND (the second pass).
+
+    Operator-adjustable from Settings → Scan Timeouts (`app_settings` category
+    'config', key `build_poc_second_pass_iters`, written by the BFF
+    `/api/settings/build-poc-limits`). Env `BUILD_POC_SECOND_PASS_ITERS` is the
+    fallback; 0 / blank / non-numeric means "use the compiled default".
+
+    Was a hard 10, with the rationale "the go-around is a SECOND chance, not a
+    second budget". In practice it is the binding limit on any CVE that needs
+    deep recon: a request asking for 50 was clamped to 10 by the min() below,
+    and CVE-2024-22120 stopped at exactly 10 with stop_reason=max_iters while
+    every one of its 10 iterations was genuinely reaching the target. Operator
+    raised it to 50 (2026-10-12) and asked for it to be adjustable rather than
+    compiled in. Bounded at 200 so a typo cannot start an unbounded loop.
+    """
+    raw = _get_setting("build_poc_second_pass_iters", "")
+    try:
+        val = int(str(raw).strip())
+    except (TypeError, ValueError):
+        val = 0
+    if val <= 0:
+        val = _BUILD_POC_SECOND_PASS_ITERS
+    return max(1, min(int(val), 200))
 
 
 def _deep_recon_plan(missing: list, has_session: bool, vuln_class: str = "") -> list:
@@ -14988,6 +15840,35 @@ def _scan_evidence_for_target(cve, ip, port, eid, vc) -> dict:
                         "verb_sweep": lr.get("verb_sweep") or {}})
             except Exception as e:  # noqa: BLE001
                 logging.debug("scan_evidence prior_live_recon failed: %s", e)
+
+            # 8. SAST findings — source-code-level injection points that focus
+            #    the network attack. Application-area data until promoted.
+            try:
+                _ensure_sast_tables()
+                _sast_where = "target_host = %s"
+                _sast_args = [ip_s]
+                if eid_s:
+                    _sast_where += " AND (engagement_id = %s OR engagement_id IS NULL)"
+                    _sast_args.append(eid_s)
+                cur.execute(f"""
+                    SELECT vuln_class, rule_id, file_path, line_start,
+                           matched_code, message, cwe, severity
+                    FROM sast_findings
+                    WHERE {_sast_where}
+                    ORDER BY CASE severity WHEN 'critical' THEN 0
+                        WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END
+                    LIMIT 30
+                """, _sast_args)
+                sast_rows = cur.fetchall()
+                if sast_rows:
+                    out["sast_findings"] = [{
+                        "vuln_class": r[0], "rule": r[1], "file": r[2],
+                        "line": r[3], "code": (r[4] or "")[:300],
+                        "message": (r[5] or "")[:200],
+                        "cwe": r[6] or [], "severity": r[7],
+                    } for r in sast_rows]
+            except Exception as e:  # noqa: BLE001
+                logging.debug("scan_evidence sast failed: %s", e)
     except Exception as e:  # noqa: BLE001
         logging.debug("_scan_evidence_for_target top-level failed cve=%s: %s", cve, e)
     return out
@@ -15859,6 +16740,20 @@ def _gather_manifest_text(man: dict) -> str:
             passed = "PASS" if pr.get("passed") else ("FAIL" if pr.get("passed") is False else "?")
             snip = (pr.get("run_snip") or "").replace("\n", " ")[:260]
             lines.append(f"  iter={pr.get('iteration')} phase={pr.get('phase')} [{passed}]  snip: {snip}")
+
+    sast = ev.get("sast_findings") or []
+    if sast:
+        lines.append("")
+        lines.append("SAST_EVIDENCE — source-code findings from Semgrep (application-level, "
+                     "exact injection points with file/line/code):")
+        for sf in sast[:12]:
+            cwes = ",".join(sf.get("cwe") or [])
+            lines.append(f"  [{sf.get('severity','?')}] {sf.get('vuln_class','')} {sf.get('rule','')}"
+                         f"  {sf.get('file','')}:{sf.get('line','?')}  cwe={cwes or '-'}")
+            if sf.get("code"):
+                lines.append(f"    code: {sf['code'][:200]}")
+            if sf.get("message"):
+                lines.append(f"    msg: {sf['message'][:150]}")
     return "\n".join(lines)
 
 
@@ -15945,6 +16840,12 @@ def _extract_target_spec(cve: str, ip, port, product, version, eid,
     port = int(port or 80)
     details = details or _fetch_cve_details(cve)
     vuln_class = _vuln_class_from_cve(cve, details)
+    # Every OTHER mapped class this CVE also is — see _vuln_classes_from_cve.
+    # The primary is unchanged; this only recovers what used to be discarded.
+    try:
+        vuln_class_chain = _vuln_classes_from_cve(cve, details)
+    except Exception:  # noqa: BLE001
+        vuln_class_chain = []
     spec = {
         "ip": str(ip),
         "port": port,
@@ -16002,6 +16903,7 @@ def _extract_target_spec(cve: str, ip, port, product, version, eid,
         diff_text = ""
     spec["input_source"] = _classify_input_source(details, diff_text)
     spec["artifact_required"] = bool(spec["input_source"].get("artifact_required"))
+    spec["vuln_class_chain"] = vuln_class_chain
     # Recall research hints from RAG for this CVE / class so the crafter sees
     # operator-authored guidance, not only the hard-coded class text.
     spec["rag_hints"] = _rag_hints_for(
@@ -16041,20 +16943,33 @@ _CRAFT_CLASS_GUIDANCE = {
              "will report attack_success when the server made the outbound request. If an OOB sink URL "
              "is in the spec, your assertion should match on `SINK-VERIFIED: <canary>` after the attacker "
              "polls the sink."),
-    "sqli": ("Use a time-based blind payload: SLEEP(5) / pg_sleep(5) / WAITFOR DELAY '0:0:5'. "
-             "Return assertion as {\"min_seconds\": 5, \"canary\": \"<canary>\"} — a visible marker "
-             "usually isn't possible in blind SQLi. For union-based, inject the canary via a reflected "
-             "column."),
+    # DEFAULT TO A VISIBLE CANARY, NOT A STOPWATCH. This guidance used to lead
+    # with "use a time-based blind payload" and mention union-based as a
+    # trailing afterthought, which made blind timing the reflex even where the
+    # injection reflects. A reflected canary is strictly stronger evidence: it
+    # proves the server executed YOUR injected value, whereas an elapsed time
+    # only proves the server was slow (hence the whole scaled-payload
+    # confirmation apparatus that a timing verdict then needs). Blind timing is
+    # the fallback for when nothing reflects — not the opening move.
+    "sqli": ("FIRST try union-based / error-based injection that makes the canary VISIBLE in the "
+             "response: inject <canary> into a reflected column (e.g. ' UNION SELECT 1,'<canary>',3-- ) "
+             "and return assertion {\"expect_regex\": \"<canary>\"}. Substitute the real canary string "
+             "into the payload — never leave a {CANARY} placeholder — and never place it only inside a "
+             "SQL comment (after --), where it cannot be reflected. "
+             "ONLY fall back to a time-based blind payload (SLEEP(5) / pg_sleep(5) / "
+             "WAITFOR DELAY '0:0:5', assertion {\"min_seconds\": 5, \"canary\": \"<canary>\"}) when the "
+             "injection genuinely returns no reflected output, or the advisory explicitly says the "
+             "vulnerability is time-based / blind. A timing verdict proves only that the server was "
+             "slow; a reflected canary proves it executed your payload."),
     "ssti": ("Jinja2/Twig/ERB template injection. Place the canary as a template variable the server "
              "evaluates, e.g. {{<canary expression>}} that resolves to the canary string in the response. "
              "Common SSTI payloads: {{config.__class__.__init__.__globals__['os'].popen('echo <canary>').read()}}"),
-    "cmdi": ("Shell command injection. Append a `; echo <canary>` or `` `echo <canary>` `` to the "
+    "cmdi": ("Shell command injection. Append a `; echo <canary>`, `` `echo <canary>` `` or "
+             "`|echo <canary>` to the "
              "vulnerable parameter so the server echoes the canary in its response."),
     "lfi":  ("Local file inclusion / path traversal. Request /../../../../../../etc/passwd first to confirm "
              "the primitive, then read /tmp/secret and reflect the content via a response field. Place the "
              "canary in the filename or output marker."),
-    "cmdi": ("Shell command injection — inject `; echo <canary>` or `|echo <canary>` into the vulnerable "
-             "parameter so the server executes it and echoes the canary back in the response body."),
     "upload": ("Upload a file whose content contains the canary and whose extension bypasses the whitelist "
                "(e.g. .phtml / .phar / double extension). Then fetch the uploaded file's URL and expect the "
                "canary in the response."),
@@ -16073,6 +16988,49 @@ _CRAFT_CLASS_GUIDANCE = {
 }
 
 
+def _class_guidance_block(vuln_class: str, chain=None) -> str:
+    """Payload-family guidance for a CVE's class, plus every OTHER mapped class.
+
+    Shared by BOTH synth paths. It used to live inline in `_llm_craft_payload`,
+    which is reached only from `_decomposed_synthesize_cve_poc` — so the class
+    guidance (including the rewritten sqli text that puts a reflected canary
+    ahead of a stopwatch, and the multi-CWE chain) never reached the
+    MONOLITHIC path. Every CVE in the focused-10 benchmark synthesises as
+    `llm_poc` / `llm_poc_with_sink_verify`, i.e. the monolithic path, so in
+    practice that guidance was reaching nothing. Observed 2026-10-12:
+    CVE-2024-3408 is the CVE the chain was built for and its prompts contained
+    no chain at all.
+
+    Returns "" when the class is unknown and there is no chain, so a caller can
+    interpolate it unconditionally.
+    """
+    vc = (vuln_class or "unknown").strip().lower()
+    # The "unknown" entry is deliberately NOT used here: its text tells the
+    # model to start from "the advisory_poc from the spec", which is
+    # decomposed-path language — there is no spec on the monolithic path.
+    # _llm_craft_payload still falls back to it for its own prompt.
+    base = _CRAFT_CLASS_GUIDANCE.get(vc) if vc != "unknown" else None
+    out = ""
+    if base:
+        out = f"VULN-CLASS GUIDANCE ({vc}):\n{base}\n"
+    try:
+        extra = [c for c in (chain or [])
+                 if c != vc and c in _CRAFT_CLASS_GUIDANCE]
+    except Exception:  # noqa: BLE001
+        extra = []
+    if extra:
+        out += (
+            "\nTHIS CVE IS ALSO: " + ", ".join(extra) + ". The advisory describes "
+            "more than one weakness, and the exploit must chain them — typically the "
+            "access/bypass step FIRST to reach the vulnerable sink, THEN the payload "
+            "step that produces the observable effect. Guidance for the other "
+            "step(s):\n"
+            + "\n".join(f"  [{c}] {_CRAFT_CLASS_GUIDANCE[c]}" for c in extra)
+            + "\nPlace the canary so it proves the FINAL step, not merely that you "
+              "authenticated.\n")
+    return out
+
+
 def _llm_craft_payload(target_spec: dict, canary: str, model=None) -> dict:
     """Narrow LLM call: craft only the exploit payload (method, path, body,
     headers) for the target_spec's vuln_class + endpoint. ~500-800 tokens
@@ -16082,7 +17040,13 @@ def _llm_craft_payload(target_spec: dict, canary: str, model=None) -> dict:
     unparseable JSON.
     """
     vuln_class = target_spec.get("vuln_class") or "unknown"
-    class_guidance = _CRAFT_CLASS_GUIDANCE.get(vuln_class, _CRAFT_CLASS_GUIDANCE["unknown"])
+    # Composed by the SHARED helper so the monolithic path gets byte-identical
+    # guidance; the prompt template below already prints its own
+    # "VULN-CLASS GUIDANCE (...)" header, so strip the helper's.
+    _blk = _class_guidance_block(vuln_class, target_spec.get("vuln_class_chain"))
+    _hdr = f"VULN-CLASS GUIDANCE ({vuln_class}):\n"
+    class_guidance = (_blk[len(_hdr):] if _blk.startswith(_hdr) else _blk) \
+        or _CRAFT_CLASS_GUIDANCE["unknown"]
     spec_block = (
         f"  endpoint-base: {target_spec.get('scheme')}://{target_spec.get('ip')}:{target_spec.get('port')}\n"
         f"  product+version: {target_spec.get('product')} {target_spec.get('version')}\n"
@@ -16367,7 +17331,8 @@ def _shadow_dispatch_decomposed(new: dict, cve, ip, port, eid, run_id, model=Non
     try:
         v = _poc_assertion_verdict_with_semantic(
             (new or {}).get("assertion") or {}, output, ec,
-            rationale=(new or {}).get("rationale", ""), model=model, elapsed_seconds=elapsed)
+            rationale=(new or {}).get("rationale", ""), model=model, elapsed_seconds=elapsed,
+            command=command)
     except Exception as e:  # noqa: BLE001
         v = {"passed": False, "method": "verdict_error", "confidence": 0.0,
              "reason": f"{type(e).__name__}: {e}"}
@@ -16866,6 +17831,28 @@ def _fetch_cve_details(cve):
                 # Debounced to one attempt per 6h so a CVE with genuinely no
                 # published PoC doesn't cost 3 GETs on every synth.
                 import time as _tm
+                # Backfill #2 (2026-10-12): rows cached before CWE extraction
+                # shipped have no `cwe` key, and this same early return would
+                # skip it forever — exactly the trap documented above for
+                # advisory_poc. Without this the CWE-first classifier is inert
+                # for every CVE already in the cache, which is all of them.
+                # One NVD call, persisted; debounced to once per 24h so a CVE
+                # with genuinely no mapped CWE isn't re-fetched on every synth.
+                _cwe_checked = float((cached or {}).get("_cwe_checked") or 0)
+                if (isinstance(cached, dict) and not cached.get("cwe")
+                        and _tm.time() - _cwe_checked > 24 * 3600):
+                    try:
+                        cached["cwe"] = _fetch_cve_cwes(cve)
+                    except Exception:  # noqa: BLE001
+                        cached["cwe"] = []
+                    cached["_cwe_checked"] = _tm.time()
+                    try:
+                        cur.execute("""UPDATE software_research_cache SET results=%s, updated_at=now()
+                                       WHERE LOWER(product)=LOWER(%s) AND source='nvd_cve'""",
+                                    (Json(cached), cve))
+                        conn.commit()
+                    except Exception:  # noqa: BLE001
+                        pass
                 _checked = float((cached or {}).get("_advisory_poc_checked") or 0)
                 if (isinstance(cached, dict) and not cached.get("advisory_poc")
                         and _tm.time() - _checked > 6 * 3600):
@@ -16920,6 +17907,8 @@ def _fetch_cve_details(cve):
                 descs = c.get("descriptions") or []
                 details["description"] = next((d.get("value") for d in descs if d.get("lang") == "en"), "")
                 details["refs"] = [x.get("url") for x in (c.get("references") or [])][:6]
+                # CWE is what _vuln_class_from_cve trusts above the prose.
+                details["cwe"] = _cwe_ids_from_details({"weaknesses": c.get("weaknesses") or []})
                 metrics = c.get("metrics") or {}
                 for mk in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
                     if metrics.get(mk):
@@ -17673,6 +18662,7 @@ def _learning_propose(kind, name, entry, evidence=None, auto_apply=True, eid=Non
             except Exception:  # noqa: BLE001
                 pass
             try:
+                from webhooks import emit_webhook
                 emit_webhook("exploit_learned", "skill",
                              {"kind": kind, "name": name, "applied": True, "source": source,
                               "engagement_id": eid})
@@ -18099,6 +19089,7 @@ def _run_postex_weaponize(cve, ip, port, vuln_class, confirmed_command, eid, run
     if not corr["corrected"]:
         _poc_index(cve, ip, run_id, log_path, False, correct_iters, None, eid)
         try:
+            from webhooks import emit_webhook
             emit_webhook("exploit_weaponized", "poc",
                          {"cve": cve, "target": ip, "vuln_class": vuln_class, "phase": "correct",
                           "corrected": False, "extracted": False})
@@ -18141,6 +19132,7 @@ def _run_postex_weaponize(cve, ip, port, vuln_class, confirmed_command, eid, run
             logging.warning("store postex loot failed: %s", e)
     _poc_index(cve, ip, run_id, log_path, extracted, iters, security_test_id, eid)
     try:
+        from webhooks import emit_webhook
         emit_webhook("exploit_weaponized", "poc",
                      {"cve": cve, "target": ip, "vuln_class": vuln_class, "corrected": True,
                       "extracted": extracted, "objective": obj, "security_test_id": security_test_id})
@@ -18221,6 +19213,7 @@ def _flag_exploit_confirmed(cve, ip, port, command, eid):
                      Json({"cve_ref": f"https://nvd.nist.gov/vuln/detail/{cve}"}),
                      Json({**meta, "poc_verified": True}), eid))
             conn.commit()
+        from webhooks import emit_webhook
         emit_webhook("exploit_confirmed", "poc",
                      {"cve": cve, "target": ip, "port": port, "vuln_class": vclass,
                       "next": "weaponize (post-ex, gated)"})
@@ -18581,11 +19574,27 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
             f"invent a different endpoint — the advisory one is proven to land.\n"
             f"```\n{_adv_poc[:1500]}\n```\n"
         )
+    # PAYLOAD-FAMILY GUIDANCE on the monolithic path too. This prompt had none:
+    # _CRAFT_CLASS_GUIDANCE was reachable only from the decomposed path, and
+    # every CVE in the focused-10 benchmark synthesises as llm_poc /
+    # llm_poc_with_sink_verify — i.e. here. So the rewritten sqli guidance
+    # (reflected canary before the stopwatch) and the multi-CWE chain were
+    # reaching nothing in practice. Fail-soft: a classifier error must not stop
+    # a synthesis that worked without this block for its whole life.
+    try:
+        _vc = _vuln_class_from_cve(cve, details)
+        _class_block = _class_guidance_block(_vc, _vuln_classes_from_cve(cve, details))
+    except Exception as _cge:  # noqa: BLE001
+        logging.debug("class guidance failed for %s: %s", cve, _cge)
+        _class_block = ""
+    if _class_block:
+        _poc_trace(run_id, "class_guidance", response=_class_block[:400])
     prompt = (f"AUTHORIZED lab pentest. Build a proof-of-concept for {cve} on {tgt} "
               f"({product or ''} {version or ''}).\n"
               f"CVE description: {details.get('description') or '(none)'}\n"
               f"References: {', '.join(details.get('refs') or [])}\n"
               f"{_adv_poc_block}{guidance_extra}\n"
+              f"{_class_block}"
               f"{listener_hint}\n"
               f"CRITICAL — anchor the proof to THIS exploit's effect, not pre-existing state. "
               f"Make the PoC CAUSE the exact marker '{canary}' to appear as a DIRECT RESULT of "
@@ -19174,6 +20183,7 @@ def _auto_approve_proven_patterns():
             _REFINE_PATTERNS_CACHE["t"] = 0.0
             for a in approved:
                 try:
+                    from webhooks import emit_webhook
                     emit_webhook("refine_pattern_auto_approved",
                                  "rag-knowledge", a)
                 except Exception:  # noqa: BLE001
@@ -19371,6 +20381,7 @@ def _timing_payload_scale(command, delta=7):
     the payload (both runs scaling in step is the signal).
     """
     import re as _re
+    from urllib.parse import unquote as _unq, quote as _q
     # SLEEP(N) / pg_sleep(N) — N may be int or float
     for pat_name, pat in (
         ("SLEEP",    r"\bSLEEP\s*\(\s*(\d+(?:\.\d+)?)\s*\)"),
@@ -19380,6 +20391,10 @@ def _timing_payload_scale(command, delta=7):
         # group is replaced, so the delimiter encoding is preserved on rebuild.
         ("SLEEP",    r"\bSLEEP\s*(?:%28|\()\s*(?:%20)*(\d+(?:\.\d+)?)"),
         ("pg_sleep", r"\bpg_sleep\s*(?:%28|\()\s*(?:%20)*(\d+(?:\.\d+)?)"),
+        # DOUBLE-ENCODED forms — payload carried through a layer that re-encodes
+        # (SLEEP%25285%2529 → url-decode → SLEEP%285%29 → url-decode → SLEEP(5)).
+        ("SLEEP",    r"\bSLEEP\s*%2528\s*(\d+(?:\.\d+)?)"),
+        ("pg_sleep", r"\bpg_sleep\s*%2528\s*(\d+(?:\.\d+)?)"),
     ):
         m = _re.search(pat, command, _re.I)
         if m:
@@ -19389,22 +20404,61 @@ def _timing_payload_scale(command, delta=7):
             new_str = str(int(new)) if "." not in m.group(1) else f"{new:.1f}"
             new_cmd = command[:m.start(1)] + new_str + command[m.end(1):]
             return new_cmd, pat_name, old, new
-    # WAITFOR DELAY '0:0:N'  (MSSQL)
-    m = _re.search(r"WAITFOR\s+DELAY\s+'0:0:(\d+)'", command, _re.I)
-    if m:
-        old = int(m.group(1))
-        new = old + delta
-        new_cmd = (command[:m.start()] + f"WAITFOR DELAY '0:0:{new}'"
-                   + command[m.end():])
-        return new_cmd, "WAITFOR", float(old), float(new)
-    # BENCHMARK(N, expr) — scale iteration count by delta/5 (so a +7s delta
-    # roughly doubles the work on a baseline that took ~5s)
+    # WAITFOR DELAY '0:0:N'  (MSSQL) — also URL-encoded variants
+    for wf_pat in (r"WAITFOR\s+DELAY\s+'0:0:(\d+)'",
+                   r"WAITFOR\s+DELAY\s+%270:0:(\d+)%27",
+                   r"WAITFOR%20DELAY%20%270:0:(\d+)%27"):
+        m = _re.search(wf_pat, command, _re.I)
+        if m:
+            old = int(m.group(1))
+            new = old + delta
+            # Rebuild with same encoding as the match
+            matched_text = m.group(0)
+            new_text = matched_text[:m.start(1) - m.start()] + str(new) + matched_text[m.end(1) - m.start():]
+            new_cmd = command[:m.start()] + new_text + command[m.end():]
+            return new_cmd, "WAITFOR", float(old), float(new)
+    # BENCHMARK(N, expr) — scale iteration count by *2
     m = _re.search(r"\bBENCHMARK\s*\(\s*(\d+)\s*,", command, _re.I)
     if m:
         old = int(m.group(1))
         new = old * 2  # BENCHMARK scales linearly with iteration count
         new_cmd = command[:m.start(1)] + str(new) + command[m.end(1):]
         return new_cmd, "BENCHMARK", float(old), float(new)
+    # URL-DECODE FALLBACK: if no pattern matched in the raw command, try
+    # url-decoding, scaling, and re-encoding. This catches payloads where
+    # function names, parens, or digits are all percent-encoded.
+    decoded = _unq(command)
+    if decoded != command:
+        dec_cmd, pat, old_n, new_n = _timing_payload_scale(decoded, delta)
+        if pat is not None:
+            # Re-encode only the substituted portion. Find the old and new
+            # SLEEP/pg_sleep substring and do a targeted replacement in the
+            # original encoded command.
+            old_sub = _unq(command)  # already decoded
+            # The decoded command had a match; encode the scaled version
+            # and do a single replacement in the original command.
+            # Strategy: find the url-encoded span that decodes to the
+            # matched function call, replace it.
+            import difflib
+            sm = difflib.SequenceMatcher(None, decoded, dec_cmd)
+            for tag, i1, i2, j1, j2 in sm.get_opcodes():
+                if tag == 'replace':
+                    # The changed portion in the decoded string
+                    old_dec_span = decoded[i1:i2]
+                    new_dec_span = dec_cmd[j1:j2]
+                    # Find and replace in the original (encoded) command
+                    old_enc = _q(old_dec_span, safe='')
+                    new_enc = _q(new_dec_span, safe='')
+                    if old_enc in command:
+                        return command.replace(old_enc, new_enc, 1), pat, old_n, new_n
+                    # Try the literal encoded digit
+                    for enc_old_digit in (_q(old_dec_span, safe=''),
+                                         old_dec_span):
+                        if enc_old_digit in command:
+                            return command.replace(enc_old_digit, new_dec_span, 1), pat, old_n, new_n
+                    break
+            # Simple fallback: just return the decoded+scaled version
+            return dec_cmd, pat, old_n, new_n
     return command, None, None, None
 
 
@@ -19728,7 +20782,7 @@ def _recon_discovered_knowledge(product, version, limit=20):
     return "\n".join(lines)
 
 
-def _poc_shell_syntax_check(command):
+def _poc_shell_syntax_check(command, canary=None, assertion=None):
     """Dry-parse a shell command via shlex to catch quote-balance / escape
     errors BEFORE dispatch. Returns (ok: bool, error: str). On error the
     caller refuses to dispatch (saves a listener round-trip) and feeds the
@@ -19750,16 +20804,76 @@ def _poc_shell_syntax_check(command):
     if refused:
         return (False, "llm refusal detected (not a shell command)")
     try:
-        _sh.split(command, posix=True)
+        _tokens = _sh.split(command, posix=True)
     except ValueError as e:
         return (False, str(e))
     except Exception:  # noqa: BLE001
         # Unknown error — don't block dispatch over a false positive
         return (True, "")
-    # Secondary heuristic: unbalanced parentheses count (shlex ignores these)
-    opens = command.count("(") - command.count(")")
-    if opens != 0:
-        return (False, f"unbalanced parentheses (depth={opens})")
+    # Secondary heuristic: unbalanced parentheses — but SKIP curl data args.
+    # SQL injection payloads legitimately have unbalanced parens inside -d body
+    # (e.g. "locations_ids[]=1') UNION SELECT...") — those are HTTP data, not
+    # shell syntax.
+    _data_flags = {"-d", "--data", "--data-urlencode", "--data-raw",
+                   "--data-binary", "--data-ascii"}
+    _skip_next = False
+    _shell_parens = 0
+    for _tok in _tokens:
+        if _skip_next:
+            _skip_next = False
+            continue
+        if _tok in _data_flags:
+            _skip_next = True
+            continue
+        if any(_tok.startswith(f + "=") for f in _data_flags):
+            continue
+        _shell_parens += _tok.count("(") - _tok.count(")")
+    if _shell_parens != 0:
+        return (False, f"unbalanced parentheses (depth={_shell_parens})")
+    # UNSUBSTITUTED CANARY PLACEHOLDER. Observed on CVE-2024-5314, whose
+    # "successful" command injected the literal template token:
+    #   sortfield=' UNION SELECT 1,{CANARY},3-- POCz6f0ccdd8a0
+    # (%7BCANARY%7D once URL-encoded). The real canary never reached the
+    # payload, so nothing the exploit did could ever reflect it. Catch the
+    # token in both raw and percent-encoded form, before dispatch.
+    import re as _re_ph
+    _ph = _re_ph.search(r"(?:\{|%7[Bb])\s*(CANARY|canary)[^}]*?(?:\}|%7[Dd])", command)
+    if _ph:
+        return (False, f"unsubstituted canary placeholder {_ph.group(0)!r} in the "
+                       "command — substitute the real canary string into the payload")
+    # CANARY ONLY INSIDE A SQL COMMENT. Same CVE-2024-5314 command parked the
+    # real canary after `--`, where the database discards it: it cannot be
+    # reflected, so the assertion can never legitimately match. A canary in a
+    # comment is decoration, not proof.
+    #
+    # ONLY when the assertion expects the canary to be REFLECTED. For a
+    # blind-timing assertion there is by definition nothing to reflect into —
+    # CLAUDE.md: "a visible marker usually isn't possible in blind SQLi" — so
+    # tagging the request by putting the canary in a trailing comment is
+    # legitimate, not a defect. Refusing it there is a dead end: the model has
+    # nowhere else to put the marker, so every rewrite is refused too.
+    #
+    # Regression this guards against (2026-10-12, CVE-2024-22120 under F2b):
+    # applied unconditionally, this check refused 14 commands and the run
+    # finished with target_runs=0 — not one command reached the target, versus
+    # 2-3 in the preceding runs. A correct rule applied to the wrong case is
+    # still a broken build.
+    # OPT-IN, not opt-out: fire only when we positively know the assertion
+    # wants the canary reflected. An unknown assertion must NOT refuse — the
+    # failure mode of this check is a dead end (every rewrite refused too), so
+    # where the cost of a false negative is a weaker check and the cost of a
+    # false positive is a build that can never dispatch, the default belongs
+    # on the permissive side.
+    _wants_reflection = bool(isinstance(assertion, dict)
+                             and assertion.get("min_seconds") is None)
+    if canary and canary in command and _wants_reflection:
+        _live = _re_ph.sub(r"--[^\n]*", "", command)   # strip SQL line comments
+        _live = _re_ph.sub(r"/\*.*?\*/", "", _live, flags=_re_ph.S)  # and block comments
+        if canary not in _live:
+            return (False, f"canary {canary!r} appears ONLY inside a SQL comment "
+                           "(after -- or within /* */), where the server discards "
+                           "it and it can never be reflected — place it in a "
+                           "selected column or other reflected position")
     return (True, "")
 
 
@@ -19795,16 +20909,21 @@ def _parse_curl_time_total_ms(output):
     return None
 
 
-def _poc_assertion_passes(assertion, output, exit_code=None, elapsed_seconds=None):
+def _poc_assertion_passes(assertion, output, exit_code=None, elapsed_seconds=None,
+                          command=None):
     """Boolean verdict — backwards-compatible with every existing caller. For
     the verdict REASON (method / confidence / tier), use _poc_assertion_verdict.
-    elapsed_seconds is optional and only consulted for latency-based assertions."""
-    v = _poc_assertion_verdict(assertion, output, exit_code, elapsed_seconds=elapsed_seconds)
+    elapsed_seconds is optional and only consulted for latency-based assertions.
+    command is optional and only consulted to check a min_seconds assertion
+    actually has a timing payload to measure."""
+    v = _poc_assertion_verdict(assertion, output, exit_code,
+                               elapsed_seconds=elapsed_seconds, command=command)
     return v["passed"]
 
 
 def _poc_assertion_verdict(assertion, output, exit_code=None,
-                             rationale=None, model=None, elapsed_seconds=None):
+                             rationale=None, model=None, elapsed_seconds=None,
+                             command=None):
     """Return a structured verdict: {passed, method, confidence, reason}.
     Methods, in order of attempt + strongest first:
       - 'regex'            — canary-anchored regex matched outright (strongest)
@@ -19843,6 +20962,28 @@ def _poc_assertion_verdict(assertion, output, exit_code=None,
         min_s = a.get("min_seconds")
         max_s = a.get("max_seconds")
         if min_s is not None:
+            # NEVER DISPATCHED ≠ TOO FAST. Several refine paths short-circuit
+            # before dispatch and synthesise an `output` so the loop still gets
+            # feedback; those carry elapsed = 0.0, which measures nothing. This
+            # check must precede every elapsed comparison below, or a command
+            # the target never received is reported as "timing payload did not
+            # block the server" — the same defect as the no-payload case, in a
+            # second form.
+            #
+            # Observed live on CVE-2024-22120, 2026-10-12, two consecutive
+            # iterations: iter 1 was blocked by a missing runner program
+            # (its own output says "the command was NOT sent to the target")
+            # and iter 2 was refused by the pre-dispatch canary check — both
+            # graded latency_too_fast, and iter 1's false reason was written to
+            # cross-run error memory as "-|latency_too_fast|prerun_tool_missing".
+            _not_run = _poc_command_not_executed(out, exit_code)
+            if _not_run:
+                return {"passed": False, "method": "latency_not_executed",
+                        "confidence": 1.0,
+                        "reason": f"no timing verdict is possible: {_not_run}. "
+                                  "The elapsed time measures nothing — fix the "
+                                  "reason the command did not run; do NOT change "
+                                  "the timing payload."}
             # Operator opted into a timing assertion — it is now AUTHORITATIVE.
             # Pass only on real timing match; do NOT fall through to the regex
             # / default_truthy path for a run that was too fast (that would
@@ -19853,22 +20994,83 @@ def _poc_assertion_verdict(assertion, output, exit_code=None,
                         "reason": "assertion requires min_seconds but caller "
                                   "did not supply elapsed_seconds"}
             e_f = float(elapsed_seconds)
+            # CONNECTION TIMEOUT ≠ SLEEP SUCCESS: curl exit code 28 means the
+            # TCP connection itself timed out — the server never received the
+            # payload. A 135s connection timeout looks identical to SLEEP(5)
+            # succeeding when only elapsed >= min_seconds is checked. Parse the
+            # exit code AND the output for connection-error signatures.
+            _conn_timeout = (exit_code == 28
+                             or "curl: (28)" in out
+                             or "Failed to connect" in out
+                             or "Connection timed out" in out
+                             or "ConnectError" in out
+                             or "No route to host" in out)
+            if _conn_timeout:
+                return {"passed": False, "method": "latency_connection_error",
+                        "confidence": 1.0,
+                        "reason": f"elapsed {e_f:.1f}s but output contains a "
+                                  "connection error (curl exit 28 / Failed to "
+                                  "connect / No route to host) — the target "
+                                  "never received the payload; this is "
+                                  "infrastructure failure, not SLEEP success"}
+            # NO TIMING PAYLOAD ≠ TIMING FAILURE. A min_seconds assertion only
+            # means anything when the COMMAND actually carries a timing payload
+            # (SLEEP / pg_sleep / WAITFOR / BENCHMARK). Without one, every
+            # latency_* verdict below is describing a payload that does not
+            # exist: a 302 login-wall redirect gets reported to the refine loop
+            # as "timing payload did not block the server", the loop is taught
+            # to think in timing terms, and the false reason is written into
+            # cross-run error memory (observed signature on CVE-2024-32511:
+            # "302|latency_too_fast|location: {url}", 14 runs, all locked into
+            # timing on an auth-bypass CVE).
+            #
+            # The same no-payload check already exists on the SUCCESS path
+            # (see the _timing_confirmation_rerun block + CLAUDE.md
+            # "Blind-timing verdicts must be confirmed with a scaled payload");
+            # it was simply never asked on the failure path. Answer it here so
+            # both paths agree, and say plainly that the ASSERTION is wrong for
+            # this command rather than blaming the target.
+            #
+            # command=None (older callers that cannot supply it) keeps the
+            # legacy behaviour — this never fires on an unknown command.
+            if command is not None:
+                try:
+                    _tp = _timing_payload_scale(command)[1]
+                except Exception:  # noqa: BLE001
+                    _tp = None
+                if _tp is None:
+                    return {"passed": False, "method": "latency_unconfirmable",
+                            "confidence": 0.3,
+                            "reason": "assertion sets min_seconds but the command "
+                                      "contains NO timing payload (no SLEEP / "
+                                      "pg_sleep / WAITFOR / BENCHMARK) — a timing "
+                                      "verdict cannot describe this command. The "
+                                      "ASSERTION is wrong for this exploit, not the "
+                                      "target: switch to a reflected-canary "
+                                      "assertion ({\"expect_regex\": \"<canary>\"}) "
+                                      "unless the advisory specifically says the "
+                                      "vulnerability is time-based / blind."}
             if e_f < float(min_s):
                 return {"passed": False, "method": "latency_too_fast",
                         "confidence": 1.0,
                         "reason": f"elapsed {e_f:.1f}s below min_seconds {min_s} "
                                   "(timing payload did not block the server)"}
-            if max_s is not None and e_f > float(max_s):
+            # Default max_seconds cap: without an explicit upper bound, a
+            # 135s connection timeout "passes" (135 > 5). Apply min_s * 4
+            # when the operator didn't set max_seconds explicitly.
+            _eff_max = float(max_s) if max_s is not None else float(min_s) * 4
+            if e_f > _eff_max:
                 return {"passed": False, "method": "latency_too_slow",
                         "confidence": 1.0,
-                        "reason": f"elapsed {e_f:.1f}s above max_seconds {max_s} "
+                        "reason": f"elapsed {e_f:.1f}s above max_seconds "
+                                  f"{_eff_max} "
                                   "(request may be timing out, not sleeping)"}
             # Timing matched. If anchored to canary, canary MUST also appear.
             if a.get("canary_in_timing") and a.get("canary"):
                 if a["canary"] in out:
                     return {"passed": True, "method": "latency_anchored",
                             "confidence": 0.95,
-                            "reason": f"elapsed {e_f:.1f}s in [{min_s},{max_s}] "
+                            "reason": f"elapsed {e_f:.1f}s in [{min_s},{_eff_max}] "
                                       "AND canary present"}
                 return {"passed": False, "method": "latency_unanchored",
                         "confidence": 1.0,
@@ -19945,13 +21147,13 @@ def _poc_assertion_verdict(assertion, output, exit_code=None,
 
 def _poc_assertion_verdict_with_semantic(assertion, output, exit_code=None,
                                            rationale=None, model=None,
-                                           elapsed_seconds=None):
+                                           elapsed_seconds=None, command=None):
     """Full verdict including semantic fallback. Call this from _run_refine_poc
     when the raw verdict returns passed=False — it tries the LLM pass as a
     secondary signal, bounded by the canary-grounded safety check."""
     v = _poc_assertion_verdict(assertion, output, exit_code,
                                  rationale=rationale, model=model,
-                                 elapsed_seconds=elapsed_seconds)
+                                 elapsed_seconds=elapsed_seconds, command=command)
     if v["passed"]:
         return v
     if not _poc_semantic_verify_enabled():
@@ -20460,6 +21662,7 @@ def _flag_precondition(cve, ip, pc, eid):
                 (str(_u.uuid4()), title, ip, reason,
                  ["csrf", "nonce", "precondition", "poc_builder"], Json(meta)))
             conn.commit()
+        from webhooks import emit_webhook
         emit_webhook("precondition_detected", "poc",
                      {"cve": cve, "target": ip, "skill": "csrf_nonce",
                       "tokens_found": len(pc.get("tokens") or []),
@@ -24341,8 +25544,39 @@ def _assemble_from_cve_spec(cve, ip, port, canary):
     if canary:
         payload = payload + f" -- {canary}" if "--" not in payload else payload.replace(
             "-- -", f"-- {canary}")
+    # Resolve template vars ({hostid}, {scriptid}, {sessionid}, {N}, etc.)
+    # from confirmed_facts before passing to _curl_from_cve_spec.
+    import copy as _copy
+    req = _copy.deepcopy(spec.get("request") or {})
+    _tgt = f"{ip}:{port or 80}"
+    _resolved = {}
     try:
-        cmd = _curl_from_cve_spec(ip, port, spec.get("request") or {}, payload)
+        with get_db() as _c, _c.cursor() as _cur:
+            _cur.execute("SELECT claim_type, claim_key, claim_value "
+                         "FROM confirmed_facts WHERE target=%s "
+                         "AND status='confirmed' AND claim_value IS NOT NULL",
+                         (_tgt,))
+            for _ct, _ck, _cv in _cur.fetchall():
+                if _ct == "object_id":
+                    _resolved[_ck] = _cv
+                elif _ct == "token_valid":
+                    _resolved.setdefault(_ck, _cv)
+    except Exception:  # noqa: BLE001
+        pass
+    def _resolve_vars(v):
+        if isinstance(v, str):
+            for k, rv in _resolved.items():
+                v = v.replace("{" + k + "}", rv)
+            v = v.replace("{N}", "5")
+            return v
+        if isinstance(v, dict):
+            return {k: _resolve_vars(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [_resolve_vars(x) for x in v]
+        return v
+    req = _resolve_vars(req)
+    try:
+        cmd = _curl_from_cve_spec(ip, port, req, payload)
     except Exception:  # noqa: BLE001
         return None
     a = dict(spec.get("assertion") or {"min_seconds": 5, "max_seconds": 30})
@@ -24646,6 +25880,12 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         s = _re_dup.sub(r"'[a-f0-9]{32,}'", "'{HEX}'", s)       # hex blobs
         return s[:300]
     _stop_reason = None
+    # TARGET-UNREACHABLE EARLY EXIT: after N consecutive connection timeouts
+    # (curl exit 28, "Failed to connect", "No route to host"), stop the loop
+    # instead of burning the full iteration budget on a dead target. The
+    # pipeline was spending 50 × 135s = 112 minutes on targets that were down.
+    _CONN_FAIL_EXIT_AT = int(os.environ.get("REFINE_CONN_FAIL_EXIT_AT", "3") or "3")
+    _consecutive_conn_fails = 0
     # Cross-run error memory (2026-10-09): one row per iteration, flushed at
     # the end by _record_error_memory; the refine prompt consults
     # _similar_prior_errors when the loop is stuck (bounded lookups per build).
@@ -24664,6 +25904,27 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         _si = (metrics or {}).get("_session_cookie_header") if isinstance(metrics, dict) else None
         if _si:
             _known_cred_values.append(str(_si))
+    except Exception:  # noqa: BLE001
+        pass
+    # Build a KNOWN-BAD block from refuted confirmed_facts so the LLM
+    # doesn't retry endpoints/sids that were already proven wrong.
+    _refuted_note = ""
+    try:
+        _tgt = f"{ip}:{port or 80}"
+        with get_db() as _c, _c.cursor() as _cur:
+            _cur.execute("""SELECT claim_type, claim_key, evidence
+                           FROM confirmed_facts
+                           WHERE target=%s AND status='refuted'
+                           ORDER BY confirmed_at DESC LIMIT 15""",
+                         (_tgt,))
+            _refuted = _cur.fetchall()
+        if _refuted:
+            _lines = []
+            for _ct, _ck, _ev in _refuted:
+                _short = (_ev or "")[:120]
+                _lines.append(f"  - [{_ct}] {_ck}: {_short}")
+            _refuted_note = ("\nKNOWN-BAD (refuted — do NOT retry these):\n"
+                             + "\n".join(_lines[:10]))
     except Exception:  # noqa: BLE001
         pass
     for it in range(1, max(1, max_iters) + 1):
@@ -24697,7 +25958,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         # 2 of 11 PARTIAL cases ran all 5 iters on commands that /bin/sh refused
         # at parse time. On fail: synthesize a syntax-error "output" so the
         # existing refine path kicks in with specific feedback.
-        _syn_ok, _syn_err = _poc_shell_syntax_check(command)
+        _syn_ok, _syn_err = _poc_shell_syntax_check(command, canary=canary, assertion=assertion)
         if not _syn_ok:
             _refused_now, _ = _poc_detect_llm_refusal(command)
             if _refused_now:
@@ -24916,7 +26177,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         # marker in output.
         _verdict = _poc_assertion_verdict_with_semantic(
             assertion, output, ec, rationale=rationale, model=model,
-            elapsed_seconds=_this_iter_seconds)
+            elapsed_seconds=_this_iter_seconds, command=command)
         success = _verdict["passed"]
         verification_method = _verdict["method"]
         verification_confidence = _verdict["confidence"]
@@ -25023,6 +26284,32 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         else:
             for k in _status_tier_streak:
                 _status_tier_streak[k] = 0
+        # TARGET-UNREACHABLE EARLY EXIT: detect connection failures and stop
+        # before burning the full iteration budget on a dead target.
+        _is_conn_fail = bool(
+            ec == 28
+            or "curl: (28)" in (output or "")
+            or "Failed to connect" in (output or "")
+            or "Connection timed out" in (output or "")
+            or "ConnectError" in (output or "")
+            or "No route to host" in (output or "")
+            or verification_method == "latency_connection_error")
+        if _is_conn_fail:
+            _consecutive_conn_fails += 1
+        else:
+            _consecutive_conn_fails = 0
+        if _consecutive_conn_fails >= _CONN_FAIL_EXIT_AT and not success:
+            _stop_reason = "target_unreachable"
+            metrics["target_unreachable_exit"] = _consecutive_conn_fails
+            _poc_trace(run_id, "target_unreachable_exit", iteration=it,
+                       response=(f"{_consecutive_conn_fails} consecutive connection "
+                                 f"failures — target {ip}:{port} is unreachable; "
+                                 "stopping to avoid wasting iterations on a dead target"),
+                       extra={"consecutive": _consecutive_conn_fails,
+                              "threshold": _CONN_FAIL_EXIT_AT,
+                              "iterations_saved": max_iters - it,
+                              "last_output_preview": (output or "")[:300]})
+            break
         if success or it >= max_iters:
             break
         # Status-cluster escalation: 2+ iters in a row returned the same
@@ -25056,6 +26343,26 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                         path_block = (
                             f"\nLIVE PATHS on {ip}:{port} (status != 404, from a "
                             f"listener probe just now — these are REAL):\n{rendered}")
+                    # Also surface crawl_urls from gather manifest
+                    _gf = gather_facts or ""
+                    import re as _re_esc
+                    _crawl_from_gather = [
+                        m.group(1) for m in _re_esc.finditer(
+                            r"(?:crawl_url|endpoint|candidate)[^:]*:\s*(\S+)", _gf)
+                        if m.group(1).startswith("/")][:10]
+                    if _crawl_from_gather and _tripped_tier == "all_404":
+                        _dedup = {p for p, _ in live} if live else set()
+                        _extra_paths = [p for p in _crawl_from_gather if p not in _dedup]
+                        if _extra_paths:
+                            path_block += (
+                                f"\nGATHER-DISCOVERED ENDPOINTS (from this run's recon — "
+                                f"not yet probed, try these too):\n"
+                                + "\n".join(f"  ???  {p}" for p in _extra_paths[:8]))
+                    if _tripped_tier == "all_404":
+                        path_block += (
+                            "\nIMPORTANT: Your current endpoint returns 404. You MUST "
+                            "switch to one of the LIVE PATHS above. Do NOT retry the "
+                            "same 404 endpoint.")
                 else:
                     _poc_trace(run_id, f"escalation:{_tripped_tier}",
                                iteration=it, response="text-only remediation",
@@ -25282,6 +26589,37 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         # is a RENDERING concern, not a knowledge concern, so it stays here.
         _prev_had_latency = bool(isinstance(assertion, dict)
                                  and assertion.get("min_seconds") is not None)
+        # ...BUT the shape must not be sticky when it was never right. Handing
+        # back the timing template unconditionally means ONE wrong first guess
+        # converts the whole build into a timing build: there is no path back
+        # to expect_regex, so every later iteration copies min_seconds and
+        # every failure is re-read as a timing failure. On CVE-2024-32511 (an
+        # auth-bypass CVE, correctly classified as auth-bypass) that cost all
+        # 14 runs and poisoned cross-run error memory with
+        # "302|latency_too_fast|location: {url}".
+        #
+        # A timing assertion only earns its stickiness when the command
+        # actually carries a timing payload to measure. Without one, offer the
+        # reflected-canary shape instead and SAY why — the same answer the
+        # verdict path now gives (latency_unconfirmable).
+        _timing_payload_present = True
+        if _prev_had_latency:
+            try:
+                _timing_payload_present = _timing_payload_scale(command or "")[1] is not None
+            except Exception:  # noqa: BLE001
+                _timing_payload_present = True  # fail-soft: keep legacy shape
+        _assert_switch_note = ""
+        if _prev_had_latency and not _timing_payload_present:
+            _prev_had_latency = False
+            _assert_switch_note = (
+                "\nASSERTION KIND IS WRONG FOR THIS COMMAND: the previous assertion "
+                "set min_seconds, but your command contains NO timing payload "
+                "(no SLEEP / pg_sleep / WAITFOR / BENCHMARK), so a timing verdict "
+                "can never describe it. Do NOT try to make the command slower to "
+                "satisfy the clock. Use a reflected-canary assertion instead and "
+                "make the exploit's effect visible in the output. Only go back to "
+                "min_seconds if the advisory specifically says this vulnerability "
+                "is time-based / blind.\n")
         if _prev_had_latency:
             _assert_template = (f"{{\"min_seconds\": {assertion.get('min_seconds')}, "
                                 f"\"max_seconds\": {assertion.get('max_seconds') or 30}, "
@@ -25327,7 +26665,8 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                         + str(gather_facts)[:1500]) if gather_facts else "")
         rprompt = (f"AUTHORIZED lab pentest. The PoC for {cve} on http://{ip}:{port} did NOT "
                    f"succeed.\nCommand: {command}\nOutput:\n{(output or '')[:1500]}{precond}{gather_note}"
-                   f"{shell_syntax_note}{refusal_note}{rag_pattern_notes}{regress_note}{model_switch_note}{path_discovery_note}{waf_hit_note}{similar_note}{escalation_guidance}{anchor_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
+                   f"{_refuted_note}"
+                   f"{shell_syntax_note}{refusal_note}{_assert_switch_note}{rag_pattern_notes}{regress_note}{model_switch_note}{path_discovery_note}{waf_hit_note}{similar_note}{escalation_guidance}{anchor_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
                    f"appear. Return ONE JSON object only: {{\"command\": \"<better command, may "
                    f"chain curl calls with ; and shell vars to fetch a token first>\", "
                    f"\"assertion\": {_assert_template}}}. No prose.")
@@ -25488,6 +26827,27 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                 reflection = False
                 _poc_trace(run_id, "reflection_check", iteration=iters,
                            response="reflected match is inside an execution/error context -> primitive confirmed, not reflection")
+            # CONFIRMED-TIMING EXCEPTION. In a blind time-based proof the canary
+            # is a request TAG, not the evidence — CLAUDE.md: "a visible marker
+            # usually isn't possible in blind SQLi". The proof is the scaled
+            # payload re-run (SLEEP(N) -> SLEEP(N+7)) showing the server's
+            # elapsed time scale with it, which is deterministic, inline and
+            # already confidence 0.98. If the model ALSO happens to echo the
+            # canary, reflection says nothing about that proof, and downgrading
+            # on it discards a verdict that never depended on the canary.
+            #
+            # Observed on CVE-2024-3552, 2026-10-12: latency_confirmed at 0.98
+            # with the timing re-run passed, and verified flipped to False
+            # purely because the command printed its own canary. The same CVE
+            # verified in the three prior runs whose command happened not to
+            # echo it. Scoped to the CONFIRMED methods only — bare `latency` /
+            # `latency_anchored` are unconfirmed and keep the downgrade.
+            if reflection and verification_method in (
+                    "latency_confirmed", "latency_confirmed_anchored"):
+                reflection = False
+                _poc_trace(run_id, "reflection_check", iteration=iters,
+                           response=f"method={verification_method}: the proof is the scaled-payload "
+                                    "timing re-run, not the canary -> reflection does not apply")
             if reflection:
                 verified = False
     off_target = bool(success and not verified)
@@ -25896,6 +27256,7 @@ def establish_session_endpoint(body: EstablishSessionBody, authorized: bool = De
             "login_url": body.login_url, "bruteforce": body.bruteforce}
     s = _establish_session_for_build(body.ip, body.port, auth, eid)
     try:
+        from webhooks import emit_webhook
         emit_webhook("web_session_established", "software",
                      {"target": body.ip, "ok": s.get("ok"), "method": s.get("method"),
                       "user": s.get("username")})
@@ -28718,6 +30079,469 @@ def _failure_analysis_llm(cve, ip, port, run_id, analysis) -> dict | None:
     return {"narrative": narrative, "ranked_next_steps": steps, "confidence": conf, "model": model_used}
 
 
+# ── Post-run review agent (RAG-driven) ──────────────────────────────
+# Review criteria come from knowledge/build_poc_review.yaml via RAG,
+# not hardcoded rules. Operator can add/edit criteria without code
+# changes. Findings feed back into RAG so future runs learn.
+
+BUILD_POC_REVIEW_RAG_SOURCE = "build_poc_review_criteria"
+
+
+def _ensure_build_poc_reviews_table():
+    try:
+        with get_db() as c, c.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS public.build_poc_reviews (
+                    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                    engagement_id   uuid,
+                    run_id          text NOT NULL,
+                    cve             text NOT NULL,
+                    ip              text NOT NULL,
+                    port            int,
+                    product         text,
+                    verified        boolean DEFAULT false,
+                    stage_reached   text,
+                    findings        jsonb NOT NULL DEFAULT '[]'::jsonb,
+                    summary         text,
+                    recommendations jsonb DEFAULT '[]'::jsonb,
+                    operator_feedback jsonb,
+                    rag_learning_ids text[] DEFAULT '{}',
+                    llm_model       text,
+                    created_at      timestamptz NOT NULL DEFAULT now(),
+                    updated_at      timestamptz NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS ix_bpr_run ON public.build_poc_reviews(run_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS ix_bpr_cve ON public.build_poc_reviews(cve, ip, created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS ix_bpr_eng ON public.build_poc_reviews(engagement_id)")
+            c.commit()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _load_build_poc_review_knowledge():
+    """Embed review criteria from knowledge/build_poc_review.yaml into
+    rag_documents. Idempotent — safe to call on startup or change."""
+    import yaml as _yaml
+    yaml_path = os.path.join(os.path.dirname(__file__), "..", "..", "knowledge", "build_poc_review.yaml")
+    if not os.path.isfile(yaml_path):
+        yaml_path = "/knowledge/build_poc_review.yaml"
+    if not os.path.isfile(yaml_path):
+        return {"ok": False, "reason": "yaml not found"}
+    try:
+        with open(yaml_path) as f:
+            data = _yaml.safe_load(f) or {}
+        criteria = data.get("review_criteria") or []
+        if not criteria:
+            return {"ok": False, "reason": "no criteria in yaml"}
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM rag_documents WHERE metadata->>'source' = %s",
+                        (BUILD_POC_REVIEW_RAG_SOURCE,))
+            conn.commit()
+        loaded = 0
+        for c in criteria:
+            if not isinstance(c, dict) or not c.get("id"):
+                continue
+            title = f"Build-PoC Review: {c.get('question', c['id'])}"
+            body_parts = [
+                f"Category: {c.get('category', 'general')}",
+                f"Question: {c.get('question', '')}",
+                f"What to check: {'; '.join(c.get('what_to_check') or [])}",
+                f"Failure indicator: {c.get('failure_indicator', '')}",
+                f"Remediation: {c.get('remediation', '')}",
+                f"Severity: {c.get('severity', 'medium')}",
+            ]
+            body = "\n".join(body_parts)
+            try:
+                vec = _embed_text(f"{title}\n{body}")
+                vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+                meta = {"source": BUILD_POC_REVIEW_RAG_SOURCE,
+                        "kind": "review_criterion",
+                        "criterion_id": c["id"],
+                        "category": c.get("category", "general"),
+                        "severity": c.get("severity", "medium"),
+                        "learning_tags": c.get("learning_tags", [])}
+                with get_db() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO rag_documents (title, text_chunk, metadata, embedding) "
+                        "VALUES (%s, %s, %s, %s::vector)",
+                        (title, body, Json(meta), vec_str))
+                    conn.commit()
+                loaded += 1
+            except Exception as e:  # noqa: BLE001
+                logging.warning("review criteria load failed for %s: %s", c["id"], e)
+        return {"ok": True, "loaded": loaded, "total": len(criteria)}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": str(e)[:200]}
+
+
+def _retrieve_review_criteria(run_context: str, top_k: int = 10) -> list:
+    """Retrieve relevant review criteria from RAG based on run context."""
+    try:
+        vec = _embed_text(run_context)
+        vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("SET LOCAL ivfflat.probes = 100")
+            cur.execute("""
+                SELECT title, text_chunk, metadata,
+                       1 - (embedding <=> %s::vector) AS similarity
+                FROM rag_documents
+                WHERE metadata->>'source' = %s
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+            """, (vec_str, BUILD_POC_REVIEW_RAG_SOURCE, vec_str, top_k))
+            rows = cur.fetchall()
+        return [{"title": r[0], "text": r[1],
+                 "metadata": r[2] if isinstance(r[2], dict) else {},
+                 "similarity": float(r[3])} for r in rows]
+    except Exception as e:  # noqa: BLE001
+        logging.warning("review criteria retrieval failed: %s", e)
+        return []
+
+
+def _retrieve_prior_reviews(cve, product=None, top_k: int = 5) -> list:
+    """Retrieve learnings from prior reviews for the same product/CVE."""
+    try:
+        query = f"build-PoC review learnings for {cve}"
+        if product:
+            query += f" {product}"
+        vec = _embed_text(query)
+        vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("SET LOCAL ivfflat.probes = 100")
+            cur.execute("""
+                SELECT title, text_chunk, metadata,
+                       1 - (embedding <=> %s::vector) AS similarity
+                FROM rag_documents
+                WHERE metadata->>'source' = 'build_poc_review_learning'
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+            """, (vec_str, vec_str, top_k))
+            rows = cur.fetchall()
+        return [{"title": r[0], "text": r[1],
+                 "metadata": r[2] if isinstance(r[2], dict) else {},
+                 "similarity": float(r[3])} for r in rows]
+    except Exception as e:  # noqa: BLE001
+        return []
+
+
+def _evaluate_review_criterion(criterion, trace_summary, result, fa, session_info) -> dict:
+    """Evaluate one review criterion against the run data. Returns a finding."""
+    crit_id = (criterion.get("metadata") or {}).get("criterion_id", "unknown")
+    crit_text = criterion.get("text", "")
+    severity = (criterion.get("metadata") or {}).get("severity", "medium")
+    finding = {"criterion_id": crit_id, "severity": severity,
+               "question": crit_text.split("Question: ", 1)[-1].split("\n", 1)[0] if "Question:" in crit_text else crit_id,
+               "status": "pass", "evidence": "", "recommendation": ""}
+    ts = trace_summary or {}
+    fa = fa or {}
+    si = session_info or {}
+    res = result or {}
+    if crit_id == "auth_session_valid":
+        if si.get("ok") and si.get("cookie_header"):
+            validated = si.get("validated")
+            finding["evidence"] = f"Session established via {si.get('method','unknown')}, validated={validated}"
+            if not validated:
+                finding["status"] = "warn"
+                finding["recommendation"] = "Session was set but not validated; may be a pre-login cookie"
+        elif si:
+            finding["status"] = "fail"
+            finding["evidence"] = f"Login failed: {si.get('note','no details')}"
+            finding["recommendation"] = "Check field variants, discovered forms, CSRF handling"
+        else:
+            finding["status"] = "skip"
+            finding["evidence"] = "No auth attempted"
+    elif crit_id == "timing_confirmation_scaled":
+        tc = ts.get("timing_confirmation") or {}
+        if tc:
+            if tc.get("confirmed"):
+                finding["evidence"] = f"Timing confirmed: {tc.get('second_s')}s vs expected {tc.get('expected_s')}s"
+            else:
+                finding["status"] = "fail"
+                finding["evidence"] = (f"Timing NOT confirmed: second_s={tc.get('second_s')}, "
+                                       f"expected_s={tc.get('expected_s')}, pattern={tc.get('pattern')}")
+                finding["recommendation"] = "Check URL-encoding of scaled payload; verify injection context"
+        elif res.get("verification_method", "").startswith("latency"):
+            finding["status"] = "warn"
+            finding["evidence"] = "Latency-based verdict but no timing confirmation trace found"
+        else:
+            finding["status"] = "skip"
+            finding["evidence"] = "Non-timing verification method"
+    elif crit_id == "recon_consumed_by_gather":
+        ri = fa.get("recon_inventory") or {}
+        blockers = fa.get("blockers") or []
+        recon_urls = ri.get("urls") or []
+        recon_params = ri.get("params_by_path") or {}
+        if blockers:
+            missing_with_recon = [b for b in blockers
+                                  if (b.get("what_live_recon_found") or "").strip()]
+            if missing_with_recon:
+                finding["status"] = "fail"
+                finding["evidence"] = f"Gather blocked on {[b['item'] for b in blockers]} but recon had data for: {[b['item'] for b in missing_with_recon]}"
+                finding["recommendation"] = "Recon data was not consumed by gather manifest"
+            else:
+                finding["status"] = "warn"
+                finding["evidence"] = f"Gather blocked on {[b['item'] for b in blockers]}; no recon data available"
+        elif recon_urls or recon_params:
+            finding["evidence"] = f"Recon found {len(recon_urls)} URLs, {len(recon_params)} param sets; gather consumed them"
+    elif crit_id == "go_around_overwrite":
+        finding["status"] = "pass"
+        finding["evidence"] = "Go-around overwrite guard is active"
+    elif crit_id == "target_reachable":
+        if fa.get("stage_reached") == "recon" and not (fa.get("tried") or []):
+            finding["status"] = "fail"
+            finding["evidence"] = "Run stopped at recon stage with no target runs"
+            finding["recommendation"] = "Verify target container is running and reachable"
+        else:
+            finding["evidence"] = f"Target reached; {len(fa.get('tried') or [])} commands executed"
+    elif crit_id == "strategy_exhaustion":
+        stop = res.get("stop_reason", "")
+        iters = int(res.get("iterations") or 0)
+        if stop in ("dup_exit", "identical_resend"):
+            finding["status"] = "warn" if iters > 10 else "fail"
+            finding["evidence"] = f"Strategy exhaustion at iter {iters}: {stop}"
+            finding["recommendation"] = "Provide more diverse recon data or try different vuln class"
+        else:
+            finding["evidence"] = f"No exhaustion; ran {iters} iterations"
+    elif crit_id == "gather_manifest_complete":
+        missing = fa.get("missing") or (fa.get("blockers") and [b["item"] for b in fa["blockers"]]) or []
+        if missing:
+            finding["status"] = "fail"
+            finding["evidence"] = f"Gather incomplete: missing {missing}"
+            finding["recommendation"] = "Add recon sources for missing fields; check LLM fallback"
+        else:
+            finding["evidence"] = "Gather manifest complete"
+    elif crit_id == "csrf_nonce_handling":
+        sess = (fa.get("recon_inventory") or {}).get("session") or {}
+        if sess.get("note") and "csrf" in str(sess.get("note", "")).lower():
+            finding["status"] = "warn"
+            finding["evidence"] = f"CSRF-related session issue: {sess.get('note','')[:200]}"
+            finding["recommendation"] = "Ensure CSRF tokens are harvested and included in exploit"
+        else:
+            finding["status"] = "skip"
+            finding["evidence"] = "No CSRF issues detected"
+    elif crit_id == "iteration_efficiency":
+        m = res.get("metrics") or {}
+        skipped = int(m.get("skipped_runs_bad_syntax") or 0) + int(m.get("skipped_runs_llm_refusal") or 0)
+        total = int(res.get("iterations") or 1)
+        if total > 0 and skipped / total > 0.5:
+            finding["status"] = "warn"
+            finding["evidence"] = f"{skipped}/{total} iterations skipped ({100*skipped//total}%)"
+            finding["recommendation"] = "Improve prompt quality to reduce syntax errors"
+        else:
+            finding["evidence"] = f"{skipped}/{total} iterations skipped"
+    else:
+        finding["status"] = "skip"
+        finding["evidence"] = "Criterion evaluated generically"
+    return finding
+
+
+def _post_run_review(run_id, cve, ip, port, product, result, fa, session_info,
+                     trace_summary, eid=None) -> dict:
+    """Run the post-run review agent. Retrieves criteria from RAG, evaluates
+    each against the run trace, optionally calls LLM for synthesis, and stores
+    findings for operator review. Returns the review dict."""
+    _ensure_build_poc_reviews_table()
+    res = result or {}
+    fa = fa or {}
+    context_q = (f"build-PoC review {cve} {product or ''} "
+                 f"stage={fa.get('stage_reached','')} "
+                 f"verified={res.get('verified')} "
+                 f"stop={res.get('stop_reason','')}")
+    criteria = _retrieve_review_criteria(context_q)
+    prior_learnings = _retrieve_prior_reviews(cve, product)
+    findings = []
+    for crit in criteria:
+        finding = _evaluate_review_criterion(crit, trace_summary, result, fa, session_info)
+        findings.append(finding)
+    fail_count = sum(1 for f in findings if f["status"] == "fail")
+    warn_count = sum(1 for f in findings if f["status"] == "warn")
+    summary_parts = []
+    if res.get("verified"):
+        summary_parts.append(f"VERIFIED exploit for {cve}")
+    else:
+        summary_parts.append(f"Unverified attempt for {cve} (stage: {fa.get('stage_reached','unknown')})")
+    summary_parts.append(f"{fail_count} failures, {warn_count} warnings across {len(findings)} criteria")
+    if prior_learnings:
+        summary_parts.append(f"{len(prior_learnings)} prior learnings retrieved from RAG")
+    summary = "; ".join(summary_parts)
+    recommendations = []
+    for f in findings:
+        if f["status"] in ("fail", "warn") and f.get("recommendation"):
+            recommendations.append({
+                "criterion": f["criterion_id"],
+                "severity": f["severity"],
+                "action": f["recommendation"],
+                "from_rag": True
+            })
+    for pl in prior_learnings[:3]:
+        recommendations.append({
+            "criterion": "prior_learning",
+            "severity": "info",
+            "action": (pl.get("text") or "")[:300],
+            "from_rag": True,
+            "source": "prior_review"
+        })
+    review = {
+        "run_id": run_id, "cve": cve, "ip": ip, "port": port,
+        "product": product, "verified": bool(res.get("verified")),
+        "stage_reached": fa.get("stage_reached"),
+        "findings": findings, "summary": summary,
+        "recommendations": recommendations,
+        "prior_learnings_count": len(prior_learnings),
+        "criteria_count": len(criteria),
+    }
+    # Cross-attempt repeated-strategy detection: if prior attempts on the same
+    # CVE hit the same stop_reason at the same stage, flag it — the build is
+    # repeating a failing strategy instead of adapting.
+    try:
+        with get_db() as _c, _c.cursor() as _cur:
+            _cur.execute("""
+                SELECT run_id, stage_reached, stop_reason, summary
+                FROM build_poc_attempts
+                WHERE cve = %s AND run_id != %s AND verified = false
+                ORDER BY created_at DESC LIMIT 5
+            """, (cve, run_id))
+            _prior = _cur.fetchall()
+        if _prior and fa:
+            _this_stage = fa.get("stage_reached", "")
+            _this_stop = res.get("stop_reason", "")
+            _same_strategy = [
+                p for p in _prior
+                if p[1] == _this_stage and p[2] == _this_stop]
+            if _same_strategy:
+                findings.append({
+                    "criterion_id": "repeated_strategy",
+                    "severity": "high",
+                    "question": "Is this attempt using a different strategy than prior failures?",
+                    "status": "fail",
+                    "evidence": (f"{len(_same_strategy)} prior attempt(s) also "
+                                 f"stopped at stage='{_this_stage}' with "
+                                 f"stop_reason='{_this_stop}'"),
+                    "recommendation": (
+                        "The same strategy is failing repeatedly. "
+                        "A different approach is needed — try a different "
+                        "endpoint, injection point, or auth method. "
+                        "Prior run IDs: " +
+                        ", ".join(p[0] for p in _same_strategy[:3]))
+                })
+    except Exception:  # noqa: BLE001
+        pass
+    model_used = None
+    try:
+        llm_summary = _review_llm_synthesis(cve, ip, product, findings,
+                                            recommendations, prior_learnings)
+        if llm_summary:
+            review["llm_narrative"] = llm_summary.get("narrative")
+            review["llm_recommendations"] = llm_summary.get("recommendations")
+            model_used = llm_summary.get("model")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO build_poc_reviews
+                    (engagement_id, run_id, cve, ip, port, product, verified,
+                     stage_reached, findings, summary, recommendations, llm_model)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+                RETURNING id
+            """, (eid, run_id, cve, ip, port, product, bool(res.get("verified")),
+                  fa.get("stage_reached"), Json(findings), summary,
+                  Json(recommendations), model_used))
+            row = cur.fetchone()
+            if row:
+                review["review_id"] = str(row[0])
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("review store failed run=%s: %s", run_id, e)
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("build_poc_review_completed", "build_poc_review", {
+            "run_id": run_id, "cve": cve, "ip": ip,
+            "engagement_id": eid, "verified": bool(res.get("verified")),
+            "fail_count": fail_count, "warn_count": warn_count,
+            "criteria_evaluated": len(findings),
+            "review_id": review.get("review_id")})
+    except Exception:  # noqa: BLE001
+        pass
+    return review
+
+
+def _review_llm_synthesis(cve, ip, product, findings, recommendations, prior_learnings) -> dict | None:
+    """One LLM call to synthesize a narrative from the structured review findings.
+    Fail-soft: returns None on any error."""
+    fails = [f for f in findings if f["status"] in ("fail", "warn")]
+    if not fails:
+        return None
+    prompt = (f"You are a security testing review agent. A build-PoC run for {cve} on "
+              f"{ip} (product: {product or 'unknown'}) has completed.\n\n"
+              f"Review findings (failures/warnings only):\n")
+    for f in fails[:8]:
+        prompt += f"- [{f['severity']}] {f['question']}: {f['evidence'][:200]}\n"
+    if prior_learnings:
+        prompt += "\nPrior learnings from similar runs:\n"
+        for pl in prior_learnings[:3]:
+            prompt += f"- {(pl.get('text') or '')[:200]}\n"
+    prompt += ("\nProvide a JSON object with:\n"
+               '{"narrative": "120 words max summary of what went wrong and why",\n'
+               ' "recommendations": [{"step": "...", "priority": "high|medium|low", "why": "..."}],\n'
+               ' "confidence": 0.0-1.0}\n'
+               "Respond with ONLY the JSON object.")
+    try:
+        raw = _llm_for_model(prompt, caller="exploit.judge", num_predict=600, temperature=0.2)
+        if not raw or not isinstance(raw, str):
+            return None
+        import json as _j, re as _re
+        m = _re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", raw, _re.S)
+        if not m:
+            return None
+        obj = _j.loads(m.group(0))
+        return {
+            "narrative": str(obj.get("narrative", ""))[:1200],
+            "recommendations": (obj.get("recommendations") or [])[:5],
+            "confidence": min(1.0, max(0.0, float(obj.get("confidence", 0.5)))),
+            "model": "routed"
+        }
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _store_review_learning(review_id, cve, product, finding, operator_note="", eid=None):
+    """Store an approved review finding back into RAG as a learning for future runs."""
+    title = f"Review learning: {cve} - {finding.get('question', finding.get('criterion_id', 'unknown'))}"
+    body = (f"CVE: {cve}\nProduct: {product or 'unknown'}\n"
+            f"Finding: {finding.get('evidence', '')}\n"
+            f"Recommendation: {finding.get('recommendation', '')}\n"
+            f"Operator note: {operator_note}\n"
+            f"Status: {finding.get('status', 'unknown')}")
+    try:
+        vec = _embed_text(f"{title}\n{body}")
+        vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+        meta = {"source": "build_poc_review_learning",
+                "kind": "review_learning",
+                "cve": cve, "product": product,
+                "criterion_id": finding.get("criterion_id"),
+                "review_id": review_id,
+                "engagement_id": eid}
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO rag_documents (title, text_chunk, metadata, embedding) "
+                "VALUES (%s, %s, %s, %s::vector) RETURNING id",
+                (title, body, Json(meta), vec_str))
+            doc_id = str(cur.fetchone()[0])
+            cur.execute("""UPDATE build_poc_reviews
+                           SET rag_learning_ids = array_append(rag_learning_ids, %s),
+                               updated_at = now()
+                           WHERE id = %s::uuid""",
+                        (doc_id, review_id))
+            conn.commit()
+        return doc_id
+    except Exception as e:  # noqa: BLE001
+        logging.warning("review learning store failed: %s", e)
+        return None
+
+
 def _load_hints_for(cve, ip=None, port=None):
     """Return the concatenated active hints matching this (cve, ip, port). Most-specific
     first (exact host+port), then host-only, then cve-only. Empty on any failure."""
@@ -29071,6 +30895,7 @@ def add_poc_hint(body: PocHintBody, authorized: bool = Depends(auth)):
                      body.hint, eid, body.created_by or "operator"))
         row = cur.fetchone(); conn.commit()
     try:
+        from webhooks import emit_webhook
         emit_webhook("poc_hint_added", "software",
                      {"cve": body.cve, "target": body.target_host, "hint_len": len(body.hint)})
     except Exception:  # noqa: BLE001
@@ -29333,6 +31158,17 @@ _RUNNER_BIN_CACHE_TTL = 3600
 def _command_binaries(command: str) -> list:
     """Names of the external programs a shell command invokes, first-seen order.
 
+    A `#` token starts a shell COMMENT and ends the simple command: the words
+    after it are prose, not programs. Without this the tail that
+    `_augment_with_sink_verification` auto-adds for every blind/OOB class —
+    whose first line is `# sink-verification tail (auto-added for blind/OOB
+    class):` — yielded the "programs" `sink-verification` and `auto-added`.
+    `_prerun_tool_check` then found them missing on the runner, returned
+    ok=False, and the command was NEVER DISPATCHED. Observed on CVE-2024-22120,
+    2026-10-12: "PRERUN_TOOL_MISSING: sink-verification — not installed on the
+    runner; the command was NOT sent to the target." Every command carrying
+    that auto-added tail was unrunnable for the same reason.
+
     Pure text analysis, no execution. Quoted strings are blanked first (the
     payloads carry `|`, `;`, `&&` inside quotes), heredoc bodies are dropped,
     then the first word of every simple command (split on `|| && | ; newline
@@ -29346,6 +31182,13 @@ def _command_binaries(command: str) -> list:
     s = (command or "").split("<<", 1)[0]
     s = _re.sub(r"'[^']*'", " ", s)
     s = _re.sub(r'"(?:\\.|[^"\\])*"', " ", s)
+    # Strip comments BEFORE segmenting. The segment splitter breaks on "(" and
+    # ")", so "# sink-verification tail (auto-added for blind/OOB class):"
+    # becomes two segments and only the first still carries the "#" — the
+    # per-token guard below would let "auto-added" through as a program name.
+    # Quotes are already blanked above, so a surviving "#" at the start of a
+    # word is a real comment (a "#" inside a URL is mid-word and is kept).
+    s = _re.sub(r"(?m)(?:(?<=\s)|^)#[^\n]*", " ", s)
     segs = _re.split(r"\|\||&&|[|;\n]|\$\(|`|[(){}]", s)
     out, seen = [], set()
     for seg in segs:
@@ -29355,6 +31198,8 @@ def _command_binaries(command: str) -> list:
             if skip_next:
                 skip_next = False
                 continue
+            if t.startswith("#"):
+                break                                      # comment: rest of the line is prose
             if _re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t):
                 continue                                   # VAR=value prefix
             if _re.match(r"^[0-9]*[<>]", t) or t.startswith("&>"):
@@ -29558,6 +31403,115 @@ def export_build_poc_attempt_review_md(run_id: str, authorized: bool = Depends(a
                     headers={"Content-Disposition": f'attachment; filename="{base}-attempt-review.md"'})
 
 
+# ── Post-run review endpoints ──────────────────────────────────────────────────
+
+@app.get("/build-poc/reviews", tags=["Assets"])
+def list_build_poc_reviews(
+    cve: Optional[str] = Query(None),
+    ip: Optional[str] = Query(None),
+    engagement_id: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    _: bool = Depends(auth),
+):
+    """List post-run reviews with optional filters."""
+    _ensure_build_poc_reviews_table()
+    eid = _resolve_engagement_id(engagement_id)
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            parts, params = ["1=1"], []
+            if eid:
+                parts.append("(engagement_id = %s OR engagement_id IS NULL)")
+                params.append(eid)
+            if cve:
+                parts.append("cve = %s"); params.append(cve)
+            if ip:
+                parts.append("ip = %s"); params.append(ip)
+            params.append(limit)
+            cur.execute(f"""SELECT id, engagement_id, run_id, cve, ip, port, product,
+                                   verified, stage_reached, summary,
+                                   jsonb_array_length(COALESCE(findings, '[]'::jsonb)) AS findings_count,
+                                   llm_model, created_at
+                            FROM build_poc_reviews
+                            WHERE {' AND '.join(parts)}
+                            ORDER BY created_at DESC LIMIT %s""", params)
+            return [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        raise HTTPException(500, str(e)[:300])
+
+
+@app.get("/build-poc/reviews/{review_id}", tags=["Assets"])
+def get_build_poc_review(review_id: str, _: bool = Depends(auth)):
+    """Get full review detail including findings and recommendations."""
+    _ensure_build_poc_reviews_table()
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM build_poc_reviews WHERE id = %s::uuid", (review_id,))
+            r = cur.fetchone()
+            if not r:
+                raise HTTPException(404, "review not found")
+            return dict(r)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e)[:300])
+
+
+class ReviewFeedbackBody(BaseModel):
+    finding_index: int
+    action: str  # approve | reject | note
+    note: Optional[str] = None
+
+
+@app.post("/build-poc/reviews/{review_id}/feedback", tags=["Assets"])
+def submit_review_feedback(review_id: str, body: ReviewFeedbackBody, _: bool = Depends(auth)):
+    """Submit operator feedback on a review finding. Approved findings are
+    stored back into RAG as learnings for future runs."""
+    _ensure_build_poc_reviews_table()
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM build_poc_reviews WHERE id = %s::uuid", (review_id,))
+            r = cur.fetchone()
+            if not r:
+                raise HTTPException(404, "review not found")
+            findings = r.get("findings") or []
+            if body.finding_index < 0 or body.finding_index >= len(findings):
+                raise HTTPException(400, f"finding_index {body.finding_index} out of range")
+            finding = findings[body.finding_index]
+            feedback = dict(r.get("operator_feedback") or {})
+            feedback[str(body.finding_index)] = {
+                "action": body.action, "note": body.note,
+                "at": str(datetime.now(timezone.utc).isoformat())}
+            cur.execute("""UPDATE build_poc_reviews
+                           SET operator_feedback = %s, updated_at = now()
+                           WHERE id = %s::uuid""",
+                        (Json(feedback), review_id))
+            conn.commit()
+        doc_id = None
+        if body.action == "approve":
+            doc_id = _store_review_learning(
+                review_id, r["cve"], r.get("product"), finding,
+                operator_note=body.note or "", eid=r.get("engagement_id"))
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("build_poc_review_feedback", "build_poc_review", {
+                "review_id": review_id, "finding_index": body.finding_index,
+                "action": body.action, "criterion": finding.get("criterion_id"),
+                "cve": r["cve"], "rag_doc_id": doc_id})
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": True, "action": body.action, "rag_doc_id": doc_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e)[:300])
+
+
+@app.post("/build-poc/reviews/sync-knowledge", tags=["Assets"])
+def sync_review_knowledge(_: bool = Depends(auth)):
+    """Reload review criteria from knowledge/build_poc_review.yaml into RAG."""
+    return _load_build_poc_review_knowledge()
+
+
 @app.get("/build-poc/shadow-runs", tags=["Assets"])
 def build_poc_shadow_runs(limit: int = Query(50, ge=1, le=500),
                           only_divergent: bool = Query(False),
@@ -29601,6 +31555,54 @@ def build_poc_shadow_runs(limit: int = Query(50, ge=1, le=500),
         raise HTTPException(500, f"shadow-run listing failed: {type(e).__name__}: {e}")
 
 
+def _is_synthetic_cve(cve) -> bool:
+    """True when the token was synthesized by the builder, not a real CVE id.
+
+    Checks BOTH prefixes on purpose: `POC-` is current, `NOCVE-` is what rows
+    created before 2026-10-11 carry. Anything that branches on "do we have a
+    real CVE to research" must use this rather than one literal, or older
+    builds start hunting for a CVE that never existed.
+    """
+    return str(cve or "").startswith(("POC-", "NOCVE-"))
+
+
+def _synth_poc_token(ip: str, port, product=None) -> str:
+    """A readable id for a build with no CVE: POC-<ip>-<port>[-<product>]-NNN.
+
+    e.g. `POC-172.18.0.32-9090-lobechat-001`. The counter increments per
+    (ip, port, product) so a re-run against the same target reads as the next
+    attempt. The predecessor was `NOCVE-<unix-epoch>`, which was unique but told
+    the operator nothing and sorted meaninglessly in the Store.
+
+    Uniqueness matters beyond display: this token keys `derived_cve_specs`,
+    `poc_hints`, `build_poc_error_memory` and the Store row, so a repeat would
+    overwrite the previous build's derived spec.
+    """
+    slug = _re_module.sub(r"[^a-z0-9]+", "-", str(product or "").lower()).strip("-")[:24]
+    base = f"POC-{ip}-{port}" + (f"-{slug}" if slug else "")
+    highest = 0
+    # Query each table separately: a deployment missing one of them must not
+    # zero the count from the others and hand back a token already in use.
+    for table in ("exploit_store", "derived_cve_specs", "build_poc_attempts"):
+        try:
+            with get_db() as conn, conn.cursor() as cur:
+                cur.execute(f"SELECT cve FROM {table} WHERE cve LIKE %s", (f"{base}-%",))
+                for (tok,) in cur.fetchall():
+                    tok = str(tok or "")
+                    # Re-check the prefix here rather than trusting the LIKE to
+                    # have done it. Without this the suffix parser happily reads
+                    # the epoch out of an unrelated `NOCVE-1790970623` and
+                    # returns `...-1790970624` as the "next" counter.
+                    if not tok.startswith(base + "-"):
+                        continue
+                    m = _re_module.fullmatch(r"\d{3,}", tok[len(base) + 1:])
+                    if m:
+                        highest = max(highest, int(m.group(0)))
+        except Exception as e:  # noqa: BLE001
+            logging.warning("poc-token counter: %s lookup failed: %s", table, e)
+    return f"{base}-{highest + 1:03d}"
+
+
 @app.post("/software/build-poc", tags=["Assets"])
 def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     """PoC-builder: research -> synthesize -> run-and-refine. Invoking this authorizes
@@ -29612,23 +31614,22 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     the path/query folded into the operator hint)."""
     eid = _validate_engagement_uuid(_resolve_engagement_id())
     cve = (body.cve or "").strip().upper()
-    # cve is optional — synth a NOCVE-<timestamp> token when absent so the
-    # build pipeline (run_id, hints, Store rows) stays unique. Still accepts
-    # a CVE-YYYY-NNNNN id when the operator supplies one.
+    # cve is optional. When absent we synthesize a token AFTER the target is
+    # resolved, so it can name the target it belongs to. Still accepts a
+    # CVE-YYYY-NNNNN id when the operator supplies one.
     if cve and not cve.startswith("CVE-"):
         raise HTTPException(400, "cve must be a CVE id (CVE-YYYY-NNNNN) or empty")
-    if not cve:
-        import time as _ttmp
-        cve = f"NOCVE-{int(_ttmp.time())}"
     ip, port, hint = _resolve_target_url(
         body.target_url, body.ip, body.port, body.endpoint_hint, body.hint)
     if not ip:
         raise HTTPException(400, "either ip or target_url is required")
-    # Without a CVE we need SOMETHING to tell the builder what to look for.
-    # Require either a product name or an endpoint hint so synth has signal.
-    if cve.startswith("NOCVE-") and not (body.product or hint or body.target_url):
-        raise HTTPException(400, "without a CVE, supply at least product, "
-                                 "target_url, or endpoint_hint so synth has signal")
+    if not cve:
+        # Without a CVE we need SOMETHING to tell the builder what to look for.
+        # Require either a product name or an endpoint hint so synth has signal.
+        if not (body.product or hint or body.target_url):
+            raise HTTPException(400, "without a CVE, supply at least product, "
+                                     "target_url, or endpoint_hint so synth has signal")
+        cve = _synth_poc_token(ip, port, body.product)
     # Fail-closed authorization: an operator "release" grants this endpoint (standing,
     # revocable); otherwise a grant must already exist. No grant -> refuse.
     if body.release:
@@ -29950,6 +31951,7 @@ def approve_refine_pattern(pattern_id: str,
         conn.commit()
     _REFINE_PATTERNS_CACHE["t"] = 0.0  # bust cache
     try:
+        from webhooks import emit_webhook
         emit_webhook("refine_pattern_approved", "rag-knowledge",
                      {"id": pattern_id, "operator": body.operator})
     except Exception:  # noqa: BLE001
@@ -29988,6 +31990,7 @@ def mine_refine_patterns(min_hits: int = 3,
     daemon; operators can also trigger ad-hoc from the UI."""
     promoted = _mine_refine_pattern_candidates(limit=limit, min_hits=min_hits)
     try:
+        from webhooks import emit_webhook
         emit_webhook("refine_patterns_mined", "rag-knowledge",
                      {"promoted": len(promoted), "signals": [p["signal"] for p in promoted]})
     except Exception:  # noqa: BLE001
@@ -30049,6 +32052,7 @@ def grant_poc_endpoint(body: PocGrantBody, authorized: bool = Depends(auth)):
     eid = _validate_engagement_uuid(_resolve_engagement_id())
     _grant_poc(body.ip, body.port, eid, granted_by="operator", note=body.note or "")
     try:
+        from webhooks import emit_webhook
         emit_webhook("poc_grant_released", "software",
                      {"target": _poc_target_key(body.ip, body.port), "engagement_id": eid})
     except Exception:  # noqa: BLE001
@@ -30066,6 +32070,7 @@ def revoke_poc_endpoint(ip: str, port: Optional[int] = None, authorized: bool = 
         n = cur.rowcount
         conn.commit()
     try:
+        from webhooks import emit_webhook
         emit_webhook("poc_grant_revoked", "software", {"target": _poc_target_key(ip, port), "revoked": n})
     except Exception:  # noqa: BLE001
         pass
@@ -30476,6 +32481,7 @@ def _save_exploit_store(name, cve=None, kind="cve_poc", target_host=None, target
                  Json(metadata or {}), created_by))
             new_id = str(cur.fetchone()[0]); conn.commit()
         try:
+            from webhooks import emit_webhook
             emit_webhook("exploit_store_saved", "exploit_store",
                          {"id": new_id, "cve": cve, "kind": kind, "verified": verified,
                           "target": target_host, "engagement_id": eid})
@@ -30621,6 +32627,8 @@ def list_exploit_store(cve: Optional[str] = None, kind: Optional[str] = None,
                        engagement_id: Optional[str] = None,
                        all_engagements: bool = False,
                        scope_only: bool = False,
+                       sort_by: Optional[str] = None,
+                       sort_order: Optional[str] = None,
                        authorized: bool = Depends(auth)):
     """List saved exploits (Exploit Store). Filter by cve/kind/verified.
 
@@ -30670,7 +32678,11 @@ def list_exploit_store(cve: Optional[str] = None, kind: Optional[str] = None,
            "FROM exploit_store es")
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY es.updated_at DESC LIMIT %s"; args.append(max(1, min(1000, limit)))
+    _SORT_COLS = {"time": "es.built_at", "ip": "es.target_host", "cve": "es.cve",
+                  "name": "es.name", "updated": "es.updated_at", "verified": "es.verified"}
+    col = _SORT_COLS.get(sort_by, "es.updated_at")
+    direction = "ASC" if sort_order == "asc" else "DESC"
+    sql += f" ORDER BY {col} {direction} NULLS LAST LIMIT %s"; args.append(max(1, min(1000, limit)))
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(sql, args)
         return {"exploits": [dict(r) for r in cur.fetchall()],
@@ -30818,6 +32830,10 @@ def get_derivation_intel(exploit_id: str, authorized: bool = Depends(auth)):
 # strategist never reached the key trace.
 _KEY_TRACE_PHASES = {
     "cve_spec_derivation", "synth_seeded_from_confirmed",
+    # Whether projectdiscovery already ships a check for this CVE. Key, not
+    # noise: if a verified template existed and the build still failed, that is
+    # the first thing the reviewer needs to see.
+    "nuclei_template_available",
     "enforced_resolved_ids", "enforced_request_contract",
     "challenge_building_blocks", "readiness_gate",
     "recon:access_enumeration", "poc_captured_credentials",
@@ -30929,6 +32945,7 @@ def update_exploit_store(exploit_id: str, body: ExploitStoreUpdateBody,
         cur.execute(f"UPDATE exploit_store SET {', '.join(fields)} WHERE id = %s RETURNING *", args)
         row = cur.fetchone(); conn.commit()
     try:
+        from webhooks import emit_webhook
         emit_webhook("exploit_store_updated", "exploit_store", {"id": exploit_id})
     except Exception:  # noqa: BLE001
         pass
@@ -31345,6 +33362,54 @@ def _review_source_links(md: dict, intel: dict, target_host=None, cap=60) -> lis
     return rows
 
 
+def _md_github_slug(text: str, seen: dict) -> str:
+    """GitHub's heading-anchor slug, with its duplicate suffixing.
+
+    Lowercase, drop everything that is not a word char / space / hyphen, then
+    spaces to hyphens. A repeated slug gets -1, -2, ... exactly as GitHub does,
+    so "## Confirmed facts (12)" -> `confirmed-facts-12` and a second identical
+    heading -> `confirmed-facts-12-1`. Anchors must match or the links are dead.
+    """
+    slug = _re_module.sub(r"[^\w\s-]", "", text.lower()).strip()
+    slug = _re_module.sub(r"[\s_]+", "-", slug)
+    n = seen.get(slug, 0)
+    seen[slug] = n + 1
+    return slug if n == 0 else f"{slug}-{n}"
+
+
+def _md_toc(body: list) -> list:
+    """A linked index of the `##`/`###` headings actually present in `body`.
+
+    Derived from the emitted lines rather than a fixed list, because almost
+    every section here is conditional — a hardcoded index would advertise
+    sections a given report does not contain, and silently omit new ones.
+    Returns [] when there is nothing worth indexing.
+    """
+    headings = []
+    in_fence = False
+    for line in body:
+        s = str(line)
+        # Don't index "## ..." inside a fenced code block (command output and
+        # captured HTTP bodies routinely contain lines starting with #).
+        if s.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        m = _re_module.match(r"^(#{2,3})\s+(.*\S)\s*$", s)
+        if m:
+            headings.append((len(m.group(1)), m.group(2)))
+    if len(headings) < 2:
+        return []
+    seen: dict = {}
+    out = ["## Contents", ""]
+    for level, text in headings:
+        indent = "  " * (level - 2)
+        out.append(f"{indent}- [{text}](#{_md_github_slug(text, seen)})")
+    out.append("")
+    return out
+
+
 def _render_review_md(r: dict, intel: dict, failure_analysis=None, live_recon=None) -> str:
     """The review.md body, shared by the exploit-store export and the
     build-poc attempt export (which has no store row). `r` is a row-like dict:
@@ -31708,12 +33773,35 @@ def _render_review_md(r: dict, intel: dict, failure_analysis=None, live_recon=No
         out.append("")
         for t in trace:
             out.append(f"### `{t.get('phase')}` (iter {t.get('iteration') or '?'}, {t.get('ts') or ''})")
+            if t.get("llm_model"):
+                out.append(f"**model:** `{t['llm_model']}`")
+            prompt = (t.get("prompt") or "").strip()
+            if prompt:
+                out.append("")
+                out.append("<details><summary>prompt (%d chars)</summary>" % len(prompt))
+                out.append("")
+                out.append("```")
+                out.append(prompt[:8000])
+                out.append("```")
+                out.append("</details>")
             resp = (t.get("response") or "").strip()
             if resp:
+                out.append("")
+                out.append("**response:**")
                 out.append("")
                 out.append("```")
                 out.append(resp[:4000])
                 out.append("```")
+            run_out = (t.get("run_output") or "").strip()
+            if run_out:
+                out.append("")
+                out.append("**target output:**")
+                out.append("")
+                out.append("```")
+                out.append(run_out[:4000])
+                out.append("```")
+            if t.get("assertion_passed") is not None:
+                out.append(f"\n**assertion:** {'PASS' if t['assertion_passed'] else 'FAIL'}")
             extra = t.get("extra") or {}
             if extra:
                 out.append("")
@@ -31742,17 +33830,41 @@ def _render_review_md(r: dict, intel: dict, failure_analysis=None, live_recon=No
     if full_tr:
         out.append(f"## Full PoC trace ({len(full_tr)} entries)")
         out.append("")
-        out.append("_Every phase the pipeline emitted, in order. Response bodies truncated to "
+        out.append("_Every phase the pipeline emitted, in order. Bodies truncated to "
                    "4000 chars; the raw JSONL lives at `poc_log_path` inside rag-api._")
         out.append("")
         for t in full_tr:
-            out.append(f"### `{t.get('phase') or '?'}` — iter {t.get('iteration') or '?'} — {t.get('ts') or ''}")
+            phase_label = t.get('phase') or '?'
+            out.append(f"### `{phase_label}` — iter {t.get('iteration') or '?'} — {t.get('ts') or ''}")
+            if t.get("llm_model"):
+                out.append(f"**model:** `{t['llm_model']}`")
+            prompt = (t.get("prompt") or "").strip()
+            if prompt:
+                out.append("")
+                out.append("<details><summary>prompt (%d chars)</summary>" % len(prompt))
+                out.append("")
+                out.append("```")
+                out.append(prompt[:8000])
+                out.append("```")
+                out.append("</details>")
             resp = (t.get("response") or "").strip()
             if resp:
+                out.append("")
+                out.append("**response:**")
                 out.append("")
                 out.append("```")
                 out.append(resp[:4000])
                 out.append("```")
+            run_out = (t.get("run_output") or "").strip()
+            if run_out:
+                out.append("")
+                out.append("**target output:**")
+                out.append("")
+                out.append("```")
+                out.append(run_out[:4000])
+                out.append("```")
+            if t.get("assertion_passed") is not None:
+                out.append(f"\n**assertion:** {'PASS' if t['assertion_passed'] else 'FAIL'}")
             extra = t.get("extra") or {}
             if extra:
                 out.append("")
@@ -31761,6 +33873,14 @@ def _render_review_md(r: dict, intel: dict, failure_analysis=None, live_recon=No
 
     if not metrics and not research and not spec and not facts and not creds and not foots and not trace and not manual and not full_tr and not failure_analysis:
         out.append("_No derivation evidence stored for this exploit yet._")
+    # Index the sections. Inserted just before the first heading so it sits
+    # under the title + target line, and built from `out` as it finally stands
+    # so it lists exactly the sections this report contains.
+    toc = _md_toc(out)
+    if toc:
+        first = next((i for i, ln in enumerate(out)
+                      if _re_module.match(r"^#{2,3}\s+\S", str(ln))), len(out))
+        out = out[:first] + toc + out[first:]
     return "\n".join(out).rstrip() + "\n"
 
 
@@ -31831,6 +33951,7 @@ def exploit_manual_research_search(exploit_id: str, body: ManualResearchSearchBo
             (json.dumps([entry], default=str), exploit_id))
         conn.commit()
     try:
+        from webhooks import emit_webhook
         emit_webhook("exploit_manual_research_search", "exploit_store",
                      {"id": exploit_id, "query": q, "hits": len(hits),
                       "search_error": bool(search_err)})
@@ -31876,6 +33997,7 @@ def push_exploit_to_node(exploit_id: str, body: ExploitPushBody, authorized: boo
     fn = body.filename or f"{_re.sub(r'[^A-Za-z0-9_.-]+','_', row['cve'] or row['name'] or 'exploit')}_poc.py"
     result = _push_python_over_ssh(code, ssh_user, ssh_host, ssh_key, dest_dir, fn)
     try:
+        from webhooks import emit_webhook
         emit_webhook("exploit_store_pushed", "exploit_store",
                      {"id": exploit_id, "node_id": body.node_id, "ok": result.get("ok"),
                       "dest": result.get("dest")})
@@ -32006,6 +34128,7 @@ def send_exploit_to_burp(exploit_id: str, authorized: bool = Depends(auth)):
              row["rationale"] or "", cves, json.dumps(meta, default=str)))
         qid = str(cur.fetchone()[0]); conn.commit()
     try:
+        from webhooks import emit_webhook
         emit_webhook("exploit_store_sent_to_burp", "exploit_store",
                      {"id": exploit_id, "queue_id": qid, "cve": row["cve"], "target": row["target_host"]})
     except Exception:  # noqa: BLE001
@@ -32220,6 +34343,7 @@ def restore_exploit_version(exploit_id: str, version: int, authorized: bool = De
                      v["http_request"], v["rationale"], v["verified"], v["llm_model"], exploit_id))
         row = cur.fetchone(); conn.commit()
     try:
+        from webhooks import emit_webhook
         emit_webhook("exploit_store_version_restored", "exploit_store",
                      {"id": exploit_id, "restored_version": version})
     except Exception:  # noqa: BLE001
@@ -33403,6 +35527,7 @@ def _register_web_session_access(ip, port, username, cookie, product=None,
                 logging.debug("mirror web_session->credential_findings failed: %s", e)
             c.commit()
         try:
+            from webhooks import emit_webhook
             emit_webhook("foothold_web_session", "access",
                          {"target": str(ip), "port": port, "user": username,
                           "product": product, "engagement_id": eid})
@@ -34179,6 +36304,7 @@ def research_exploit_endpoint(body: ResearchExploitBody, authorized: bool = Depe
         raise HTTPException(400, "cve must be a CVE id")
     out = _research_exploit(cve, body.ip, body.port, body.product, body.version, model=body.model)
     try:
+        from webhooks import emit_webhook
         emit_webhook("exploit_research_run", "exploit_store",
                      {"cve": cve, "target": body.ip,
                       "has_public_module": out["sources"]["has_public_module"],
@@ -34233,6 +36359,7 @@ def research_for_exploit(exploit_id: str, seed: bool = False, authorized: bool =
                         (json.dumps(analysis, default=str), exploit_id))
             conn.commit()
     try:
+        from webhooks import emit_webhook
         emit_webhook("exploit_research_run", "exploit_store",
                      {"id": exploit_id, "cve": row["cve"], "seeded": seeded,
                       "has_public_module": out["sources"]["has_public_module"]})
@@ -34349,6 +36476,7 @@ def tweak_with_burp(exploit_id: str, body: TweakWithBurpBody, authorized: bool =
     except Exception as e:  # noqa: BLE001
         logging.debug("tweak LLM reply parse failed: %s", e)
     try:
+        from webhooks import emit_webhook
         emit_webhook("exploit_tweak_with_burp", "exploit_store", {
             "id": exploit_id, "cve": row.get("cve"), "target": ctx["target"],
             "has_suggestion": bool(suggestion.get("suggested_command")),
@@ -34474,6 +36602,7 @@ def exploit_bakeoff(exploit_id: str, body: BakeoffBody, authorized: bool = Depen
         pass
     results = [_bakeoff_one(row["cve"], ip, port, exploit_id, m, eid, guidance) for m in models]
     try:
+        from webhooks import emit_webhook
         emit_webhook("exploit_bakeoff", "exploit_store",
                      {"id": exploit_id, "cve": row["cve"], "target": ip, "models": len(models),
                       "hits": sum(1 for x in results if x.get("canary_hit"))})
@@ -34659,6 +36788,7 @@ def _resolve_and_queue_exploit(cve, ip, port, product, version, eid, dedupe=True
               cmd, Json(params), 0.9, reason, Json(meta), asset_id, eid, edb_id))
         conn.commit()
     try:
+        from webhooks import emit_webhook
         emit_webhook("cve_exploit_resolved", "software",
                      {"cve": cve, "method": method, "target": ip, "pending_exploit_id": pid})
     except Exception:  # noqa: BLE001
@@ -37641,6 +39771,93 @@ def _infer_target_type(target: str) -> str:
         return "ip"
     except ValueError:
         return "domain"
+
+
+#: Every column of a scope target, in export order. `engagement_name` is
+#: joined, not stored — an export keyed only by a uuid is not usable in a
+#: spreadsheet, which is the whole point of the format.
+SCOPE_EXPORT_COLUMNS = [
+    "id", "name", "target", "target_type", "source", "added_at",
+    "engagement_id", "engagement_name",
+]
+
+
+@app.get("/scope/export.csv", tags=["Scope"])
+def export_scope_csv(
+    name: Optional[str] = Query(None, description="One scope name; omit for every scope the engagement can see"),
+    engagement_id: Optional[str] = Query(None, description="Overrides the X-Engagement-Id header"),
+    all_engagements: bool = Query(False, description="Cross-engagement export; the caller must label this in the UI"),
+    include_placeholders: bool = Query(False, description="Include the empty placeholder rows list_scope_names hides"),
+    _: bool = Depends(auth),
+):
+    """Scope targets as CSV, with every field.
+
+    Deterministic: ordered by (name, target) rather than added_at, so two
+    exports of unchanged data are byte-identical and diffable — CLAUDE.md
+    requires exports to be deterministic and documented.
+
+    Engagement-filtered like every other listing endpoint: the active
+    X-Engagement-Id plus NULL-engagement rows (legacy/global, intentionally
+    visible in every engagement). `all_engagements=true` is the explicit
+    operator override for a cross-engagement audit.
+    """
+    import csv as _csv
+    import datetime as _dt
+    import io as _io
+
+    eid = None if all_engagements else _resolve_engagement_id(engagement_id)
+    where, args = ["TRUE"], []
+    if not include_placeholders:
+        where.append("st.target <> '' AND st.source IS DISTINCT FROM %s")
+        args.append(_SCOPE_PLACEHOLDER_SOURCE)
+    if name:
+        where.append("LOWER(st.name) = LOWER(%s)")
+        args.append(name)
+    if eid:
+        where.append("(st.engagement_id = %s OR st.engagement_id IS NULL)")
+        args.append(eid)
+
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""SELECT st.id::text AS id, st.name, st.target,
+                       COALESCE(st.target_type, '') AS target_type,
+                       COALESCE(st.source, '')      AS source,
+                       st.added_at,
+                       COALESCE(st.engagement_id::text, '') AS engagement_id,
+                       COALESCE(e.name, '')                 AS engagement_name
+                  FROM scope_targets st
+                  LEFT JOIN engagements e ON e.id = st.engagement_id
+                 WHERE {' AND '.join(where)}
+                 ORDER BY st.name, st.target""",
+            args,
+        )
+        rows = cur.fetchall()
+
+    buf = _io.StringIO()
+    w = _csv.DictWriter(buf, fieldnames=SCOPE_EXPORT_COLUMNS,
+                        extrasaction="ignore", lineterminator="\n")
+    w.writeheader()
+    for r in rows:
+        d = dict(r)
+        # ISO-8601 so a spreadsheet and a diff both read it the same way.
+        d["added_at"] = r["added_at"].isoformat() if r.get("added_at") else ""
+        w.writerow(d)
+
+    stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
+    fname = f"scope-targets-{(name or 'all').replace('/', '_')}-{stamp}.csv"
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("scope_targets_exported", "scope", {
+            "scope_name": name or "(all)", "rows": len(rows),
+            "engagement_id": eid, "all_engagements": bool(all_engagements),
+        })
+    except Exception:  # noqa: BLE001
+        pass
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
 
 
 @app.get("/scope/conflicts", tags=["Scope"])
@@ -48038,6 +50255,7 @@ def _refine_mine_sweep_loop():
                         logging.info("refine-mine promoted %d pending patterns",
                                      len(promoted))
                         try:
+                            from webhooks import emit_webhook
                             emit_webhook("refine_patterns_mined", "rag-knowledge",
                                          {"promoted": len(promoted),
                                           "signals": [p["signal"] for p in promoted]})

@@ -448,3 +448,114 @@ cycle, else the local import), pyflakes reports 0 undefined names, and
 `BASELINE_COUNT["app/rag-api/api.py"]` is 0.
 **Enforced by:** `tests/test_pyflakes_undefined_names.py` (ratchet; fails on
 growth or on any new name)
+
+## The Flow-authoring UI calls `/api/rules`, which no BFF router proxies
+**Found:** 2026-10-11, by the new frontend→BFF route guard
+**Evidence:** `tests/test_frontend_route_contracts.py` lists five `apiFetch`
+call sites in `dashboard/frontend/src/api/flows.ts` (lines 62, 75, 87, 100, 111)
+whose paths resolve to no declared BFF route. rag-api declares the endpoints;
+`grep -rn '"/api/rules' dashboard/bff/` returns **nothing**, so only the proxy
+leg is missing. `flows.ts` is imported by `dashboard/frontend/src/pages/KnowledgeBase.tsx:33`,
+so the Flow-authoring surface is live and every one of its calls 404s.
+**Where:** `dashboard/bff/routers/` (no owner yet) — the fix is the same shape as
+the `/api/software/poc-hints` proxies added to `routers/assets.py` in this change.
+**Done when:** the five paths are proxied, the five `FRONTEND_DEBT` entries in
+`tests/test_frontend_route_contracts.py` are deleted, and creating + testing a
+rule from the Knowledge Base page round-trips.
+**Enforced by:** `tests/test_frontend_route_contracts.py::test_frontend_paths_resolve`
+(the five entries are in `FRONTEND_DEBT`; `test_no_stale_debt` fails if they are
+fixed without being removed)
+
+## `0.0.0.0` is an undeclared sentinel, and host views must exclude it
+**Found:** 2026-10-11 (corrected from an earlier, partly wrong reading of the same
+evidence)
+**Evidence:** 40 live `assets` rows in the **redteam3** engagement carry
+`ip = 0.0.0.0` with a real hostname (`umn-live.legacycorp.net`, `ijmca.legacycorp.net`, …),
+`last_seen` today. This is NOT corruption: `0.0.0.0` is a deliberate convention
+meaning "hostname known, IP unresolvable" — see `app/rag-api/api.py:1908`
+("Can't resolve — store as 0.0.0.0, keep hostname in metadata"), the branch at
+`api.py:1596`, and the fallback in `etl/parse_httpx.py`. The defect is that the
+convention is **undeclared** (no constant, no column comment, no schema note) and
+that any view grouping by `ip` presents the sentinel as a scanned host. Fixed in
+`/ports/summary`; other host-grouped views have not been audited.
+**Where:** `assets.ip` (NOT NULL inet, so a hostname-only asset is not
+representable); every reader that groups or lists by `a.ip`.
+**Done when:** the sentinel is named in one place both writers and readers import
+rather than being a bare literal in at least four files; every host-grouped view
+excludes it (audit `assets`/host listings beyond `/ports/summary`); and the
+decision is recorded on whether `assets.ip` should become nullable so an
+unresolved hostname needs no sentinel at all. The nullable-ip migration was NOT
+attempted here: `ip` is NOT NULL with a unique index on
+`(ip, COALESCE(hostname,''))`, and changing it on a live engagement's data
+without auditing every reader that assumes non-null is a larger change than the
+bug warrants.
+**Enforced by:** not enforced
+
+### ffuf's own data has two homes: `recon_findings` and `web_findings`
+**Found:** 2026-10-12
+**Evidence:** `etl/parse_ffuf.py:109` writes `INSERT INTO recon_findings (...)
+source='ffuf', finding_type='web_path'` for the `/ingest/ffuf` file-upload route
+(`app/rag-api/api.py:4908`). The Strategy 0 parser added today
+(`etl/parse_tool_output.py::_parse_content_discovery`) writes the SAME facts to
+`web_findings` with `issue_type='discovered_path'`, because that is where the
+sibling content-discovery parsers put them (`etl/parse_katana.py`,
+`etl/parse_httpx.py`). The two paths therefore dedupe against different keys —
+`recon_fingerprint(source, finding_type, target, data)` vs
+`web_fingerprint(url, source, name, issue_type)` — so one uploaded ffuf JSON and
+one dispatched ffuf run over the same host produce two unrelated sets of rows
+that no query joins. Same split exists for `etl/parse_gau.py` (recon_findings)
+against `parse_katana`/`parse_httpx` (web_findings), so this is the general
+shape, not an ffuf quirk.
+**Where:** `etl/parse_ffuf.py`, `etl/parse_tool_output.py::_parse_content_discovery`,
+`etl/parse_gau.py`.
+**Done when:** a discovered URL has ONE home. Either `parse_ffuf` is rewritten to
+call `_parse_content_discovery`'s writer (upload and dispatch then share a
+fingerprint), or the decision is recorded that `recon_findings` holds
+discovery-of-hosts and `web_findings` discovery-of-URLs, with `parse_ffuf` and
+`parse_gau` moved to the latter. Not attempted here: `recon_findings` rows from
+the upload route already exist in the live database and moving them is a
+migration, not a parser change.
+**Enforced by:** not enforced
+
+### ffuf and feroxbuster have no `knowledge/extractors/*.yaml` spec
+**Found:** 2026-10-12
+**Evidence:** `ls knowledge/extractors/` lists 13 specs including
+`gobuster.yaml`, whose `notable:` block turns "N paths discovered by content
+brute force" into a `recon_findings` fact via
+`app/rag-api/output_analysis.analyse_output` →
+`post_review_agent.ingest_extracted_facts`. `_spec_for("ffuf")` and
+`_spec_for("feroxbuster")` both return None, so neither tool contributes a
+notable fact to a post-review report even though both now parse. gobuster is the
+DEFAULT content-discovery tool (`knowledge/content_discovery.yaml:
+default_tool: gobuster`) and ffuf/feroxbuster are its two alternates, so the
+three behave differently in the review surface purely by accident of which got a
+spec first.
+**Where:** `knowledge/extractors/` (no `ffuf.yaml`, no `feroxbuster.yaml`).
+**Done when:** both tools have a spec with the same `notable:` facts gobuster
+declares, OR `analyse_output` reads the `PARSERS` registry result when no spec
+exists so a registry parser also produces notable facts. Note the RAG-coverage
+ratchet: a new `knowledge/*.yaml` must ship its loader in the same change
+(`tests/test_knowledge_rag_coverage.py`).
+**Enforced by:** not enforced
+
+### A multi-CWE CVE gets one payload family, and the rest are discarded
+**Found:** 2026-10-12
+**Evidence:** `_vuln_class_from_cve` returns a single string. CVE-2024-3408's NVD
+record carries `['CWE-798', 'CWE-94']` (observed in
+`software_research_cache.results->'cwe'` during the 2026-10-12 focused-10 run).
+The new CWE-first lookup iterates in NVD order, so `CWE-798` → `auth-bypass`
+wins and `CWE-94` → `cmdi` is discarded. The advisory describes the CVE as "an
+authentication bypass AND remote code execution (RCE)", and the baseline run's
+command did both — forged a Flask session, then attempted code execution — so
+the single class names only half the exploit. `_CRAFT_CLASS_GUIDANCE` is then
+selected by that one class, and the crafter is given auth-bypass guidance for
+an exploit whose payoff is RCE. CVE-2024-3408 has never landed in any archived
+run (`Docs/run_archive.*`: regex_missed / dup_exit every time).
+**Where:** `app/rag-api/api.py::_vuln_class_from_cve`,
+`app/rag-api/api.py::_CRAFT_CLASS_GUIDANCE`, `_llm_craft_payload`.
+**Done when:** a CVE with several mapped CWEs carries an ordered list of classes
+and the crafter sees guidance for the chain (e.g. "auth-bypass to reach the sink,
+then cmdi for the payload"), rather than guidance for whichever CWE sorted first.
+Pre-existing: the description-only classifier had the same single-value shape, so
+this is not a regression introduced by the CWE lookup.
+**Enforced by:** not enforced

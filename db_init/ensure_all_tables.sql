@@ -426,6 +426,12 @@ CREATE TABLE IF NOT EXISTS public.scan_recommendations (
     asset_id    uuid REFERENCES public.assets(id) ON DELETE CASCADE,
     ip          inet,
     service     text,
+    -- The port this recommendation is aimed at. Without it, dedup had to key on
+    -- (ip, service), so a host with four `http` ports (an app on 9090 plus
+    -- harness ports) counted as covered the moment ANY one of them got a
+    -- recommendation — the other three were never scanned. The value was
+    -- already being carried in extra->>'port'; this makes it queryable.
+    port        integer,
     banner      text,
     scanner     text NOT NULL,
     action      text,
@@ -461,6 +467,19 @@ DO $$ BEGIN
     ALTER TABLE public.scan_recommendations
         ADD COLUMN IF NOT EXISTS target_kind text NOT NULL DEFAULT 'service';
 EXCEPTION WHEN OTHERS THEN NULL; END $$;
+-- Existing installs: add port, and backfill it from where it was already being
+-- written so the dedup key is correct for rows created before the column.
+DO $$ BEGIN
+    ALTER TABLE public.scan_recommendations ADD COLUMN IF NOT EXISTS port integer;
+EXCEPTION WHEN OTHERS THEN NULL; END $$;
+DO $$ BEGIN
+    UPDATE public.scan_recommendations
+       SET port = NULLIF(extra->>'port', '')::integer
+     WHERE port IS NULL AND extra ? 'port'
+       AND NULLIF(extra->>'port', '') ~ '^[0-9]+$';
+EXCEPTION WHEN OTHERS THEN NULL; END $$;
+CREATE INDEX IF NOT EXISTS idx_scan_recommendations_ip_service_port
+    ON public.scan_recommendations(ip, service, port);
 DO $$ BEGIN
     ALTER TABLE public.scan_recommendations
         ADD CONSTRAINT scan_recommendations_target_kind_check
@@ -1596,6 +1615,33 @@ CREATE TABLE IF NOT EXISTS public.build_poc_attempts (
 CREATE INDEX IF NOT EXISTS ix_bpa_cve_ip ON public.build_poc_attempts(cve, ip, created_at DESC);
 CREATE INDEX IF NOT EXISTS ix_bpa_eng ON public.build_poc_attempts(engagement_id);
 
+-- 2026-10-10: post-run review agent results. Each row is a structured review
+-- of a build-PoC run, with findings evaluated against RAG-stored criteria.
+-- Operator feedback (approve/reject/note) feeds back into rag_documents so
+-- future runs learn from past reviews.
+CREATE TABLE IF NOT EXISTS public.build_poc_reviews (
+    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id   uuid,
+    run_id          text NOT NULL,
+    cve             text NOT NULL,
+    ip              text NOT NULL,
+    port            int,
+    product         text,
+    verified        boolean DEFAULT false,
+    stage_reached   text,
+    findings        jsonb NOT NULL DEFAULT '[]'::jsonb,
+    summary         text,
+    recommendations jsonb DEFAULT '[]'::jsonb,
+    operator_feedback jsonb,
+    rag_learning_ids text[] DEFAULT '{}',
+    llm_model       text,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    updated_at      timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_bpr_run ON public.build_poc_reviews(run_id);
+CREATE INDEX IF NOT EXISTS ix_bpr_cve ON public.build_poc_reviews(cve, ip, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_bpr_eng ON public.build_poc_reviews(engagement_id);
+
 -- 2026-10-09: cross-run error memory. One row per FAILING build-PoC iteration:
 -- the normalised error signature, the command that produced it, what the next
 -- command changed and whether a later iteration passed. The refine loop reads
@@ -2662,6 +2708,12 @@ INSERT INTO public.app_settings (key, value, category) VALUES
   ('llm.reasoning_effort.cve_poc_synth',           'high', 'config'),
   ('llm.reasoning_effort.decomposed_craft',        'high', 'config'),
   ('llm.reasoning_effort.cve_poc_refine',          'high', 'config'),
+  -- 2026-10-12 build-PoC limits (counts, not seconds). Read by rag-api
+  -- _build_poc_second_pass_iters(), written by the BFF
+  -- /api/settings/build-poc-limits (Settings -> Scan Timeouts). The deep-recon
+  -- go-around used to be a hard 10, which was the binding cap on every CVE
+  -- that needed deep recon: a request for 50 was clamped to 10.
+  ('build_poc_second_pass_iters',                  '50',   'config'),
   -- 2026-10-10 db-txn-watchdog (rag-api): alert on transactions older than N min;
   -- terminate when > 0 (Postgres 16 has no transaction_timeout of its own).
   ('db_txn_alert_after_min',                       '15',   'config'),
@@ -2754,6 +2806,8 @@ ALTER TABLE public.vulns ADD COLUMN IF NOT EXISTS verified_at timestamptz;
 ALTER TABLE public.vulns ADD COLUMN IF NOT EXISTS tester_notes text;
 ALTER TABLE public.vulns ADD COLUMN IF NOT EXISTS original_severity text;
 ALTER TABLE public.vulns ADD COLUMN IF NOT EXISTS report_ready boolean DEFAULT false;
+ALTER TABLE public.vulns ADD COLUMN IF NOT EXISTS cwe text[] DEFAULT '{}';
+CREATE INDEX IF NOT EXISTS idx_vulns_cwe_gin ON public.vulns USING GIN (cwe);
 
 ALTER TABLE public.web_findings ADD COLUMN IF NOT EXISTS workflow_status text DEFAULT 'new'
     CHECK (workflow_status IN ('new','triaging','confirmed','false_positive','accepted_risk','in_report','deferred'));
@@ -6394,6 +6448,150 @@ ALTER TABLE web_auth_configs DROP CONSTRAINT IF EXISTS web_auth_configs_host_key
 CREATE UNIQUE INDEX IF NOT EXISTS ux_web_auth_configs_eng_host
   ON web_auth_configs (COALESCE(engagement_id, '00000000-0000-0000-0000-000000000000'::uuid), host);
 
+-- ── Exploit-intel persistence (runtime-ensured too; here for clean installs) ──
+-- Confirmed-facts ledger: durable record of verified target/exploit state
+-- (session validity, endpoint existence, resolved object-ids, version
+-- applicability, vendor-doc answers) reused across attacks. TARGET-level
+-- facts carry cve=NULL so any attack against the same target reuses them.
+-- Identity includes PRODUCT: the same ip:port runs multiple apps (Zabbix the
+-- application vs Apache the web server) and a fact for one is not a fact for
+-- the other. host (hostname/vhost) is tracked distinctly from the ip.
+CREATE TABLE IF NOT EXISTS public.confirmed_facts (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id uuid, target text NOT NULL, host text, product text,
+    version text, cve text,
+    claim_type text NOT NULL, claim_key text NOT NULL, claim_value text,
+    status text NOT NULL, evidence text, method text,
+    confidence real NOT NULL DEFAULT 0.9, ttl_seconds int NOT NULL DEFAULT 0,
+    source_run_id text,
+    confirmed_at timestamptz NOT NULL DEFAULT now(),
+    last_checked_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_confirmed_fact ON public.confirmed_facts
+    (target, COALESCE(product,''), claim_type, claim_key,
+     COALESCE(claim_value,''), COALESCE(cve,''));
+CREATE INDEX IF NOT EXISTS idx_confirmed_target
+    ON public.confirmed_facts (target, COALESCE(product,''));
+
+-- AGENT-DERIVED CVE EXPLOIT SPECS (auto-derivation pipeline persists verified recipes here)
+CREATE TABLE IF NOT EXISTS public.derived_cve_specs (
+    cve           text PRIMARY KEY,
+    product       text,
+    version       text,
+    vuln_class    text,
+    spec          jsonb NOT NULL,
+    verified      boolean NOT NULL DEFAULT false,
+    verify_method text,
+    verify_evidence text,
+    source        text,
+    derived_at    timestamptz NOT NULL DEFAULT now(),
+    last_verified timestamptz,
+    status        text NOT NULL DEFAULT 'tentative',  -- 'tentative' | 'verified' | 'refuted'
+    attempts      integer NOT NULL DEFAULT 0,
+    last_failure  text,
+    refine_hints  jsonb NOT NULL DEFAULT '{}'::jsonb  -- {tried_payloads:[], tried_endpoints:[], tried_proof_models:[], notes:""}
+);
+-- Idempotent columns for in-place upgrades (ensure_all_tables runs on existing DBs too)
+ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'tentative';
+ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS attempts integer NOT NULL DEFAULT 0;
+ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS last_failure text;
+ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS refine_hints jsonb NOT NULL DEFAULT '{}'::jsonb;
+
+-- Discovered app knowledge: per-product/version facts the build loop learns
+-- (endpoints, params, csrf source, cookie shape, secondary products).
+CREATE TABLE IF NOT EXISTS public.discovered_app_knowledge (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    product text NOT NULL, version text, fact_type text NOT NULL, fact_value text NOT NULL,
+    confidence real NOT NULL DEFAULT 0.5, discovered_from text, source_run_id text,
+    engagement_id uuid, hits int NOT NULL DEFAULT 1,
+    last_seen_at timestamptz NOT NULL DEFAULT now(),
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_dak_product ON public.discovered_app_knowledge (lower(product));
+
+-- ─── SAST findings (Semgrep / static-analysis source-code scans) ────────────
+-- Source-code level findings from static analysis tools.  NOT limited to web
+-- apps — covers any language/framework Semgrep supports. Tied to an engagement
+-- and optionally to a target host (when the source corresponds to a deployed
+-- service). The build-PoC gather phase reads these to know the exact injection
+-- point, parameter, and code path to target.
+CREATE TABLE IF NOT EXISTS public.sast_findings (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id uuid,
+    scan_id       text,
+    source_type   text NOT NULL DEFAULT 'upload',
+    source_url    text,
+    target_host   text,
+    target_port   integer,
+    rule_id       text NOT NULL,
+    severity      text CHECK (severity IN ('info','low','medium','high','critical') OR severity IS NULL),
+    confidence    text,
+    vuln_class    text,
+    file_path     text,
+    line_start    integer,
+    line_end      integer,
+    col_start     integer,
+    col_end       integer,
+    matched_code  text,
+    message       text,
+    fix           text,
+    cwe           text[] DEFAULT '{}',
+    owasp         text[] DEFAULT '{}',
+    metadata      jsonb DEFAULT '{}'::jsonb,
+    fingerprint   text NOT NULL,
+    semgrep_version text,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_sast_fingerprint ON public.sast_findings(fingerprint);
+CREATE INDEX IF NOT EXISTS ix_sast_eng ON public.sast_findings(engagement_id);
+CREATE INDEX IF NOT EXISTS ix_sast_vuln ON public.sast_findings(vuln_class);
+CREATE INDEX IF NOT EXISTS ix_sast_scan ON public.sast_findings(scan_id);
+CREATE INDEX IF NOT EXISTS ix_sast_target ON public.sast_findings(target_host);
+
+-- Semgrep scan runs — tracks each scan invocation (GitHub clone, upload, web source)
+CREATE TABLE IF NOT EXISTS public.sast_scans (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id uuid,
+    scan_id       text NOT NULL UNIQUE,
+    source_type   text NOT NULL,
+    source_url    text,
+    target_host   text,
+    target_port   integer,
+    status        text NOT NULL DEFAULT 'pending',
+    findings_count integer DEFAULT 0,
+    high_count    integer DEFAULT 0,
+    medium_count  integer DEFAULT 0,
+    error_message text,
+    metadata      jsonb DEFAULT '{}'::jsonb,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_sast_scans_eng ON public.sast_scans(engagement_id);
+
+-- Refine-error patterns: operator-extensible + learned refine-time fix guidance.
+CREATE TABLE IF NOT EXISTS public.refine_error_patterns (
+    id text PRIMARY KEY, title text NOT NULL, guidance text NOT NULL, triggers jsonb NOT NULL,
+    source text NOT NULL DEFAULT 'yaml',
+    created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(),
+    approved_by text, approved_at timestamptz,
+    trial_count int NOT NULL DEFAULT 0, success_count int NOT NULL DEFAULT 0,
+    last_trial_at timestamptz
+);
+
+-- ════════════════════════════════════════════════════════════════════════
+-- DATA REPAIRS — must stay LAST in this file.
+--
+-- Moved here 2026-10-12. These ran mid-file, so the six CREATE TABLEs that
+-- had been appended after the block existed only AFTER the repairs that may
+-- reference them. A repair can only touch tables that already exist, and the
+-- first failure aborts the whole transaction — so on a fresh install the
+-- block could abort and silently skip every repair after the failure.
+-- The NOTE above web_auth_configs recorded this; this is the fix.
+--
+-- Anything appended to this file goes ABOVE this banner.
+-- Enforced by tests/test_db_init_order.py.
+-- ════════════════════════════════════════════════════════════════════════
 -- ── Normalize asset identity so port data is not duplicated per IP ──
 --
 -- ix_assets_ip_hostname is UNIQUE(ip, COALESCE(hostname,'')) on purpose, so one
@@ -6787,73 +6985,3 @@ UPDATE public.vulns SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{
 WHERE script LIKE ANY(ARRAY['sslscan:%','testssl:%','sslyze:%']) AND port_id IS NULL AND (metadata->>'port') IS NULL;
 
 
--- ── Exploit-intel persistence (runtime-ensured too; here for clean installs) ──
--- Confirmed-facts ledger: durable record of verified target/exploit state
--- (session validity, endpoint existence, resolved object-ids, version
--- applicability, vendor-doc answers) reused across attacks. TARGET-level
--- facts carry cve=NULL so any attack against the same target reuses them.
--- Identity includes PRODUCT: the same ip:port runs multiple apps (Zabbix the
--- application vs Apache the web server) and a fact for one is not a fact for
--- the other. host (hostname/vhost) is tracked distinctly from the ip.
-CREATE TABLE IF NOT EXISTS public.confirmed_facts (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    engagement_id uuid, target text NOT NULL, host text, product text,
-    version text, cve text,
-    claim_type text NOT NULL, claim_key text NOT NULL, claim_value text,
-    status text NOT NULL, evidence text, method text,
-    confidence real NOT NULL DEFAULT 0.9, ttl_seconds int NOT NULL DEFAULT 0,
-    source_run_id text,
-    confirmed_at timestamptz NOT NULL DEFAULT now(),
-    last_checked_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_confirmed_fact ON public.confirmed_facts
-    (target, COALESCE(product,''), claim_type, claim_key,
-     COALESCE(claim_value,''), COALESCE(cve,''));
-CREATE INDEX IF NOT EXISTS idx_confirmed_target
-    ON public.confirmed_facts (target, COALESCE(product,''));
-
--- AGENT-DERIVED CVE EXPLOIT SPECS (auto-derivation pipeline persists verified recipes here)
-CREATE TABLE IF NOT EXISTS public.derived_cve_specs (
-    cve           text PRIMARY KEY,
-    product       text,
-    version       text,
-    vuln_class    text,
-    spec          jsonb NOT NULL,
-    verified      boolean NOT NULL DEFAULT false,
-    verify_method text,
-    verify_evidence text,
-    source        text,
-    derived_at    timestamptz NOT NULL DEFAULT now(),
-    last_verified timestamptz,
-    status        text NOT NULL DEFAULT 'tentative',  -- 'tentative' | 'verified' | 'refuted'
-    attempts      integer NOT NULL DEFAULT 0,
-    last_failure  text,
-    refine_hints  jsonb NOT NULL DEFAULT '{}'::jsonb  -- {tried_payloads:[], tried_endpoints:[], tried_proof_models:[], notes:""}
-);
--- Idempotent columns for in-place upgrades (ensure_all_tables runs on existing DBs too)
-ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'tentative';
-ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS attempts integer NOT NULL DEFAULT 0;
-ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS last_failure text;
-ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS refine_hints jsonb NOT NULL DEFAULT '{}'::jsonb;
-
--- Discovered app knowledge: per-product/version facts the build loop learns
--- (endpoints, params, csrf source, cookie shape, secondary products).
-CREATE TABLE IF NOT EXISTS public.discovered_app_knowledge (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    product text NOT NULL, version text, fact_type text NOT NULL, fact_value text NOT NULL,
-    confidence real NOT NULL DEFAULT 0.5, discovered_from text, source_run_id text,
-    engagement_id uuid, hits int NOT NULL DEFAULT 1,
-    last_seen_at timestamptz NOT NULL DEFAULT now(),
-    created_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_dak_product ON public.discovered_app_knowledge (lower(product));
-
--- Refine-error patterns: operator-extensible + learned refine-time fix guidance.
-CREATE TABLE IF NOT EXISTS public.refine_error_patterns (
-    id text PRIMARY KEY, title text NOT NULL, guidance text NOT NULL, triggers jsonb NOT NULL,
-    source text NOT NULL DEFAULT 'yaml',
-    created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(),
-    approved_by text, approved_at timestamptz,
-    trial_count int NOT NULL DEFAULT 0, success_count int NOT NULL DEFAULT 0,
-    last_trial_at timestamptz
-);

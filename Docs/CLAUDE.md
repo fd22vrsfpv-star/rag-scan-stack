@@ -357,6 +357,39 @@ Two rules that cut across all tiers:
 - **`except: pass` around an HTTP call hides a 404 forever.** If a call may
   legitimately fail, handle that case explicitly and surface it. Silence here
   turns a broken endpoint into "it returned zero results".
+- **`apiFetch` prepends `/api`; callers pass a BARE path.** A frontend caller
+  that passes a path already starting with `/api/` requests `/api/api/...`,
+  which matches no BFF route. Nothing rewrites it in between: routers mount
+  prefix-free, the `/api` prefix is a literal in the decorator (or in
+  `APIRouter(prefix=...)`), nginx `proxy_pass` has no URI part, and Vite's dev
+  proxy uses the non-rewriting string shorthand. Every `apiFetch` path must also
+  resolve to a route some BFF router declares — a path whose only proxy leg is
+  missing 404s exactly like a typo'd one.
+- **An HTTP status is not an exception.** `httpx` does not raise on 4xx/5xx, so
+  `await c.put(...)` returns normally when the write failed. A proxy that does
+  not check `resp.status_code` reports failure to the operator as success — and
+  if it also triggers an action on that path, the action fires anyway. A
+  `try/except Exception` around the call does NOT cover this; it catches only
+  transport errors.
+- **A service that sends traffic to targets MUST be on `test_net`.** Targets
+  live there; a container without that interface has no route, so its packets
+  are dropped rather than refused and every connection hangs for the full
+  timeout (~135s) before reporting "Could not connect to server". That is
+  indistinguishable from a dead target. It is worse to diagnose when the
+  dispatcher and the executor differ: `rag-api` sits on both networks, so its
+  prerun probe logs a real HTTP status while the command it hands to
+  `kali-listener` times out against the same host, port and second. Network
+  reachability is **not** the authorization boundary — `etl/scope_gate.py` is —
+  so detaching a runner does not make it safer, only broken in a way that reads
+  as "target down".
+  *Enforced by:* `tests/test_target_network_reachability.py`.
+  *Why:* `kali-listener`, the container that actually runs build-PoC commands,
+  declared only `agents_net` while every sibling runner declared
+  `agents_net` + `test_net`. A focused-10 CVE-Bench run reported
+  `stop=target_unreachable` for 5 of 10 CVEs whose targets were up and serving.
+  From `rag-api` the URL answered in 0.16 ms; from `kali-listener` it timed out
+  after 30 s having never completed a TCP connect. Every verdict that run
+  produced described the network, not the exploits.
 - **Every SQL column must exist on its table.** A query naming a column the
   table lacks passes import, passes `ast.parse`, reports a healthy container,
   and 500s only when that path executes. Postgres reports only the *first* bad
@@ -404,7 +437,11 @@ Two rules that cut across all tiers:
   `tests/test_fingerprint.py` (unit cases + Python↔SQL trigger agreement),
   `tests/test_endpoint_smoke.py` and `scripts/smoke_endpoints.py` (live sweep,
   bare + parameterised), `tests/test_route_contracts.py` (declaration order,
-  shadowing).
+  shadowing), `tests/test_frontend_route_contracts.py` (frontend→BFF: no doubled
+  `/api` prefix, every `apiFetch` path resolves to a declared route;
+  `FRONTEND_DYNAMIC`/`FRONTEND_DEBT` ratchets),
+  `tests/test_exploit_approval_status.py` (a non-2xx upstream status write is
+  reported as a failure and fires no execution).
 - *Why:* Burp import POSTed every finding to `/findings/web`, a route no service
   has ever declared, inside `except Exception: pass` — so it reported
   `{"ok": true, "imported": 0}` while storing nothing. `/api/exploits/pending`
@@ -413,6 +450,23 @@ Two rules that cut across all tiers:
   the columns are `http_method` and `param_location`. Containers were healthy,
   the suite was green, the OpenAPI schema listed every one, and 361 proxies had
   never had their far end checked.
+
+  The frontend→BFF edge was the one nobody checked. Nine `apiFetch` call sites in
+  `ExploitManager.tsx` passed `/api/sast/...` and `/api/build-poc/reviews...` to a
+  helper that already prepends `/api`, so every request went to `/api/api/...`.
+  The SAST tab and half the Reviews tab had **never worked**, and because neither
+  query destructured `isError`, each 404 rendered as an empty list — "no findings
+  yet" rather than "this endpoint does not exist". The same guard immediately
+  found a second cause of the identical symptom: the workbench's PoC Hints card
+  (list/add/delete) called `/software/poc-hints`, which rag-api declares and the
+  BFF proxied nowhere.
+
+  Separately, `approve_exploit` discarded its PUT response entirely — the result
+  was not even bound — and returned `{"ok": True}` plus fired the exploit
+  regardless. `httpx` does not raise on 4xx/5xx, so a rag-api 500 read as a
+  successful approval and the exploit ran against a row the database never marked
+  approved. `bulk_action`'s `try/except Exception` looked like it covered this; it
+  catches only transport errors.
 
   The SQL guard's first run found **20** more, the worst being seven in
   `build_existing_target_context()` — whose caller logs the failure as a

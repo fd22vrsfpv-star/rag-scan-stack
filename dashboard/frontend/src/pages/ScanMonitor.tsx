@@ -7,7 +7,7 @@ import { useAgentSessions, useSessionScans } from '@/api/agentSessions'
 import { useNodes } from '@/api/nodes'
 import type { AgentSession, SessionScansResponse } from '@/api/agentSessions'
 import { StatusDot } from '@/components/common/StatusDot'
-import { Square, ExternalLink, Bot, ChevronDown, ChevronRight, Radio, Play, Wifi, Trash2, Shield, Search, X, Clock, CalendarClock, Timer, Activity } from 'lucide-react'
+import { Square, ExternalLink, Bot, ChevronDown, ChevronRight, Radio, Play, Wifi, Trash2, Shield, Search, X, Clock, CalendarClock, Timer, Activity, Crosshair } from 'lucide-react'
 import { apiFetch } from '@/api/client'
 import { cn, formatDate } from '@/lib/utils'
 import { useState, useMemo, useEffect } from 'react'
@@ -373,12 +373,21 @@ export default function ScanMonitor() {
                 <StatusDot status={job.status} />
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2">
+                    {job.kind === 'build_poc' && (
+                      <Crosshair className="h-3.5 w-3.5 text-red-400 shrink-0" />
+                    )}
                     <span className="text-sm font-medium">{job.type}</span>
                     <span className="text-xs text-muted-foreground font-mono">{job.job_id.slice(0, 8)}</span>
                     {job.scope_name && (
                       <span className="flex items-center gap-1 px-1.5 py-0.5 bg-purple-500/10 text-purple-400 text-[10px] rounded-full border border-purple-500/30" title={`Scope: ${job.scope_name}`}>
                         <Shield className="h-2.5 w-2.5" />
                         {job.scope_name}
+                      </span>
+                    )}
+                    {job.kind === 'build_poc' && (
+                      <span className="flex items-center gap-1 px-1.5 py-0.5 bg-red-500/10 text-red-400 text-[10px] rounded-full border border-red-500/30">
+                        <Crosshair className="h-2.5 w-2.5" />
+                        exploit build
                       </span>
                     )}
                   </div>
@@ -545,6 +554,9 @@ export default function ScanMonitor() {
                   className="flex items-center gap-3 flex-1 min-w-0"
                 >
                   <StatusDot status={job.status} />
+                  {job.kind === 'build_poc' && (
+                    <Crosshair className="h-3 w-3 text-red-400 shrink-0" />
+                  )}
                   <span className="text-sm">{job.type}</span>
                   <span className="text-xs text-muted-foreground font-mono">{job.job_id.slice(0, 8)}</span>
                   {job.scope_name && (
@@ -581,6 +593,22 @@ export default function ScanMonitor() {
                   )}>
                     {job.status}
                   </span>
+                  {job.kind === 'build_poc' && (job.last_data as any)?.verified != null && (
+                    <span className={cn(
+                      'flex items-center gap-1 px-1.5 py-0.5 text-[10px] rounded-full border shrink-0',
+                      (job.last_data as any).verified
+                        ? 'bg-green-500/10 text-green-400 border-green-500/30'
+                        : 'bg-orange-500/10 text-orange-400 border-orange-500/30',
+                    )}>
+                      <Crosshair className="h-2.5 w-2.5" />
+                      {(job.last_data as any).verified ? 'Verified' : (job.last_data as any).stage_reached || 'unverified'}
+                    </span>
+                  )}
+                  {job.kind === 'build_poc' && (job.last_data as any)?.stop_reason && (
+                    <span className="text-[10px] text-muted-foreground">
+                      {(job.last_data as any).stop_reason}
+                    </span>
+                  )}
                 </Link>
                 {(job.last_data as any)?.command && (
                   <p className="text-[10px] text-muted-foreground font-mono truncate ml-7 -mt-1 mb-0.5 max-w-[600px]" title={String((job.last_data as any).command)}>

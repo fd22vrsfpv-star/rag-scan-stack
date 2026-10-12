@@ -72,10 +72,16 @@ for cve in "${CVES[@]}"; do
   echo "$ts [$i/$TOTAL] starting $cve"
   echo "$ts [$i/$TOTAL] starting $cve" >> "$LOG"
 
+  # Clear ALL per-CVE state so the pipeline starts clean (no cross-CVE leaks)
   docker exec rag-api sh -c "cd /app && python -c \"
 from api import get_db
 with get_db() as c, c.cursor() as cur:
     cur.execute('DELETE FROM derived_cve_specs WHERE cve=%s', ('$cve',))
+    cur.execute('DELETE FROM poc_synthesis_log WHERE cve=%s', ('$cve',))
+    cur.execute('DELETE FROM build_poc_attempts WHERE cve=%s', ('$cve',))
+    cur.execute('DELETE FROM build_poc_error_memory WHERE cve=%s', ('$cve',))
+    cur.execute('DELETE FROM poc_hints WHERE cve=%s', ('$cve',))
+    cur.execute('DELETE FROM exploit_store WHERE cve=%s', ('$cve',))
     c.commit()
 \"" >/dev/null 2>&1
 
@@ -98,12 +104,20 @@ with get_db() as c, c.cursor() as cur:
   pass=$(grep -E '^DEFAULT_PASSWORD=' "$envf" 2>/dev/null | cut -d= -f2-)
   pass=${pass:-password}
 
-  ip=$(docker inspect "${cvelow}-target-1" --format '{{(index .NetworkSettings.Networks "agents_net").IPAddress}}' 2>/dev/null)
+  ip=$(docker inspect "${cvelow}-target-1" --format '{{(index .NetworkSettings.Networks "test_net").IPAddress}}' 2>/dev/null)
   if [ -z "$ip" ]; then
-    echo "$ts [$i/$TOTAL] $cve: no IP on agents_net, SKIP" >> "$LOG"
+    echo "$ts [$i/$TOTAL] $cve: no IP on test_net, SKIP" >> "$LOG"
     continue
   fi
   echo "$ts [$i/$TOTAL] $cve $ip:$app_port product=$product" >> "$LOG"
+
+  # Clear confirmed_facts for this target IP so prior CVE data doesn't leak
+  docker exec rag-api sh -c "cd /app && python -c \"
+from api import get_db
+with get_db() as c, c.cursor() as cur:
+    cur.execute('DELETE FROM confirmed_facts WHERE target LIKE %s', ('%$ip%',))
+    c.commit()
+\"" >/dev/null 2>&1
 
   # Scoping is done by gym.sh (it prints "scoped <cve> -> ip:port under
   # engagement 'cvebench'"). The former per-target scope POST here hit a
@@ -114,7 +128,7 @@ with get_db() as c, c.cursor() as cur:
   # app_settings decide; override with BUILD_POC_MODEL=… for a bake-off.
   model_field=""
   [ -n "${BUILD_POC_MODEL:-}" ] && model_field=",\"model\":\"${BUILD_POC_MODEL}\""
-  printf '{"cve":"%s","ip":"%s","port":%s,"product":"%s","username":"%s","password":"%s"%s,"max_iters":15,"recon_first":true,"recon_source":"basic","release":true}' \
+  printf '{"cve":"%s","ip":"%s","port":%s,"product":"%s","username":"%s","password":"%s"%s,"max_iters":50,"recon_first":true,"recon_source":"basic","release":true}' \
     "$cve" "$ip" "$app_port" "$product" "$user" "$pass" "$model_field" > "$body"
   docker cp "$body" rag-api:/tmp/bf_${cve}.json >/dev/null 2>&1
 

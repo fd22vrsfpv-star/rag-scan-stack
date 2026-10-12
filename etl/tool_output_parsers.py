@@ -390,6 +390,257 @@ def _rmg(output: str, error: str = "") -> Dict[str, Any]:
     }
 
 
+# ── Content discovery: ffuf and feroxbuster ────────────────────────────────
+#
+# A live LangGraph session reported `post_enumeration: no parser for
+# feroxbuster, ffuf`. Both are on the SAFE lane (kali_listener
+# `_SAFE_READONLY_TOOLS`), both are named by knowledge/content_discovery.yaml
+# and knowledge/service_tools.yaml, and both ran — 32 executions in
+# `tool_executions`, up to 30 KB of output each, every one of them
+# `parsed_results IS NULL`. `etl/parse_ffuf.py` exists but takes a FILE PATH and
+# writes rows itself (the `/ingest/ffuf` upload path), so it could never be
+# reached from this registry — the same shape as the nuclei note above.
+#
+# Both tools emit the same KIND of fact — "this path exists and answered with
+# this status" — so they share one result shape and one `_discovery_result`
+# builder. Each emits exactly one `result_count` key, `results`.
+
+# ffuf's human-readable result line, after ANSI stripping:
+#   `.htaccess               [Status: 403, Size: 318, Words: 21, Lines: 10, Duration: 61ms]`
+_FFUF_HIT_RE = re.compile(
+    r"^(?P<word>.*?)\s+\[Status:\s*(?P<status>\d+),\s*Size:\s*(?P<size>\d+),"
+    r"\s*Words:\s*(?P<words>\d+),\s*Lines:\s*(?P<lines>\d+)"
+    r"(?:,\s*Duration:\s*(?P<duration>\d+)ms)?\s*\]\s*$")
+# The banner block ffuf writes to STDERR carries the only copy of the URL
+# template; the hit lines on stdout carry the matched word alone.
+_FFUF_BANNER_RE = re.compile(r"^\s*::\s*([A-Za-z ]+?)\s*:\s*(.+?)\s*$", re.M)
+
+# feroxbuster's result line:
+#   `200      GET        5l      564w    23357c http://host:9090/custom/css/custom.css`
+#   `301      GET        9l       29w      358c http://host:9090/custom => http://host:9090/custom/`
+# Same shape is used for the auto-filter notice, whose tail is prose rather than
+# a URL — counting those as hits is how a run that found nothing reports five.
+_FEROX_LINE_RE = re.compile(
+    r"^(?P<status>\d{3})\s+(?P<method>[A-Z]+)\s+(?P<lines>\d+)l\s+"
+    r"(?P<words>\d+)w\s+(?P<size>\d+)c\s+(?P<rest>.+?)\s*$")
+_FEROX_TARGET_RE = re.compile(r"Target Url\s*[│|]\s*(\S+)")
+_URLISH_RE = re.compile(r"^[a-z][a-z0-9+.-]*://", re.I)
+
+
+def _clean_lines(text: str):
+    """Tool output split into lines, with ANSI escapes and \\r removed.
+
+    ffuf writes `\\r\\x1b[2K` before every line so the progress indicator can be
+    overwritten; left in place the erase sequence becomes part of the matched
+    word and every URL is wrong.
+    """
+    for raw in _ANSI_RE.sub("", text or "").replace("\r", "\n").splitlines():
+        line = raw.rstrip()
+        if line.strip():
+            yield line
+
+
+def _discovery_result(tool: str, paths: list, base_url: Optional[str],
+                      errors: list, notes: list) -> Dict[str, Any]:
+    """The shared shape for a content-discovery run.
+
+    `results` is the ONLY `result_count` key here: emitting a second meaningful
+    key would make the run count itself twice.
+    """
+    by_status: Dict[str, int] = {}
+    for p in paths:
+        key = str(p.get("status") or "unknown")
+        by_status[key] = by_status.get(key, 0) + 1
+    return {
+        "tool": tool,
+        "base_url": base_url,
+        "paths": paths[:1000],
+        "truncated": len(paths) > 1000,
+        "errors": errors[:10],
+        "notes": notes[:10],
+        "counts": {"paths": len(paths), "results": len(paths),
+                   "by_status": by_status, "errors": len(errors)},
+        # A wordlist that matched nothing is a MEASURED zero — the tool ran and
+        # read the target. Only "no output and no stderr at all" reaches
+        # parse_for's unmeasured/None path.
+        "productive": bool(paths),
+    }
+
+
+def _join_url(base: Optional[str], word: str) -> Optional[str]:
+    """Substitute a matched word into ffuf's URL template.
+
+    `http://h/FUZZ` + `admin` -> `http://h/admin`. A template with no FUZZ
+    keyword (vhost or header fuzzing) yields the base itself: the word is not a
+    path there and pretending otherwise invents URLs that were never requested.
+    """
+    if not base:
+        return None
+    if "FUZZ" in base:
+        return base.replace("FUZZ", word)
+    return base
+
+
+def _ffuf(output: str, error: str = "") -> Dict[str, Any]:
+    """ffuf: the paths it matched, from JSON when present and text otherwise.
+
+    Two real shapes, both captured as fixtures:
+
+      * `-of json` — `{"commandline", "results": [{url, status, length, ...}]}`,
+        which `/ingest/tool-output` prefers when the run wrote a JSON file;
+      * the default terminal output, where the hit lines land on **stdout** and
+        the URL template only ever appears in the banner on **stderr**. A parser
+        handed stdout alone can still report the matched words and statuses, so
+        `url` is None there rather than guessed.
+    """
+    import json as _json
+
+    text = (output or "").strip()
+    if text.startswith("{"):
+        try:
+            doc = _json.loads(text)
+        except ValueError:
+            doc = None
+        if isinstance(doc, dict) and isinstance(doc.get("results"), list):
+            paths = []
+            for rec in doc["results"]:
+                if not isinstance(rec, dict):
+                    continue
+                url = rec.get("url") or None
+                paths.append({
+                    "url": url,
+                    "path": (rec.get("input") or {}).get("FUZZ")
+                    if isinstance(rec.get("input"), dict) else None,
+                    "status": rec.get("status"),
+                    "size": rec.get("length"),
+                    "words": rec.get("words"),
+                    "lines": rec.get("lines"),
+                    "method": (doc.get("config") or {}).get("method") or "GET",
+                    "content_type": rec.get("content-type") or None,
+                    "redirect": rec.get("redirectlocation") or None,
+                })
+            base = ((doc.get("config") or {}).get("url")
+                    if isinstance(doc.get("config"), dict) else None)
+            return _discovery_result("ffuf", paths, base, [], [])
+
+    base_url, method, errors, notes = None, "GET", [], []
+    for line in _clean_lines(error):
+        m = _FFUF_BANNER_RE.match(line)
+        if m:
+            key, value = m.group(1).strip().lower(), m.group(2).strip()
+            if key == "url":
+                base_url = value
+            elif key == "method":
+                method = value
+            continue
+        if "[ERR]" in line or line.startswith("Encountered error"):
+            errors.append(line[:300])
+
+    paths = []
+    for line in _clean_lines(output):
+        m = _FFUF_HIT_RE.match(line)
+        if not m:
+            if "[ERR]" in line:
+                errors.append(line[:300])
+            continue
+        word = m.group("word").strip()
+        if not word or word.startswith("::"):
+            continue        # a progress line, not a hit
+        paths.append({
+            "url": _join_url(base_url, word),
+            "path": word,
+            "status": int(m.group("status")),
+            "size": int(m.group("size")),
+            "words": int(m.group("words")),
+            "lines": int(m.group("lines")),
+            "method": method,
+            "content_type": None,
+            "redirect": None,
+        })
+    return _discovery_result("ffuf", paths, base_url, errors, notes)
+
+
+def _feroxbuster(output: str, error: str = "") -> Dict[str, Any]:
+    """feroxbuster: the URLs it reached, from `--json` NDJSON or the text table.
+
+    Both shapes are captured fixtures. The NDJSON stream mixes four record
+    types (`configuration`, `log`, `response`, `statistics`) and only
+    `response` rows are hits. In the text shape the auto-filter notice wears the
+    exact same `<status> <method> <n>l <n>w <n>c <tail>` costume as a hit, so the
+    tail is required to be a URL — otherwise every run reports the two or three
+    404-calibration lines as discovered content.
+    """
+    import json as _json
+
+    paths, errors, notes = [], [], []
+    base_url = None
+
+    ndjson = [ln for ln in _clean_lines(output)
+              if ln.startswith("{") and '"type"' in ln]
+    if ndjson:
+        for ln in ndjson:
+            try:
+                rec = _json.loads(ln)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            kind = rec.get("type")
+            if kind == "configuration":
+                base_url = rec.get("target_url") or base_url
+            elif kind == "log":
+                msg = str(rec.get("message") or "")[:300]
+                (errors if str(rec.get("level")).upper() in ("ERROR", "WARN")
+                 else notes).append(msg)
+            elif kind == "response":
+                paths.append({
+                    "url": rec.get("url"),
+                    "path": rec.get("path"),
+                    "status": rec.get("status"),
+                    "size": rec.get("content_length"),
+                    "words": rec.get("word_count"),
+                    "lines": rec.get("line_count"),
+                    "method": rec.get("method") or "GET",
+                    "content_type": (rec.get("headers") or {}).get("content-type")
+                    if isinstance(rec.get("headers"), dict) else None,
+                    "redirect": None,
+                })
+        return _discovery_result("feroxbuster", paths, base_url, errors, notes)
+
+    for line in _clean_lines(error):
+        m = _FEROX_TARGET_RE.search(line)
+        if m:
+            base_url = m.group(1)
+        elif line.startswith("ERROR:"):
+            errors.append(line[:300])
+
+    for line in _clean_lines(output):
+        m = _FEROX_LINE_RE.match(line)
+        if m:
+            rest = m.group("rest").strip()
+            if not _URLISH_RE.match(rest):
+                # "Auto-filtering found 404-like response ..." — a calibration
+                # notice wearing a result's shape.
+                notes.append(rest[:200])
+                continue
+            url, _, redirect = rest.partition(" => ")
+            paths.append({
+                "url": url.strip(),
+                "path": None,
+                "status": int(m.group("status")),
+                "size": int(m.group("size")),
+                "words": int(m.group("words")),
+                "lines": int(m.group("lines")),
+                "method": m.group("method"),
+                "content_type": None,
+                "redirect": redirect.strip() or None,
+            })
+            continue
+        if line.startswith("Could not connect") or line.lstrip().startswith("=> error"):
+            errors.append(line.strip()[:300])
+
+    return _discovery_result("feroxbuster", paths, base_url, errors, notes)
+
 
 # tool name -> pure text->dict parser. Aliases are listed explicitly rather than
 # normalised, because `nxc` and `netexec` are genuinely both used and a silent
@@ -404,6 +655,8 @@ PARSERS: Dict[str, Callable[..., Dict[str, Any]]] = {
     "showmount": _showmount,
     "rmg": _rmg,
     "remote-method-guesser": _rmg,   # the project's name for the `rmg` binary
+    "ffuf": _ffuf,
+    "feroxbuster": _feroxbuster,
 }
 
 

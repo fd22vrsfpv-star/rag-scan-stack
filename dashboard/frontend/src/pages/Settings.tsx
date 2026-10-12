@@ -3603,10 +3603,20 @@ const SCAN_TIMEOUT_FIELDS: { key: string; label: string; help: string }[] = [
   { key: 'scan_timeout_build_poc_deep_recon', label: 'Build-PoC deep recon',      help: 'Deep-recon budget per build when gather is NOT READY. 0 = env default (480)' },
 ]
 
+// Build-PoC LIMITS are counts, not seconds — separate endpoint, separate
+// validation (1..200), rendered below the timeouts in the same tab.
+const BUILD_POC_LIMIT_FIELDS: { key: string; label: string; help: string }[] = [
+  { key: 'build_poc_second_pass_iters', label: 'Build-PoC second-pass iterations',
+    help: 'Refine budget for the deep-recon go-around. Was a hard 10, which capped every CVE needing deep recon' },
+]
+
 function ScanTimeoutsTab() {
   type TimeoutResp = { timeouts: Record<string, number>; defaults: Record<string, number> }
+  type LimitResp = { limits: Record<string, number>; defaults: Record<string, number> }
   const [data, setData] = useState<TimeoutResp | null>(null)
+  const [limits, setLimits] = useState<LimitResp | null>(null)
   const [draft, setDraft] = useState<Record<string, string>>({})
+  const [limitDraft, setLimitDraft] = useState<Record<string, string>>({})
   const [saving, setSaving] = useState(false)
   const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
 
@@ -3618,6 +3628,15 @@ function ScanTimeoutsTab() {
       setMsg(null)
     } catch (e) {
       setMsg({ kind: 'err', text: `Load failed: ${String(e)}` })
+    }
+    // Separate try: a limits failure must not blank the timeouts the operator
+    // can still edit, and vice versa.
+    try {
+      const l = await apiFetch<LimitResp>('/settings/build-poc-limits')
+      setLimits(l)
+      setLimitDraft(Object.fromEntries(Object.entries(l.limits).map(([k, v]) => [k, String(v)])))
+    } catch (e) {
+      setMsg({ kind: 'err', text: `Build-PoC limits load failed: ${String(e)}` })
     }
   }
   useEffect(() => { load() }, [])
@@ -3639,7 +3658,23 @@ function ScanTimeoutsTab() {
         method: 'PUT',
         body: JSON.stringify({ timeouts }),
       })
-      setMsg({ kind: 'ok', text: 'Scan timeouts saved.' })
+      if (limits) {
+        const lim: Record<string, number> = {}
+        for (const [k, v] of Object.entries(limitDraft)) {
+          const n = Number(v)
+          if (!Number.isFinite(n) || n < 1 || n > 200) {
+            setMsg({ kind: 'err', text: `Invalid value for ${k}: must be an integer between 1 and 200` })
+            setSaving(false)
+            return
+          }
+          lim[k] = Math.floor(n)
+        }
+        await apiFetch('/settings/build-poc-limits', {
+          method: 'PUT',
+          body: JSON.stringify({ limits: lim }),
+        })
+      }
+      setMsg({ kind: 'ok', text: 'Scan timeouts and build-PoC limits saved.' })
       await load()
     } catch (e) {
       setMsg({ kind: 'err', text: `Save failed: ${String(e)}` })
@@ -3649,8 +3684,8 @@ function ScanTimeoutsTab() {
   }
 
   const resetToDefaults = () => {
-    if (!data) return
-    setDraft(Object.fromEntries(Object.entries(data.defaults).map(([k, v]) => [k, String(v)])))
+    if (data) setDraft(Object.fromEntries(Object.entries(data.defaults).map(([k, v]) => [k, String(v)])))
+    if (limits) setLimitDraft(Object.fromEntries(Object.entries(limits.defaults).map(([k, v]) => [k, String(v)])))
   }
 
   return (
@@ -3688,6 +3723,29 @@ function ScanTimeoutsTab() {
               <span className="text-xs text-muted-foreground">{f.help}</span>
               <span className="text-[10px] text-muted-foreground font-mono text-right">
                 default: {data.defaults[f.key] ?? 0}s
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {limits && (
+        <div className="space-y-2 pt-3 border-t border-border">
+          <div className="text-xs font-medium">Build-PoC limits (counts, not seconds)</div>
+          {BUILD_POC_LIMIT_FIELDS.map(f => (
+            <div key={f.key} className="grid grid-cols-[220px_120px_1fr_120px] items-center gap-3">
+              <label className="text-sm font-medium" title={f.key}>{f.label}</label>
+              <input
+                type="number"
+                min={1}
+                max={200}
+                value={limitDraft[f.key] ?? ''}
+                onChange={e => setLimitDraft({ ...limitDraft, [f.key]: e.target.value })}
+                className="px-2 py-1 text-sm font-mono rounded bg-muted border border-border"
+              />
+              <span className="text-xs text-muted-foreground">{f.help}</span>
+              <span className="text-[10px] text-muted-foreground font-mono text-right">
+                default: {limits.defaults[f.key] ?? 0}
               </span>
             </div>
           ))}

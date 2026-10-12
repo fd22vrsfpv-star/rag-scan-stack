@@ -36,8 +36,18 @@ tool_metadata:
       description: "Directory/file brute force — pick one."
       members: [gobuster, feroxbuster, dirsearch, wfuzz, ffuf]
     web_vuln_scan:
-      description: "Generic web vulnerability scan — pick one."
-      members: [nikto, nuclei]
+      description: >
+        Generic web misconfiguration / known-file scan — pick one.
+        nuclei is deliberately NOT a member. It was, and because an overlap
+        group is an OR, nikto won every time and nuclei was dropped from every
+        web recommendation. The two are not interchangeable: nikto checks
+        misconfigurations and known paths, while nuclei runs ~14k templates
+        including CVE-specific exploit checks. Collapsing them meant CVE
+        detection silently never ran — a WordPress target with a verified
+        nuclei template for CVE-2024-5084 (Hash Form arbitrary file upload,
+        CVSS 9.8) produced eight web recommendations and none of them could
+        have found it.
+      members: [nikto]
     tech_fingerprint:
       description: "Web technology fingerprint — pick one."
       members: [whatweb, wappalyzer]

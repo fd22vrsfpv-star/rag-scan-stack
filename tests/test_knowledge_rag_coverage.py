@@ -57,6 +57,9 @@ RAG_LOADED_OTHER = {
     # the structured triggers into refine_error_patterns table.
     "refine_error_patterns.yaml": "etl/load_refine_patterns.py",
     "build_poc_research_patterns.yaml": "etl/load_research_patterns.py",
+    # Post-run review criteria: _load_build_poc_review_knowledge embeds each
+    # criterion into rag_documents so the review agent can retrieve them.
+    "build_poc_review.yaml": "app/rag-api/api.py",
 }
 
 # YAMLs that ARE embedded into rag_documents, mapped to the loader that does it.

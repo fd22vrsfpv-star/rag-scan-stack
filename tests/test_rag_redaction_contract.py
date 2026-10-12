@@ -16,10 +16,14 @@ Sabotage-proven per CLAUDE.md: edit any loader to pass `secret_value`
 directly and this test fails by name.
 """
 import ast
+import pathlib
 import re
 import pytest
 
-API_PATH = "/opt/rag-scan-stack/app/rag-api/api.py"
+# Derived from this file, not hardcoded: the absolute path only resolved on
+# the dev box, so all four tests in this module failed in CI with
+# FileNotFoundError instead of checking anything.
+API_PATH = str(pathlib.Path(__file__).resolve().parents[1] / "app" / "rag-api" / "api.py")
 SENSITIVE_NAMES = (
     "secret", "secret_value", "plaintext", "password", "pwd", "passphrase",
     "token", "api_key", "apikey", "auth_token", "bearer", "cookie_value",

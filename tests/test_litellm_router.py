@@ -360,7 +360,10 @@ def test_litellm_completion_for_builds_azure_classic_openai_call(monkeypatch):
     """CLASSIC Azure OpenAI (…/.openai.azure.com) → `azure/<deployment>`.
     api_base, api_key, api_version plumbed through. Patches litellm.completion
     to capture kwargs so the test runs without a real endpoint."""
-    import litellm
+    # litellm is installed only in the llm_query container — a missing
+    # optional dep must SKIP, not fail (CLAUDE.md: a skip says "cannot run
+    # here", an error says "broken").
+    litellm = pytest.importorskip("litellm")
     captured = {}
     class _FakeMsg: content = "ok"
     class _FakeChoice: message = _FakeMsg()
@@ -390,7 +393,10 @@ def test_litellm_completion_for_builds_azure_foundry_openai_call(monkeypatch):
     not supported" because the hand-rolled dispatcher's `_azure_is_foundry`
     rule wasn't applied here. Also strips the `/api/projects/<name>`
     suffix from api_base — LiteLLM wants the resource root."""
-    import litellm
+    # litellm is installed only in the llm_query container — a missing
+    # optional dep must SKIP, not fail (CLAUDE.md: a skip says "cannot run
+    # here", an error says "broken").
+    litellm = pytest.importorskip("litellm")
     captured = {}
     class _R:
         choices = [type("C", (), {"message": type("M", (), {"content": "ok"})()})()]
@@ -409,7 +415,10 @@ def test_litellm_completion_for_builds_azure_foundry_anthropic_call(monkeypatch)
     Same empirical rule the alias factory uses, enforced on the completion
     call too so the kill-switch-ON path routes to Foundry Anthropic exactly
     like the hand-rolled adapter does today."""
-    import litellm
+    # litellm is installed only in the llm_query container — a missing
+    # optional dep must SKIP, not fail (CLAUDE.md: a skip says "cannot run
+    # here", an error says "broken").
+    litellm = pytest.importorskip("litellm")
     captured = {}
     class _R:
         choices = [type("C", (), {"message": type("M", (), {"content": "ok"})()})()]
@@ -428,7 +437,10 @@ def test_litellm_completion_for_builds_azure_foundry_anthropic_call(monkeypatch)
 
 def test_litellm_completion_for_ollama_no_api_key(monkeypatch):
     """Ollama path doesn't send api_key (local LAN). api_base is passed."""
-    import litellm
+    # litellm is installed only in the llm_query container — a missing
+    # optional dep must SKIP, not fail (CLAUDE.md: a skip says "cannot run
+    # here", an error says "broken").
+    litellm = pytest.importorskip("litellm")
     captured = {}
     class _R:
         choices = [type("C", (), {"message": type("M", (), {"content": "ok"})()})()]
@@ -453,7 +465,10 @@ def test_litellm_chat_completion_for_preserves_messages(monkeypatch):
     (the single-prompt wrapper would flatten them into one user turn).
     This is what makes `chat()`'s non-routed cutover safe — multi-turn
     semantics survive."""
-    import litellm
+    # litellm is installed only in the llm_query container — a missing
+    # optional dep must SKIP, not fail (CLAUDE.md: a skip says "cannot run
+    # here", an error says "broken").
+    litellm = pytest.importorskip("litellm")
     captured = {}
     class _R:
         choices = [type("C", (), {"message": type("M", (), {"content": "ok"})()})()]
@@ -478,7 +493,10 @@ def test_litellm_chat_completion_for_builds_azure_foundry_call(monkeypatch):
     stripped api_base — same translation table as the completion wrapper.
     Catches the easy mistake of forgetting to add a branch to one but not
     the other."""
-    import litellm
+    # litellm is installed only in the llm_query container — a missing
+    # optional dep must SKIP, not fail (CLAUDE.md: a skip says "cannot run
+    # here", an error says "broken").
+    litellm = pytest.importorskip("litellm")
     captured = {}
     class _R:
         choices = [type("C", (), {"message": type("M", (), {"content": "ok"})()})()]

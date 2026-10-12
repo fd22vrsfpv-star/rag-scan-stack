@@ -92,7 +92,11 @@ def _load(scope_rows, gate_ok=True, rows=None):
         "logger": _Log(),
         "_SCOPE_GATE_OK": gate_ok,
         "_SCOPE_GATE_ERROR": "" if gate_ok else "etl not mounted",
-        "load_dispatch_scope": lambda cur: scope_rows,
+        # Returns (rows, source) — the real signature since the gate started
+        # reporting WHERE scope came from. The stub returned bare rows, so the
+        # production unpack `rows, source = load_dispatch_scope(cur)` raised
+        # ValueError and all four tests failed against correct code.
+        "load_dispatch_scope": lambda cur: (scope_rows, "engagement"),
         # in scope = the 10.0.0.0/8 fixture space
         "is_in_scope": lambda ip, sr: ip.startswith("10."),
     }
