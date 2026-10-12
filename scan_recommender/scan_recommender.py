@@ -394,13 +394,88 @@ def _generate_vulnx_recommendations_for_software(software_list: List[Dict]) -> L
     return recs
 
 
+def _row_port(data: dict) -> Optional[int]:
+    """Port for a recon_findings row, from `port` or parsed out of `target`.
+
+    whatweb's native rows carry NO `port` key — the port exists only inside
+    `target` ("http://1.2.3.4:9090"). Filtering on `data->>'port'` therefore
+    discarded exactly the rows that hold the CMS detection.
+    """
+    p = data.get("port")
+    if p not in (None, ""):
+        try:
+            return int(p)
+        except (TypeError, ValueError):
+            pass
+    tgt = str(data.get("target") or data.get("url") or "")
+    if tgt:
+        try:
+            from urllib.parse import urlsplit
+            u = urlsplit(tgt if "://" in tgt else f"//{tgt}")
+            if u.port:
+                return int(u.port)
+            if u.scheme == "https":
+                return 443
+            if u.scheme == "http":
+                return 80
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+def _tech_tokens_from_row(data: dict) -> List[str]:
+    """Tech tokens out of a recon_findings row, whatever shape it is in.
+
+    Three shapes reach this table and only the first was ever read:
+
+      `tech` / `webserver`   httpx-style, the shape this function expected
+      `plugins`              whatweb's NATIVE shape — a dict keyed by plugin
+                             name ("WordPress": {"version": ["6.8.3"]})
+      `key_values`/`raw_output`  the generic ingest shape
+
+    Reading only the first meant a whatweb row that plainly said
+    `WordPress: 6.8.3` produced no tokens, no tech_signature match, and so no
+    CMS-targeted nuclei tags — the detection was in the database and nothing
+    could see it.
+    """
+    out: List[str] = []
+    tech = data.get("tech")
+    if isinstance(tech, list):
+        out.extend(str(t) for t in tech if t)
+    ws = data.get("webserver")
+    if ws:
+        out.append(str(ws))
+    plugins = data.get("plugins")
+    if isinstance(plugins, dict):
+        for name, detail in plugins.items():
+            if not name:
+                continue
+            out.append(str(name))
+            # Keep "WordPress 6.8.3" alongside "WordPress": tech_signatures
+            # match on substrings, and the version is what a CVE lookup needs.
+            ver = (detail or {}).get("version") if isinstance(detail, dict) else None
+            if isinstance(ver, list) and ver:
+                out.append(f"{name} {ver[0]}")
+    elif isinstance(plugins, list):
+        out.extend(str(p) for p in plugins if p)
+    kv = data.get("key_values")
+    if isinstance(kv, dict):
+        for k, v in kv.items():
+            if v:
+                out.append(f"{k} {v}" if k else str(v))
+    return out
+
+
 def _get_detected_tech(ip: Optional[str], port: Optional[int] = None) -> tuple:
     """Return (tech_tokens, source) for an IP[:port] (G1).
 
-    Reads the tech-stack httpx/whatweb already detected and persisted to
-    `recon_findings.data` (`->'tech'` array + `->>'webserver'`).  Used to
-    pick CMS/framework-targeted nuclei templates.  Defensive: returns
-    ([], "") on any error so recommendation generation never breaks.
+    Reads the tech stack httpx/whatweb already detected and persisted to
+    `recon_findings.data`. Used to pick CMS/framework-targeted nuclei
+    templates. Defensive: returns ([], "") on any error so recommendation
+    generation never breaks.
+
+    The port filter is applied in Python, not SQL, because a row's port may
+    only be derivable from its `target` URL — see `_row_port`.
     """
     if not ip:
         return [], ""
@@ -413,11 +488,10 @@ def _get_detected_tech(ip: Optional[str], port: Optional[int] = None) -> tuple:
                 JOIN public.assets a ON a.id = rf.asset_id
                 WHERE host(a.ip) = %s
                   AND rf.source IN ('httpx', 'whatweb')
-                  AND (%s IS NULL OR rf.data->>'port' = %s)
                 ORDER BY rf.created_at DESC
-                LIMIT 10
+                LIMIT 50
                 """,
-                (ip, port, str(port) if port is not None else None),
+                (ip,),
             )
             rows = cur.fetchall()
     except Exception as e:
@@ -428,14 +502,19 @@ def _get_detected_tech(ip: Optional[str], port: Optional[int] = None) -> tuple:
     source = ""
     for r in rows:
         data = r.get("data") or {}
-        if isinstance(data, dict):
-            tech = data.get("tech") or []
-            if isinstance(tech, list):
-                tokens.extend(str(t) for t in tech if t)
-            ws = data.get("webserver")
-            if ws:
-                tokens.append(str(ws))
-        source = source or (r.get("source") or "")
+        if not isinstance(data, dict):
+            continue
+        if port is not None:
+            rp = _row_port(data)
+            # Keep rows whose port is unknown: dropping them is what hid the
+            # CMS detection before. A wrong-port row contributes a token the
+            # tech_signatures match simply will not hit.
+            if rp is not None and rp != int(port):
+                continue
+        got = _tech_tokens_from_row(data)
+        if got:
+            tokens.extend(got)
+            source = source or (r.get("source") or "")
     return tokens, source
 
 
