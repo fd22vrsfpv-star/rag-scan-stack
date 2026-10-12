@@ -97,13 +97,15 @@ def test_cves_without_poc_endpoint_shape():
 
 
 # ─── CVE-optional path ────────────────────────────────────────────────────
-# BuildPocBody.cve is Optional[str]; the endpoint synthesizes NOCVE-<ts>
-# when absent so run_id/hints stay unique. Validation still rejects a
-# non-CVE string and requires some signal (product/url/hint) alongside.
+# BuildPocBody.cve is Optional[str]; the endpoint synthesizes
+# POC-<ip>-<port>[-<product>]-NNN when absent so run_id/hints stay unique.
+# (Rows created before 2026-10-11 carry the older NOCVE-<epoch> form; both are
+# recognised by _is_synthetic_cve.) Validation still rejects a non-CVE string
+# and requires some signal (product/url/hint) alongside.
 
 def test_build_poc_cve_optional_in_pydantic_model():
     """BuildPocBody.cve is Optional[str]; empty is OK — endpoint synthesizes
-    NOCVE-<ts>. Verifies the Pydantic field is actually optional (not a
+    the POC- token. Verifies the Pydantic field is actually optional (not a
     required field we claim is optional in the docstring)."""
     py = """
 import sys; sys.path.insert(0,'/app')
@@ -121,9 +123,9 @@ print('OK')
 
 
 def test_build_poc_rejects_non_cve_string():
-    """A malformed CVE string must 400, not quietly fall through to NOCVE
+    """A malformed CVE string must 400, not quietly fall through to token
     synthesis. Guards against operator typos (e.g. 'CVE2024-X') landing
-    as a NOCVE-prefixed build."""
+    as a synthesized build."""
     r = subprocess.run(
         ["docker", "exec", "rag-api", "sh", "-lc",
          'curl -sk -o /dev/null -w "%{http_code}" -X POST '
