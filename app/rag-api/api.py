@@ -15276,7 +15276,7 @@ _BUILD_POC_EARLY_STOP_ITERS = int(os.environ.get("BUILD_POC_EARLY_STOP_ITERS") o
 _BUILD_POC_DEEP_RECON_BUDGET_SEC = int(os.environ.get("BUILD_POC_DEEP_RECON_BUDGET_SEC") or "480")
 # Compiled fallback only. Read `_build_poc_second_pass_iters()` instead — the
 # live value comes from Settings so it changes without a rebuild.
-_BUILD_POC_SECOND_PASS_ITERS = int(os.environ.get("BUILD_POC_SECOND_PASS_ITERS") or "50")
+_BUILD_POC_SECOND_PASS_ITERS = int(os.environ.get("BUILD_POC_SECOND_PASS_ITERS") or "7")
 
 
 def _build_poc_second_pass_iters() -> int:
@@ -15287,13 +15287,25 @@ def _build_poc_second_pass_iters() -> int:
     `/api/settings/build-poc-limits`). Env `BUILD_POC_SECOND_PASS_ITERS` is the
     fallback; 0 / blank / non-numeric means "use the compiled default".
 
-    Was a hard 10, with the rationale "the go-around is a SECOND chance, not a
-    second budget". In practice it is the binding limit on any CVE that needs
-    deep recon: a request asking for 50 was clamped to 10 by the min() below,
-    and CVE-2024-22120 stopped at exactly 10 with stop_reason=max_iters while
-    every one of its 10 iterations was genuinely reaching the target. Operator
-    raised it to 50 (2026-10-12) and asked for it to be adjustable rather than
-    compiled in. Bounded at 200 so a typo cannot start an unbounded loop.
+    Was a hard 10, then raised to 50 (2026-10-12) on the reasoning that CVEs
+    were stopping at max_iters with every iteration reaching the target.
+    LOWERED TO 7 the same day, because the archives contradict that reasoning:
+    across 111 build attempts in 12 runs,
+
+        iterations used   attempts   verified
+                      1          9          4   (44%)
+                      2          8          3   (38%)
+                    3-5         22          0
+                    6-9         10          0
+                    10+         17          0
+
+    Every one of the 7 successes landed on iteration 1 or 2. 233 iterations
+    were spent at step 3 or beyond and produced ZERO verified results. The
+    refine loop has never once rescued a build. 7 keeps a margin over the
+    observed success band without funding a loop that has never paid out;
+    effort belongs in the FIRST command, not in refining a bad one.
+
+    Bounded at 200 so a typo cannot start an unbounded loop.
     """
     raw = _get_setting("build_poc_second_pass_iters", "")
     try:

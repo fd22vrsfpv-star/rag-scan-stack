@@ -1801,7 +1801,7 @@ BUILD_POC_LIMIT_KEYS = [
 def _build_poc_limit_defaults() -> Dict[str, int]:
     """Match the compiled fallbacks in rag-api (_build_poc_second_pass_iters)."""
     return {
-        "build_poc_second_pass_iters": 50,   # was a hard 10 until 2026-10-12
+        "build_poc_second_pass_iters": 7,    # 50 -> 7: no archived build EVER verified past iteration 2
     }
 
 

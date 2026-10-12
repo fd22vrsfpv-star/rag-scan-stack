@@ -2713,7 +2713,7 @@ INSERT INTO public.app_settings (key, value, category) VALUES
   -- /api/settings/build-poc-limits (Settings -> Scan Timeouts). The deep-recon
   -- go-around used to be a hard 10, which was the binding cap on every CVE
   -- that needed deep recon: a request for 50 was clamped to 10.
-  ('build_poc_second_pass_iters',                  '50',   'config'),
+  ('build_poc_second_pass_iters',                  '7',    'config'),
   -- 2026-10-10 db-txn-watchdog (rag-api): alert on transactions older than N min;
   -- terminate when > 0 (Postgres 16 has no transaction_timeout of its own).
   ('db_txn_alert_after_min',                       '15',   'config'),

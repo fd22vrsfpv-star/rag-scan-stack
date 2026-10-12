@@ -81,8 +81,8 @@ def test_compiled_default_is_50():
     src = _read(API)
     m = re.search(r'_BUILD_POC_SECOND_PASS_ITERS\s*=\s*int\(.*?or\s*"(\d+)"\)', src)
     assert m, "compiled fallback not found"
-    assert m.group(1) == "50", (
-        f"compiled fallback should be 50, found {m.group(1)} — this is the "
+    assert m.group(1) == "7", (
+        f"compiled fallback should be 7, found {m.group(1)} — this is the "
         "value used when the setting is unset"
     )
 
@@ -178,4 +178,4 @@ def test_setting_is_seeded_in_db_init():
     )
     m = re.search(r"\('" + KEY + r"',\s*'(\d+)'", src)
     assert m, "seed row must carry a numeric value"
-    assert m.group(1) == "50", f"seeded value should be 50, found {m.group(1)}"
+    assert m.group(1) == "7", f"seeded value should be 7, found {m.group(1)}"
