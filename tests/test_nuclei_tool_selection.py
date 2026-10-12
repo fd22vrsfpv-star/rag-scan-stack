@@ -142,3 +142,59 @@ def test_wordpress_tokens_match_a_tech_signature_with_wp_plugin_tag():
     assert "wp-plugin" in (wp.get("nuclei_tags") or []), (
         "wordpress no longer yields the wp-plugin tag; CVE-2024-5084 and every "
         "other plugin CVE template becomes unreachable")
+
+
+# ── Recommendation coverage is per (ip, service, PORT) ─────────────────────
+# scan_recommendations had no `port` column, so the "which ports still need a
+# recommendation" query joined on (ip, service). A host with several ports
+# running the same service — an app on 9090 plus harness ports on 8000/9091,
+# all 'http' — counted as covered the moment ANY one of them was recommended.
+# Observed on a live target: 1 of 5 ports considered; after the fix, 4.
+
+API = os.path.join(REPO, "app", "rag-api", "api.py")
+RECO = os.path.join(REPO, "scan_recommender", "scan_recommender.py")
+DDL = os.path.join(REPO, "db_init", "ensure_all_tables.sql")
+
+
+def _read(p):
+    if not os.path.exists(p):
+        pytest.skip(f"{os.path.basename(p)} not present")
+    return open(p, encoding="utf-8").read()
+
+
+def test_coverage_query_keys_on_port():
+    src = _read(API)
+    i = src.find("LEFT JOIN public.scan_recommendations sr")
+    assert i != -1, "the coverage LEFT JOIN is gone"
+    join = src[i:i + 400]
+    assert "sr.port" in join, (
+        "the coverage query no longer keys on port; ports sharing a service "
+        "will be treated as covered by one another and never scanned")
+    assert "sr.port IS NULL" in join, (
+        "rows written before the port column must still suppress, or the fix "
+        "re-queues work that was already done")
+
+
+def test_writer_persists_the_port_column():
+    src = _read(RECO)
+    i = src.find("INSERT INTO public.scan_recommendations")
+    assert i != -1, "the recommendation INSERT is gone"
+    stmt = src[i:i + 500]
+    assert "port" in stmt.split("VALUES")[0], (
+        "port is not in the INSERT column list; the coverage query would see "
+        "NULL for every new row and the dedup silently reverts")
+    assert "rec_port" in src, "rec_port is never computed"
+
+
+def test_schema_declares_port_and_backfills_it():
+    ddl = _read(DDL)
+    i = ddl.find("CREATE TABLE IF NOT EXISTS public.scan_recommendations")
+    assert i != -1
+    block = ddl[i:i + 4000]
+    assert "port        integer" in block or "port integer" in block, (
+        "scan_recommendations.port missing from the table definition")
+    assert "ADD COLUMN IF NOT EXISTS port integer" in ddl, (
+        "existing installs get no port column; the dedup fix is a no-op there")
+    assert "extra->>'port'" in ddl, (
+        "no backfill from where the port was already being written, so rows "
+        "created before the column keep suppressing every port on their service")

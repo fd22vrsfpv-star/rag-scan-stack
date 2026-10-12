@@ -1387,12 +1387,22 @@ def persist_recommendations(
             # Dispatch-side dedupe cannot fix this; by then the rows exist.
             rec_kind = classify_target_kind(rec.get("scanner"))
             rec_ip = ip
+            # Promoted out of `extra` into its own column: coverage is per
+            # (ip, service, port), and with the port only in jsonb the dedup
+            # query could not see it, so one http port standing in for all of
+            # them looked like full coverage.
+            try:
+                _rp = rec.get("port", rec_extra.get("port"))
+                rec_port = int(_rp) if _rp not in (None, "") else None
+            except (TypeError, ValueError):
+                rec_port = None
             if rec_kind == "range":
                 scope_cidr = _scope_cidr_for(cur, engagement_id, ip)
                 rec_ip = scope_cidr or ip
                 rec_service = None          # a sweep is not service-specific
                 rec_banner = None
                 rec_extra.pop("port", None)  # nor port-specific
+                rec_port = None
                 rec_asset_id = None          # a CIDR is not one asset
             else:
                 rec_asset_id = asset_id
@@ -1427,14 +1437,14 @@ def persist_recommendations(
             cur.execute(
                 """
                 INSERT INTO public.scan_recommendations
-                  (asset_id, ip, service, banner, scanner, action, script, template, source, model, extra, priority, engagement_id, target_kind, status)
+                  (asset_id, ip, service, port, banner, scanner, action, script, template, source, model, extra, priority, engagement_id, target_kind, status)
                 VALUES
-                  (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, 50), %s, %s, %s)
+                  (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, 50), %s, %s, %s)
                 ON CONFLICT (fingerprint) DO NOTHING
                 RETURNING id;
                 """,
                 (
-                    rec_asset_id, rec_ip, rec_service, rec_banner,
+                    rec_asset_id, rec_ip, rec_service, rec_port, rec_banner,
                     rec.get("scanner"), rec.get("action"),
                     rec.get("script"), rec.get("template"),
                     source, model,
