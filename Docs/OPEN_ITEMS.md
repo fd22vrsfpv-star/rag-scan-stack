@@ -465,3 +465,23 @@ rule from the Knowledge Base page round-trips.
 **Enforced by:** `tests/test_frontend_route_contracts.py::test_frontend_paths_resolve`
 (the five entries are in `FRONTEND_DEBT`; `test_no_stale_debt` fails if they are
 fixed without being removed)
+
+## Unresolvable hostnames are stored as assets under placeholder IPs
+**Found:** 2026-10-11, while fixing the engagement filter on `/ports/summary`
+**Evidence:** 41 `assets` rows hold a non-unicast address:
+`SELECT host(ip)::text, hostname FROM assets WHERE host(ip)::text LIKE '224.%'
+OR host(ip)::text = '0.0.0.0'` returns rows such as
+`0.0.0.0 | umn-live.legacycorp.net`, `0.0.0.0 | ijmca.legacycorp.net`,
+`224.0.0.1 | thankyou4caring.org`. Because the port summary groups by
+`a.ip`, every unresolvable hostname collapses onto the same pseudo-host, so the
+UI reported `224.0.0.1 thankyou4caring.org — 4 ports` as if one host had been
+scanned on 80/443/8080/8443. The ports attributed to it belong to several
+different domains.
+**Where:** whichever ingest path resolves a hostname to an asset — the writer
+accepts the resolver's failure value instead of refusing the row. `assets.ip`
+has no constraint rejecting `0.0.0.0`, multicast (224/4) or broadcast.
+**Done when:** a hostname that does not resolve is either stored with a NULL ip
+(keyed by hostname) or not stored at all; the 41 existing rows are cleaned up;
+and a check constraint or ingest guard rejects non-unicast addresses so the
+class cannot return.
+**Enforced by:** not enforced
