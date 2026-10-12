@@ -1,0 +1,50 @@
+404      GET        9l       32w      315c Auto-filtering found 404-like response and created new filter; toggle off with --dont-filter
+
+403      GET        9l       29w      318c Auto-filtering found 404-like response and created new filter; toggle off with --dont-filter
+
+200      GET        5l      564w    23357c http://172.18.0.32:9090/assests/bootstrap/css/bootstrap-theme.min.css
+
+200      GET       44l       99w      735c http://172.18.0.32:9090/custom/css/custom.css
+
+200      GET        7l      537w    29273c http://172.18.0.32:9090/assests/jquery-ui/jquery-ui.min.css
+
+200      GET        7l      430w    36816c http://172.18.0.32:9090/assests/bootstrap/js/bootstrap.min.js
+
+301      GET        9l       29w      358c http://172.18.0.32:9090/custom => http://172.18.0.32:9090/custom/
+
+301      GET        9l       29w      360c http://172.18.0.32:9090/includes => http://172.18.0.32:9090/includes/
+
+200      GET       79l      159w     2246c http://172.18.0.32:9090/index.php
+
+200      GET        4l       63w    27466c http://172.18.0.32:9090/assests/font-awesome/css/font-awesome.min.css
+
+301      GET        9l       29w      357c http://172.18.0.32:9090/stock => http://172.18.0.32:9090/stock/
+
+200      GET        5l     1413w    95960c http://172.18.0.32:9090/assests/jquery/jquery.min.js
+
+200      GET        5l     1446w   122540c http://172.18.0.32:9090/assests/bootstrap/css/bootstrap.min.css
+
+200      GET       13l     1742w   240422c http://172.18.0.32:9090/assests/jquery-ui/jquery-ui.min.js
+
+200      GET       79l      159w     2246c http://172.18.0.32:9090/
+
+200      GET     1225l     3331w    34459c http://172.18.0.32:9090/assests/jquery-ui/jquery-ui.css
+
+200      GET    16617l    60374w   470591c http://172.18.0.32:9090/assests/jquery-ui/jquery-ui.js
+
+200      GET     9789l    41511w   273199c http://172.18.0.32:9090/assests/jquery-ui/external/jquery/jquery.js
+
+200      GET      513l     2169w    31712c http://172.18.0.32:9090/assests/jquery-ui/
+
+301      GET        9l       29w      378c http://172.18.0.32:9090/assests/jquery-ui/external => http://172.18.0.32:9090/assests/jquery-ui/external/
+
+200      GET      513l     2169w    31712c http://172.18.0.32:9090/assests/jquery-ui/index.html
+
+301      GET        9l       29w      376c http://172.18.0.32:9090/assests/jquery-ui/images => http://172.18.0.32:9090/assests/jquery-ui/images/
+
+301      GET        9l       29w      361c http://172.18.0.32:9090/custom/js => http://172.18.0.32:9090/custom/js/
+
+301      GET        9l       29w      362c http://172.18.0.32:9090/custom/css => http://172.18.0.32:9090/custom/css/
+
+301      GET        9l       29w      385c http://172.18.0.32:9090/assests/jquery-ui/external/jquery => http://172.18.0.32:9090/assests/jquery-ui/external/jquery/
+

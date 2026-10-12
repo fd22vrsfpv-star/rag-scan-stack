@@ -8,6 +8,7 @@ Given raw stdout from a security tool execution, attempts to:
 4. Fall back to recon_findings with raw text in JSONB data
 """
 
+import functools
 import os
 import re
 import json
@@ -430,12 +431,153 @@ def _parse_sslscan(stdout: str, target: str, port: Optional[int],
     return stats
 
 
-# Tool-specific parser dispatch — checked before generic strategies
+def _parse_content_discovery(stdout: str, target: str, port: Optional[int],
+                             asset_id: Optional[str], cur,
+                             tool_name: str = "ffuf") -> Optional[dict]:
+    """ffuf / feroxbuster: every discovered path, stored as a `web_finding`.
+
+    WHY THIS EXISTS
+    ---------------
+    A LangGraph session reported `post_enumeration: no parser for feroxbuster,
+    ffuf` while 32 executions of the two sat in `tool_executions` with up to
+    30 KB of output apiece. Without an entry here the generic strategies take
+    over: ffuf's terminal output is neither JSON nor a two-column table, so a
+    run that found 23 live paths was stored as ONE raw-text recon_finding and
+    no path was ever queryable.
+
+    The structure comes from `etl.tool_output_parsers.parse_for` — the same
+    function the session analysis uses — so there is ONE implementation of
+    "what did ffuf find" and it cannot drift from the one the agents read.
+    This function only decides where the rows go.
+
+    `url` is the identity: feroxbuster prints absolute URLs, ffuf prints the
+    matched word and keeps the URL template on stderr, which `/ingest/tool-
+    output` never receives. When the parse has no URL the target+port this run
+    was dispatched against supplies the base, which is the same host the
+    command was built from — never a guess.
+
+    Returns None when the output is not recognisably this tool's, so the
+    generic strategies still get their turn.
+    """
+    try:
+        from etl.tool_output_parsers import parse_for
+    except ImportError:  # pragma: no cover — bare import from within etl/
+        from tool_output_parsers import parse_for
+    try:
+        from etl.identity_upsert import resolve_engagement_for_host
+    except ImportError:  # pragma: no cover
+        from identity_upsert import resolve_engagement_for_host
+
+    parsed = parse_for(tool_name, stdout or "")
+    if not parsed:
+        return None
+
+    stats = {
+        "records_seen": len(parsed.get("paths") or []),
+        "findings_inserted": 0,
+        "vulns_inserted": 0,
+        "web_findings_inserted": 0,
+        "web_findings_deduped": 0,
+        "recon_findings_inserted": 0,
+        "evidence_stored": 0,
+        "out_of_scope": 0,
+        "parse_method": f"{tool_name}_content_discovery",
+        "finding_ids": [],
+        "errors": list(parsed.get("errors") or [])[:5],
+    }
+
+    # Ingest scope gate. feroxbuster's --extract-links follows what a page
+    # points AT, so a crawl of an in-scope site can surface third-party URLs;
+    # scope was checked when the tool was pointed at the host, not on what came
+    # back. (Same reason etl/parse_katana.py gates its crawl results.)
+    enforce_scope, scope_rows = load_ingest_scope(cur)
+
+    # Collected target data MUST carry the engagement (CLAUDE.md "Engagement
+    # attribution is mandatory"); resolved from the target's asset then its
+    # scope entry, never invented when the host cannot be tied to one.
+    engagement_id = resolve_engagement_for_host(cur, target)
+
+    base = (parsed.get("base_url") or "").strip()
+    scheme = "https" if port in (443, 8443) else "http"
+    host_base = f"{scheme}://{target}:{port}" if (target and port) else (
+        f"{scheme}://{target}" if target else "")
+
+    for hit in parsed.get("paths") or []:
+        url = (hit.get("url") or "").strip()
+        if not url:
+            path = (hit.get("path") or "").strip()
+            root = base.replace("/FUZZ", "") if "FUZZ" in base else (base or host_base)
+            if not root or not path:
+                continue
+            url = f"{root.rstrip('/')}/{path.lstrip('/')}"
+        if not host_in_scope(url, enforce_scope, scope_rows):
+            stats["out_of_scope"] += 1
+            continue
+
+        status = hit.get("status")
+        # A CONSTANT name, stored and fingerprinted alike. It has to be stable
+        # across runs (the status changes) AND across tools (ffuf and
+        # feroxbuster finding the same URL is one finding, not two), and the
+        # value stored must be the value hashed or a later writer recomputing
+        # web_fingerprint from the stored row would disagree with this one.
+        name = "Discovered path"
+        evidence = (
+            f"{tool_name} content discovery against {target or host_base}: "
+            f"status={status} size={hit.get('size')} words={hit.get('words')} "
+            f"lines={hit.get('lines')}"
+            + (f" redirect={hit['redirect']}" if hit.get("redirect") else "")
+        )
+        fid = str(uuid.uuid4())
+        try:
+            cur.execute("SAVEPOINT cd_rec")
+            cur.execute(
+                """INSERT INTO web_findings
+                   (id, asset_id, engagement_id, url, source, name, method,
+                    status_code, severity, evidence, issue_type,
+                    first_seen, last_seen, fingerprint)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now(), %s)
+                   ON CONFLICT (fingerprint) DO UPDATE SET
+                       last_seen   = now(),
+                       status_code = EXCLUDED.status_code,
+                       evidence    = COALESCE(EXCLUDED.evidence, web_findings.evidence)
+                   RETURNING id""",
+                (fid, asset_id, engagement_id, url, tool_name, name,
+                 hit.get("method") or "GET",
+                 int(status) if isinstance(status, int) else None,
+                 "info", evidence[:4000], "discovered_path",
+                 web_fingerprint(url, tool_name, name, "discovered_path")),
+            )
+            row = cur.fetchone()
+            cur.execute("RELEASE SAVEPOINT cd_rec")
+            if row:
+                stats["finding_ids"].append(str(row["id"]))
+                stats["web_findings_inserted"] += 1
+                stats["findings_inserted"] += 1
+            else:
+                # `trg_web_findings_dedup` is BEFORE INSERT and RETURNs NULL on a
+                # duplicate: it bumps last_seen on the existing row and the
+                # INSERT stores nothing, so RETURNING yields no row. That is a
+                # re-sighting, not a failure, and counting it as an insert would
+                # report 23 new paths on every re-run of the same scan.
+                stats["web_findings_deduped"] = stats.get("web_findings_deduped", 0) + 1
+        except Exception as e:  # noqa: BLE001
+            cur.execute("ROLLBACK TO SAVEPOINT cd_rec")
+            if len(stats["errors"]) < 5:
+                stats["errors"].append(f"{type(e).__name__}: {e}")
+    return stats
+
+
+# Tool-specific parser dispatch — checked before generic strategies.
+# Keys are lower-case; the dispatch lower-cases the incoming tool name so
+# `FFUF` from an operator-typed command reaches the same parser.
 _TOOL_PARSERS = {
     "ssh-audit": _parse_ssh_audit,
     "sslscan": _parse_sslscan,
     "testssl": _parse_sslscan,  # same format patterns
     "sslyze": _parse_sslscan,
+    "ffuf": functools.partial(_parse_content_discovery, tool_name="ffuf"),
+    "feroxbuster": functools.partial(_parse_content_discovery,
+                                     tool_name="feroxbuster"),
 }
 
 
@@ -486,7 +628,7 @@ def structure_tool_output(
             asset_id = _resolve_asset_id(cur, target)
 
             # --- Strategy 0: Tool-specific parser ---
-            parser = _TOOL_PARSERS.get(tool_name)
+            parser = _TOOL_PARSERS.get((tool_name or "").strip().lower())
             if parser:
                 result = parser(stdout, target, port, asset_id, cur)
                 if result:
