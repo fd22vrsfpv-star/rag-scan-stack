@@ -374,7 +374,15 @@ def test_gather_manifest_fills_cheap_gaps_before_judging():
     body = _func_src("_gather_manifest")
     for src_name in ("plan_verify", "local_source", "candidate_probe", "cli.options(", "_probe_session_valid(", "_artifact_requirements("):
         assert src_name in body, f"collector must try {src_name}"
-    assert "_gather_decide(items, vc)" in body
+    # The decision must be delegated to _gather_decide. It now also receives the
+    # CVSS privilege level (pre-auth gate: auth is a hard precondition at
+    # PR:L/H, where 0 of 21 archived attempts ever verified), so pin the CALL,
+    # not its arity.
+    assert "_gather_decide(items, vc" in body, "the decision must go through _gather_decide"
+    assert "_privileges_required(" in body, (
+        "the privilege level must reach the decision, or the pre-auth gate "
+        "can never fire"
+    )
 
 
 def test_gather_manifest_is_recorded_and_injected():

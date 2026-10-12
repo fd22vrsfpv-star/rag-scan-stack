@@ -14802,7 +14802,8 @@ _GATHER_FOLLOW_UP = {
 }
 
 
-def _gather_mine_sources(advisory_poc: str = "", derived_vector: str = "", description: str = "") -> dict:
+def _gather_mine_sources(advisory_poc: str = "", derived_vector: str = "", description: str = "",
+                         fix_diff: str = "", recon_text: str = "") -> dict:
     """PURE: pull endpoint paths, input field names, methods and header
     names out of the advisory PoC text and the derived vector notes. Real
     shapes this handles (2026-10-07 round 4):
@@ -14821,6 +14822,20 @@ def _gather_mine_sources(advisory_poc: str = "", derived_vector: str = "", descr
     # round 12: derivation failed, so the only place naming `/update-settings`
     # was the NVD description — treat it like derived prose
     dv = (derived_vector or "") + ("\n" + description if description else "")
+    # THE FIX DIFF NAMES THE BUG. The patch that closes a CVE touches the
+    # vulnerable handler, so its context lines carry the endpoint path and the
+    # parameter by name. _fetch_fix_diff_text already runs in
+    # _extract_target_spec — its output went only to _classify_input_source
+    # ("is an artifact required"), and the miner never saw it. Across 37
+    # gather-incomplete runs the missing items were endpoint x22, method x22,
+    # input_field x14; this is the highest-authority source for all three.
+    if fix_diff:
+        dv += "\n" + fix_diff
+    # OUR OWN RECON of this host. When the advisory is vague we have often
+    # already crawled the endpoint: discovered_params carries url_pattern,
+    # param_name, param_location and http_method for the target.
+    if recon_text:
+        dv += "\n" + recon_text
     paths, fields, methods, headers = [], [], [], []
     # URLs → paths (advisory first: it is a literal PoC)
     for m in _re.finditer(r"https?://[^/\s\"'`]+(/[^\s\"'`?#]+)", adv):
@@ -15574,7 +15589,33 @@ def _deep_recon_for_gaps(cve, ip, port, product, eid, run_id, manifest: dict, *,
     return out
 
 
-def _gather_decide(items: list, vuln_class: str) -> dict:
+
+def _privileges_required(details: dict | None) -> str:
+    """CVSS "Privileges Required" for this CVE: "N", "L", "H", or "" when unknown.
+
+    Why this matters, from 111 archived build attempts across 12 runs:
+      PR:N  90 attempts, 62 with auth FAILING -> all 7 verified builds came
+            from here. Auth is genuinely optional; gating on it would have
+            destroyed the only thing that works.
+      PR:L/H 21 attempts -> 0 verified, ever.
+    So auth is worth blocking on exactly where privileges are required, and
+    nowhere else. Reads the stored vector, falling back to any CVSS:3.x vector
+    found in the raw record.
+    """
+    import re as _re
+    d = details or {}
+    vec = str(d.get("cvss_vector") or "")
+    m = _re.search(r"/PR:([NLH])", vec)
+    if m:
+        return m.group(1)
+    try:
+        m = _re.search(r"CVSS:3\.[01]/AV:[NALP]/AC:[LH]/PR:([NLH])", json.dumps(d))
+        return m.group(1) if m else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _gather_decide(items: list, vuln_class: str, privileges_required: str = "") -> dict:
     """PURE decision over gathered items (no network): which items are
     required for this class, which are missing, is the run ready, and the
     follow-up per missing item. `items` = [{"item", "status", "value",
@@ -15597,7 +15638,17 @@ def _gather_decide(items: list, vuln_class: str) -> dict:
     for name in ("auth", "artifact", "endpoint_id"):
         if by.get(name, {}).get("status") in ("missing", "gathered"):
             required.add(name)
+    # PRE-AUTH. When CVSS says privileges are REQUIRED, a payload cannot land
+    # without a session — so auth is required even if nothing has reported it
+    # yet, and the run stops here rather than spending its iteration budget
+    # writing commands that cannot work. Scoped to PR:L/H on purpose: at PR:N
+    # auth failed in 62 of 90 archived attempts and every verified build still
+    # came from that group.
+    if str(privileges_required or "").upper() in ("L", "H"):
+        required.add("auth")
     if vc == "auth-bypass":
+        # The exploit IS the bypass — demanding a working login first would
+        # refuse the very thing under test, whatever CVSS says about it.
         required.discard("auth")
     missing = []
     for name in sorted(required):
@@ -15874,6 +15925,40 @@ def _scan_evidence_for_target(cve, ip, port, eid, vc) -> dict:
     return out
 
 
+
+def _gather_recon_text(ip, port, limit: int = 40) -> str:
+    """What WE already discovered about this host, as miner-readable text.
+
+    discovered_params and web_findings hold endpoints and parameter names we
+    crawled ourselves. The gather miner read only advisory prose, so a target
+    whose endpoint we had already walked still reported `endpoint: missing`.
+    Fail-soft: any DB error returns "" and gather proceeds exactly as before.
+    """
+    try:
+        lines = []
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""SELECT DISTINCT dp.url_pattern, dp.param_name,
+                                  dp.http_method, dp.param_location
+                             FROM discovered_params dp
+                             JOIN assets a ON a.id = dp.asset_id
+                            WHERE host(a.ip) = %s
+                            LIMIT %s""", (str(ip), limit))
+            for url, pname, meth, loc in cur.fetchall():
+                lines.append(f"recon param: {meth or 'GET'} {url} param={pname} in={loc or '?'}")
+            cur.execute("""SELECT DISTINCT wf.url, wf.method
+                             FROM web_findings wf
+                             JOIN assets a ON a.id = wf.asset_id
+                            WHERE host(a.ip) = %s AND wf.url IS NOT NULL
+                              AND (wf.port IS NULL OR wf.port = %s)
+                            LIMIT %s""", (str(ip), int(port or 0) or None, limit))
+            for url, meth in cur.fetchall():
+                lines.append(f"recon url: {meth or 'GET'} {url}")
+        return "\n".join(lines)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("gather recon text failed for %s:%s — %s", ip, port, e)
+        return ""
+
+
 def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan_verdicts=None,
                      session_info=None, auth=None, analysis=None, recon_text="", run_id=None,
                      timeout=4, id_pool=None, segments=None) -> dict:
@@ -16000,7 +16085,18 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
     for m in _re.finditer(r"(PRIMARY|ALT\d):\s+class=(\S+)\s+endpoint=(\S+)\s+param=(\S+)", plan_text or ""):
         cands.append({"label": m.group(1), "endpoint": m.group(3), "param": m.group(4)})
     verdicts = plan_verdicts or {}
-    mined = _gather_mine_sources(spec.get("advisory_poc") or "", str(spec.get("derived_vector") or ""), spec.get("description") or "")
+    # Feed the miner every source we hold, not just advisory prose: the fix
+    # diff (highest authority — it names the vulnerable handler) and our own
+    # recon of this host.
+    try:
+        _diff_for_mine = _fetch_fix_diff_text((spec.get("refs") or []))
+    except Exception:  # noqa: BLE001
+        _diff_for_mine = ""
+    mined = _gather_mine_sources(
+        spec.get("advisory_poc") or "", str(spec.get("derived_vector") or ""),
+        spec.get("description") or "",
+        fix_diff=_diff_for_mine,
+        recon_text=_gather_recon_text(ip, port))
     facts["mined"] = mined
     needs_id_path = None
     for c in cands:
@@ -16373,7 +16469,7 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
     else:
         add("artifact", "n/a", None, "classifier")
 
-    decision = _gather_decide(items, vc)
+    decision = _gather_decide(items, vc, _privileges_required(details))
 
     # LLM gather fallback — when the deterministic miner missed any key the
     # LLM can meaningfully propose from documentation, make ONE LLM call and
@@ -16454,7 +16550,7 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
         # outcome unconditionally — an empty proposal used to leave no
         # record at all, which hid 31 silent failures (2026-10-09).
         if _llm_proposed:
-            decision = _gather_decide(items, vc)
+            decision = _gather_decide(items, vc, _privileges_required(details))
         try:
             _poc_trace(run_id, "gather_llm_fallback",
                        response=f"proposed={_llm_proposed or {}} new_ready={decision.get('ready')} "
@@ -17912,7 +18008,12 @@ def _fetch_cve_details(cve):
                 metrics = c.get("metrics") or {}
                 for mk in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
                     if metrics.get(mk):
-                        details["cvss"] = metrics[mk][0].get("cvssData", {}).get("baseScore")
+                        _cd = metrics[mk][0].get("cvssData", {})
+                        details["cvss"] = _cd.get("baseScore")
+                        # The VECTOR carries PR (privileges required), which
+                        # decides whether auth is a precondition for exploiting
+                        # this CVE at all. The score alone cannot say that.
+                        details["cvss_vector"] = _cd.get("vectorString") or ""
                         break
     except Exception as e:  # noqa: BLE001
         logging.debug("nvd fetch failed for %s: %s", cve, e)
@@ -22600,10 +22701,33 @@ def _fetch_nuclei_template(cve, timeout=10):
     has one). Nuclei templates are HIGHLY structured — endpoint, method, matcher
     are all explicit, no advisory ambiguity. Returns the YAML text or ''."""
     import httpx as _hx
+    # LOCAL FIRST. nuclei-runner mounts the whole corpus and already resolves a
+    # CVE to its exact path, so asking it costs no network and cannot guess
+    # wrong. The GitHub fallback below hardcoded http/cves/{2022,2023,2024} —
+    # but CVE-2024-22120 lives at code/cves/2024/, so it 404'd three times and
+    # returned "" for every non-http template, and saw nothing from 2025+ at
+    # all. The template is the single most structured payload source we have:
+    # endpoint, method, content-type, parameter, payload and success matcher,
+    # all explicit.
+    try:
+        _nu = os.environ.get("NUCLEI_URL", "https://nuclei-runner:8011")
+        with _hx.Client(verify=False, timeout=timeout) as _c:
+            _r = _c.get(f"{_nu}/templates/for-cve/{cve}",
+                        params={"include_body": "true"})
+            if _r.status_code == 200:
+                _j = _r.json() or {}
+                if _j.get("found") and _j.get("body"):
+                    return _j["body"][:12000]
+    except Exception as e:  # noqa: BLE001
+        logging.debug("local nuclei template lookup failed for %s: %s", cve, e)
+    # Fallback: GitHub raw. Kept for a corpus that is stale or unmounted, and
+    # widened to the directories and years the local lookup would have covered.
+    import datetime as _d
+    _yrs = [str(y) for y in range(_d.date.today().year, 2021, -1)]
     paths = [
-        f"https://raw.githubusercontent.com/projectdiscovery/nuclei-templates/main/http/cves/2024/{cve}.yaml",
-        f"https://raw.githubusercontent.com/projectdiscovery/nuclei-templates/main/http/cves/2023/{cve}.yaml",
-        f"https://raw.githubusercontent.com/projectdiscovery/nuclei-templates/main/http/cves/2022/{cve}.yaml",
+        f"https://raw.githubusercontent.com/projectdiscovery/nuclei-templates/main/{sub}/cves/{yr}/{cve}.yaml"
+        for sub in ("http", "code", "javascript")
+        for yr in _yrs
     ]
     try:
         with _hx.Client(verify=False, follow_redirects=True, timeout=timeout) as c:

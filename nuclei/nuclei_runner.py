@@ -715,8 +715,33 @@ def search_templates(q: str = Query(..., description="Product name or keyword to
     return {"ok": True, "query": q, "count": len(results), "results": results}
 
 
+
+def _read_body(fpath: str, max_body: int = 12000) -> str:
+    """Template text, trimmed to the part a payload builder needs.
+
+    Keeps `info:` (name/severity/description give the vuln class) and the whole
+    executable section (`http:` / `code:` / `javascript:` / `flow:`), which is
+    where the request and matcher live. Drops nothing silently: when the file is
+    larger than max_body the executable section is kept and info is trimmed,
+    because the request matters more than the prose.
+    """
+    try:
+        with open(fpath) as fh:
+            text = fh.read(max_body * 3)
+    except Exception as e:  # noqa: BLE001
+        return f"(unreadable: {e})"
+    import re as _re
+    m = _re.search(r"(?m)^(http|code|javascript|flow|dns|tcp|headless|file):", text)
+    if not m:
+        return text[:max_body]
+    exec_part = text[m.start():]
+    info_part = text[:m.start()]
+    if len(exec_part) >= max_body:
+        return exec_part[:max_body]
+    return (info_part[-(max_body - len(exec_part)):] + exec_part)
+
 @app.get("/templates/for-cve/{cve}")
-def template_for_cve(cve: str):
+def template_for_cve(cve: str, include_body: bool = False, max_body: int = 12000):
     """Is there a nuclei template for this CVE, and what would running it mean?
 
     The PoC workbench asks this before synthesising anything: when projectdiscovery
@@ -777,6 +802,16 @@ def template_for_cve(cve: str):
                 "intrusive": "intrusive" in [t.lower() for t in tag_list],
                 "verified": bool((info.get("metadata") or {}).get("verified")),
                 "reference": (info.get("reference") or [])[:4],
+                # include_body: the TEMPLATE IS A PAYLOAD SPEC. The executable
+                # section carries endpoint, method, content-type, parameter name,
+                # the payload itself and the success matcher — every item the
+                # build-poc gather phase reports as missing (endpoint x22,
+                # method x22, input_field x14 across 37 stalled runs). Served
+                # from the local corpus so the caller does not have to guess a
+                # GitHub path: CVE-2024-22120 lives under code/cves/, not
+                # http/cves/, and the guessing fetcher 404'd three times and
+                # returned nothing.
+                **({"body": _read_body(fpath, max_body)} if include_body else {}),
             }
     return {"ok": True, "found": False, "cve": want,
             "reason": "no template with that ID in the corpus"}
