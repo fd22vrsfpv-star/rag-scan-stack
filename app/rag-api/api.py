@@ -20702,7 +20702,7 @@ def _recon_discovered_knowledge(product, version, limit=20):
     return "\n".join(lines)
 
 
-def _poc_shell_syntax_check(command, canary=None):
+def _poc_shell_syntax_check(command, canary=None, assertion=None):
     """Dry-parse a shell command via shlex to catch quote-balance / escape
     errors BEFORE dispatch. Returns (ok: bool, error: str). On error the
     caller refuses to dispatch (saves a listener round-trip) and feeds the
@@ -20765,7 +20765,28 @@ def _poc_shell_syntax_check(command, canary=None):
     # real canary after `--`, where the database discards it: it cannot be
     # reflected, so the assertion can never legitimately match. A canary in a
     # comment is decoration, not proof.
-    if canary and canary in command:
+    #
+    # ONLY when the assertion expects the canary to be REFLECTED. For a
+    # blind-timing assertion there is by definition nothing to reflect into —
+    # CLAUDE.md: "a visible marker usually isn't possible in blind SQLi" — so
+    # tagging the request by putting the canary in a trailing comment is
+    # legitimate, not a defect. Refusing it there is a dead end: the model has
+    # nowhere else to put the marker, so every rewrite is refused too.
+    #
+    # Regression this guards against (2026-10-12, CVE-2024-22120 under F2b):
+    # applied unconditionally, this check refused 14 commands and the run
+    # finished with target_runs=0 — not one command reached the target, versus
+    # 2-3 in the preceding runs. A correct rule applied to the wrong case is
+    # still a broken build.
+    # OPT-IN, not opt-out: fire only when we positively know the assertion
+    # wants the canary reflected. An unknown assertion must NOT refuse — the
+    # failure mode of this check is a dead end (every rewrite refused too), so
+    # where the cost of a false negative is a weaker check and the cost of a
+    # false positive is a build that can never dispatch, the default belongs
+    # on the permissive side.
+    _wants_reflection = bool(isinstance(assertion, dict)
+                             and assertion.get("min_seconds") is None)
+    if canary and canary in command and _wants_reflection:
         _live = _re_ph.sub(r"--[^\n]*", "", command)   # strip SQL line comments
         _live = _re_ph.sub(r"/\*.*?\*/", "", _live, flags=_re_ph.S)  # and block comments
         if canary not in _live:
@@ -25856,7 +25877,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         # 2 of 11 PARTIAL cases ran all 5 iters on commands that /bin/sh refused
         # at parse time. On fail: synthesize a syntax-error "output" so the
         # existing refine path kicks in with specific feedback.
-        _syn_ok, _syn_err = _poc_shell_syntax_check(command, canary=canary)
+        _syn_ok, _syn_err = _poc_shell_syntax_check(command, canary=canary, assertion=assertion)
         if not _syn_ok:
             _refused_now, _ = _poc_detect_llm_refusal(command)
             if _refused_now:
