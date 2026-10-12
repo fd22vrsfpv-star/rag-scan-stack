@@ -296,12 +296,18 @@ def test_generate_routed_fails_over_on_429(llm_query_mod, monkeypatch):
         seen.append((backend, model))
         if (backend, model) == ("azure", "DeepSeek-V4-Flash"):
             raise HTTPException(429, "RateLimitReached")
-        return "from the fallback"
+        # (text, usage) — the real _generate_text shape. Returning a bare string
+        # made production's `text, usage = _generate_text(...)` raise ValueError,
+        # so this test failed against correct code.
+        return "from the fallback", {"prompt_tokens": 1, "completion_tokens": 2,
+                                     "total_tokens": 3}
 
     monkeypatch.setattr(m, "_generate_text", fake_generate)
     route = {"task": "news", "backend": "azure", "model": "DeepSeek-V4-Flash",
              "fallback": {"backend": "ollama", "model": "qwen2.5:14b"}}
-    text, used, failed_over = m._generate_routed(route, "hi", None)
+    # 4-tuple: usage was added to the return alongside the failover flag.
+    text, used, failed_over, usage = m._generate_routed(route, "hi", None)
+    assert usage["total_tokens"] == 3, "usage must be propagated from the fallback"
 
     assert text == "from the fallback"
     assert used == ("ollama", "qwen2.5:14b")
@@ -695,10 +701,23 @@ def test_provider_test_endpoint_reports_each_stage():
         "the per-provider test route is gone"
     for stage in ('"endpoint"', '"auth"', '"deployments"', '"generate"'):
         assert stage in src, f"the check does not report {stage}"
-    # The end-to-end leg is the only one that proves usability, and it must
-    # apply the same max_completion_tokens swap llm_query does or a gpt-5
-    # deployment tests as broken while working fine in the app.
-    assert "max_completion_tokens" in src
+    # The end-to-end leg is the only one that proves usability, and it must see
+    # exactly what real traffic sees — including the max_tokens ->
+    # max_completion_tokens swap a gpt-5 deployment needs, or it tests as broken
+    # while working fine in the app.
+    #
+    # It used to hand-roll that call, so this asserted the swap string appeared
+    # here. The leg now DELEGATES to llm_query /api/generate, which owns the
+    # swap (llm_query.py) along with every other per-provider shape. Assert the
+    # delegation instead: it is the stronger property, and the literal string
+    # had become something this file must NOT contain.
+    assert "/api/generate" in src, (
+        "the generate leg must delegate to llm_query, which owns the "
+        "per-provider request shaping (max_completion_tokens, api_version, ...)"
+    )
+    assert "max_completion_tokens" not in src, (
+        "re-hand-rolling the provider call here is what the delegation replaced"
+    )
     assert "DeploymentNotFound" in src, (
         "a 404 on generate should say the model is not on this resource"
     )
