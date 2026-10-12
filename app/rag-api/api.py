@@ -14236,18 +14236,123 @@ def _execute_curl_chain_in_python(command: str, chain_timeout: int = 180) -> dic
 # Phase 1 scaffold stub so shadow comparison still records something.
 
 
+# CWE -> crafter vuln class. Only unambiguous mappings belong here: a CWE that
+# could reasonably drive two different payload families (e.g. CWE-20 "Improper
+# Input Validation", which covers everything from SQLi to buffer overflow) is
+# deliberately ABSENT so the description decides. Being silent is correct for
+# those; guessing from a vague CWE would be worse than the prose it overrides.
+_CWE_TO_VULN_CLASS = {
+    "CWE-89":  "sqli",            # SQL injection
+    "CWE-918": "ssrf",            # Server-Side Request Forgery
+    "CWE-1336": "ssti",           # Server-Side Template Injection
+    "CWE-94":  "cmdi",            # Code injection
+    "CWE-77":  "cmdi",            # Command injection
+    "CWE-78":  "cmdi",            # OS command injection
+    "CWE-88":  "cmdi",            # Argument injection
+    "CWE-98":  "lfi",             # PHP remote/local file inclusion
+    "CWE-22":  "lfi",             # Path traversal
+    "CWE-23":  "lfi",             # Relative path traversal
+    "CWE-36":  "lfi",             # Absolute path traversal
+    "CWE-73":  "lfi",             # External control of filename/path
+    "CWE-611": "xxe",             # XML external entity
+    "CWE-502": "deserialization", # Deserialization of untrusted data
+    "CWE-434": "upload",          # Unrestricted upload of dangerous file type
+    "CWE-269": "auth-bypass",     # Improper privilege management
+    "CWE-285": "auth-bypass",     # Improper authorization
+    "CWE-287": "auth-bypass",     # Improper authentication
+    "CWE-306": "auth-bypass",     # Missing authentication for critical function
+    "CWE-639": "auth-bypass",     # Authorization bypass through user-controlled key (IDOR)
+    "CWE-862": "auth-bypass",     # Missing authorization
+    "CWE-863": "auth-bypass",     # Incorrect authorization
+    "CWE-798": "auth-bypass",     # Hard-coded credentials
+    "CWE-79":  "xss",             # Cross-site scripting
+}
+
+
+def _cwe_ids_from_details(details: dict | None) -> list:
+    """Normalised CWE ids from a details dict, best-effort and order-preserving.
+
+    Tolerates every shape this codebase stores: a list of ids, a list of dicts,
+    a comma-joined string, or a raw NVD `weaknesses` block. Returns [] when
+    nothing parseable is present, which is the signal to fall back to prose.
+    """
+    import re as _re
+    d = details or {}
+    raw = d.get("cwe") or d.get("cwes") or d.get("weaknesses") or []
+    if isinstance(raw, (dict, list)):
+        try:
+            blob = json.dumps(raw)
+        except Exception:  # noqa: BLE001
+            blob = str(raw)
+    else:
+        blob = str(raw)
+    seen, out = set(), []
+    for m in _re.findall(r"CWE[-_ ]?(\d+)", blob, _re.I):
+        cid = f"CWE-{m}"
+        if cid not in seen:
+            seen.add(cid)
+            out.append(cid)
+    return out
+
+
+def _fetch_cve_cwes(cve: str) -> list:
+    """One bounded NVD lookup for a CVE's weaknesses. Fail-soft: [] on any
+    error, so a classifier never blocks on the network."""
+    import requests as _rq
+    try:
+        key = os.environ.get("NVD_API_KEY", "")
+        if not key:
+            try:
+                with get_db() as conn, conn.cursor() as cur:
+                    cur.execute("SELECT value FROM app_settings WHERE key='nvd_api_key'")
+                    rr = cur.fetchone(); key = rr[0] if rr else ""
+            except Exception:  # noqa: BLE001
+                pass
+        h = {"apiKey": key} if key else {}
+        resp = _rq.get("https://services.nvd.nist.gov/rest/json/cves/2.0",
+                       params={"cveId": cve}, headers=h, timeout=20)
+        if resp.ok:
+            vulns = (resp.json() or {}).get("vulnerabilities") or []
+            if vulns:
+                return _cwe_ids_from_details(
+                    {"weaknesses": (vulns[0].get("cve") or {}).get("weaknesses") or []})
+    except Exception as e:  # noqa: BLE001
+        logging.debug("nvd cwe fetch failed for %s: %s", cve, e)
+    return []
+
+
 def _vuln_class_from_cve(cve: str, details: dict) -> str:
     """Classify a CVE into a vulnerability class the crafter understands.
 
     Returns one of: ssrf, sqli, ssti, lfi, cmdi, xss, auth-bypass, path-traversal,
     xxe, deserialization, upload, unknown.
 
-    Fail-soft: returns "unknown" rather than raising. Reads from NVD
-    description + any CWE references. Deterministic.
+    Fail-soft: returns "unknown" rather than raising. Deterministic.
+
+    CWE OUTRANKS PROSE. The docstring used to claim this read "NVD description
+    + any CWE references" while the code only ever built `text` from the
+    description — CWE was never consulted. A CWE id is a curated, unambiguous
+    classification; the description is prose that may never contain the phrase
+    being matched. CVE-2024-36675 carries CWE-918 and the description
+    "vulnerable to Server-Side Request Forgery (SSRF) via the get_head
+    function" — it still classified as `unknown` and was never attempted,
+    the only misclassification in the 2026-10-12 focused-10 run.
+
+    So: when a mapped CWE is present it decides, and the description is only
+    the fallback for an absent or unmapped CWE.
     """
     import re as _re
     desc = ((details or {}).get("description") or "").lower()
     text = f"{cve.lower()} {desc}"
+    # --- CWE first (authoritative when mapped) --------------------------------
+    try:
+        cwes = _cwe_ids_from_details(details)
+    except Exception:  # noqa: BLE001
+        cwes = []
+    for _c in cwes:
+        _cls = _CWE_TO_VULN_CLASS.get(_c)
+        if _cls:
+            return _cls
     # Order matters — more specific classes first.
     checks = [
         ("ssti", r"\b(server[-\s]?side template injection|ssti|jinja2 injection|template injection|velocity injection)\b"),
@@ -16743,20 +16848,33 @@ _CRAFT_CLASS_GUIDANCE = {
              "will report attack_success when the server made the outbound request. If an OOB sink URL "
              "is in the spec, your assertion should match on `SINK-VERIFIED: <canary>` after the attacker "
              "polls the sink."),
-    "sqli": ("Use a time-based blind payload: SLEEP(5) / pg_sleep(5) / WAITFOR DELAY '0:0:5'. "
-             "Return assertion as {\"min_seconds\": 5, \"canary\": \"<canary>\"} — a visible marker "
-             "usually isn't possible in blind SQLi. For union-based, inject the canary via a reflected "
-             "column."),
+    # DEFAULT TO A VISIBLE CANARY, NOT A STOPWATCH. This guidance used to lead
+    # with "use a time-based blind payload" and mention union-based as a
+    # trailing afterthought, which made blind timing the reflex even where the
+    # injection reflects. A reflected canary is strictly stronger evidence: it
+    # proves the server executed YOUR injected value, whereas an elapsed time
+    # only proves the server was slow (hence the whole scaled-payload
+    # confirmation apparatus that a timing verdict then needs). Blind timing is
+    # the fallback for when nothing reflects — not the opening move.
+    "sqli": ("FIRST try union-based / error-based injection that makes the canary VISIBLE in the "
+             "response: inject <canary> into a reflected column (e.g. ' UNION SELECT 1,'<canary>',3-- ) "
+             "and return assertion {\"expect_regex\": \"<canary>\"}. Substitute the real canary string "
+             "into the payload — never leave a {CANARY} placeholder — and never place it only inside a "
+             "SQL comment (after --), where it cannot be reflected. "
+             "ONLY fall back to a time-based blind payload (SLEEP(5) / pg_sleep(5) / "
+             "WAITFOR DELAY '0:0:5', assertion {\"min_seconds\": 5, \"canary\": \"<canary>\"}) when the "
+             "injection genuinely returns no reflected output, or the advisory explicitly says the "
+             "vulnerability is time-based / blind. A timing verdict proves only that the server was "
+             "slow; a reflected canary proves it executed your payload."),
     "ssti": ("Jinja2/Twig/ERB template injection. Place the canary as a template variable the server "
              "evaluates, e.g. {{<canary expression>}} that resolves to the canary string in the response. "
              "Common SSTI payloads: {{config.__class__.__init__.__globals__['os'].popen('echo <canary>').read()}}"),
-    "cmdi": ("Shell command injection. Append a `; echo <canary>` or `` `echo <canary>` `` to the "
+    "cmdi": ("Shell command injection. Append a `; echo <canary>`, `` `echo <canary>` `` or "
+             "`|echo <canary>` to the "
              "vulnerable parameter so the server echoes the canary in its response."),
     "lfi":  ("Local file inclusion / path traversal. Request /../../../../../../etc/passwd first to confirm "
              "the primitive, then read /tmp/secret and reflect the content via a response field. Place the "
              "canary in the filename or output marker."),
-    "cmdi": ("Shell command injection — inject `; echo <canary>` or `|echo <canary>` into the vulnerable "
-             "parameter so the server executes it and echoes the canary back in the response body."),
     "upload": ("Upload a file whose content contains the canary and whose extension bypasses the whitelist "
                "(e.g. .phtml / .phar / double extension). Then fetch the uploaded file's URL and expect the "
                "canary in the response."),
@@ -17569,6 +17687,28 @@ def _fetch_cve_details(cve):
                 # Debounced to one attempt per 6h so a CVE with genuinely no
                 # published PoC doesn't cost 3 GETs on every synth.
                 import time as _tm
+                # Backfill #2 (2026-10-12): rows cached before CWE extraction
+                # shipped have no `cwe` key, and this same early return would
+                # skip it forever — exactly the trap documented above for
+                # advisory_poc. Without this the CWE-first classifier is inert
+                # for every CVE already in the cache, which is all of them.
+                # One NVD call, persisted; debounced to once per 24h so a CVE
+                # with genuinely no mapped CWE isn't re-fetched on every synth.
+                _cwe_checked = float((cached or {}).get("_cwe_checked") or 0)
+                if (isinstance(cached, dict) and not cached.get("cwe")
+                        and _tm.time() - _cwe_checked > 24 * 3600):
+                    try:
+                        cached["cwe"] = _fetch_cve_cwes(cve)
+                    except Exception:  # noqa: BLE001
+                        cached["cwe"] = []
+                    cached["_cwe_checked"] = _tm.time()
+                    try:
+                        cur.execute("""UPDATE software_research_cache SET results=%s, updated_at=now()
+                                       WHERE LOWER(product)=LOWER(%s) AND source='nvd_cve'""",
+                                    (Json(cached), cve))
+                        conn.commit()
+                    except Exception:  # noqa: BLE001
+                        pass
                 _checked = float((cached or {}).get("_advisory_poc_checked") or 0)
                 if (isinstance(cached, dict) and not cached.get("advisory_poc")
                         and _tm.time() - _checked > 6 * 3600):
@@ -17623,6 +17763,8 @@ def _fetch_cve_details(cve):
                 descs = c.get("descriptions") or []
                 details["description"] = next((d.get("value") for d in descs if d.get("lang") == "en"), "")
                 details["refs"] = [x.get("url") for x in (c.get("references") or [])][:6]
+                # CWE is what _vuln_class_from_cve trusts above the prose.
+                details["cwe"] = _cwe_ids_from_details({"weaknesses": c.get("weaknesses") or []})
                 metrics = c.get("metrics") or {}
                 for mk in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
                     if metrics.get(mk):
@@ -20475,7 +20617,7 @@ def _recon_discovered_knowledge(product, version, limit=20):
     return "\n".join(lines)
 
 
-def _poc_shell_syntax_check(command):
+def _poc_shell_syntax_check(command, canary=None):
     """Dry-parse a shell command via shlex to catch quote-balance / escape
     errors BEFORE dispatch. Returns (ok: bool, error: str). On error the
     caller refuses to dispatch (saves a listener round-trip) and feeds the
@@ -20523,6 +20665,29 @@ def _poc_shell_syntax_check(command):
         _shell_parens += _tok.count("(") - _tok.count(")")
     if _shell_parens != 0:
         return (False, f"unbalanced parentheses (depth={_shell_parens})")
+    # UNSUBSTITUTED CANARY PLACEHOLDER. Observed on CVE-2024-5314, whose
+    # "successful" command injected the literal template token:
+    #   sortfield=' UNION SELECT 1,{CANARY},3-- POCz6f0ccdd8a0
+    # (%7BCANARY%7D once URL-encoded). The real canary never reached the
+    # payload, so nothing the exploit did could ever reflect it. Catch the
+    # token in both raw and percent-encoded form, before dispatch.
+    import re as _re_ph
+    _ph = _re_ph.search(r"(?:\{|%7[Bb])\s*(CANARY|canary)[^}]*?(?:\}|%7[Dd])", command)
+    if _ph:
+        return (False, f"unsubstituted canary placeholder {_ph.group(0)!r} in the "
+                       "command — substitute the real canary string into the payload")
+    # CANARY ONLY INSIDE A SQL COMMENT. Same CVE-2024-5314 command parked the
+    # real canary after `--`, where the database discards it: it cannot be
+    # reflected, so the assertion can never legitimately match. A canary in a
+    # comment is decoration, not proof.
+    if canary and canary in command:
+        _live = _re_ph.sub(r"--[^\n]*", "", command)   # strip SQL line comments
+        _live = _re_ph.sub(r"/\*.*?\*/", "", _live, flags=_re_ph.S)  # and block comments
+        if canary not in _live:
+            return (False, f"canary {canary!r} appears ONLY inside a SQL comment "
+                           "(after -- or within /* */), where the server discards "
+                           "it and it can never be reflected — place it in a "
+                           "selected column or other reflected position")
     return (True, "")
 
 
@@ -25584,7 +25749,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         # 2 of 11 PARTIAL cases ran all 5 iters on commands that /bin/sh refused
         # at parse time. On fail: synthesize a syntax-error "output" so the
         # existing refine path kicks in with specific feedback.
-        _syn_ok, _syn_err = _poc_shell_syntax_check(command)
+        _syn_ok, _syn_err = _poc_shell_syntax_check(command, canary=canary)
         if not _syn_ok:
             _refused_now, _ = _poc_detect_llm_refusal(command)
             if _refused_now:
