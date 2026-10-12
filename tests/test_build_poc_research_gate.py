@@ -644,7 +644,10 @@ def test_deep_recon_executor_is_gated_bounded_and_reuses_the_credential_checker(
 
 def test_graph_loops_once_through_deep_recon_on_gaps_and_early_stop():
     g = GRAPH.read_text()
-    assert 'g.add_node("deep_recon", node_deep_recon)' in g
+    # Nodes register through the _add_node wrapper (which adds tracing), not
+    # g.add_node directly — this assertion pinned the pre-wrapper form and had
+    # been failing since that refactor.
+    assert '_add_node(g, "deep_recon", node_deep_recon)' in g
     assert 'g.add_conditional_edges("gather_check", _route_after_gather' in g and 'g.add_edge("deep_recon", "gather_check")' in g
     assert 'g.add_conditional_edges("run_refine", _route_after_refine' in g
     assert 'g.add_edge("gather_check", "synth")' not in g and 'g.add_edge("run_refine", "save_store")' not in g
@@ -790,9 +793,24 @@ def test_widen_plan_tries_default_creds_first_without_a_session():
 
 
 def test_second_pass_iterations_are_capped():
-    assert '_BUILD_POC_SECOND_PASS_ITERS = int(os.environ.get("BUILD_POC_SECOND_PASS_ITERS") or "10")' in API.read_text()
+    """The go-around is still a SECOND CHANCE, not an unbounded budget.
+
+    2026-10-12: the cap moved from a hard-compiled 10 to an operator setting
+    (`build_poc_second_pass_iters`, default 50) because that clamp was the
+    binding limit on every CVE needing deep recon — a request for 50 became 10.
+    This test now pins the INVARIANT (a cap is applied, read at runtime) rather
+    than the old literal; the setting's own chain is covered by
+    tests/test_build_poc_iteration_setting.py.
+    """
+    api = API.read_text()
+    assert "_BUILD_POC_SECOND_PASS_ITERS = int(os.environ.get(" in api, (
+        "the compiled fallback must still exist")
+    assert "def _build_poc_second_pass_iters(" in api, (
+        "the cap must be read at runtime so Settings takes effect without a rebuild")
     node = _func_src("node_deep_recon", GRAPH)
-    assert '"max_iters": min(' in node and "_BUILD_POC_SECOND_PASS_ITERS" in node
+    assert '"max_iters": min(' in node, "the go-around must still clamp"
+    assert "_second_pass_cap" in node, (
+        "the clamp must use the runtime value, not the import-time constant")
 
 
 def test_credential_unsourced_is_traced_once_per_distinct_command():
