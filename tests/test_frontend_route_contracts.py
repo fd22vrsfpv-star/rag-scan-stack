@@ -55,19 +55,7 @@ FRONTEND_DYNAMIC: dict[str, str] = {}
 
 # Known violations kept visible while they are fixed. Ratchets: a new one fails
 # by name, and a stale entry fails test_no_stale_debt.
-FRONTEND_DEBT: dict[str, str] = {
-    # The Flow-authoring UI (KnowledgeBase.tsx) calls rag-api's /rules endpoints
-    # through apiFetch, but no BFF router proxies /api/rules -- so every call
-    # 404s. rag-api declares them; only the proxy leg is missing. Out of scope
-    # for the Exploit Workbench review that added this guard; tracked in
-    # Docs/OPEN_ITEMS.md. Fix = add the proxies, same shape as the poc-hints
-    # ones in routers/assets.py.
-    "dashboard/frontend/src/api/flows.ts:62": "no BFF proxy for /api/rules",
-    "dashboard/frontend/src/api/flows.ts:75": "no BFF proxy for /api/rules/test",
-    "dashboard/frontend/src/api/flows.ts:87": "no BFF proxy for /api/rules",
-    "dashboard/frontend/src/api/flows.ts:100": "no BFF proxy for /api/rules/sync-rag",
-    "dashboard/frontend/src/api/flows.ts:111": "no BFF proxy for /api/rules/{id}",
-}
+FRONTEND_DEBT: dict[str, str] = {}
 
 
 def _ts_files():
