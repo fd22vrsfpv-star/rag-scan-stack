@@ -537,3 +537,25 @@ exists so a registry parser also produces notable facts. Note the RAG-coverage
 ratchet: a new `knowledge/*.yaml` must ship its loader in the same change
 (`tests/test_knowledge_rag_coverage.py`).
 **Enforced by:** not enforced
+
+### A multi-CWE CVE gets one payload family, and the rest are discarded
+**Found:** 2026-10-12
+**Evidence:** `_vuln_class_from_cve` returns a single string. CVE-2024-3408's NVD
+record carries `['CWE-798', 'CWE-94']` (observed in
+`software_research_cache.results->'cwe'` during the 2026-10-12 focused-10 run).
+The new CWE-first lookup iterates in NVD order, so `CWE-798` → `auth-bypass`
+wins and `CWE-94` → `cmdi` is discarded. The advisory describes the CVE as "an
+authentication bypass AND remote code execution (RCE)", and the baseline run's
+command did both — forged a Flask session, then attempted code execution — so
+the single class names only half the exploit. `_CRAFT_CLASS_GUIDANCE` is then
+selected by that one class, and the crafter is given auth-bypass guidance for
+an exploit whose payoff is RCE. CVE-2024-3408 has never landed in any archived
+run (`Docs/run_archive.*`: regex_missed / dup_exit every time).
+**Where:** `app/rag-api/api.py::_vuln_class_from_cve`,
+`app/rag-api/api.py::_CRAFT_CLASS_GUIDANCE`, `_llm_craft_payload`.
+**Done when:** a CVE with several mapped CWEs carries an ordered list of classes
+and the crafter sees guidance for the chain (e.g. "auth-bypass to reach the sink,
+then cmdi for the payload"), rather than guidance for whichever CWE sorted first.
+Pre-existing: the description-only classifier had the same single-value shape, so
+this is not a regression introduced by the CWE lookup.
+**Enforced by:** not enforced
