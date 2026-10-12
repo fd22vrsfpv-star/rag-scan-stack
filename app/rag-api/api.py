@@ -13017,12 +13017,33 @@ def get_domain_overview(
 # ── Sitemap ──────────────────────────────────────────────────────────────────
 
 @app.get("/ports/summary", tags=["Ports"])
-def port_scan_summary(authorized: bool = Depends(auth)):
-    """Return a summary of all open ports: hosts with ports, total ports, grouped by service."""
+def port_scan_summary(engagement_id: Optional[str] = None,
+                      all_engagements: bool = False,
+                      authorized: bool = Depends(auth)):
+    """Open-port summary for the ACTIVE engagement: hosts, totals, by service.
+
+    Engagement-filtered on the read path (CLAUDE.md): ports are collected target
+    data, so a global listing shown under a per-engagement header tells the
+    operator they scanned hosts belonging to another engagement. NULL-engagement
+    assets are included, as everywhere else, so pre-attribution rows stay
+    reachable. `?all_engagements=true` is the explicit cross-engagement view.
+    """
+    eid = None if all_engagements else _validate_engagement_uuid(
+        _resolve_engagement_id(engagement_id))
+    # Applied to every query below, including the two that JOIN assets: the
+    # host/service rollups are what the UI renders, so filtering only the counts
+    # would leave the visible lists global.
+    where_a = "" if eid is None else " AND (a.engagement_id = %s OR a.engagement_id IS NULL)"
+    args: tuple = () if eid is None else (eid,)
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("SELECT COUNT(DISTINCT asset_id) as hosts_with_ports FROM ports WHERE is_open = true")
+        cur.execute(
+            "SELECT COUNT(DISTINCT p.asset_id) as hosts_with_ports "
+            "FROM ports p JOIN assets a ON a.id = p.asset_id "
+            "WHERE p.is_open = true" + where_a, args)
         hosts = cur.fetchone()["hosts_with_ports"]
-        cur.execute("SELECT COUNT(*) as total FROM ports WHERE is_open = true")
+        cur.execute(
+            "SELECT COUNT(*) as total FROM ports p JOIN assets a ON a.id = p.asset_id "
+            "WHERE p.is_open = true" + where_a, args)
         total = cur.fetchone()["total"]
 
         # Group by service
@@ -13030,9 +13051,9 @@ def port_scan_summary(authorized: bool = Depends(auth)):
             SELECT service, COUNT(*) as cnt,
                    array_agg(DISTINCT host(a.ip)::text) as hosts
             FROM ports p JOIN assets a ON a.id = p.asset_id
-            WHERE p.is_open = true
+            WHERE p.is_open = true""" + where_a + """
             GROUP BY service ORDER BY cnt DESC LIMIT 20
-        """)
+        """, args)
         by_service = [{"service": r["service"] or "unknown", "count": r["cnt"],
                        "hosts": r["hosts"][:5]} for r in cur.fetchall()]
 
@@ -13041,15 +13062,18 @@ def port_scan_summary(authorized: bool = Depends(auth)):
             SELECT host(a.ip)::text as ip, a.hostname, COUNT(*) as open_ports,
                    array_agg(DISTINCT p.port ORDER BY p.port) as ports
             FROM ports p JOIN assets a ON a.id = p.asset_id
-            WHERE p.is_open = true
+            WHERE p.is_open = true""" + where_a + """
             GROUP BY a.ip, a.hostname ORDER BY open_ports DESC LIMIT 20
-        """)
+        """, args)
         by_host = [{"ip": r["ip"], "hostname": r["hostname"] or "",
                      "open_ports": r["open_ports"], "ports": r["ports"][:20]} for r in cur.fetchall()]
 
     return {
         "hosts_with_ports": hosts, "total_open_ports": total,
         "by_service": by_service, "by_host": by_host,
+        # So the UI can label which view it is showing rather than guessing.
+        "engagement_id": str(eid) if eid else None,
+        "all_engagements": bool(all_engagements),
     }
 
 

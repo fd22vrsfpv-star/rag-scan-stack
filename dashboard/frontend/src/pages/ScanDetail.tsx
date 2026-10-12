@@ -416,9 +416,21 @@ export default function ScanDetail() {
               </div>
               {byHostScoped && byHostScoped.length > 0 && (
                 <div>
+                  {/* Only claim the narrowing we actually performed. When the
+                      scan's targets cannot be read from its params the filter
+                      returns the global list unchanged, and labelling that
+                      "this scan's targets only" asserts the operator scanned
+                      hosts they never touched. */}
                   <h4 className="text-[10px] font-medium text-muted-foreground mb-1.5">
                     Open Ports by Host
-                    <span className="text-muted-foreground ml-1">(this scan&apos;s targets only)</span>
+                    {scanTargets.length > 0 ? (
+                      <span className="text-muted-foreground ml-1">(this scan&apos;s targets only)</span>
+                    ) : (
+                      <span className="text-amber-400 ml-1"
+                            title="This scan recorded no target in its params, so the list below is every host on record for the active engagement — not just this scan's targets.">
+                        (all hosts on record — this scan&apos;s targets could not be determined)
+                      </span>
+                    )}
                   </h4>
                   <div className="space-y-1 max-h-48 overflow-y-auto">
                     {byHostScoped.map((h, i) => (
