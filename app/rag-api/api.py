@@ -32334,6 +32334,10 @@ def get_derivation_intel(exploit_id: str, authorized: bool = Depends(auth)):
 # strategist never reached the key trace.
 _KEY_TRACE_PHASES = {
     "cve_spec_derivation", "synth_seeded_from_confirmed",
+    # Whether projectdiscovery already ships a check for this CVE. Key, not
+    # noise: if a verified template existed and the build still failed, that is
+    # the first thing the reviewer needs to see.
+    "nuclei_template_available",
     "enforced_resolved_ids", "enforced_request_contract",
     "challenge_building_blocks", "readiness_gate",
     "recon:access_enumeration", "poc_captured_credentials",

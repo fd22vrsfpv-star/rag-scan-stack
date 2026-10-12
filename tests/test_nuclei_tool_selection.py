@@ -198,3 +198,63 @@ def test_schema_declares_port_and_backfills_it():
     assert "extra->>'port'" in ddl, (
         "no backfill from where the port was already being written, so rows "
         "created before the column keep suppressing every port on their service")
+
+
+# ── PoC workbench checks for an existing nuclei template ───────────────────
+# Before synthesising a PoC, build-poc asks whether projectdiscovery already
+# ships a check for the CVE. A verified upstream template is a faster and more
+# reliable answer than a from-scratch PoC, and when the build fails anyway,
+# "a working check existed" is the most useful line in the review.
+
+GRAPH = os.path.join(REPO, "app", "rag-api", "build_poc_graph.py")
+NUCLEI_RUNNER = os.path.join(REPO, "nuclei", "nuclei_runner.py")
+NUCLEI_REQS = os.path.join(REPO, "nuclei", "requirements.txt")
+
+
+def test_build_poc_checks_for_a_template():
+    src = _read(GRAPH)
+    assert "templates/for-cve" in src, (
+        "build-poc no longer asks whether a nuclei template exists for the CVE")
+    assert "nuclei_template_available" in src, "the result is not traced"
+
+
+def test_the_check_cannot_break_a_build():
+    """Advisory only. A nuclei-runner outage must not fail PoC synthesis."""
+    src = _read(GRAPH)
+    i = src.find("templates/for-cve")
+    seg = src[max(0, i - 900):i + 1400]
+    assert "except Exception" in seg, (
+        "the template check is not wrapped; a nuclei-runner outage would "
+        "abort the build")
+
+
+def test_the_result_reaches_the_key_trace():
+    api = _read(API)
+    i = api.find("_KEY_TRACE_PHASES")
+    assert "nuclei_template_available" in api[i:i + 2000], (
+        "nuclei_template_available is traced but not in _KEY_TRACE_PHASES, so "
+        "it never surfaces in Derivation Intel or the review export")
+
+
+def test_lookup_endpoint_matches_case_insensitively():
+    """fname.upper() ends '.YAML'; comparing against a lowercase '.yaml'
+    matches nothing and the endpoint silently reports 'no template'."""
+    src = _read(NUCLEI_RUNNER)
+    i = src.find("def template_for_cve")
+    assert i != -1, "the per-CVE lookup endpoint is gone"
+    seg = src[i:i + 4000]
+    assert 'f"{want}.YAML"' in seg, (
+        "the filename comparison is case-mismatched again — every lookup will "
+        "report 'no template with that ID' even when the file is present")
+    assert '"intrusive"' in seg, (
+        "the response must say whether the template is intrusive; the operator "
+        "needs to know it exploits rather than probes before running it")
+
+
+def test_pyyaml_is_declared_for_the_runner():
+    """/templates/search and the per-CVE lookup parse YAML. Without the dep
+    they raise ModuleNotFoundError on every call — which is what they did."""
+    reqs = _read(NUCLEI_REQS).lower()
+    assert "pyyaml" in reqs, (
+        "pyyaml missing from nuclei/requirements.txt; the template endpoints "
+        "500 on every request")

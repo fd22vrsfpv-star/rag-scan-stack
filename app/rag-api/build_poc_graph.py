@@ -1069,6 +1069,32 @@ def node_research(state: BuildPocState) -> Dict[str, Any]:
         except Exception as e:  # noqa: BLE001
             logging.debug("build research step failed: %s", e)
             research_out = None
+    # Does projectdiscovery already ship a check for this CVE? Worth knowing
+    # before synthesising anything: a VERIFIED upstream template is a faster and
+    # far more reliable answer than a from-scratch PoC, and when one exists and
+    # the build still fails, "a working check existed and we did not use it" is
+    # the single most useful line in the review.
+    #
+    # Advisory only — never gates the build, and every failure is swallowed.
+    try:
+        import requests as _rq
+        from api import _poc_trace
+        _nu = os.environ.get("NUCLEI_URL", "https://nuclei-runner:8011")
+        _tr = _rq.get(f"{_nu}/templates/for-cve/{state['cve']}",
+                      timeout=10, verify=False).json()
+        if _tr.get("found"):
+            _poc_trace(
+                state["run_id"], "nuclei_template_available",
+                response=(f"{_tr.get('template_id')} severity={_tr.get('severity')} "
+                          f"verified={_tr.get('verified')} intrusive={_tr.get('intrusive')} "
+                          f"path={_tr.get('template_path')}"),
+                extra={"nuclei_template": _tr})
+        else:
+            _poc_trace(state["run_id"], "nuclei_template_available",
+                       response=f"none for {state['cve']} ({_tr.get('reason')})",
+                       extra={"nuclei_template": _tr})
+    except Exception as e:  # noqa: BLE001
+        logging.debug("nuclei template check skipped for %s: %s", state.get("cve"), e)
     # Agent-driven spec derivation. Skip if a hand-curated YAML spec already exists
     # or env BUILD_POC_AUTO_DERIVE=off.
     if (os.environ.get("BUILD_POC_AUTO_DERIVE", "on") or "on").lower() != "off":
