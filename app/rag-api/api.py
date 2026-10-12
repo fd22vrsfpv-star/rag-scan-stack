@@ -31189,6 +31189,22 @@ def _command_binaries(command: str) -> list:
     # Quotes are already blanked above, so a surviving "#" at the start of a
     # word is a real comment (a "#" inside a URL is mid-word and is kept).
     s = _re.sub(r"(?m)(?:(?<=\s)|^)#[^\n]*", " ", s)
+    # Strip SHELL EXPANSIONS before segmenting. The splitter below breaks on
+    # "(", ")", "{" and "}", so an expansion becomes its own segment and its
+    # first word is taken as a program name:
+    #     curl -w %{time_total}   -> segment "time_total" -> "program" time_total
+    #     $(( END - START ))      -> segment " END - START" -> "program" END
+    # Observed live on CVE-2024-22120 (2026-10-12): the prerun tool check
+    # reported "PRERUN_TOOL_MISSING: time_total, null" and
+    # "PRERUN_TOOL_MISSING: END, ELAPSED", and refused to dispatch — target_runs
+    # fell from 10 to 1. Same defect class as the sink-verification comment:
+    # text that is not a command being read as one.
+    #
+    # $(...) is NOT stripped — a command substitution really does invoke a
+    # program, and the splitter already turns it into a segment on purpose.
+    s = _re.sub(r"\$\(\(.*?\)\)", " ", s)      # arithmetic  $(( ... ))
+    s = _re.sub(r"\$\{[^}]*\}", " ", s)          # parameter   ${ ... }
+    s = _re.sub(r"%\{[^}]*\}", " ", s)            # curl -w     %{ ... }
     segs = _re.split(r"\|\||&&|[|;\n]|\$\(|`|[(){}]", s)
     out, seen = [], set()
     for seg in segs:

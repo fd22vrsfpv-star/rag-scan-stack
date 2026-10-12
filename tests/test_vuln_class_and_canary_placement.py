@@ -456,3 +456,47 @@ def test_unknown_class_contributes_nothing_without_a_chain():
     assert '!= "unknown"' in fn or "!= 'unknown'" in fn, (
         "the helper must skip the decomposed-only 'unknown' guidance text"
     )
+
+
+# ---- F11: a shell EXPANSION is not a command either (second instance of F7)
+#
+# F7 taught _command_binaries that a `#` comment is not a command. It did not
+# teach it about expansions. The segmenter splits on "(", ")", "{" and "}", so:
+#     curl -w %{time_total}   -> segment "time_total"    -> "program" time_total
+#     $(( END - START ))      -> segment " END - START"  -> "program" END
+# _prerun_tool_check then finds them missing on the runner and REFUSES to
+# dispatch. Observed live on CVE-2024-22120, 2026-10-12, immediately after F3
+# went live and changed the commands the model writes (it now uses `-w` timing
+# and arithmetic): "PRERUN_TOOL_MISSING: time_total, null" and
+# "PRERUN_TOOL_MISSING: END, ELAPSED", with target_runs falling 10 -> 1.
+#
+# $(...) is deliberately NOT stripped: a command substitution really does
+# invoke a program, and the splitter turns it into a segment on purpose.
+
+
+def test_expansions_are_stripped_before_segmentation():
+    fn = _func(_src(), "_command_binaries")
+    code = _code_only(fn)
+    for lit, what in ((r"\$\(\(", "arithmetic $(( ))"),
+                      (r"\$\{[^}]*\}", "parameter ${ }"),
+                      (r"%\{[^}]*\}", "curl -w %{ }")):
+        assert lit in code, f"{what} expansion is not stripped"
+    strip = code.index(r"%\{[^}]*\}")
+    split = code.index("_re.split(")
+    assert strip < split, (
+        "expansions must be stripped BEFORE the segment split, or their inner "
+        "words leak out as program names"
+    )
+
+
+def test_command_substitution_is_still_parsed():
+    """$(grep ... | awk ...) DOES invoke programs — stripping it would hide a
+    genuinely missing binary, which is the opposite failure."""
+    code = _code_only(_func(_src(), "_command_binaries"))
+    assert r"\$\(\(" in code, "arithmetic strip missing"
+    # The splitter must still treat $( as a segment boundary, i.e. command
+    # substitution is parsed, not removed.
+    assert r"\$\(|" in code or r"|\$\(" in code, (
+        "the splitter no longer breaks on $( — command substitutions would "
+        "stop being parsed for the programs they invoke"
+    )
