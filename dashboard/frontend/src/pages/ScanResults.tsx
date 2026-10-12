@@ -202,7 +202,17 @@ export default function ScanResults() {
                     <tr onClick={open}
                         className={cn('border-t border-gray-800 hover:bg-gray-800/40 cursor-pointer',
                                       showSummary && 'border-b-0')}>
-                      <td className="px-3 py-2 font-mono align-top">{a.tool}</td>
+                      <td className="px-3 py-2 font-mono align-top">
+                        <div>{a.tool}</div>
+                        {/* A PoC build's note is "CVE-YYYY-NNNNN — <verdict>".
+                            Without the CVE every build in a 10-CVE run renders
+                            as an identical "cve_poc_builder" row. */}
+                        {pocLabel(a) && (
+                          <div className="text-[11px] font-sans text-orange-300/90 mt-0.5">
+                            {pocLabel(a)}
+                          </div>
+                        )}
+                      </td>
                       <td className="px-3 py-2 align-top">
                         <span className={cn(attemptedOnly ? 'text-gray-400 italic' : 'text-gray-300')}
                               title={attemptedOnly ? 'attempted host — the run produced no findings' : undefined}>
@@ -273,6 +283,20 @@ export default function ScanResults() {
       )}
     </div>
   )
+}
+
+/** Which CVE a PoC build was for, plus its verdict, for the Tool cell.
+ *
+ *  build_poc writes `note` as "CVE-YYYY-NNNNN — <verdict>" (e.g.
+ *  "CVE-2024-22120 — FAILED — needs tweaking"). Falls back to the first line of
+ *  the content ("CVE PoC Build: CVE-...") for rows written before the note was
+ *  set. Returns null for every non-PoC tool so other rows are unchanged. */
+function pocLabel(a: import('@/api/artifacts').Artifact): string | null {
+  if (a.tool !== 'cve_poc_builder') return null
+  const fromNote = a.note?.match(/CVE-\d{4}-\d{4,7}.*/)?.[0]
+  if (fromNote) return fromNote
+  const fromContent = a.content?.match(/CVE-\d{4}-\d{4,7}/)?.[0]
+  return fromContent || null
 }
 
 /** The per-item second line: how many findings the run produced and their
