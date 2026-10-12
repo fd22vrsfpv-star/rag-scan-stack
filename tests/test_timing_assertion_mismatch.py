@@ -199,3 +199,75 @@ def test_fail_soft_on_detector_error():
         "on detector failure the code must fall back to the legacy (sticky) "
         "shape rather than silently switching assertion kinds"
     )
+
+
+# -------------------------------------- F2b: never dispatched != too fast
+#
+# Found while watching the 2026-10-12 run that shipped F1/F2: the no-payload
+# check fixed one expression of the defect and missed the other. On
+# CVE-2024-22120, two consecutive iterations were graded latency_too_fast for
+# commands that never reached the target — iter 1 blocked by a missing runner
+# program ("the command was NOT sent to the target", its own words), iter 2
+# refused by the pre-dispatch canary check. Both carry elapsed = 0.0, and the
+# no-payload check does not fire because the command genuinely does contain a
+# SLEEP. The latency branch simply assumed `elapsed` was evidence.
+
+
+def test_not_executed_helper_exists():
+    src = _src()
+    fn = _func(src, "_poc_command_not_executed")
+    assert "pre-dispatch dry-parse refused to run" in fn, (
+        "must recognise the pre-dispatch refusal marker"
+    )
+    assert "45" in fn and "NOT sent to the target" in fn, (
+        "must recognise the prerun-tool-missing path (exit 45 + its marker)"
+    )
+
+
+def test_not_executed_does_not_key_on_elapsed_or_bare_exit_2():
+    """A real request can legitimately return in 0.0s, and a genuinely
+    dispatched command can exit 2 — neither proves it never ran."""
+    fn = _func(_src(), "_poc_command_not_executed")
+    assert "elapsed" not in fn.split('"""')[-1], (
+        "must not infer 'not executed' from elapsed == 0"
+    )
+    assert "exit_code == 2" not in fn, (
+        "must not treat a bare exit code 2 as 'not executed' — a dispatched "
+        "command may exit 2 on its own"
+    )
+
+
+def test_latency_branch_checks_not_executed_first():
+    fn = _func(_src(), "_poc_assertion_verdict")
+    assert "_poc_command_not_executed" in fn, (
+        "the min_seconds branch must ask whether the command ran at all"
+    )
+
+    def _ret(method):
+        m = re.search(r'"method"\s*:\s*"' + re.escape(method) + r'"', fn)
+        assert m, f'no `"method": "{method}"` return in _poc_assertion_verdict'
+        return m.start()
+
+    # It must precede EVERY other latency verdict - there is nothing to measure.
+    for later in ("latency_missing", "latency_connection_error",
+                  "latency_unconfirmable", "latency_too_fast"):
+        assert _ret("latency_not_executed") < _ret(later), (
+            f"latency_not_executed must be returned before {later}; a command "
+            "that never ran has no elapsed time to interpret"
+        )
+
+
+def test_not_executed_reason_redirects_away_from_the_payload():
+    fn = _func(_src(), "_poc_assertion_verdict")
+    i = fn.find('"method": "latency_not_executed"')
+    assert i != -1, "latency_not_executed return site not found"
+    # Join adjacent string literals: the reason is wrapped across source lines,
+    # so the sentence is not contiguous in the file even though it is at runtime.
+    window = re.sub(r'"\s*\n\s*"', "", fn[i:i + 1200]).lower()
+    assert "do not change the timing payload" in window, (
+        "the reason must tell the loop to fix why the command did not run, "
+        "not to re-shape the timing payload"
+    )
+    assert "measures nothing" in window, (
+        "the reason must say plainly that the elapsed time is not evidence"
+    )

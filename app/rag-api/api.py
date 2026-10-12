@@ -14236,6 +14236,35 @@ def _execute_curl_chain_in_python(command: str, chain_timeout: int = 180) -> dic
 # Phase 1 scaffold stub so shadow comparison still records something.
 
 
+def _poc_command_not_executed(output, exit_code=None):
+    """Did this 'run' never actually reach the target? Returns a short reason
+    string, or None when the command really was dispatched.
+
+    Several refine paths short-circuit BEFORE dispatch and synthesise an
+    `output` so the loop still gets feedback. Those carry `elapsed = 0.0`,
+    which is not a measurement of anything — the target never saw a request.
+    A latency assertion that compares 0.0s against min_seconds therefore
+    reports "timing payload did not block the server" about a server that was
+    never contacted, and that false reason reaches both the refine prompt and
+    cross-run error memory.
+
+    Keyed on the explicit markers each path writes plus its sentinel exit
+    code, never on `elapsed == 0` (a real request CAN return that fast) and
+    never on a bare exit code 2 (a genuinely dispatched command may exit 2).
+    """
+    out = output or ""
+    if "pre-dispatch dry-parse refused to run" in out:
+        return ("the command was REFUSED BEFORE DISPATCH by the pre-dispatch "
+                "check and never reached the target")
+    if exit_code == 45 or "the command was NOT sent to the target" in out:
+        return ("a required program is missing on the runner, so the command "
+                "was never sent to the target")
+    if out.startswith("REFUSE: I cannot provide (pre-dispatch detected LLM refusal"):
+        return ("the model returned refusal prose instead of a shell command; "
+                "nothing was dispatched")
+    return None
+
+
 # CWE -> crafter vuln class. Only unambiguous mappings belong here: a CWE that
 # could reasonably drive two different payload families (e.g. CWE-20 "Improper
 # Input Validation", which covers everything from SQLi to buffer overflow) is
@@ -20776,6 +20805,28 @@ def _poc_assertion_verdict(assertion, output, exit_code=None,
         min_s = a.get("min_seconds")
         max_s = a.get("max_seconds")
         if min_s is not None:
+            # NEVER DISPATCHED ≠ TOO FAST. Several refine paths short-circuit
+            # before dispatch and synthesise an `output` so the loop still gets
+            # feedback; those carry elapsed = 0.0, which measures nothing. This
+            # check must precede every elapsed comparison below, or a command
+            # the target never received is reported as "timing payload did not
+            # block the server" — the same defect as the no-payload case, in a
+            # second form.
+            #
+            # Observed live on CVE-2024-22120, 2026-10-12, two consecutive
+            # iterations: iter 1 was blocked by a missing runner program
+            # (its own output says "the command was NOT sent to the target")
+            # and iter 2 was refused by the pre-dispatch canary check — both
+            # graded latency_too_fast, and iter 1's false reason was written to
+            # cross-run error memory as "-|latency_too_fast|prerun_tool_missing".
+            _not_run = _poc_command_not_executed(out, exit_code)
+            if _not_run:
+                return {"passed": False, "method": "latency_not_executed",
+                        "confidence": 1.0,
+                        "reason": f"no timing verdict is possible: {_not_run}. "
+                                  "The elapsed time measures nothing — fix the "
+                                  "reason the command did not run; do NOT change "
+                                  "the timing payload."}
             # Operator opted into a timing assertion — it is now AUTHORITATIVE.
             # Pass only on real timing match; do NOT fall through to the regex
             # / default_truthy path for a run that was too fast (that would
