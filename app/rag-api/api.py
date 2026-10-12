@@ -32772,6 +32772,54 @@ def _review_source_links(md: dict, intel: dict, target_host=None, cap=60) -> lis
     return rows
 
 
+def _md_github_slug(text: str, seen: dict) -> str:
+    """GitHub's heading-anchor slug, with its duplicate suffixing.
+
+    Lowercase, drop everything that is not a word char / space / hyphen, then
+    spaces to hyphens. A repeated slug gets -1, -2, ... exactly as GitHub does,
+    so "## Confirmed facts (12)" -> `confirmed-facts-12` and a second identical
+    heading -> `confirmed-facts-12-1`. Anchors must match or the links are dead.
+    """
+    slug = _re_module.sub(r"[^\w\s-]", "", text.lower()).strip()
+    slug = _re_module.sub(r"[\s_]+", "-", slug)
+    n = seen.get(slug, 0)
+    seen[slug] = n + 1
+    return slug if n == 0 else f"{slug}-{n}"
+
+
+def _md_toc(body: list) -> list:
+    """A linked index of the `##`/`###` headings actually present in `body`.
+
+    Derived from the emitted lines rather than a fixed list, because almost
+    every section here is conditional — a hardcoded index would advertise
+    sections a given report does not contain, and silently omit new ones.
+    Returns [] when there is nothing worth indexing.
+    """
+    headings = []
+    in_fence = False
+    for line in body:
+        s = str(line)
+        # Don't index "## ..." inside a fenced code block (command output and
+        # captured HTTP bodies routinely contain lines starting with #).
+        if s.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        m = _re_module.match(r"^(#{2,3})\s+(.*\S)\s*$", s)
+        if m:
+            headings.append((len(m.group(1)), m.group(2)))
+    if len(headings) < 2:
+        return []
+    seen: dict = {}
+    out = ["## Contents", ""]
+    for level, text in headings:
+        indent = "  " * (level - 2)
+        out.append(f"{indent}- [{text}](#{_md_github_slug(text, seen)})")
+    out.append("")
+    return out
+
+
 def _render_review_md(r: dict, intel: dict, failure_analysis=None, live_recon=None) -> str:
     """The review.md body, shared by the exploit-store export and the
     build-poc attempt export (which has no store row). `r` is a row-like dict:
@@ -33235,6 +33283,14 @@ def _render_review_md(r: dict, intel: dict, failure_analysis=None, live_recon=No
 
     if not metrics and not research and not spec and not facts and not creds and not foots and not trace and not manual and not full_tr and not failure_analysis:
         out.append("_No derivation evidence stored for this exploit yet._")
+    # Index the sections. Inserted just before the first heading so it sits
+    # under the title + target line, and built from `out` as it finally stands
+    # so it lists exactly the sections this report contains.
+    toc = _md_toc(out)
+    if toc:
+        first = next((i for i, ln in enumerate(out)
+                      if _re_module.match(r"^#{2,3}\s+\S", str(ln))), len(out))
+        out = out[:first] + toc + out[first:]
     return "\n".join(out).rstrip() + "\n"
 
 
