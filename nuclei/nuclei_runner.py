@@ -300,7 +300,8 @@ def ensure_templates():
         except subprocess.TimeoutExpired:
             logging.warning("nuclei template update exceeded 600s — continuing with existing templates")
 
-def run_nuclei(urls: List[str], tags: Optional[str] = None, proxy: Optional[str] = None) -> pathlib.Path:
+def run_nuclei(urls: List[str], tags: Optional[str] = None, proxy: Optional[str] = None,
+               include_tags: Optional[str] = None) -> pathlib.Path:
     """Run nuclei scan on list of URLs.
 
     Args:
@@ -331,6 +332,11 @@ def run_nuclei(urls: List[str], tags: Optional[str] = None, proxy: Optional[str]
     # Add tags filter if specified
     if tags:
         cmd.extend(["-tags", tags])
+    # -itags forces templates past .nuclei-ignore, which holds back `intrusive`
+    # ones by default. Only set when the caller asked: an intrusive template
+    # exploits the target rather than probing it.
+    if include_tags:
+        cmd.extend(["-itags", include_tags])
 
     # Add SOCKS proxy if specified (for scanning through remote nodes)
     if proxy:
@@ -408,10 +414,14 @@ class JobReq(BaseModel):
     severity: Optional[str] = None
     all_ports: Optional[bool] = False  # Scan ALL open ports, not just web ports
     tags: Optional[str] = None  # Template tags filter (e.g., 'cve,rce')
+    # Tags to force IN past nuclei's .nuclei-ignore (notably 'intrusive',
+    # which exploits rather than probes). Operator-gated upstream; the runner
+    # just honours what it is told.
+    include_tags: Optional[str] = None
     proxy: Optional[str] = None  # SOCKS proxy URL for scanning through remote nodes (e.g., 'socks5://host:port')
 
 
-def _run_nuclei_scan_job(job_id: str, limit: Optional[int], severity: Optional[str], all_ports: bool = False, direct_targets: Optional[list[str]] = None, tags: Optional[str] = None, proxy: Optional[str] = None):
+def _run_nuclei_scan_job(job_id: str, limit: Optional[int], severity: Optional[str], all_ports: bool = False, direct_targets: Optional[list[str]] = None, tags: Optional[str] = None, proxy: Optional[str] = None, include_tags: Optional[str] = None):
     """Background task to run nuclei scan with progress tracking"""
     global SEVERITY
     orig_severity = SEVERITY
@@ -500,7 +510,8 @@ def _run_nuclei_scan_job(job_id: str, limit: Optional[int], severity: Optional[s
 
         # Run nuclei scan
         _job_tracker.update_progress(job_id, stage="scanning")
-        out_json = run_nuclei(targets, tags=tags, proxy=proxy)
+        out_json = run_nuclei(targets, tags=tags, proxy=proxy,
+                              include_tags=include_tags)
 
         # Count findings from output file
         findings_count = 0
@@ -764,7 +775,7 @@ def nuclei_scan(req: JobReq, background_tasks: BackgroundTasks):
     # Merge target + targets into a single target string or list
     direct_targets = req.targets or ([req.target] if req.target else None)
     background_tasks.add_task(_run_nuclei_scan_job, job_id, req.limit, req.severity, req.all_ports or False,
-                              direct_targets, req.tags, req.proxy)
+                              direct_targets, req.tags, req.proxy, req.include_tags)
     return {
         "ok": True,
         "job_id": job_id,
@@ -810,7 +821,8 @@ def nuclei_scan_sync(req: JobReq):
     global SEVERITY; orig = SEVERITY
     if req.severity: SEVERITY = req.severity
     try:
-        out_json = run_nuclei(targets, tags=req.tags)
+        out_json = run_nuclei(targets, tags=req.tags,
+                              include_tags=getattr(req, 'include_tags', None))
         # Generate a job_id for sync scans for webhook tracking
         sync_job_id = f"sync-{uuid.uuid4()}"
         target_info = req.target if req.target else (targets[0] if len(targets) == 1 else f"{len(targets)} targets")
