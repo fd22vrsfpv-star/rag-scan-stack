@@ -6448,6 +6448,150 @@ ALTER TABLE web_auth_configs DROP CONSTRAINT IF EXISTS web_auth_configs_host_key
 CREATE UNIQUE INDEX IF NOT EXISTS ux_web_auth_configs_eng_host
   ON web_auth_configs (COALESCE(engagement_id, '00000000-0000-0000-0000-000000000000'::uuid), host);
 
+-- ── Exploit-intel persistence (runtime-ensured too; here for clean installs) ──
+-- Confirmed-facts ledger: durable record of verified target/exploit state
+-- (session validity, endpoint existence, resolved object-ids, version
+-- applicability, vendor-doc answers) reused across attacks. TARGET-level
+-- facts carry cve=NULL so any attack against the same target reuses them.
+-- Identity includes PRODUCT: the same ip:port runs multiple apps (Zabbix the
+-- application vs Apache the web server) and a fact for one is not a fact for
+-- the other. host (hostname/vhost) is tracked distinctly from the ip.
+CREATE TABLE IF NOT EXISTS public.confirmed_facts (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id uuid, target text NOT NULL, host text, product text,
+    version text, cve text,
+    claim_type text NOT NULL, claim_key text NOT NULL, claim_value text,
+    status text NOT NULL, evidence text, method text,
+    confidence real NOT NULL DEFAULT 0.9, ttl_seconds int NOT NULL DEFAULT 0,
+    source_run_id text,
+    confirmed_at timestamptz NOT NULL DEFAULT now(),
+    last_checked_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_confirmed_fact ON public.confirmed_facts
+    (target, COALESCE(product,''), claim_type, claim_key,
+     COALESCE(claim_value,''), COALESCE(cve,''));
+CREATE INDEX IF NOT EXISTS idx_confirmed_target
+    ON public.confirmed_facts (target, COALESCE(product,''));
+
+-- AGENT-DERIVED CVE EXPLOIT SPECS (auto-derivation pipeline persists verified recipes here)
+CREATE TABLE IF NOT EXISTS public.derived_cve_specs (
+    cve           text PRIMARY KEY,
+    product       text,
+    version       text,
+    vuln_class    text,
+    spec          jsonb NOT NULL,
+    verified      boolean NOT NULL DEFAULT false,
+    verify_method text,
+    verify_evidence text,
+    source        text,
+    derived_at    timestamptz NOT NULL DEFAULT now(),
+    last_verified timestamptz,
+    status        text NOT NULL DEFAULT 'tentative',  -- 'tentative' | 'verified' | 'refuted'
+    attempts      integer NOT NULL DEFAULT 0,
+    last_failure  text,
+    refine_hints  jsonb NOT NULL DEFAULT '{}'::jsonb  -- {tried_payloads:[], tried_endpoints:[], tried_proof_models:[], notes:""}
+);
+-- Idempotent columns for in-place upgrades (ensure_all_tables runs on existing DBs too)
+ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'tentative';
+ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS attempts integer NOT NULL DEFAULT 0;
+ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS last_failure text;
+ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS refine_hints jsonb NOT NULL DEFAULT '{}'::jsonb;
+
+-- Discovered app knowledge: per-product/version facts the build loop learns
+-- (endpoints, params, csrf source, cookie shape, secondary products).
+CREATE TABLE IF NOT EXISTS public.discovered_app_knowledge (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    product text NOT NULL, version text, fact_type text NOT NULL, fact_value text NOT NULL,
+    confidence real NOT NULL DEFAULT 0.5, discovered_from text, source_run_id text,
+    engagement_id uuid, hits int NOT NULL DEFAULT 1,
+    last_seen_at timestamptz NOT NULL DEFAULT now(),
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_dak_product ON public.discovered_app_knowledge (lower(product));
+
+-- ─── SAST findings (Semgrep / static-analysis source-code scans) ────────────
+-- Source-code level findings from static analysis tools.  NOT limited to web
+-- apps — covers any language/framework Semgrep supports. Tied to an engagement
+-- and optionally to a target host (when the source corresponds to a deployed
+-- service). The build-PoC gather phase reads these to know the exact injection
+-- point, parameter, and code path to target.
+CREATE TABLE IF NOT EXISTS public.sast_findings (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id uuid,
+    scan_id       text,
+    source_type   text NOT NULL DEFAULT 'upload',
+    source_url    text,
+    target_host   text,
+    target_port   integer,
+    rule_id       text NOT NULL,
+    severity      text CHECK (severity IN ('info','low','medium','high','critical') OR severity IS NULL),
+    confidence    text,
+    vuln_class    text,
+    file_path     text,
+    line_start    integer,
+    line_end      integer,
+    col_start     integer,
+    col_end       integer,
+    matched_code  text,
+    message       text,
+    fix           text,
+    cwe           text[] DEFAULT '{}',
+    owasp         text[] DEFAULT '{}',
+    metadata      jsonb DEFAULT '{}'::jsonb,
+    fingerprint   text NOT NULL,
+    semgrep_version text,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_sast_fingerprint ON public.sast_findings(fingerprint);
+CREATE INDEX IF NOT EXISTS ix_sast_eng ON public.sast_findings(engagement_id);
+CREATE INDEX IF NOT EXISTS ix_sast_vuln ON public.sast_findings(vuln_class);
+CREATE INDEX IF NOT EXISTS ix_sast_scan ON public.sast_findings(scan_id);
+CREATE INDEX IF NOT EXISTS ix_sast_target ON public.sast_findings(target_host);
+
+-- Semgrep scan runs — tracks each scan invocation (GitHub clone, upload, web source)
+CREATE TABLE IF NOT EXISTS public.sast_scans (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    engagement_id uuid,
+    scan_id       text NOT NULL UNIQUE,
+    source_type   text NOT NULL,
+    source_url    text,
+    target_host   text,
+    target_port   integer,
+    status        text NOT NULL DEFAULT 'pending',
+    findings_count integer DEFAULT 0,
+    high_count    integer DEFAULT 0,
+    medium_count  integer DEFAULT 0,
+    error_message text,
+    metadata      jsonb DEFAULT '{}'::jsonb,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_sast_scans_eng ON public.sast_scans(engagement_id);
+
+-- Refine-error patterns: operator-extensible + learned refine-time fix guidance.
+CREATE TABLE IF NOT EXISTS public.refine_error_patterns (
+    id text PRIMARY KEY, title text NOT NULL, guidance text NOT NULL, triggers jsonb NOT NULL,
+    source text NOT NULL DEFAULT 'yaml',
+    created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(),
+    approved_by text, approved_at timestamptz,
+    trial_count int NOT NULL DEFAULT 0, success_count int NOT NULL DEFAULT 0,
+    last_trial_at timestamptz
+);
+
+-- ════════════════════════════════════════════════════════════════════════
+-- DATA REPAIRS — must stay LAST in this file.
+--
+-- Moved here 2026-10-12. These ran mid-file, so the six CREATE TABLEs that
+-- had been appended after the block existed only AFTER the repairs that may
+-- reference them. A repair can only touch tables that already exist, and the
+-- first failure aborts the whole transaction — so on a fresh install the
+-- block could abort and silently skip every repair after the failure.
+-- The NOTE above web_auth_configs recorded this; this is the fix.
+--
+-- Anything appended to this file goes ABOVE this banner.
+-- Enforced by tests/test_db_init_order.py.
+-- ════════════════════════════════════════════════════════════════════════
 -- ── Normalize asset identity so port data is not duplicated per IP ──
 --
 -- ix_assets_ip_hostname is UNIQUE(ip, COALESCE(hostname,'')) on purpose, so one
@@ -6841,133 +6985,3 @@ UPDATE public.vulns SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{
 WHERE script LIKE ANY(ARRAY['sslscan:%','testssl:%','sslyze:%']) AND port_id IS NULL AND (metadata->>'port') IS NULL;
 
 
--- ── Exploit-intel persistence (runtime-ensured too; here for clean installs) ──
--- Confirmed-facts ledger: durable record of verified target/exploit state
--- (session validity, endpoint existence, resolved object-ids, version
--- applicability, vendor-doc answers) reused across attacks. TARGET-level
--- facts carry cve=NULL so any attack against the same target reuses them.
--- Identity includes PRODUCT: the same ip:port runs multiple apps (Zabbix the
--- application vs Apache the web server) and a fact for one is not a fact for
--- the other. host (hostname/vhost) is tracked distinctly from the ip.
-CREATE TABLE IF NOT EXISTS public.confirmed_facts (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    engagement_id uuid, target text NOT NULL, host text, product text,
-    version text, cve text,
-    claim_type text NOT NULL, claim_key text NOT NULL, claim_value text,
-    status text NOT NULL, evidence text, method text,
-    confidence real NOT NULL DEFAULT 0.9, ttl_seconds int NOT NULL DEFAULT 0,
-    source_run_id text,
-    confirmed_at timestamptz NOT NULL DEFAULT now(),
-    last_checked_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_confirmed_fact ON public.confirmed_facts
-    (target, COALESCE(product,''), claim_type, claim_key,
-     COALESCE(claim_value,''), COALESCE(cve,''));
-CREATE INDEX IF NOT EXISTS idx_confirmed_target
-    ON public.confirmed_facts (target, COALESCE(product,''));
-
--- AGENT-DERIVED CVE EXPLOIT SPECS (auto-derivation pipeline persists verified recipes here)
-CREATE TABLE IF NOT EXISTS public.derived_cve_specs (
-    cve           text PRIMARY KEY,
-    product       text,
-    version       text,
-    vuln_class    text,
-    spec          jsonb NOT NULL,
-    verified      boolean NOT NULL DEFAULT false,
-    verify_method text,
-    verify_evidence text,
-    source        text,
-    derived_at    timestamptz NOT NULL DEFAULT now(),
-    last_verified timestamptz,
-    status        text NOT NULL DEFAULT 'tentative',  -- 'tentative' | 'verified' | 'refuted'
-    attempts      integer NOT NULL DEFAULT 0,
-    last_failure  text,
-    refine_hints  jsonb NOT NULL DEFAULT '{}'::jsonb  -- {tried_payloads:[], tried_endpoints:[], tried_proof_models:[], notes:""}
-);
--- Idempotent columns for in-place upgrades (ensure_all_tables runs on existing DBs too)
-ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'tentative';
-ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS attempts integer NOT NULL DEFAULT 0;
-ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS last_failure text;
-ALTER TABLE public.derived_cve_specs ADD COLUMN IF NOT EXISTS refine_hints jsonb NOT NULL DEFAULT '{}'::jsonb;
-
--- Discovered app knowledge: per-product/version facts the build loop learns
--- (endpoints, params, csrf source, cookie shape, secondary products).
-CREATE TABLE IF NOT EXISTS public.discovered_app_knowledge (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    product text NOT NULL, version text, fact_type text NOT NULL, fact_value text NOT NULL,
-    confidence real NOT NULL DEFAULT 0.5, discovered_from text, source_run_id text,
-    engagement_id uuid, hits int NOT NULL DEFAULT 1,
-    last_seen_at timestamptz NOT NULL DEFAULT now(),
-    created_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_dak_product ON public.discovered_app_knowledge (lower(product));
-
--- ─── SAST findings (Semgrep / static-analysis source-code scans) ────────────
--- Source-code level findings from static analysis tools.  NOT limited to web
--- apps — covers any language/framework Semgrep supports. Tied to an engagement
--- and optionally to a target host (when the source corresponds to a deployed
--- service). The build-PoC gather phase reads these to know the exact injection
--- point, parameter, and code path to target.
-CREATE TABLE IF NOT EXISTS public.sast_findings (
-    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    engagement_id uuid,
-    scan_id       text,
-    source_type   text NOT NULL DEFAULT 'upload',
-    source_url    text,
-    target_host   text,
-    target_port   integer,
-    rule_id       text NOT NULL,
-    severity      text CHECK (severity IN ('info','low','medium','high','critical') OR severity IS NULL),
-    confidence    text,
-    vuln_class    text,
-    file_path     text,
-    line_start    integer,
-    line_end      integer,
-    col_start     integer,
-    col_end       integer,
-    matched_code  text,
-    message       text,
-    fix           text,
-    cwe           text[] DEFAULT '{}',
-    owasp         text[] DEFAULT '{}',
-    metadata      jsonb DEFAULT '{}'::jsonb,
-    fingerprint   text NOT NULL,
-    semgrep_version text,
-    created_at    timestamptz NOT NULL DEFAULT now(),
-    updated_at    timestamptz NOT NULL DEFAULT now()
-);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_sast_fingerprint ON public.sast_findings(fingerprint);
-CREATE INDEX IF NOT EXISTS ix_sast_eng ON public.sast_findings(engagement_id);
-CREATE INDEX IF NOT EXISTS ix_sast_vuln ON public.sast_findings(vuln_class);
-CREATE INDEX IF NOT EXISTS ix_sast_scan ON public.sast_findings(scan_id);
-CREATE INDEX IF NOT EXISTS ix_sast_target ON public.sast_findings(target_host);
-
--- Semgrep scan runs — tracks each scan invocation (GitHub clone, upload, web source)
-CREATE TABLE IF NOT EXISTS public.sast_scans (
-    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    engagement_id uuid,
-    scan_id       text NOT NULL UNIQUE,
-    source_type   text NOT NULL,
-    source_url    text,
-    target_host   text,
-    target_port   integer,
-    status        text NOT NULL DEFAULT 'pending',
-    findings_count integer DEFAULT 0,
-    high_count    integer DEFAULT 0,
-    medium_count  integer DEFAULT 0,
-    error_message text,
-    metadata      jsonb DEFAULT '{}'::jsonb,
-    created_at    timestamptz NOT NULL DEFAULT now(),
-    updated_at    timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS ix_sast_scans_eng ON public.sast_scans(engagement_id);
-
--- Refine-error patterns: operator-extensible + learned refine-time fix guidance.
-CREATE TABLE IF NOT EXISTS public.refine_error_patterns (
-    id text PRIMARY KEY, title text NOT NULL, guidance text NOT NULL, triggers jsonb NOT NULL,
-    source text NOT NULL DEFAULT 'yaml',
-    created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(),
-    approved_by text, approved_at timestamptz,
-    trial_count int NOT NULL DEFAULT 0, success_count int NOT NULL DEFAULT 0,
-    last_trial_at timestamptz
-);

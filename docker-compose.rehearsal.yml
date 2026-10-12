@@ -71,6 +71,27 @@ services:
   rag-api:
     container_name: !reset null
     ports: !reset []
+    volumes: !override
+      # /var/run/docker.sock deliberately absent: rag-api uses it only for the
+      # CTF-mode source audit, which runs `docker ps` and greps a TARGET
+      # container's filesystem by name. In a rehearsal those names belong to
+      # the LIVE stack, so it would inspect live containers — and auditing a
+      # target's source is no part of verifying an install. Everything else
+      # below is byte-for-byte the base list.
+      - ./nmap_out:/app/nmap_out
+      - ./poc_logs:/app/poc_logs
+      - ./fact_screenshots:/app/fact_screenshots
+      - ./etl:/app/etl:ro
+      - ./common:/app/common:ro
+      - ${WORDLISTS_DIR:-./wordlists}:/wordlists
+      - ./knowledge:/knowledge:ro
+      - ./db_init:/db_init:ro
+      - ${SWAGGER_DIR:-./import/swagger}:/app/swagger_files
+      - ./scan_audit:/scan_audit:ro
+      - ./exploitdb:/exploitdb
+      - ./certs:/certs:ro
+      - ./vault/init:/vault/init:ro
+      - /opt/cve-bench:/opt/cve-bench:ro
 
   embedder:
     container_name: !reset null
