@@ -42,6 +42,7 @@ licence, and an invisible refusal reads as a proposal nobody made.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
