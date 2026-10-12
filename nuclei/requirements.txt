@@ -2,3 +2,6 @@ fastapi
 uvicorn
 psycopg2-binary
 requests
+# /templates/search parses template YAML headers. Without this the endpoint
+# raised ModuleNotFoundError on every call — it had never worked.
+pyyaml>=6.0

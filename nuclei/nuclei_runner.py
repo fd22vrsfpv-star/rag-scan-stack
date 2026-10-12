@@ -715,6 +715,73 @@ def search_templates(q: str = Query(..., description="Product name or keyword to
     return {"ok": True, "query": q, "count": len(results), "results": results}
 
 
+@app.get("/templates/for-cve/{cve}")
+def template_for_cve(cve: str):
+    """Is there a nuclei template for this CVE, and what would running it mean?
+
+    The PoC workbench asks this before synthesising anything: when projectdiscovery
+    already ships a VERIFIED check for the CVE, that is a faster and far more
+    reliable answer than a from-scratch PoC, and it is worth telling the operator
+    so even when the build proceeds.
+
+    Matches on the template ID rather than keyword-searching, because a keyword
+    hit on "CVE-2024-5084" also returns every template that merely cites it in a
+    reference block.
+
+    Returns `found: false` with a reason rather than 404 — "no template exists"
+    is a real, useful answer, not an error.
+    """
+    import os as _os
+    import re as _re
+    want = (cve or "").strip().upper()
+    if not _re.fullmatch(r"CVE-\d{4}-\d{4,7}", want):
+        return {"ok": False, "found": False, "cve": cve,
+                "reason": "not a CVE id (expected CVE-YYYY-NNNNN)"}
+    if not _os.path.isdir(TEMPLATES):
+        return {"ok": False, "found": False, "cve": want,
+                "reason": f"templates directory not found: {TEMPLATES}"}
+    try:
+        import yaml as _yaml
+    except ImportError:
+        return {"ok": False, "found": False, "cve": want,
+                "reason": "pyyaml not installed in this image"}
+
+    # Compare upper-to-upper: fname.upper() ends ".YAML", so a
+    # lowercase ".yaml" here never matches anything.
+    target_name = f"{want}.YAML"
+    for root, _dirs, files in _os.walk(TEMPLATES):
+        for fname in files:
+            if fname.upper() != target_name:
+                continue
+            fpath = _os.path.join(root, fname)
+            try:
+                with open(fpath) as fh:
+                    tmpl = _yaml.safe_load(fh.read(8192)) or {}
+            except Exception as e:  # noqa: BLE001
+                return {"ok": True, "found": True, "cve": want,
+                        "template_path": _os.path.relpath(fpath, TEMPLATES),
+                        "reason": f"template found but unreadable: {e}"}
+            info = tmpl.get("info", {}) if isinstance(tmpl, dict) else {}
+            tags = info.get("tags") or ""
+            tag_list = [t.strip() for t in tags.split(",")] if isinstance(tags, str) else list(tags)
+            return {
+                "ok": True, "found": True, "cve": want,
+                "template_id": tmpl.get("id") or fname[:-5],
+                "template_path": _os.path.relpath(fpath, TEMPLATES),
+                "name": info.get("name"),
+                "severity": info.get("severity"),
+                "tags": tag_list,
+                # The operator needs this before running it: an intrusive
+                # template exploits rather than probes, and is held back from
+                # default runs by .nuclei-ignore.
+                "intrusive": "intrusive" in [t.lower() for t in tag_list],
+                "verified": bool((info.get("metadata") or {}).get("verified")),
+                "reference": (info.get("reference") or [])[:4],
+            }
+    return {"ok": True, "found": False, "cve": want,
+            "reason": "no template with that ID in the corpus"}
+
+
 @app.get("/health")
 def health():
     try:
