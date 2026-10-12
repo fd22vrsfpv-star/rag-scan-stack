@@ -1,7 +1,40 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { apiFetch } from './client'
+import { apiFetch, apiUrl } from './client'
 import type { Engagement, CampaignEvent } from '@/lib/types'
 import { POLL } from '@/lib/polling'
+
+/** Download every scope target as CSV, with all fields.
+ *
+ *  Not apiFetch: that always parses JSON, and this body is text/csv. Mirrors
+ *  downloadFollowUpsExport — same engagement header, same Content-Disposition
+ *  filename handling, so the browser offers the server's name rather than a
+ *  guess. Errors throw with the server's text so a 403 from the scope gate is
+ *  readable instead of landing in the file.
+ */
+export async function downloadScopeTargetsCsv(
+  opts: { name?: string; allEngagements?: boolean } = {},
+): Promise<void> {
+  const params = new URLSearchParams()
+  if (opts.name) params.set('name', opts.name)
+  if (opts.allEngagements) params.set('all_engagements', 'true')
+  const eid = (() => { try { return localStorage.getItem('selected-engagement') } catch { return null } })()
+  const qs = params.toString()
+  const resp = await fetch(apiUrl(`/scope/export.csv${qs ? `?${qs}` : ''}`), {
+    headers: eid ? { 'X-Engagement-Id': eid } : {},
+  })
+  if (!resp.ok) throw new Error(`Export ${resp.status}: ${await resp.text()}`)
+  const blob = await resp.blob()
+  const cd = resp.headers.get('content-disposition') || ''
+  const m = cd.match(/filename="?([^"]+)"?/)
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = m ? m[1] : 'scope-targets.csv'
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
 
 // ── Engagements ──
 
