@@ -317,14 +317,16 @@ def node_product_identification(state: BuildPocState) -> Dict[str, Any]:
     looking through the html, pull possible dates for versions, and kick off
     the ai deep dive — earlier in the process, right after scans and recon.'
     """
-    from api import _identify_product_from_target, _poc_trace
+    from api import _identify_product_from_target, _poc_trace, _is_synthetic_cve
     _t0 = time.time()
     had_product = bool(state.get("product"))
     # Only run the (slower) deep dive when we DON'T already have research in
-    # hand and the build carries a real CVE to research.
+    # hand and the build carries a real CVE to research. _is_synthetic_cve
+    # covers both synthesized prefixes (POC- now, NOCVE- on older rows) — a
+    # single literal here would send old builds researching a nonexistent CVE.
     want_deep = (bool(state.get("research", True))
                  and bool(state.get("cve"))
-                 and not str(state.get("cve", "")).startswith("NOCVE-"))
+                 and not _is_synthetic_cve(state.get("cve")))
     info = _identify_product_from_target(
         state["ip"], state["port"],
         run_deep_dive=want_deep,

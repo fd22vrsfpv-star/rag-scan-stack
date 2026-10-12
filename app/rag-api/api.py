@@ -31022,6 +31022,54 @@ def build_poc_shadow_runs(limit: int = Query(50, ge=1, le=500),
         raise HTTPException(500, f"shadow-run listing failed: {type(e).__name__}: {e}")
 
 
+def _is_synthetic_cve(cve) -> bool:
+    """True when the token was synthesized by the builder, not a real CVE id.
+
+    Checks BOTH prefixes on purpose: `POC-` is current, `NOCVE-` is what rows
+    created before 2026-10-11 carry. Anything that branches on "do we have a
+    real CVE to research" must use this rather than one literal, or older
+    builds start hunting for a CVE that never existed.
+    """
+    return str(cve or "").startswith(("POC-", "NOCVE-"))
+
+
+def _synth_poc_token(ip: str, port, product=None) -> str:
+    """A readable id for a build with no CVE: POC-<ip>-<port>[-<product>]-NNN.
+
+    e.g. `POC-172.18.0.32-9090-lobechat-001`. The counter increments per
+    (ip, port, product) so a re-run against the same target reads as the next
+    attempt. The predecessor was `NOCVE-<unix-epoch>`, which was unique but told
+    the operator nothing and sorted meaninglessly in the Store.
+
+    Uniqueness matters beyond display: this token keys `derived_cve_specs`,
+    `poc_hints`, `build_poc_error_memory` and the Store row, so a repeat would
+    overwrite the previous build's derived spec.
+    """
+    slug = _re_module.sub(r"[^a-z0-9]+", "-", str(product or "").lower()).strip("-")[:24]
+    base = f"POC-{ip}-{port}" + (f"-{slug}" if slug else "")
+    highest = 0
+    # Query each table separately: a deployment missing one of them must not
+    # zero the count from the others and hand back a token already in use.
+    for table in ("exploit_store", "derived_cve_specs", "build_poc_attempts"):
+        try:
+            with get_db() as conn, conn.cursor() as cur:
+                cur.execute(f"SELECT cve FROM {table} WHERE cve LIKE %s", (f"{base}-%",))
+                for (tok,) in cur.fetchall():
+                    tok = str(tok or "")
+                    # Re-check the prefix here rather than trusting the LIKE to
+                    # have done it. Without this the suffix parser happily reads
+                    # the epoch out of an unrelated `NOCVE-1790970623` and
+                    # returns `...-1790970624` as the "next" counter.
+                    if not tok.startswith(base + "-"):
+                        continue
+                    m = _re_module.fullmatch(r"\d{3,}", tok[len(base) + 1:])
+                    if m:
+                        highest = max(highest, int(m.group(0)))
+        except Exception as e:  # noqa: BLE001
+            logging.warning("poc-token counter: %s lookup failed: %s", table, e)
+    return f"{base}-{highest + 1:03d}"
+
+
 @app.post("/software/build-poc", tags=["Assets"])
 def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     """PoC-builder: research -> synthesize -> run-and-refine. Invoking this authorizes
@@ -31033,23 +31081,22 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     the path/query folded into the operator hint)."""
     eid = _validate_engagement_uuid(_resolve_engagement_id())
     cve = (body.cve or "").strip().upper()
-    # cve is optional — synth a NOCVE-<timestamp> token when absent so the
-    # build pipeline (run_id, hints, Store rows) stays unique. Still accepts
-    # a CVE-YYYY-NNNNN id when the operator supplies one.
+    # cve is optional. When absent we synthesize a token AFTER the target is
+    # resolved, so it can name the target it belongs to. Still accepts a
+    # CVE-YYYY-NNNNN id when the operator supplies one.
     if cve and not cve.startswith("CVE-"):
         raise HTTPException(400, "cve must be a CVE id (CVE-YYYY-NNNNN) or empty")
-    if not cve:
-        import time as _ttmp
-        cve = f"NOCVE-{int(_ttmp.time())}"
     ip, port, hint = _resolve_target_url(
         body.target_url, body.ip, body.port, body.endpoint_hint, body.hint)
     if not ip:
         raise HTTPException(400, "either ip or target_url is required")
-    # Without a CVE we need SOMETHING to tell the builder what to look for.
-    # Require either a product name or an endpoint hint so synth has signal.
-    if cve.startswith("NOCVE-") and not (body.product or hint or body.target_url):
-        raise HTTPException(400, "without a CVE, supply at least product, "
-                                 "target_url, or endpoint_hint so synth has signal")
+    if not cve:
+        # Without a CVE we need SOMETHING to tell the builder what to look for.
+        # Require either a product name or an endpoint hint so synth has signal.
+        if not (body.product or hint or body.target_url):
+            raise HTTPException(400, "without a CVE, supply at least product, "
+                                     "target_url, or endpoint_hint so synth has signal")
+        cve = _synth_poc_token(ip, port, body.product)
     # Fail-closed authorization: an operator "release" grants this endpoint (standing,
     # revocable); otherwise a grant must already exist. No grant -> refuse.
     if body.release:
