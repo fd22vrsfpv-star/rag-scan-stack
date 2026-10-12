@@ -13714,6 +13714,7 @@ def bridge_scanner_cves(authorized: bool = Depends(auth)):
         result = promote_scanner_cves(cur, eid)
         conn.commit()
     try:
+        from webhooks import emit_webhook
         emit_webhook("scanner_cves_bridged", "software", {
             "engagement_id": eid, "scanned": result["scanned"],
             "created": result["created"]})
@@ -18661,6 +18662,7 @@ def _learning_propose(kind, name, entry, evidence=None, auto_apply=True, eid=Non
             except Exception:  # noqa: BLE001
                 pass
             try:
+                from webhooks import emit_webhook
                 emit_webhook("exploit_learned", "skill",
                              {"kind": kind, "name": name, "applied": True, "source": source,
                               "engagement_id": eid})
@@ -19087,6 +19089,7 @@ def _run_postex_weaponize(cve, ip, port, vuln_class, confirmed_command, eid, run
     if not corr["corrected"]:
         _poc_index(cve, ip, run_id, log_path, False, correct_iters, None, eid)
         try:
+            from webhooks import emit_webhook
             emit_webhook("exploit_weaponized", "poc",
                          {"cve": cve, "target": ip, "vuln_class": vuln_class, "phase": "correct",
                           "corrected": False, "extracted": False})
@@ -19129,6 +19132,7 @@ def _run_postex_weaponize(cve, ip, port, vuln_class, confirmed_command, eid, run
             logging.warning("store postex loot failed: %s", e)
     _poc_index(cve, ip, run_id, log_path, extracted, iters, security_test_id, eid)
     try:
+        from webhooks import emit_webhook
         emit_webhook("exploit_weaponized", "poc",
                      {"cve": cve, "target": ip, "vuln_class": vuln_class, "corrected": True,
                       "extracted": extracted, "objective": obj, "security_test_id": security_test_id})
@@ -19209,6 +19213,7 @@ def _flag_exploit_confirmed(cve, ip, port, command, eid):
                      Json({"cve_ref": f"https://nvd.nist.gov/vuln/detail/{cve}"}),
                      Json({**meta, "poc_verified": True}), eid))
             conn.commit()
+        from webhooks import emit_webhook
         emit_webhook("exploit_confirmed", "poc",
                      {"cve": cve, "target": ip, "port": port, "vuln_class": vclass,
                       "next": "weaponize (post-ex, gated)"})
@@ -20178,6 +20183,7 @@ def _auto_approve_proven_patterns():
             _REFINE_PATTERNS_CACHE["t"] = 0.0
             for a in approved:
                 try:
+                    from webhooks import emit_webhook
                     emit_webhook("refine_pattern_auto_approved",
                                  "rag-knowledge", a)
                 except Exception:  # noqa: BLE001
@@ -21656,6 +21662,7 @@ def _flag_precondition(cve, ip, pc, eid):
                 (str(_u.uuid4()), title, ip, reason,
                  ["csrf", "nonce", "precondition", "poc_builder"], Json(meta)))
             conn.commit()
+        from webhooks import emit_webhook
         emit_webhook("precondition_detected", "poc",
                      {"cve": cve, "target": ip, "skill": "csrf_nonce",
                       "tokens_found": len(pc.get("tokens") or []),
@@ -27228,6 +27235,7 @@ def establish_session_endpoint(body: EstablishSessionBody, authorized: bool = De
             "login_url": body.login_url, "bruteforce": body.bruteforce}
     s = _establish_session_for_build(body.ip, body.port, auth, eid)
     try:
+        from webhooks import emit_webhook
         emit_webhook("web_session_established", "software",
                      {"target": body.ip, "ok": s.get("ok"), "method": s.get("method"),
                       "user": s.get("username")})
@@ -30866,6 +30874,7 @@ def add_poc_hint(body: PocHintBody, authorized: bool = Depends(auth)):
                      body.hint, eid, body.created_by or "operator"))
         row = cur.fetchone(); conn.commit()
     try:
+        from webhooks import emit_webhook
         emit_webhook("poc_hint_added", "software",
                      {"cve": body.cve, "target": body.target_host, "hint_len": len(body.hint)})
     except Exception:  # noqa: BLE001
@@ -31921,6 +31930,7 @@ def approve_refine_pattern(pattern_id: str,
         conn.commit()
     _REFINE_PATTERNS_CACHE["t"] = 0.0  # bust cache
     try:
+        from webhooks import emit_webhook
         emit_webhook("refine_pattern_approved", "rag-knowledge",
                      {"id": pattern_id, "operator": body.operator})
     except Exception:  # noqa: BLE001
@@ -31959,6 +31969,7 @@ def mine_refine_patterns(min_hits: int = 3,
     daemon; operators can also trigger ad-hoc from the UI."""
     promoted = _mine_refine_pattern_candidates(limit=limit, min_hits=min_hits)
     try:
+        from webhooks import emit_webhook
         emit_webhook("refine_patterns_mined", "rag-knowledge",
                      {"promoted": len(promoted), "signals": [p["signal"] for p in promoted]})
     except Exception:  # noqa: BLE001
@@ -32020,6 +32031,7 @@ def grant_poc_endpoint(body: PocGrantBody, authorized: bool = Depends(auth)):
     eid = _validate_engagement_uuid(_resolve_engagement_id())
     _grant_poc(body.ip, body.port, eid, granted_by="operator", note=body.note or "")
     try:
+        from webhooks import emit_webhook
         emit_webhook("poc_grant_released", "software",
                      {"target": _poc_target_key(body.ip, body.port), "engagement_id": eid})
     except Exception:  # noqa: BLE001
@@ -32037,6 +32049,7 @@ def revoke_poc_endpoint(ip: str, port: Optional[int] = None, authorized: bool = 
         n = cur.rowcount
         conn.commit()
     try:
+        from webhooks import emit_webhook
         emit_webhook("poc_grant_revoked", "software", {"target": _poc_target_key(ip, port), "revoked": n})
     except Exception:  # noqa: BLE001
         pass
@@ -32447,6 +32460,7 @@ def _save_exploit_store(name, cve=None, kind="cve_poc", target_host=None, target
                  Json(metadata or {}), created_by))
             new_id = str(cur.fetchone()[0]); conn.commit()
         try:
+            from webhooks import emit_webhook
             emit_webhook("exploit_store_saved", "exploit_store",
                          {"id": new_id, "cve": cve, "kind": kind, "verified": verified,
                           "target": target_host, "engagement_id": eid})
@@ -32910,6 +32924,7 @@ def update_exploit_store(exploit_id: str, body: ExploitStoreUpdateBody,
         cur.execute(f"UPDATE exploit_store SET {', '.join(fields)} WHERE id = %s RETURNING *", args)
         row = cur.fetchone(); conn.commit()
     try:
+        from webhooks import emit_webhook
         emit_webhook("exploit_store_updated", "exploit_store", {"id": exploit_id})
     except Exception:  # noqa: BLE001
         pass
@@ -33915,6 +33930,7 @@ def exploit_manual_research_search(exploit_id: str, body: ManualResearchSearchBo
             (json.dumps([entry], default=str), exploit_id))
         conn.commit()
     try:
+        from webhooks import emit_webhook
         emit_webhook("exploit_manual_research_search", "exploit_store",
                      {"id": exploit_id, "query": q, "hits": len(hits),
                       "search_error": bool(search_err)})
@@ -33960,6 +33976,7 @@ def push_exploit_to_node(exploit_id: str, body: ExploitPushBody, authorized: boo
     fn = body.filename or f"{_re.sub(r'[^A-Za-z0-9_.-]+','_', row['cve'] or row['name'] or 'exploit')}_poc.py"
     result = _push_python_over_ssh(code, ssh_user, ssh_host, ssh_key, dest_dir, fn)
     try:
+        from webhooks import emit_webhook
         emit_webhook("exploit_store_pushed", "exploit_store",
                      {"id": exploit_id, "node_id": body.node_id, "ok": result.get("ok"),
                       "dest": result.get("dest")})
@@ -34090,6 +34107,7 @@ def send_exploit_to_burp(exploit_id: str, authorized: bool = Depends(auth)):
              row["rationale"] or "", cves, json.dumps(meta, default=str)))
         qid = str(cur.fetchone()[0]); conn.commit()
     try:
+        from webhooks import emit_webhook
         emit_webhook("exploit_store_sent_to_burp", "exploit_store",
                      {"id": exploit_id, "queue_id": qid, "cve": row["cve"], "target": row["target_host"]})
     except Exception:  # noqa: BLE001
@@ -34304,6 +34322,7 @@ def restore_exploit_version(exploit_id: str, version: int, authorized: bool = De
                      v["http_request"], v["rationale"], v["verified"], v["llm_model"], exploit_id))
         row = cur.fetchone(); conn.commit()
     try:
+        from webhooks import emit_webhook
         emit_webhook("exploit_store_version_restored", "exploit_store",
                      {"id": exploit_id, "restored_version": version})
     except Exception:  # noqa: BLE001
@@ -35487,6 +35506,7 @@ def _register_web_session_access(ip, port, username, cookie, product=None,
                 logging.debug("mirror web_session->credential_findings failed: %s", e)
             c.commit()
         try:
+            from webhooks import emit_webhook
             emit_webhook("foothold_web_session", "access",
                          {"target": str(ip), "port": port, "user": username,
                           "product": product, "engagement_id": eid})
@@ -36263,6 +36283,7 @@ def research_exploit_endpoint(body: ResearchExploitBody, authorized: bool = Depe
         raise HTTPException(400, "cve must be a CVE id")
     out = _research_exploit(cve, body.ip, body.port, body.product, body.version, model=body.model)
     try:
+        from webhooks import emit_webhook
         emit_webhook("exploit_research_run", "exploit_store",
                      {"cve": cve, "target": body.ip,
                       "has_public_module": out["sources"]["has_public_module"],
@@ -36317,6 +36338,7 @@ def research_for_exploit(exploit_id: str, seed: bool = False, authorized: bool =
                         (json.dumps(analysis, default=str), exploit_id))
             conn.commit()
     try:
+        from webhooks import emit_webhook
         emit_webhook("exploit_research_run", "exploit_store",
                      {"id": exploit_id, "cve": row["cve"], "seeded": seeded,
                       "has_public_module": out["sources"]["has_public_module"]})
@@ -36433,6 +36455,7 @@ def tweak_with_burp(exploit_id: str, body: TweakWithBurpBody, authorized: bool =
     except Exception as e:  # noqa: BLE001
         logging.debug("tweak LLM reply parse failed: %s", e)
     try:
+        from webhooks import emit_webhook
         emit_webhook("exploit_tweak_with_burp", "exploit_store", {
             "id": exploit_id, "cve": row.get("cve"), "target": ctx["target"],
             "has_suggestion": bool(suggestion.get("suggested_command")),
@@ -36558,6 +36581,7 @@ def exploit_bakeoff(exploit_id: str, body: BakeoffBody, authorized: bool = Depen
         pass
     results = [_bakeoff_one(row["cve"], ip, port, exploit_id, m, eid, guidance) for m in models]
     try:
+        from webhooks import emit_webhook
         emit_webhook("exploit_bakeoff", "exploit_store",
                      {"id": exploit_id, "cve": row["cve"], "target": ip, "models": len(models),
                       "hits": sum(1 for x in results if x.get("canary_hit"))})
@@ -36743,6 +36767,7 @@ def _resolve_and_queue_exploit(cve, ip, port, product, version, eid, dedupe=True
               cmd, Json(params), 0.9, reason, Json(meta), asset_id, eid, edb_id))
         conn.commit()
     try:
+        from webhooks import emit_webhook
         emit_webhook("cve_exploit_resolved", "software",
                      {"cve": cve, "method": method, "target": ip, "pending_exploit_id": pid})
     except Exception:  # noqa: BLE001
@@ -50122,6 +50147,7 @@ def _refine_mine_sweep_loop():
                         logging.info("refine-mine promoted %d pending patterns",
                                      len(promoted))
                         try:
+                            from webhooks import emit_webhook
                             emit_webhook("refine_patterns_mined", "rag-knowledge",
                                          {"promoted": len(promoted),
                                           "signals": [p["signal"] for p in promoted]})

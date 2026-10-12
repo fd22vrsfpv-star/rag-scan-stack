@@ -273,7 +273,7 @@ def _parse_scanner_issues(filepath: str, cur, stats: dict, dedupe: bool,
         elem.clear()
 
 
-def _capture_burp_session(cur, host, request_text, captured):
+def _capture_burp_session(cur, host, request_text, captured, stats=None):
     """Tie a Burp session back into the platform: pull the authenticated session
     headers (Cookie / Authorization / X-API-Key) out of a sitemap request and
     upsert them as a session-only Auth Profile for the host, so a subsequent
@@ -305,7 +305,14 @@ def _capture_burp_session(cur, host, request_text, captured):
                DO UPDATE SET session = EXCLUDED.session, updated_at = now()""",
             (host, session))
         cur.execute("RELEASE SAVEPOINT sess_sp")
-        stats["sessions_captured"] = stats.get("sessions_captured", 0) + 1
+        # `stats` was an undefined name here (F821). The NameError fired AFTER
+        # the INSERT and RELEASE, so the except below ran ROLLBACK TO SAVEPOINT
+        # and threw the captured session away — every Burp session capture was
+        # silently discarded, logged only as "burp session capture skipped".
+        # stats is now passed in, and optional so the helper stays callable
+        # without a counter.
+        if stats is not None:
+            stats["sessions_captured"] = stats.get("sessions_captured", 0) + 1
     except Exception as e:  # noqa: BLE001
         try:
             cur.execute("ROLLBACK TO SAVEPOINT sess_sp")
@@ -341,7 +348,7 @@ def _parse_sitemap_items(filepath: str, cur, stats: dict, dedupe: bool):
 
         # Tie a Burp session back in: capture the authenticated headers once per host.
         if host and request_text:
-            _capture_burp_session(cur, host, request_text, _captured_hosts)
+            _capture_burp_session(cur, host, request_text, _captured_hosts, stats)
 
         evidence_parts = []
         if request_text:
