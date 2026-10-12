@@ -490,3 +490,50 @@ attempted here: `ip` is NOT NULL with a unique index on
 without auditing every reader that assumes non-null is a larger change than the
 bug warrants.
 **Enforced by:** not enforced
+
+### ffuf's own data has two homes: `recon_findings` and `web_findings`
+**Found:** 2026-10-12
+**Evidence:** `etl/parse_ffuf.py:109` writes `INSERT INTO recon_findings (...)
+source='ffuf', finding_type='web_path'` for the `/ingest/ffuf` file-upload route
+(`app/rag-api/api.py:4908`). The Strategy 0 parser added today
+(`etl/parse_tool_output.py::_parse_content_discovery`) writes the SAME facts to
+`web_findings` with `issue_type='discovered_path'`, because that is where the
+sibling content-discovery parsers put them (`etl/parse_katana.py`,
+`etl/parse_httpx.py`). The two paths therefore dedupe against different keys —
+`recon_fingerprint(source, finding_type, target, data)` vs
+`web_fingerprint(url, source, name, issue_type)` — so one uploaded ffuf JSON and
+one dispatched ffuf run over the same host produce two unrelated sets of rows
+that no query joins. Same split exists for `etl/parse_gau.py` (recon_findings)
+against `parse_katana`/`parse_httpx` (web_findings), so this is the general
+shape, not an ffuf quirk.
+**Where:** `etl/parse_ffuf.py`, `etl/parse_tool_output.py::_parse_content_discovery`,
+`etl/parse_gau.py`.
+**Done when:** a discovered URL has ONE home. Either `parse_ffuf` is rewritten to
+call `_parse_content_discovery`'s writer (upload and dispatch then share a
+fingerprint), or the decision is recorded that `recon_findings` holds
+discovery-of-hosts and `web_findings` discovery-of-URLs, with `parse_ffuf` and
+`parse_gau` moved to the latter. Not attempted here: `recon_findings` rows from
+the upload route already exist in the live database and moving them is a
+migration, not a parser change.
+**Enforced by:** not enforced
+
+### ffuf and feroxbuster have no `knowledge/extractors/*.yaml` spec
+**Found:** 2026-10-12
+**Evidence:** `ls knowledge/extractors/` lists 13 specs including
+`gobuster.yaml`, whose `notable:` block turns "N paths discovered by content
+brute force" into a `recon_findings` fact via
+`app/rag-api/output_analysis.analyse_output` →
+`post_review_agent.ingest_extracted_facts`. `_spec_for("ffuf")` and
+`_spec_for("feroxbuster")` both return None, so neither tool contributes a
+notable fact to a post-review report even though both now parse. gobuster is the
+DEFAULT content-discovery tool (`knowledge/content_discovery.yaml:
+default_tool: gobuster`) and ffuf/feroxbuster are its two alternates, so the
+three behave differently in the review surface purely by accident of which got a
+spec first.
+**Where:** `knowledge/extractors/` (no `ffuf.yaml`, no `feroxbuster.yaml`).
+**Done when:** both tools have a spec with the same `notable:` facts gobuster
+declares, OR `analyse_output` reads the `PARSERS` registry result when no spec
+exists so a registry parser also produces notable facts. Note the RAG-coverage
+ratchet: a new `knowledge/*.yaml` must ship its loader in the same change
+(`tests/test_knowledge_rag_coverage.py`).
+**Enforced by:** not enforced
