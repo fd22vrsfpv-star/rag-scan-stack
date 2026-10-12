@@ -17069,7 +17069,8 @@ def _shadow_dispatch_decomposed(new: dict, cve, ip, port, eid, run_id, model=Non
     try:
         v = _poc_assertion_verdict_with_semantic(
             (new or {}).get("assertion") or {}, output, ec,
-            rationale=(new or {}).get("rationale", ""), model=model, elapsed_seconds=elapsed)
+            rationale=(new or {}).get("rationale", ""), model=model, elapsed_seconds=elapsed,
+            command=command)
     except Exception as e:  # noqa: BLE001
         v = {"passed": False, "method": "verdict_error", "confidence": 0.0,
              "reason": f"{type(e).__name__}: {e}"}
@@ -20557,16 +20558,21 @@ def _parse_curl_time_total_ms(output):
     return None
 
 
-def _poc_assertion_passes(assertion, output, exit_code=None, elapsed_seconds=None):
+def _poc_assertion_passes(assertion, output, exit_code=None, elapsed_seconds=None,
+                          command=None):
     """Boolean verdict — backwards-compatible with every existing caller. For
     the verdict REASON (method / confidence / tier), use _poc_assertion_verdict.
-    elapsed_seconds is optional and only consulted for latency-based assertions."""
-    v = _poc_assertion_verdict(assertion, output, exit_code, elapsed_seconds=elapsed_seconds)
+    elapsed_seconds is optional and only consulted for latency-based assertions.
+    command is optional and only consulted to check a min_seconds assertion
+    actually has a timing payload to measure."""
+    v = _poc_assertion_verdict(assertion, output, exit_code,
+                               elapsed_seconds=elapsed_seconds, command=command)
     return v["passed"]
 
 
 def _poc_assertion_verdict(assertion, output, exit_code=None,
-                             rationale=None, model=None, elapsed_seconds=None):
+                             rationale=None, model=None, elapsed_seconds=None,
+                             command=None):
     """Return a structured verdict: {passed, method, confidence, reason}.
     Methods, in order of attempt + strongest first:
       - 'regex'            — canary-anchored regex matched outright (strongest)
@@ -20634,6 +20640,43 @@ def _poc_assertion_verdict(assertion, output, exit_code=None,
                                   "connect / No route to host) — the target "
                                   "never received the payload; this is "
                                   "infrastructure failure, not SLEEP success"}
+            # NO TIMING PAYLOAD ≠ TIMING FAILURE. A min_seconds assertion only
+            # means anything when the COMMAND actually carries a timing payload
+            # (SLEEP / pg_sleep / WAITFOR / BENCHMARK). Without one, every
+            # latency_* verdict below is describing a payload that does not
+            # exist: a 302 login-wall redirect gets reported to the refine loop
+            # as "timing payload did not block the server", the loop is taught
+            # to think in timing terms, and the false reason is written into
+            # cross-run error memory (observed signature on CVE-2024-32511:
+            # "302|latency_too_fast|location: {url}", 14 runs, all locked into
+            # timing on an auth-bypass CVE).
+            #
+            # The same no-payload check already exists on the SUCCESS path
+            # (see the _timing_confirmation_rerun block + CLAUDE.md
+            # "Blind-timing verdicts must be confirmed with a scaled payload");
+            # it was simply never asked on the failure path. Answer it here so
+            # both paths agree, and say plainly that the ASSERTION is wrong for
+            # this command rather than blaming the target.
+            #
+            # command=None (older callers that cannot supply it) keeps the
+            # legacy behaviour — this never fires on an unknown command.
+            if command is not None:
+                try:
+                    _tp = _timing_payload_scale(command)[1]
+                except Exception:  # noqa: BLE001
+                    _tp = None
+                if _tp is None:
+                    return {"passed": False, "method": "latency_unconfirmable",
+                            "confidence": 0.3,
+                            "reason": "assertion sets min_seconds but the command "
+                                      "contains NO timing payload (no SLEEP / "
+                                      "pg_sleep / WAITFOR / BENCHMARK) — a timing "
+                                      "verdict cannot describe this command. The "
+                                      "ASSERTION is wrong for this exploit, not the "
+                                      "target: switch to a reflected-canary "
+                                      "assertion ({\"expect_regex\": \"<canary>\"}) "
+                                      "unless the advisory specifically says the "
+                                      "vulnerability is time-based / blind."}
             if e_f < float(min_s):
                 return {"passed": False, "method": "latency_too_fast",
                         "confidence": 1.0,
@@ -20731,13 +20774,13 @@ def _poc_assertion_verdict(assertion, output, exit_code=None,
 
 def _poc_assertion_verdict_with_semantic(assertion, output, exit_code=None,
                                            rationale=None, model=None,
-                                           elapsed_seconds=None):
+                                           elapsed_seconds=None, command=None):
     """Full verdict including semantic fallback. Call this from _run_refine_poc
     when the raw verdict returns passed=False — it tries the LLM pass as a
     secondary signal, bounded by the canary-grounded safety check."""
     v = _poc_assertion_verdict(assertion, output, exit_code,
                                  rationale=rationale, model=model,
-                                 elapsed_seconds=elapsed_seconds)
+                                 elapsed_seconds=elapsed_seconds, command=command)
     if v["passed"]:
         return v
     if not _poc_semantic_verify_enabled():
@@ -25760,7 +25803,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         # marker in output.
         _verdict = _poc_assertion_verdict_with_semantic(
             assertion, output, ec, rationale=rationale, model=model,
-            elapsed_seconds=_this_iter_seconds)
+            elapsed_seconds=_this_iter_seconds, command=command)
         success = _verdict["passed"]
         verification_method = _verdict["method"]
         verification_confidence = _verdict["confidence"]
@@ -26172,6 +26215,37 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         # is a RENDERING concern, not a knowledge concern, so it stays here.
         _prev_had_latency = bool(isinstance(assertion, dict)
                                  and assertion.get("min_seconds") is not None)
+        # ...BUT the shape must not be sticky when it was never right. Handing
+        # back the timing template unconditionally means ONE wrong first guess
+        # converts the whole build into a timing build: there is no path back
+        # to expect_regex, so every later iteration copies min_seconds and
+        # every failure is re-read as a timing failure. On CVE-2024-32511 (an
+        # auth-bypass CVE, correctly classified as auth-bypass) that cost all
+        # 14 runs and poisoned cross-run error memory with
+        # "302|latency_too_fast|location: {url}".
+        #
+        # A timing assertion only earns its stickiness when the command
+        # actually carries a timing payload to measure. Without one, offer the
+        # reflected-canary shape instead and SAY why — the same answer the
+        # verdict path now gives (latency_unconfirmable).
+        _timing_payload_present = True
+        if _prev_had_latency:
+            try:
+                _timing_payload_present = _timing_payload_scale(command or "")[1] is not None
+            except Exception:  # noqa: BLE001
+                _timing_payload_present = True  # fail-soft: keep legacy shape
+        _assert_switch_note = ""
+        if _prev_had_latency and not _timing_payload_present:
+            _prev_had_latency = False
+            _assert_switch_note = (
+                "\nASSERTION KIND IS WRONG FOR THIS COMMAND: the previous assertion "
+                "set min_seconds, but your command contains NO timing payload "
+                "(no SLEEP / pg_sleep / WAITFOR / BENCHMARK), so a timing verdict "
+                "can never describe it. Do NOT try to make the command slower to "
+                "satisfy the clock. Use a reflected-canary assertion instead and "
+                "make the exploit's effect visible in the output. Only go back to "
+                "min_seconds if the advisory specifically says this vulnerability "
+                "is time-based / blind.\n")
         if _prev_had_latency:
             _assert_template = (f"{{\"min_seconds\": {assertion.get('min_seconds')}, "
                                 f"\"max_seconds\": {assertion.get('max_seconds') or 30}, "
@@ -26218,7 +26292,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         rprompt = (f"AUTHORIZED lab pentest. The PoC for {cve} on http://{ip}:{port} did NOT "
                    f"succeed.\nCommand: {command}\nOutput:\n{(output or '')[:1500]}{precond}{gather_note}"
                    f"{_refuted_note}"
-                   f"{shell_syntax_note}{refusal_note}{rag_pattern_notes}{regress_note}{model_switch_note}{path_discovery_note}{waf_hit_note}{similar_note}{escalation_guidance}{anchor_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
+                   f"{shell_syntax_note}{refusal_note}{_assert_switch_note}{rag_pattern_notes}{regress_note}{model_switch_note}{path_discovery_note}{waf_hit_note}{similar_note}{escalation_guidance}{anchor_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
                    f"appear. Return ONE JSON object only: {{\"command\": \"<better command, may "
                    f"chain curl calls with ; and shell vars to fetch a token first>\", "
                    f"\"assertion\": {_assert_template}}}. No prose.")
