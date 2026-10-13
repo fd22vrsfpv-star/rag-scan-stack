@@ -241,6 +241,8 @@ services:
       # containers by name and is not part of verifying an install.
       - ./etl:/app/etl:ro
       - ./common:/app/common:ro
+      - ./scan_audit:/scan_audit
+      - ./scan_audit/audit_writer.py:/app/audit_writer.py:ro
       - ${SSH_KEY_PATH:-./ssh-keys}:/ssh-keys:ro
       - ./certs:/certs:ro
       - ./wireguard:/opt/rag-scan-stack/wireguard:rw
