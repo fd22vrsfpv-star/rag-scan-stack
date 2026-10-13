@@ -282,12 +282,33 @@ large change. Add the test in the same commit as the rule.
 - A command with no recognizable timing payload (no SLEEP / pg_sleep /
   WAITFOR / BENCHMARK) cannot be confirmed → `latency_unconfirmable`,
   advisory only.
+- **A timing assertion is only as good as the command under it — and
+  "timing mode" keys on the COMMAND, never the assertion.** An assertion's
+  `min_seconds` is a *claim* that this is a timing proof; a payload in the
+  command is *evidence* of one. Seed the mode from the claim and the
+  anti-drift rule (which exists to stop the loop walking away from a real
+  blind-timing proof) will refuse the canary assertion the command can
+  actually satisfy — for every remaining iteration. So: when an assertion
+  carries `min_seconds`, the command carries no payload, and a canary is
+  available, the assertion is **deterministically rewritten** to
+  `{"expect_regex": <canary>}` before dispatch and again on every refine.
+  With no canary there is nothing better to offer and
+  `latency_unconfirmable` stands — never invent a regex, that is
+  fabricating a proof. The rewrite cannot manufacture a pass: it lands on
+  the existing canary path (anchor → anti-drift → reflection guard), where
+  "canary absent" is a clean negative.
 - The confirmation runs INLINE, deterministically, no LLM involved — can't
   be subverted by model whims or by the operator forgetting to double-check.
+  The repair above is inline for the same reason: the model is what produced
+  the mismatched assertion, so it is not the thing to ask about fixing it.
 - *Enforced by:* `tests/test_timing_confirmation.py` (scaling for each
   payload type, bail-out when nothing to scale, AST-grep that the refine
   loop still calls `_timing_confirmation_rerun` and emits the three
-  downstream verdict methods).
+  downstream verdict methods), `tests/test_assertion_drift_repair.py`
+  (the repair on the real CVE-2024-4443 / CVE-2024-36412 commands, the
+  one verified blind-SQLi command left untouched, every payload form
+  preserved, `_timing_mode` not seeded from the assertion, and BOTH call
+  sites counted — a name-only check passes while one site is deleted).
 - *Why:* sqlmap's own confirmation is the standard; without it, a slow
   target or a WAF with a fixed delay-response reads as "exploited" and
   gets stored as a verified PoC. On CVE-2024-22120 (Zabbix script.execute

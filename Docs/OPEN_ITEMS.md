@@ -672,38 +672,3 @@ scaling behaviour and the verdict names, not the dispatch accounting.
 correctly and the invariant ("never accept a latency verdict on a single run")
 is being honoured — CVE-2024-3552's scaling is genuine, which is how the
 undercount was noticed.
-
-### A latency assertion rides along on a PoC that proves itself by canary
-**Found:** 2026-10-12
-**Evidence:** CVE-2024-36412 (SuiteCRM) built a *reflection*-style PoC — SQLi
-writing a PHP webshell via `INTO OUTFILE`, then a second `curl` fetching it to
-read the canary back:
-
-    ...&delegate=a');+SELECT+'<?php echo "POCzd58e3c0e36"; ?>'
-        INTO+OUTFILE+'/var/www/html/public/POCzd58e3c0e36.php'+%23...
-    ; curl -s -m 10 ... 'http://.../POCzd58e3c0e36.php'
-
-but shipped a *timing* assertion with it:
-
-    {"min_seconds": 5, "max_seconds": 30, "canary": "POCzd58e3c0e36",
-     "cve_anchored": true}
-
-The command contains no `SLEEP`/`pg_sleep`/`WAITFOR`/`BENCHMARK`, so the
-verdict was `latency_unconfirmable` at confidence 0.3 — advisory only. The
-honest verdict was available and different: the fetched webshell returned no
-canary, so `expect_regex: POCzd58e3c0e36` would have given a clean
-"canary absent -> not exploited". `drifted` was correctly set True.
-**Where:** assertion synthesis in `app/rag-api/api.py` — the assertion is built
-alongside the command but nothing checks that its *method* matches the proof
-mechanism the command actually uses.
-**Done when:** an assertion carrying `min_seconds` on a command with no
-recognisable timing payload is rewritten to the canary/regex form (the canary is
-already present in the assertion), rather than being emitted and then rejected
-downstream as unconfirmable.
-**Enforced by:** not enforced. `tests/test_timing_confirmation.py` asserts that
-an unscalable command yields `latency_unconfirmable`, which is the *downstream*
-half; nothing asserts the assertion was well-formed for its command upstream.
-**Note:** the exploit also did not work — the app answered "Thank you for
-accepting" in 0.005s on 4 of 7 attempts, i.e. it processed the request without
-executing the injection. So the CVE is a genuine negative; the drift changed
-how confidently we could say so, not the outcome.

@@ -20589,6 +20589,60 @@ def _timing_payload_scale(command, delta=7):
     return command, None, None, None
 
 
+def _repair_unmeasurable_timing_assertion(assertion, command, canary):
+    """MIRROR of the blind-timing anti-drift rule above.
+
+    Anti-drift stops the loop walking AWAY from a timing assertion when the
+    command really is a blind-timing proof. This stops the opposite error: a
+    `min_seconds` assertion riding on a command that carries no timing payload
+    at all. There is then nothing to measure, so the verdict can only ever come
+    back `latency_unconfirmable` at confidence 0.3 — an answer about our own
+    assertion rather than about the exploit.
+
+    Observed twice in the 2026-10-13 focused-10 run, both reaching the target
+    six times and both scoring 0.3:
+
+      CVE-2024-36412  SuiteCRM SQLi -> INTO OUTFILE webshell -> fetch it back
+      CVE-2024-4443   WP Business Directory, UNION SELECT 0x504f437a...
+                      INTO OUTFILE /var/www/html/poc.txt -> fetch it back
+
+    Both are CANARY proofs: the exploit writes the canary somewhere and a second
+    request reads it. Both already carried the canary IN the assertion, so the
+    correct assertion was available and unused.
+
+    The rewrite cannot manufacture a pass — `expect_regex: <canary>` succeeds
+    only if the canary actually comes back, and it lands the verdict on the
+    existing canary path (anchor -> anti-drift -> reflection guard) rather than
+    inventing a new one. On both CVEs above the canary never appeared, so the
+    honest verdict is "canary absent -> not exploited" instead of "cannot
+    confirm".
+
+    Deterministic and inline — no LLM — for the same reason the timing
+    confirmation is (CLAUDE.md, "Blind-timing verdicts must be confirmed with a
+    scaled payload"): the model is what produced the mismatched assertion, so it
+    is not the thing to ask about fixing it.
+
+    Returns (assertion, repaired: bool). Unchanged when the assertion is not a
+    timing one, when the command DOES carry a payload, or when there is no
+    canary to fall back to — in that last case `latency_unconfirmable` is still
+    the honest answer, because nothing better exists.
+    """
+    if not isinstance(assertion, dict) or assertion.get("min_seconds") is None:
+        return assertion, False
+    if not canary:
+        return assertion, False
+    try:
+        has_payload = _timing_payload_scale(command or "", delta=0)[1] is not None
+    except Exception:  # noqa: BLE001
+        # Fail SAFE: an unparseable command is not evidence of absence, so keep
+        # the caller's assertion rather than rewriting on a guess.
+        return assertion, False
+    if has_payload:
+        return assertion, False
+    return ({"expect_regex": canary, "canary": canary, "cve_anchored": True},
+            True)
+
+
 def _resolve_refine_assertion(la, prev_assertion, command, canary, timing_mode):
     """Decide the next-iteration PoC assertion from the LLM's proposed `la`.
 
@@ -20641,6 +20695,12 @@ def _resolve_refine_assertion(la, prev_assertion, command, canary, timing_mode):
             new_a["cve_anchored"] = True
             if la.get("canary_in_timing"):
                 new_a["canary_in_timing"] = True
+    # We are NOT in timing mode, which means no command this build has carried a
+    # timing payload. A min_seconds proposal here is therefore unmeasurable on
+    # this command, and accepting it is how a canary proof acquires a timing
+    # assertion — note min_seconds above deliberately overrides expect_regex, so
+    # without this the LLM can take the proof AWAY from the canary that works.
+    new_a, _ = _repair_unmeasurable_timing_assertion(new_a, command, canary)
     return new_a, False
 
 
@@ -26013,8 +26073,29 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
     # command carries a SLEEP/pg_sleep/WAITFOR/BENCHMARK payload), we REFUSE to
     # let the refine loop drift the assertion to expect_regex. Set once, never
     # cleared — the model dropping min_seconds is the exact regression we block.
-    _timing_mode = bool((assertion or {}).get("min_seconds")) or \
-        (_timing_payload_scale(command or "", delta=0)[1] is not None)
+    # Keyed on the COMMAND, not the assertion. An assertion's min_seconds is a
+    # CLAIM that this is a timing proof; a SLEEP/pg_sleep/WAITFOR/BENCHMARK in
+    # the command is EVIDENCE of it. Seeding the mode from the claim is how
+    # CVE-2024-36412 and CVE-2024-4443 each spent all 7 iterations locked into
+    # timing: their first assertion carried min_seconds, that alone set timing
+    # mode, and the anti-drift rule then REFUSED every attempt to move to the
+    # canary assertion their commands could actually satisfy. Still sticky —
+    # the moment any command carries a real payload, timing mode engages below
+    # and never clears.
+    _timing_mode = (_timing_payload_scale(command or "", delta=0)[1] is not None)
+    # An initial min_seconds assertion on a command with no payload is repaired
+    # to the canary form BEFORE the first dispatch, so iteration 1 is spent on a
+    # measurable assertion instead of discovering it is unconfirmable.
+    assertion, _a_repaired = _repair_unmeasurable_timing_assertion(
+        assertion, command, canary)
+    if _a_repaired:
+        _poc_trace(run_id, "timing_assertion_repaired", iteration=0,
+                   extra={"was": "min_seconds", "now": "expect_regex",
+                          "canary": canary,
+                          "reason": "command carries no SLEEP/pg_sleep/WAITFOR/"
+                                    "BENCHMARK payload, so min_seconds has "
+                                    "nothing to measure; the canary proof is "
+                                    "what this command actually makes"})
     # Refine-pattern tracking across iterations. MUST be initialised before the
     # loop: it is read near the top of each iteration (on success) but only
     # assigned at the end, so a FIRST-iteration success (e.g. a synth command
@@ -27015,6 +27096,15 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                               "reason": "blind-timing proof: canary never appears "
                                         "in output, expect_regex can't fire"})
         if _new_a is not None:
+            _new_a, _rep = _repair_unmeasurable_timing_assertion(
+                _new_a, command, canary)
+            if _rep:
+                _poc_trace(run_id, "timing_assertion_repaired", iteration=it,
+                           extra={"was": "min_seconds", "now": "expect_regex",
+                                  "canary": canary,
+                                  "reason": "refined command carries no timing "
+                                            "payload; a latency verdict on it "
+                                            "could only be unconfirmable"})
             assertion = _new_a
 
     anchored = _poc_assertion_is_anchored(assertion, canary)
