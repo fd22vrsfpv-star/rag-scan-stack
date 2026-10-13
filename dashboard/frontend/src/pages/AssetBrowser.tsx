@@ -1596,7 +1596,22 @@ export default function AssetBrowser() {
   const [selectedIp, setSelectedIp] = useState<string | null>(null)
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null)
   const [selectedPort, setSelectedPort] = useState<Port | null>(null)
-  const [detailTab, setDetailTab] = useState<'ports' | 'credentials' | 'access' | 'facts' | 'enumeration' | 'screenshots' | 'recon'>('ports')
+  type DetailTab = 'ports' | 'credentials' | 'access' | 'facts' | 'enumeration' | 'screenshots' | 'recon'
+  const DETAIL_TABS: DetailTab[] = ['ports', 'recon', 'credentials', 'access', 'facts', 'enumeration', 'screenshots']
+  // Persisted so a refresh does not bounce back to Ports mid-triage. Fail-soft
+  // on both read and write: localStorage throws in a private window and in
+  // some embedded views, and a remembered tab is a convenience, never state
+  // the page needs to render.
+  const [detailTab, setDetailTab] = useState<DetailTab>(() => {
+    try {
+      const v = localStorage.getItem('assets-detail-tab')
+      if (v && (DETAIL_TABS as string[]).includes(v)) return v as DetailTab
+    } catch { /* unavailable — fall through to the default */ }
+    return 'ports'
+  })
+  useEffect(() => {
+    try { localStorage.setItem('assets-detail-tab', detailTab) } catch { /* ignore */ }
+  }, [detailTab])
   const [search, setSearch] = useState('')
   const [credStatusFilter, setCredStatusFilter] = useState<string>('')
   // Track which credential rows have their audit panel expanded.  Keyed by
@@ -2173,7 +2188,13 @@ export default function AssetBrowser() {
             const isCloudImport = (row.tags || []).includes('cloud_import') ||
               row.ip === '127.0.1.1' || row.ip === '127.0.0.1' ||
               (row.tags || []).some(tag => ['microburst', 'azurehound', 'prowler', 'scoutsuite', 'pacu', 'cloudfox'].includes(tag))
-            setDetailTab(isCloudImport ? 'recon' : 'ports')
+            // KEEP the operator's tab when moving between assets. Resetting to
+            // 'ports' on every selection makes it impossible to walk a list
+            // comparing one thing — pick Screenshots, click the next host, and
+            // you were back on Ports. The only override is a cloud-import
+            // asset, whose IP is a synthetic marker with no ports or
+            // screenshots to show, so 'recon' is the only tab with content.
+            setDetailTab(prev => (isCloudImport ? 'recon' : prev))
             setSelectedAssetId(row.id || null)
             setSelectedIp(row.ip)
           }}

@@ -326,3 +326,52 @@ def test_content_intel_matches_hosts_not_substrings():
         "ContentIntel still substring-matches the URL against scope domains")
     assert re.search(r"endsWith\s*\(\s*['\"]\.['\"]\s*\+", src), (
         "no suffix match — a subdomain of an in-scope apex will be hidden")
+
+
+def test_asset_detail_tab_survives_changing_asset():
+    """Selecting the next asset must KEEP the operator's tab.
+
+    The row click reset it to 'ports' on every selection, so walking a list to
+    compare one thing — pick Screenshots, click the next host — bounced back to
+    Ports every time, which makes paging through assets unusable.
+
+    The single allowed override is a cloud-import asset: its IP is a synthetic
+    127.0.x.x marker with no ports or screenshots, so 'recon' is the only tab
+    with anything in it.
+    """
+    import pathlib
+    import re
+    page = (pathlib.Path(__file__).resolve().parents[1]
+            / "dashboard" / "frontend" / "src" / "pages" / "AssetBrowser.tsx")
+    if not page.exists():
+        import pytest
+        pytest.skip(f"{page} not present")
+    src = page.read_text(encoding="utf-8")
+    # the reset took the form setDetailTab(isCloudImport ? 'recon' : 'ports')
+    assert not re.search(r"setDetailTab\s*\(\s*\w+\s*\?\s*['\"]recon['\"]\s*:\s*['\"]ports['\"]", src), (
+        "the row click still resets the detail tab to 'ports' on every asset "
+        "selection — paging through assets loses the tab")
+    # it must preserve the previous value via the functional form
+    assert re.search(r"setDetailTab\s*\(\s*prev\s*=>", src), (
+        "nothing preserves the previous tab when the selected asset changes")
+
+
+def test_asset_detail_tab_is_persisted_fail_soft():
+    """Per the repo's tab convention: persist the selection so a refresh does
+    not bounce to the first tab, and fail soft — localStorage throws in a
+    private window and the remembered tab is a convenience, not state the page
+    needs to render."""
+    import pathlib
+    import re
+    page = (pathlib.Path(__file__).resolve().parents[1]
+            / "dashboard" / "frontend" / "src" / "pages" / "AssetBrowser.tsx")
+    if not page.exists():
+        import pytest
+        pytest.skip(f"{page} not present")
+    src = page.read_text(encoding="utf-8")
+    i = src.find("assets-detail-tab")
+    assert i != -1, "the detail tab is not persisted"
+    window = src[max(0, i - 900):i + 900]
+    assert window.count("try") >= 2 and window.count("catch") >= 2, (
+        "localStorage read/write is not wrapped — it throws in a private "
+        "window and would take the page down with it")
