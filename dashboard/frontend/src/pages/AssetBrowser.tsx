@@ -63,7 +63,34 @@ const assetColumns: ColumnDef<Asset, unknown>[] = [
         </div>
       )
     }
-    return <span className="font-mono text-sm font-medium">{String(row.original.hostname ?? '-')}</span>
+    // Label the scope, and mark it when the gate will refuse a scan. A blocked
+    // target that looks identical to a runnable one reads as a bug when it does
+    // nothing (CLAUDE.md, Authorization gates).
+    const scope = row.original.scope_name
+    const blocked = row.original.scannable === false
+    return (
+      <span className="flex items-center gap-1.5 min-w-0">
+        <span className={cn('font-mono text-sm font-medium truncate',
+          blocked && 'text-muted-foreground')}>
+          {String(row.original.hostname ?? '-')}
+        </span>
+        {blocked && (
+          <span
+            title={`In the "${scope}" scope, which the dispatch gate never scans. `
+                 + `Visible for reference; scans against it are refused.`}
+            className="shrink-0 px-1 py-0.5 rounded text-[9px] font-sans border border-amber-500/40 bg-amber-500/10 text-amber-400"
+          >
+            not scannable
+          </span>
+        )}
+        {scope && !blocked && (
+          <span className="shrink-0 px-1 py-0.5 rounded text-[9px] font-sans text-muted-foreground border border-border"
+                title={`Scope: ${scope}`}>
+            {scope}
+          </span>
+        )}
+      </span>
+    )
   }},
   { accessorKey: 'os', header: 'OS / Type / Provider', size: 160, cell: ({ row }) => {
     const tags = row.original.tags || []
@@ -1387,11 +1414,16 @@ function PortDetailDialog({
   ip,
   vulns,
   onClose,
+  scannable = true,
 }: {
   port: Port
   ip: string
   vulns: Vuln[]
   onClose: () => void
+  /** False when this host sits in a never-dispatchable scope. The gate refuses
+   *  the command anyway; disabling it here means the operator is told BEFORE
+   *  clicking rather than reading a refusal as a failure. */
+  scannable?: boolean
 }) {
   const portVulns = vulns
     .filter(v => v.port === port.port && v.proto === port.proto)
@@ -1520,7 +1552,10 @@ function PortDetailDialog({
                               onError: (e) => setExecResults(prev => ({ ...prev, [cmd.command]: { ok: false, stdout: '', stderr: String(e) } })),
                             })
                           }}
-                          disabled={!selectedNode || reconExecute.isPending}
+                          disabled={!selectedNode || reconExecute.isPending || !scannable}
+                          title={!scannable
+                            ? 'This host is in a scope the dispatch gate never scans — the command would be refused.'
+                            : undefined}
                           className="px-1.5 py-0.5 text-[9px] font-medium rounded bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
                         >Run</button>
                       </div>
@@ -1756,6 +1791,15 @@ export default function AssetBrowser() {
         }
 
         // Both identities: the scope may name either the hostname or the IP.
+        // Prefer the scope the asset is actually FILED IN. Suffix matching
+        // against the scope's targets is not the same question: `examplecorp.com`
+        // is a examplecorp target, so `*.examplecorp.com` matched it — and the 40
+        // hosts filed in no_services showed up under examplecorp anyway, which
+        // read as "the move didn't work".
+        //
+        // Fall back to suffix matching only when the asset is in NO scope, so
+        // a host that has never been triaged still appears somewhere.
+        if (a.scope_name) return a.scope_name === scopeFilter
         return matchesAnyScope(a.hostname, a.ip)
       })
     }
@@ -2947,6 +2991,14 @@ export default function AssetBrowser() {
               <X className="h-4 w-4" />
             </button>
           </div>
+          {selectedAsset?.scannable === false && (
+            <div className="mx-4 mt-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+              <span className="font-semibold">Not scannable.</span>{' '}
+              This host is in the <span className="font-mono">{selectedAsset.scope_name}</span> scope,
+              which the dispatch gate never scans — it is kept visible for reference, and any scan
+              against it is refused.
+            </div>
+          )}
           <p className="px-4 pt-2 text-[11px] text-muted-foreground">
             <kbd className="px-1 rounded bg-muted">↑</kbd>/<kbd className="px-1 rounded bg-muted">↓</kbd>
             {' '}or <kbd className="px-1 rounded bg-muted">j</kbd>/<kbd className="px-1 rounded bg-muted">k</kbd>
@@ -3057,6 +3109,7 @@ export default function AssetBrowser() {
           port={selectedPort}
           ip={selectedIp}
           vulns={vulnsData?.vulns ?? []}
+          scannable={selectedAsset?.scannable !== false}
           onClose={() => setSelectedPort(null)}
         />
       )}

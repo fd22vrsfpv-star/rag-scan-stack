@@ -1541,6 +1541,48 @@ def get_assets(
         cur.execute(sql, (*where_params, limit, offset))
         rows = cur.fetchall()
 
+    # Which scope each asset sits in, and whether that scope is scannable.
+    #
+    # The gate refuses dispatch to a never-dispatchable scope (customer tenants,
+    # typosquats, staging, operator-excluded) — but a refused target looks
+    # identical to a runnable one in the table, so the refusal reads as a bug
+    # when the operator clicks Scan. CLAUDE.md: "Blocked items MUST be labelled
+    # in the UI, not silently dropped."
+    #
+    # One query for the page, matched on hostname OR address because a scope
+    # entry may name either.
+    try:
+        from etl.scope_gate import NEVER_DISPATCHABLE_SCOPES as _NODISPATCH
+    except Exception:  # noqa: BLE001 — never break the asset list over a label
+        _NODISPATCH = ()
+    _scope_of: dict = {}
+    if rows:
+        _keys = [str(r.get("hostname") or "").lower() for r in rows if r.get("hostname")]
+        _keys += [str(r.get("ip") or "") for r in rows if r.get("ip")]
+        if _keys:
+            try:
+                with get_db() as _sc, _sc.cursor() as _scur:
+                    _scur.execute(
+                        """SELECT lower(target), name FROM scope_targets
+                            WHERE lower(target) = ANY(%s)
+                              AND target IS NOT NULL AND target <> ''""",
+                        ([k.lower() for k in _keys],))
+                    for _t, _n in _scur.fetchall():
+                        # A target can appear in several scopes; a
+                        # never-dispatchable one wins, because that is the
+                        # answer that changes what the operator may do.
+                        if _t not in _scope_of or _n in _NODISPATCH:
+                            _scope_of[_t] = _n
+            except Exception as _se:  # noqa: BLE001
+                logging.debug("asset scope lookup failed: %s", _se)
+    for _r in rows:
+        _name = (_scope_of.get(str(_r.get("hostname") or "").lower())
+                 or _scope_of.get(str(_r.get("ip") or "").lower()))
+        _r["scope_name"] = _name
+        # None (not in any scope) is NOT "blocked" — it simply has no scope
+        # entry, and the gate decides separately. Only a known bad scope is.
+        _r["scannable"] = (_name not in _NODISPATCH) if _name else True
+
     # Fast batch lookup: which tools discovered each asset
     asset_ids = [str(r["id"]) for r in rows if r.get("id")]
     if asset_ids:
@@ -41537,6 +41579,106 @@ class AutoClassifyBody(BaseModel):
     generate_rules: bool = True
     limit: Optional[int] = None
     unknown_scope: str = "unknown_scope"
+
+
+class ReclassifyBody(BaseModel):
+    apply: bool = False
+    limit: int = 5000
+
+
+@app.post("/engagements/{engagement_id}/scope/reclassify", tags=["Scope Classification"])
+def reclassify_engagement_scope(engagement_id: str, body: ReclassifyBody | None = None,
+                                _: bool = Depends(auth)):
+    """Re-file hosts that ALREADY have a scope but no longer belong in it.
+
+    `auto-classify` only looks at hosts that are not yet in `scope_targets`, so
+    it can file a newly discovered host and never revisit one. A name that
+    resolved when it was first seen and is dead now keeps its original scope
+    forever — which is why 40 unresolved hosts had to be moved by hand.
+
+    Deliberately NARROW. It only moves a host INTO `no_services`, and only when
+    the rules say the host has no attack surface: nothing resolving and nothing
+    listening.
+
+    Two refusals that matter more than the feature:
+
+    * It never pulls a host OUT of a never-dispatchable scope.
+      `no_services` IS dispatchable, so moving a customer tenant there would
+      make it scannable again — the exact opposite of filing it as a tenant.
+    * It never moves a target that other targets in the same scope sit under.
+      Relocating an apex splits the scope; 87 such entries sit in one scope
+      here and two of them were moved out by accident earlier today.
+
+    `apply` defaults to FALSE: the first call reports what would move.
+    """
+    body = body or ReclassifyBody()
+    from scope_classifier import get_classifier
+    try:
+        from etl.scope_gate import NEVER_DISPATCHABLE_SCOPES as _NODISPATCH
+    except Exception:  # noqa: BLE001
+        _NODISPATCH = ()
+    clf = get_classifier()
+    moved, candidates, skipped_parent = [], 0, []
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        clf.load_rules(cur)
+        cur.execute(
+            """SELECT target, name FROM scope_targets
+                WHERE engagement_id = %s::uuid AND target <> '' LIMIT %s""",
+            (engagement_id, body.limit))
+        rows = [(r["target"], r["name"]) for r in cur.fetchall()]
+        in_scope_names = {}
+        for t, n in rows:
+            in_scope_names.setdefault(n, []).append(t)
+        hosts = [t for t, n in rows
+                 if n != "no_services" and n not in _NODISPATCH]
+        if hosts:
+            cur.execute(
+                """SELECT a.hostname,
+                          bool_or(host(a.ip) IN ('0.0.0.0','::')) AS unresolved,
+                          count(p.id) FILTER (WHERE p.is_open) AS open_ports,
+                          count(p.id)                          AS port_rows
+                     FROM assets a LEFT JOIN ports p ON p.asset_id = a.id
+                    WHERE a.hostname = ANY(%s) GROUP BY a.hostname""", (hosts,))
+            # port_scanned separates "scanned, nothing listening" from "nobody
+            # looked" — without it this pass would bury unscanned hosts.
+            state = {r["hostname"]: {"has_asset": True,
+                                     "unresolved": bool(r["unresolved"]),
+                                     "open_ports": int(r["open_ports"] or 0),
+                                     "port_scanned": int(r["port_rows"] or 0) > 0}
+                     for r in cur.fetchall()}
+        else:
+            state = {}
+        scope_of = {t: n for t, n in rows}
+        for host in hosts:
+            ctx = state.get(host, {"has_asset": False, "unresolved": False, "open_ports": 0})
+            sug = clf.classify_rules_only(host, ctx)
+            if not sug or sug.scope != "no_services":
+                continue
+            candidates += 1
+            siblings = in_scope_names.get(scope_of[host], [])
+            if any(t != host and t.endswith("." + host) for t in siblings):
+                skipped_parent.append(host)
+                continue
+            moved.append({"target": host, "from": scope_of[host]})
+        if body.apply and moved:
+            cur.execute(
+                """UPDATE scope_targets SET name = 'no_services', source = 'reclassified'
+                    WHERE engagement_id = %s::uuid AND target = ANY(%s)
+                      AND name <> 'no_services'""",
+                (engagement_id, [m["target"] for m in moved]))
+            conn.commit()
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("scope_reclassified", "scope_classifier",
+                     {"engagement_id": engagement_id, "applied": bool(body.apply),
+                      "moved": len(moved), "skipped_parent": len(skipped_parent)})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "applied": bool(body.apply), "candidates": candidates,
+            "moved": len(moved) if body.apply else 0,
+            "would_move": 0 if body.apply else len(moved),
+            "skipped_parents": skipped_parent[:20],
+            "targets": [m["target"] for m in moved][:50]}
 
 
 @app.post("/engagements/{engagement_id}/scope/auto-classify", tags=["Scope Classification"])

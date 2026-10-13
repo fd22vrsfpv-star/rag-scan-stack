@@ -352,3 +352,29 @@ async def auto_classify_engagement_scope(engagement_id: str, body: AutoClassifyB
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text[:300])
         return safe_json(resp)
+
+
+class ReclassifyBody(BaseModel):
+    """`apply` defaults to FALSE — the first call reports what would move."""
+    apply: bool = False
+    limit: int = 5000
+
+
+@router.post("/api/engagements/{engagement_id}/scope/reclassify")
+async def reclassify_engagement_scope(engagement_id: str, body: ReclassifyBody | None = None):
+    """Re-file already-scoped hosts that no longer have an attack surface.
+
+    auto-classify only sees hosts with NO scope yet, so a name that resolved
+    when first seen and is dead now keeps its original scope forever. This is
+    the pass that revisits them, and it only ever moves INTO no_services.
+    """
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=600) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/engagements/{engagement_id}/scope/reclassify",
+            json=(body or ReclassifyBody()).model_dump(),
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text[:300])
+        return safe_json(resp)

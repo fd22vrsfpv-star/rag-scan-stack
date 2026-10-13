@@ -172,7 +172,18 @@ class ScopeClassifier:
             #   unresolved:      true  -> ip is 0.0.0.0 / ::  / absent
             #   max_open_ports:  N     -> at most N listening ports
             #   probed:          true  -> an asset row exists (default true)
+            #   port_scanned:    true  -> the host HAS port rows, i.e. something
+            #                             actually looked at its ports
+            #
+            # port_scanned is the difference between "we scanned it and nothing
+            # was listening" and "nobody has looked". Measured here: 16 resolved
+            # assets have port rows with none open, and 1562 have no port rows
+            # at all. Filing the second group as "no services" would bury 1562
+            # hosts that might be serving anything, and they would never be
+            # scanned again to find out.
             if cond.get("probed", True) and not context.get("has_asset"):
+                return False
+            if cond.get("port_scanned") and not context.get("port_scanned"):
                 return False
             if cond.get("unresolved") and not context.get("unresolved"):
                 return False
@@ -184,7 +195,8 @@ class ScopeClassifier:
                 except (TypeError, ValueError):
                     return False
             # An all-empty condition set must not match everything.
-            return any(k in cond for k in ("unresolved", "max_open_ports", "probed"))
+            return any(k in cond for k in ("unresolved", "max_open_ports",
+                                           "probed", "port_scanned"))
 
         elif rt == "composite":
             op = cond.get("op", "and").lower()
@@ -453,7 +465,8 @@ def classify_and_assign_engagement(cur, engagement_id: str,
         cur.execute(
             """SELECT a.hostname,
                       bool_or(host(a.ip) IN ('0.0.0.0', '::')) AS unresolved,
-                      count(p.id) FILTER (WHERE p.is_open)     AS open_ports
+                      count(p.id) FILTER (WHERE p.is_open)     AS open_ports,
+                      count(p.id)                              AS port_rows
                  FROM assets a
                  LEFT JOIN ports p ON p.asset_id = a.id
                 WHERE a.hostname = ANY(%s)
@@ -464,8 +477,10 @@ def classify_and_assign_engagement(cur, engagement_id: str,
             hn = r["hostname"] if isinstance(r, dict) else r[0]
             unres = r["unresolved"] if isinstance(r, dict) else r[1]
             opn = r["open_ports"] if isinstance(r, dict) else r[2]
+            prows = r["port_rows"] if isinstance(r, dict) else r[3]
             state[hn] = {"has_asset": True, "unresolved": bool(unres),
-                         "open_ports": int(opn or 0)}
+                         "open_ports": int(opn or 0),
+                         "port_scanned": int(prows or 0) > 0}
 
     in_scope = unknown = 0
     per_scope: dict = {}
