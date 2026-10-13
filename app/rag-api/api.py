@@ -47759,6 +47759,65 @@ def get_tag_suggestions(_: bool = Depends(auth)):
     return {"tags": sorted(all_tags), "predefined": PREDEFINED_TAGS}
 
 
+@app.get("/recon/gowitness-report", tags=["Screenshots"])
+def gowitness_report(match: Optional[str] = Query(None, description="host/URL substring, e.g. a scope name"),
+                     engagement_id: Optional[str] = Query(None),
+                     all_engagements: bool = Query(False),
+                     status: Optional[str] = Query(None, description="comma-separated codes, e.g. 200,403"),
+                     fmt: str = Query("json", pattern="^(json|csv|html)$"),
+                     limit: int = Query(2000, ge=1, le=20000),
+                     authorized: bool = Depends(auth)):
+    """One combined GoWitness view — every screenshot with its status code and
+    title, instead of a grid of unlabelled thumbnails.
+
+    The data was always complete: every `recon_findings` row from gowitness
+    carries url, final_url, status_code, title, server, technologies, TLS and
+    the screenshot path. What was missing was a way to LOOK at it — triaging
+    669 examplecorp hosts meant opening each thumbnail to find out what it was.
+
+    `fmt=json` feeds the UI; `csv` and `html` download. The HTML is a contact
+    sheet (thumbnail + status badge + title, filterable by status) that
+    references screenshots through the dashboard proxy rather than embedding
+    them — the examplecorp set alone is 59 MB of PNG.
+
+    Engagement-filtered by default per CLAUDE.md "Engagement + scope filters
+    apply on READS"; `all_engagements=true` is the explicit override.
+    """
+    import gowitness_report as _gwr
+    eid = _resolve_engagement_id(engagement_id)
+    statuses = None
+    if status:
+        statuses = {int(s) for s in status.split(",") if s.strip().isdigit()} or None
+    where, args = ["source = 'gowitness'"], []
+    if match:
+        where.append("(data->>'url' ILIKE %s OR COALESCE(target,'') ILIKE %s)")
+        args += [f"%{match}%", f"%{match}%"]
+    if eid and not all_engagements:
+        where.append("(engagement_id = %s OR engagement_id IS NULL)")
+        args.append(eid)
+    sql = ("SELECT data, target, engagement_id, created_at FROM recon_findings WHERE "
+           + " AND ".join(where) + " ORDER BY data->>'url' LIMIT %s")
+    args.append(limit)
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute(sql, args)
+        raw = cur.fetchall()
+    rows = _gwr.rows_from_records(raw, statuses)
+    label = match or ("all engagements" if all_engagements else "engagement")
+    if fmt == "csv":
+        return Response(content=_gwr.to_csv(rows), media_type="text/csv",
+                        headers={"Content-Disposition":
+                                 f'attachment; filename="gowitness_{_gwr.slug(label)}.csv"'})
+    if fmt == "html":
+        return Response(content=_gwr.to_html(rows, label), media_type="text/html",
+                        headers={"Content-Disposition":
+                                 f'attachment; filename="gowitness_{_gwr.slug(label)}.html"'})
+    return {"ok": True, "label": label, "count": len(rows),
+            "engagement_id": str(eid) if eid else None,
+            "all_engagements": bool(all_engagements),
+            "status_counts": _gwr.status_counts(rows),
+            "rows": rows}
+
+
 class ScreenshotMetadataBody(BaseModel):
     path: str
     filename: str

@@ -6,6 +6,7 @@ import { useReportSummary, useReportFull, useExportPdf, useExportBurp, useExport
 import { apiFetch } from '@/api/client'
 import { useEngagements, useEngagement } from '@/api/engagements'
 import { useScopeNames, useScope } from '@/api/scope'
+import { useGowitnessReport, downloadGowitnessReport } from '@/api/gowitness'
 import { useUIStore } from '@/stores/ui'
 import { SEVERITY_LEVELS, SOURCES } from '@/lib/constants'
 import { cn } from '@/lib/utils'
@@ -354,6 +355,8 @@ export default function Reports() {
         {reportFull.error && <p className="text-xs text-red-500">{String(reportFull.error)}</p>}
         {exportPdf.error && <p className="text-xs text-red-500">{String(exportPdf.error)}</p>}
       </div>
+
+      <GowitnessReportCard scopeName={scopeName} />
 
       {/* Preview */}
       {preview && (
@@ -971,6 +974,110 @@ netsh advfirewall firewall delete rule name="WSL2 SOCKS ${selectedNode.proxy_por
 
       {/* Final result */}
       {replayResult && <p className={`text-xs ${replayResult.startsWith('Error') ? 'text-red-500' : 'text-green-500'}`}>{replayResult}</p>}
+    </div>
+  )
+}
+
+
+/** GoWitness contact sheet — every screenshot with its status code and title.
+ *
+ *  The Screenshots tab in Recon Explorer renders a grid of unlabelled
+ *  thumbnails, so triaging a large scope meant opening each image to find out
+ *  whether it was a live app, a 403, or a parked domain holder. The data for
+ *  all of it was already stored; this is the view over it.
+ *
+ *  Scoped to the engagement + the selected scope name by default. Downloads
+ *  reuse the Content-Disposition filename the server sends.
+ */
+function GowitnessReportCard({ scopeName }: { scopeName?: string }) {
+  const [status, setStatus] = useState('')
+  const [busy, setBusy] = useState<'' | 'csv' | 'html'>('')
+  const [err, setErr] = useState('')
+  const { data, isLoading, isError, error } = useGowitnessReport({
+    match: scopeName || undefined,
+    status: status || undefined,
+  })
+
+  const counts = data?.status_counts ?? {}
+  const download = async (fmt: 'csv' | 'html') => {
+    setBusy(fmt); setErr('')
+    try {
+      await downloadGowitnessReport(fmt, {
+        match: scopeName || undefined,
+        status: status || undefined,
+      })
+    } catch (e) {
+      setErr(String(e))
+    } finally {
+      setBusy('')
+    }
+  }
+
+  return (
+    <div className="bg-card border border-border rounded-lg p-4 space-y-3">
+      <div className="flex items-start justify-between gap-3 flex-wrap">
+        <div>
+          <h3 className="text-sm font-semibold flex items-center gap-2">
+            <Eye className="h-4 w-4" /> GoWitness Contact Sheet
+          </h3>
+          <p className="text-xs text-muted-foreground mt-0.5">
+            Every screenshot with its status code, title and tech — one page, no clicking through.
+            {scopeName
+              ? <> Scoped to <span className="font-mono">{scopeName}</span>.</>
+              : <> Select a scope above to narrow it.</>}
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => download('html')}
+            disabled={busy !== '' || !data?.count}
+            className="flex items-center gap-2 px-3 py-1.5 bg-primary text-primary-foreground rounded-md text-sm hover:bg-primary/90 disabled:opacity-50"
+          >
+            {busy === 'html' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+            Contact sheet (HTML)
+          </button>
+          <button
+            onClick={() => download('csv')}
+            disabled={busy !== '' || !data?.count}
+            className="flex items-center gap-2 px-3 py-1.5 bg-secondary text-secondary-foreground rounded-md text-sm hover:bg-secondary/80 disabled:opacity-50"
+          >
+            {busy === 'csv' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+            CSV
+          </button>
+        </div>
+      </div>
+
+      {/* Status chips double as the filter — the counts ARE the summary. */}
+      <div className="flex flex-wrap items-center gap-1.5">
+        <button
+          onClick={() => setStatus('')}
+          className={cn('px-2 py-0.5 rounded-full text-xs border',
+            status === '' ? 'border-primary text-primary' : 'border-border text-muted-foreground')}
+        >
+          all {data?.count ?? 0}
+        </button>
+        {Object.entries(counts).map(([code, n]) => (
+          <button
+            key={code}
+            onClick={() => setStatus(status === code ? '' : code)}
+            className={cn('px-2 py-0.5 rounded-full text-xs border font-mono',
+              status === code ? 'border-primary text-primary' : 'border-border text-muted-foreground')}
+          >
+            {code} {n}
+          </button>
+        ))}
+      </div>
+
+      {isLoading && <p className="text-xs text-muted-foreground">Loading…</p>}
+      {/* isError destructured deliberately: a silent empty list is how a dead
+          endpoint masquerades as "no data yet" (CLAUDE.md, endpoint coverage). */}
+      {isError && <p className="text-xs text-red-500">Report failed: {String(error)}</p>}
+      {err && <p className="text-xs text-red-500">{err}</p>}
+      {!isLoading && !isError && !data?.count && (
+        <p className="text-xs text-muted-foreground">
+          No GoWitness screenshots for this engagement{scopeName ? ` in ${scopeName}` : ''} yet.
+        </p>
+      )}
     </div>
   )
 }

@@ -539,6 +539,47 @@ async def get_screenshot_metadata(
         return safe_json(resp)
 
 
+# NOTE: must stay ABOVE /api/screenshots/{path:path} for the same reason the
+# metadata route does — the catch-all would swallow it.
+@router.get("/api/recon/gowitness-report")
+async def gowitness_report(
+    match: Optional[str] = None,
+    status: Optional[str] = None,
+    fmt: str = "json",
+    all_engagements: bool = False,
+    limit: int = 2000,
+):
+    """One combined GoWitness view: every screenshot with its status code and
+    title. `fmt=json` feeds the UI; `csv` and `html` are downloads.
+
+    Not `safe_json` for the download formats — that would discard the
+    Content-Disposition and hand the browser a JSON blob instead of a file.
+    Same pattern as the scope CSV export.
+    """
+    s = get_settings()
+    params: dict = {"fmt": fmt, "all_engagements": str(all_engagements).lower(),
+                    "limit": limit}
+    if match:
+        params["match"] = match
+    if status:
+        params["status"] = status
+    async with httpx.AsyncClient(timeout=120) as c:
+        resp = await c.get(f"{s.rag_api_url}/recon/gowitness-report",
+                           params=params,
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text[:500])
+        if fmt in ("csv", "html"):
+            return Response(
+                content=resp.content,
+                media_type=resp.headers.get("content-type",
+                                            "text/csv" if fmt == "csv" else "text/html"),
+                headers={"Content-Disposition":
+                         resp.headers.get("content-disposition",
+                                          f'attachment; filename="gowitness.{fmt}"')})
+        return safe_json(resp)
+
+
 @router.get("/api/screenshots/{path:path}")
 async def proxy_screenshot(path: str):
     """Proxy screenshot files from osint-runner."""
