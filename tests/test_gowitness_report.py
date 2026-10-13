@@ -378,3 +378,102 @@ def test_keyboard_tagging_toggles_rather_than_only_adding():
     block = src[i:i + 3000]
     assert "remove:" in block and "add:" in block, (
         "the shortcut does not toggle — it can only add the tag")
+
+
+# ── asset delete: an IP is not one asset ───────────────────────────────────
+# DELETE FROM assets WHERE host(ip)::text = ANY(...) removed EVERY asset on the
+# address. Shared hosting puts 174 assets on 74.123.153.33 in this database and
+# 156 on 209.160.102.17, and every unresolved domain sits on 0.0.0.0 — so
+# selecting one domain and pressing Delete destroyed all of its neighbours.
+
+def _delete_assets_handler():
+    src = API.read_text(encoding="utf-8")
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.FunctionDef) and node.name == "delete_assets":
+            return node, (ast.get_source_segment(src, node) or "")
+    pytest.fail("DELETE /assets handler is gone")
+
+
+def test_delete_assets_accepts_ids():
+    node, body = _delete_assets_handler()
+    assert '"ids"' in body or "'ids'" in body, (
+        "the delete still takes only ips — one checkbox would remove every "
+        "asset sharing that address")
+    assert "id = ANY" in body, "ids are not used to scope the DELETE"
+
+
+def test_delete_by_id_is_preferred_over_ip():
+    """Both are supported, but ids must WIN when given — otherwise the UI's
+    precise selection is widened back out to the whole address."""
+    _, body = _delete_assets_handler()
+    i_ids, i_ips = body.find("if ids:"), body.find("host(ip)")
+    assert i_ids != -1, "no id branch"
+    assert i_ids < i_ips, "the ip branch runs first — ids would never be used"
+
+
+def test_delete_reports_the_blast_radius():
+    """`requested` vs `deleted` is how a caller SEES that deleting by ip took
+    more rows than it named, instead of finding out afterwards."""
+    node, _ = _delete_assets_handler()
+    # Check the RETURNED dict, not the function text: `requested` is also a
+    # local variable, so a substring check passes while the caller still sees
+    # nothing. (Caught by sabotage — the first version of this test did exactly
+    # that.)
+    returns = [n for n in ast.walk(node) if isinstance(n, ast.Return)]
+    keys = set()
+    for r in returns:
+        if isinstance(r.value, ast.Dict):
+            keys |= {k.value for k in r.value.keys
+                     if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+    assert "requested" in keys, (
+        f"the response does not report how many rows were in scope; returns {sorted(keys)}")
+    assert "deleted" in keys
+
+
+def test_delete_proxy_checks_status():
+    """The destructive path above all others: httpx does not raise on 4xx/5xx,
+    so a refused delete would read as success and the UI would clear its
+    selection as though the rows were gone."""
+    bff = REPO / "dashboard" / "bff" / "routers" / "assets.py"
+    if not bff.exists():
+        pytest.skip(f"{bff} not present")
+    src = bff.read_text(encoding="utf-8")
+    for node in ast.parse(src).body:
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name == "delete_assets":
+            fn = ast.get_source_segment(src, node) or ""
+    assert "status_code" in fn and "HTTPException" in fn
+
+
+def test_asset_rows_are_keyed_by_id_not_ip():
+    """getRowId feeds the selection keys, and the selection keys feed DELETE.
+    An ip-keyed row id makes one checkbox stand for every asset on that
+    address."""
+    page = REPO / "dashboard" / "frontend" / "src" / "pages" / "AssetBrowser.tsx"
+    if not page.exists():
+        pytest.skip(f"{page} not present")
+    src = page.read_text(encoding="utf-8")
+    import re as _re
+    assert not _re.search(r"getRowId=\{\(row\)\s*=>\s*row\.ip\}", src), (
+        "asset rows are still keyed by ip — selection collides across shared "
+        "hosting and the keys are passed to a DELETE")
+    assert _re.search(r"getRowId=\{\(row\)\s*=>\s*row\.id", src), (
+        "asset rows are not keyed by the asset id")
+
+
+def test_delete_confirm_names_what_it_will_remove():
+    """The old dialog said "Delete 1 asset(s)" while the request removed every
+    asset on that IP, so the number the operator confirmed was not the number
+    that went."""
+    page = REPO / "dashboard" / "frontend" / "src" / "pages" / "AssetBrowser.tsx"
+    if not page.exists():
+        pytest.skip(f"{page} not present")
+    src = page.read_text(encoding="utf-8")
+    i = src.find("const handleDeleteAssets")
+    assert i != -1, "handleDeleteAssets is gone"
+    block = src[i:i + 1400]
+    assert "hostname" in block, "the confirm dialog does not name the assets"
+    # Regex so this pins the PROPERTY (ids are what gets sent) rather than one
+    # exact spelling that a reformat would break.
+    import re as _re2
+    assert _re2.search(r"deleteAssets\.mutate\(\s*ids\b", block), (
+        "the delete still sends ips")

@@ -1913,10 +1913,18 @@ export default function AssetBrowser() {
   const selectedSubdomainCount = Object.values(subdomainSelection).filter(Boolean).length
 
   const handleDeleteAssets = () => {
-    const ips = Object.keys(assetSelection).filter(k => assetSelection[k])
-    if (!ips.length) return
-    if (!window.confirm(`Delete ${ips.length} asset(s) and all related ports, vulns, and findings? This cannot be undone.`)) return
-    deleteAssets.mutate(ips, { onSuccess: () => setAssetSelection({}) })
+    const ids = Object.keys(assetSelection).filter(k => assetSelection[k])
+    if (!ids.length) return
+    // Name what is going. The old dialog said "Delete 1 asset(s)" while the
+    // request deleted every asset sharing that IP, so the count the operator
+    // confirmed was not the count that was removed.
+    const rows = ids.map(id => assets.find(a => a.id === id)).filter(Boolean)
+    const names = rows.slice(0, 8).map(a => a!.hostname || a!.ip).join('\n  ')
+    const more = rows.length > 8 ? `\n  ...and ${rows.length - 8} more` : ''
+    if (!window.confirm(
+      `Delete ${ids.length} asset(s) and all related ports, vulns, and findings?\n\n  ${names}${more}\n\nThis cannot be undone.`
+    )) return
+    deleteAssets.mutate(ids, { onSuccess: () => setAssetSelection({}) })
   }
 
   const handleDeleteSubdomains = () => {
@@ -2268,7 +2276,10 @@ export default function AssetBrowser() {
           selectable
           rowSelection={assetSelection}
           onRowSelectionChange={setAssetSelection}
-          getRowId={(row) => row.ip}
+          // The ASSET id, not the ip. 174 assets share 74.123.153.33 here, so
+          // an ip-keyed row id made one checkbox select all of them — and the
+          // selection keys fed a DELETE.
+          getRowId={(row) => row.id || row.ip}
           rowClassName={(row) => (row.pending_exploits ?? 0) > 0
             ? 'bg-amber-500/5 border-l-2 border-l-amber-500/60'
             : (row.spray_ready ?? 0) > 0
@@ -3055,9 +3066,13 @@ export default function AssetBrowser() {
       {showScopeModal === 'assets' && (
         <ScopeAssignModal
           fromScope={scopeFilter || undefined}
-          targets={Object.keys(assetSelection).filter(k => assetSelection[k]).map(ip => {
-            const asset = assets.find(a => a.ip === ip)
-            return { target: asset?.hostname || ip, target_type: asset?.hostname ? 'domain' : 'ip' }
+          targets={Object.keys(assetSelection).filter(k => assetSelection[k]).map(key => {
+            // key is the asset id (see getRowId); fall back to ip for rows
+            // that somehow have none, so an unidentified asset is still
+            // assignable rather than silently dropped.
+            const asset = assets.find(a => a.id === key) ?? assets.find(a => a.ip === key)
+            return { target: asset?.hostname || asset?.ip || key,
+                     target_type: asset?.hostname ? 'domain' : 'ip' }
           })}
           onClose={() => setShowScopeModal(null)}
           onSuccess={() => setAssetSelection({})}

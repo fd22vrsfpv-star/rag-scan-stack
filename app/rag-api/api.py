@@ -1733,15 +1733,42 @@ def purge_by_pattern(body: dict, authorized: bool = Depends(auth)):
 
 @app.delete("/assets")
 def delete_assets(body: dict, authorized: bool = Depends(auth)):
-    """Bulk-delete assets by IP. Cascades to ports, vulns, web_findings, etc."""
-    ips = body.get("ips", [])
-    if not ips:
-        raise HTTPException(status_code=400, detail="No IPs provided")
+    """Bulk-delete assets. Cascades to ports, vulns, web_findings, etc.
+
+    Prefer `ids` — **an IP is not one asset**. Shared hosting puts many domains
+    behind one address: this database has 174 assets on 74.123.153.33 and 156 on
+    209.160.102.17, and every unresolved domain sits on 0.0.0.0. Deleting by IP
+    therefore removes EVERY asset on that address, so selecting one domain in
+    the UI and pressing Delete destroyed all 174 of its neighbours.
+
+    `ips` still works, because deleting a host by address is a legitimate
+    operation — but it is no longer the default, and the response now reports
+    `requested` alongside `deleted` so a caller can SEE the blast radius
+    instead of discovering it afterwards.
+    """
+    ids = [str(i) for i in (body.get("ids") or []) if str(i).strip()]
+    ips = [str(i) for i in (body.get("ips") or []) if str(i).strip()]
+    if not ids and not ips:
+        raise HTTPException(status_code=400, detail="No ids or ips provided")
     with get_db() as conn, conn.cursor() as cur:
-        cur.execute("DELETE FROM assets WHERE host(ip)::text = ANY(%s)", (ips,))
-        deleted = cur.rowcount
+        if ids:
+            # Exactly the rows named. uuid cast is explicit so a malformed id is
+            # a 400 from Postgres rather than a silent no-match.
+            try:
+                cur.execute("DELETE FROM assets WHERE id = ANY(%s::uuid[])", (ids,))
+            except Exception as e:  # noqa: BLE001
+                conn.rollback()
+                raise HTTPException(status_code=400, detail=f"bad asset id: {e}")
+            deleted = cur.rowcount
+            requested = len(ids)
+        else:
+            cur.execute("SELECT count(*) FROM assets WHERE host(ip)::text = ANY(%s)", (ips,))
+            requested = cur.fetchone()[0]
+            cur.execute("DELETE FROM assets WHERE host(ip)::text = ANY(%s)", (ips,))
+            deleted = cur.rowcount
         conn.commit()
-    return {"ok": True, "deleted": deleted}
+    return {"ok": True, "deleted": deleted, "requested": requested,
+            "by": "ids" if ids else "ips"}
 
 
 @app.delete("/targets/{domain}", tags=["Targets"])

@@ -229,14 +229,22 @@ export function useAddScanRecommendation() {
   })
 }
 
+/** Bulk-delete assets.
+ *
+ *  Takes IDS, not IPs. An IP is not one asset: shared hosting puts many
+ *  domains behind one address (174 assets on a single IP in this database),
+ *  so deleting by IP removes every neighbour too. `{ips}` remains supported
+ *  server-side for deleting a host by address on purpose; the UI does not use
+ *  it.
+ */
 export function useDeleteAssets() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (ips: string[]) =>
-      apiFetch<{ ok: boolean; deleted: number }>('/assets', {
+    mutationFn: (ids: string[]) =>
+      apiFetch<{ ok: boolean; deleted: number; requested: number; by: string }>('/assets', {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ips }),
+        body: JSON.stringify({ ids }),
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['assets'] })

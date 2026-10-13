@@ -136,6 +136,13 @@ async def purge_by_pattern(request: Request):
 
 @router.delete("/api/assets")
 async def delete_assets(request: Request):
+    """Bulk-delete assets. The body carries `ids` (preferred) or `ips`.
+
+    The status is CHECKED: httpx does not raise on 4xx/5xx, so a refused delete
+    would otherwise come back through safe_json looking like a success and the
+    UI would clear its selection as if the rows were gone. That matters more
+    here than almost anywhere — this is the destructive path.
+    """
     s = get_settings()
     body = await request.json()
     async with httpx.AsyncClient(timeout=15) as c:
@@ -145,6 +152,8 @@ async def delete_assets(request: Request):
             json=body,
             headers={"x-api-key": s.api_key, **engagement_headers()},
         )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text[:300])
         return safe_json(resp)
 
 
