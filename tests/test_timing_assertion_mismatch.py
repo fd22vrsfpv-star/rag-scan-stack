@@ -29,10 +29,15 @@ Run standalone:
     sh -c "pip -q install pytest; python -m pytest tests/test_timing_assertion_mismatch.py -q"
 """
 import ast
+import os
 import pathlib
 import re
+import sys
 
 import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _ast_assert import call_kwarg, calls_with  # noqa: E402
 
 API = pathlib.Path(__file__).resolve().parents[1] / "app" / "rag-api" / "api.py"
 
@@ -347,13 +352,14 @@ def _listener_src():
 def test_vector_run_executes_under_bash():
     src = _listener_src()
     assert "_EXEC_SHELL" in src, "the exec shell must be resolved"
-    assert 'shutil.which("bash")' in src, (
+    assert calls_with(src, "shutil.which", args=["bash"]), (
         "resolve bash at import; a hardcoded path breaks on an image that "
         "installs it elsewhere"
     )
-    m = re.search(r"subprocess\.run\(\s*cmd,\s*shell=True[^)]*\)", src, re.S)
-    assert m, "the shell=True exec site is gone"
-    assert "executable=_EXEC_SHELL" in m.group(0), (
+    assert calls_with(src, "subprocess.run", kwargs={"shell": True}), (
+        "the shell=True exec site is gone"
+    )
+    assert call_kwarg(src, "subprocess.run", "executable"), (
         "shell=True without executable= uses /bin/sh (dash here), which "
         "rejects the bash syntax the model writes"
     )
