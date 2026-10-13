@@ -672,3 +672,33 @@ scaling behaviour and the verdict names, not the dispatch accounting.
 correctly and the invariant ("never accept a latency verdict on a single run")
 is being honoured — CVE-2024-3552's scaling is genuine, which is how the
 undercount was noticed.
+
+### `/scope/move` drags PARENT domains out of the source scope
+**Found:** 2026-10-13 (re-confirmed while moving 40 targets to `no_services`)
+**Evidence:** the handler deliberately widens the selection:
+
+    for item in list(to_move):
+        for st in source_targets:
+            if item.endswith('.' + st) or item == st:
+                to_move.add(st)
+
+Both apexes are in the examplecorp scope — `SELECT target FROM scope_targets
+WHERE name='examplecorp' AND target IN ('legacycorp.net','examplecorp.com')` returns
+both. So moving `aehn-live.legacycorp.net` ALSO moves `legacycorp.net`, and moving
+`analytics-lcrm.examplecorp.com` ALSO moves `examplecorp.com`. Relocating the two
+apexes that define the engagement's scope is not a side effect anyone selecting
+a subdomain would expect, and the UI gives no warning: the modal said
+"40 item(s) selected".
+
+The docstring states the behaviour ("Matches exact targets AND targets that are
+in the source scope that the given items are subdomains of"), so it is
+intentional — but it is intentional for a different case (triaging a whole
+unknown_scope branch), and it is silently destructive for this one.
+
+The 40-target move was therefore done with a direct UPDATE plus an apex guard
+(`REFUSING: apex domains in the selection`) rather than through this endpoint.
+**Where:** `app/rag-api/api.py::move_scope_targets`.
+**Done when:** the parent-widening is opt-in (`include_parents: true`, default
+false), or the response reports the widened set so the caller can refuse; and
+the UI shows the final list before committing.
+**Enforced by:** not enforced.

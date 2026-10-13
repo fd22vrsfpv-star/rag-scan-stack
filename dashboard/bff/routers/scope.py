@@ -304,3 +304,37 @@ async def review_pivot_suggestions_bulk(body: BulkReviewPivotBody):
             headers={"x-api-key": s.api_key, **engagement_headers()},
         )
         return safe_json(resp)
+
+
+class AutoClassifyBody(BaseModel):
+    """Mirrors rag-api's AutoClassifyBody. `generate_rules` defaults to FALSE
+    here: seeding rules is a side effect the operator should ask for, not
+    something a classify button does quietly."""
+    generate_rules: bool = False
+    unknown_scope: str = "unknown_scope"
+    limit: Optional[int] = None
+
+
+@router.post("/api/engagements/{engagement_id}/scope/auto-classify")
+async def auto_classify_engagement_scope(engagement_id: str, body: AutoClassifyBody | None = None):
+    """Classify every DISCOVERED host for this engagement into a scope.
+
+    Only touches hosts that are not already in `scope_targets` for the
+    engagement — it assigns newly discovered hosts and never re-files existing
+    ones, which is worth knowing before expecting it to reorganise a scope.
+
+    This route existed on rag-api with no proxy, so the dashboard got a 404 and
+    the whole feature was CLI-only. Long timeout: it walks every discovered host
+    (145 candidates took a few seconds, but a first run on a large engagement
+    walks thousands).
+    """
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=600) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/engagements/{engagement_id}/scope/auto-classify",
+            json=(body or AutoClassifyBody()).model_dump(),
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text[:300])
+        return safe_json(resp)
