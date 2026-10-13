@@ -7291,7 +7291,7 @@ def search_findings(
             COALESCE(host(a.ip)::text, split_part(split_part(pf.url, '://', 2), '/', 1), split_part(split_part(pf.url, '://', 2), ':', 1)) as ip,
             a.hostname,
             COALESCE(
-                (substring(pf.url from '://[^/:]+:(\d+)'))::int,
+                (substring(pf.url from '://[^/:]+:(\\d+)'))::int,
                 CASE WHEN pf.url LIKE 'https://%%' THEN 443 WHEN pf.url LIKE 'http://%%' THEN 80 ELSE NULL END
             ) as port,
             pf.url,

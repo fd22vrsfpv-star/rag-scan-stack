@@ -5,7 +5,7 @@ import psycopg2
 
 DB_DSN = os.environ.get("DB_DSN", "postgresql://app:app@rag-postgres:5432/scans")
 
-VIEW_SQL = """
+VIEW_SQL = r"""
 CREATE OR REPLACE VIEW public.detected_software AS
 -- Source 1: Nmap/Masscan service detection
 SELECT a.id AS asset_id, host(a.ip)::text AS ip, a.hostname, p.port, p.proto AS protocol,
