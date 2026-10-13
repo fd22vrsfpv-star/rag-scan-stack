@@ -192,10 +192,18 @@ def test_bff_proxy_preserves_the_download_headers():
 # ── live ───────────────────────────────────────────────────────────────────
 
 def _live():
+    """Resolve the live rag-api base + key, or skip.
+
+    Uses conftest's shared RAG_API rather than a literal: a hardcoded service
+    URL drifts from the rest of the suite and is caught by
+    test_no_new_hardcoded_service_urls. RAG_API_URL still wins when set, since
+    that is the variable the container itself exports.
+    """
     import urllib.request
     import ssl
+    from conftest import RAG_API
     key = os.environ.get("API_KEY")
-    base = os.environ.get("RAG_API_URL", "https://localhost:8000")
+    base = os.environ.get("RAG_API_URL") or RAG_API
     if not key:
         pytest.skip("API_KEY not set — run inside rag-api for the live checks")
     ctx = ssl.create_default_context()
