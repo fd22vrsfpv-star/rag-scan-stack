@@ -2019,6 +2019,71 @@ def get_asset_scan_parameters(ip: str, keys: str = Query(None),
             "counts_by_provenance": by_prov, "advice": advice}
 
 
+class AssetTagsBody(BaseModel):
+    """`add`/`remove` are the triage shape — toggling one tag must not clobber
+    tags another pass set. `set` replaces outright, for an explicit edit."""
+    add: Optional[List[str]] = None
+    remove: Optional[List[str]] = None
+    set: Optional[List[str]] = None
+
+
+@app.patch("/assets/{asset_id}/tags", tags=["Assets"])
+def update_asset_tags(asset_id: str, body: AssetTagsBody,
+                      engagement_id: Optional[str] = None,
+                      _: bool = Depends(auth)):
+    """Add / remove / replace an asset's tags — the write path behind
+    keyboard triage on the Assets page.
+
+    `assets.tags` is `text[]`, so the values go through `as_text_array`: a bare
+    string here raises `malformed array literal` (CLAUDE.md, "A column's TYPE
+    matters as much as its name").
+
+    Engagement-checked: a caller may only tag an asset in the active engagement,
+    or one with no engagement yet (pre-attribution data stays reachable, same
+    rule the listing endpoints follow). Returns the resulting tag list so the
+    caller can reconcile rather than guess.
+    """
+    from etl.sql_types import as_text_array
+    add = as_text_array(body.add or [], dedupe=True) or []
+    remove = {t.lower() for t in (as_text_array(body.remove or [], dedupe=True) or [])}
+    # `set: []` means "clear every tag" and must not collapse into "set was not
+    # provided" — as_text_array returns None for an empty list, so the presence
+    # of the FIELD is the signal, not the truthiness of its value.
+    replace = (as_text_array(body.set, dedupe=True) or []) if body.set is not None else None
+    if not add and not remove and replace is None:
+        raise HTTPException(400, "give at least one of add / remove / set")
+    eid = _resolve_engagement_id(engagement_id)
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT id::text, tags, engagement_id::text FROM assets WHERE id = %s",
+                    (asset_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"no asset {asset_id}")
+        if eid and row["engagement_id"] and row["engagement_id"] != str(eid):
+            raise HTTPException(
+                403, "asset belongs to a different engagement; switch engagement to tag it")
+        current = list(row["tags"] or [])
+        if replace is not None:
+            new = replace
+        else:
+            seen = {t.lower() for t in current}
+            new = [t for t in current if t.lower() not in remove]
+            new += [t for t in add if t.lower() not in seen]
+        cur.execute("UPDATE assets SET tags = %s WHERE id = %s RETURNING tags",
+                    (new, asset_id))
+        out = cur.fetchone()
+        conn.commit()
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("tags_updated", "asset",
+                     {"asset_id": asset_id, "tags": list(out["tags"] or []),
+                      "added": add, "removed": sorted(remove),
+                      "engagement_id": str(eid) if eid else None})
+    except Exception:  # noqa: BLE001 — telemetry must never fail the write
+        pass
+    return {"ok": True, "asset_id": asset_id, "tags": list(out["tags"] or [])}
+
+
 @app.post("/assets/{ip}/parameters", tags=["Assets"])
 def declare_asset_scan_parameter(ip: str, body: dict, _: bool = Depends(auth)):
     """Declare a value for this host, overriding what was observed.

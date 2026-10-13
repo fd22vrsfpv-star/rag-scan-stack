@@ -1,8 +1,9 @@
-import { useState, useMemo, useEffect, Fragment } from 'react'
+import { useState, useMemo, useEffect, useCallback, Fragment } from 'react'
 import { Link } from 'react-router-dom'
 import { useQueryClient, useQuery, useQueries } from '@tanstack/react-query'
 import PageHelp from '@/components/PageHelp'
 import { useAssets, useAssetPorts, useAssetVulns, usePortRecommendations, useSubdomains, useDeleteAssets, useDeleteSubdomains, useAssetCredentials, useAllCredentials, useUpdateCredentialStatus, useCreateCredential, useDeleteCredential, usePurgeDomain, usePurgePattern, useDetectedSoftware, useBulkDismissSoftware, useCveTuning, useUpdateCveTuning, useSearchsploit, getDdgSearchUrls, useResearchCache, useVulnxFindings, useResolveExploit, useBuildPoc, useAssetAccess, useRefreshAccess, useReviewAccess, useAccessSummary, usePendingExploitCounts, useAssetPortAdvice, useAssetEnumeration,
+  useUpdateAssetTags, TRIAGE_TAGS,
   type ObtainedAccess, type DdgSearchResponse, type EnumHighlight, type EnumCredential, type EnumLoot, type EnumLoginAttempt, type EnumListeningPort } from '@/api/assets'
 import { apiFetch } from '@/api/client'
 import { useTargetedReconLookup, useTargetedReconExecute } from '@/api/targeted-recon'
@@ -1612,6 +1613,7 @@ export default function AssetBrowser() {
   useEffect(() => {
     try { localStorage.setItem('assets-detail-tab', detailTab) } catch { /* ignore */ }
   }, [detailTab])
+
   const [search, setSearch] = useState('')
   const [credStatusFilter, setCredStatusFilter] = useState<string>('')
   // Track which credential rows have their audit panel expanded.  Keyed by
@@ -1795,6 +1797,74 @@ export default function AssetBrowser() {
     // to guarantee invalidation when the local scope dropdown changes, even
     // though matchesScope identity would normally cover it.
   }, [allAssets, isScopeFiltering, matchesScope, search, portsFilter, providerFilter, assetKindFilter, scopeFilter, accessSummary, pendingExploits, accessFilter])
+
+  // One selection path for the mouse AND the keyboard, so arrowing to a row
+  // behaves identically to clicking it.
+  const selectAsset = useCallback((row: (typeof assets)[number]) => {
+    setSelectedPort(null)
+    // A cloud_import asset's IP is a synthetic 127.0.x.x marker and its real
+    // identity is the asset id (one row per imported file), so ports and
+    // screenshots are empty and `recon` is the only tab with content.
+    const isCloudImport = (row.tags || []).includes('cloud_import') ||
+      row.ip === '127.0.1.1' || row.ip === '127.0.0.1' ||
+      (row.tags || []).some(tag => ['microburst', 'azurehound', 'prowler', 'scoutsuite', 'pacu', 'cloudfox'].includes(tag))
+    // KEEP the operator's tab. Resetting to 'ports' on every selection made it
+    // impossible to walk a list comparing one thing.
+    setDetailTab(prev => (isCloudImport ? 'recon' : prev))
+    setSelectedAssetId(row.id || null)
+    setSelectedIp(row.ip)
+  }, [])
+
+  // ── Keyboard triage ──────────────────────────────────────────────────────
+  // Walk the asset list with the arrow keys and tag without reaching for the
+  // mouse. Combined with the tab now surviving a selection change, this is the
+  // "arrow down the list and mark each one" pass: j/k or Up/Down moves, r/i/x
+  // toggles a tag on the selected asset.
+  //
+  // Bound to window rather than the table so it works while the detail drawer
+  // has focus — the whole point is to keep reading the drawer while moving.
+  // Suppressed whenever the operator is typing, or a modifier is held, so it
+  // never eats a real shortcut or a search term.
+  const tagMutation = useUpdateAssetTags()
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey || e.altKey) return
+      const el = e.target as HTMLElement | null
+      const tag = (el?.tagName || '').toLowerCase()
+      if (tag === 'input' || tag === 'textarea' || tag === 'select' || el?.isContentEditable) return
+      if (!assets.length) return
+      const key = e.key.toLowerCase()
+
+      if (key === 'arrowdown' || key === 'j' || key === 'arrowup' || key === 'k') {
+        const down = key === 'arrowdown' || key === 'j'
+        const cur = assets.findIndex(a => (selectedAssetId ? a.id === selectedAssetId : a.ip === selectedIp))
+        // No selection yet → Down starts at the top, Up at the bottom.
+        const next = cur === -1
+          ? (down ? 0 : assets.length - 1)
+          : Math.min(assets.length - 1, Math.max(0, cur + (down ? 1 : -1)))
+        const row = assets[next]
+        if (row) {
+          e.preventDefault()
+          selectAsset(row)
+        }
+        return
+      }
+
+      const hit = TRIAGE_TAGS.find(t => t.key === key)
+      if (hit && selectedAssetId) {
+        e.preventDefault()
+        const row = assets.find(a => a.id === selectedAssetId)
+        const has = (row?.tags || []).some(t => t.toLowerCase() === hit.tag)
+        // Toggle: tagging twice is how an operator corrects a mis-key, and a
+        // pass that could only ADD would make the first slip permanent.
+        tagMutation.mutate(has
+          ? { assetId: selectedAssetId, remove: [hit.tag] }
+          : { assetId: selectedAssetId, add: [hit.tag] })
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [assets, selectedAssetId, selectedIp, tagMutation, selectAsset])
 
   // Available provider chips derived from the current asset set, sorted by
   // count desc — operators see what tags exist without us hardcoding the list.
@@ -2179,25 +2249,7 @@ export default function AssetBrowser() {
         <DataTable
           data={assets}
           columns={assetColumns}
-          onRowClick={(row) => {
-            setSelectedPort(null)
-            // For cloud_import assets the IP is a synthetic marker (127.0.x.x)
-            // and the meaningful identity is the asset id (one row per CSV).
-            // Open the recon tab directly so the operator sees the linked
-            // findings instead of empty ports/screenshots.
-            const isCloudImport = (row.tags || []).includes('cloud_import') ||
-              row.ip === '127.0.1.1' || row.ip === '127.0.0.1' ||
-              (row.tags || []).some(tag => ['microburst', 'azurehound', 'prowler', 'scoutsuite', 'pacu', 'cloudfox'].includes(tag))
-            // KEEP the operator's tab when moving between assets. Resetting to
-            // 'ports' on every selection makes it impossible to walk a list
-            // comparing one thing — pick Screenshots, click the next host, and
-            // you were back on Ports. The only override is a cloud-import
-            // asset, whose IP is a synthetic marker with no ports or
-            // screenshots to show, so 'recon' is the only tab with content.
-            setDetailTab(prev => (isCloudImport ? 'recon' : prev))
-            setSelectedAssetId(row.id || null)
-            setSelectedIp(row.ip)
-          }}
+          onRowClick={selectAsset}
           globalFilter={search}
           onGlobalFilterChange={setSearch}
           selectable
@@ -2844,10 +2896,38 @@ export default function AssetBrowser() {
                 <p className="text-xs text-muted-foreground font-mono">{assets.find(a => a.ip === selectedIp)?.hostname}</p>
               )}
             </div>
+            {/* Triage tags + the keys that toggle them. Clickable too, so the
+                shortcut is discoverable rather than something you have to be
+                told about. */}
+            <div className="flex items-center gap-1.5 ml-auto mr-3">
+              {TRIAGE_TAGS.map(t => {
+                const row = assets.find(a => a.ip === selectedIp)
+                const on = (row?.tags || []).some(x => x.toLowerCase() === t.tag)
+                return (
+                  <button
+                    key={t.tag}
+                    onClick={() => row?.id && tagMutation.mutate(
+                      on ? { assetId: row.id, remove: [t.tag] }
+                         : { assetId: row.id, add: [t.tag] })}
+                    title={`${t.label} — press ${t.key}`}
+                    className={cn('px-2 py-0.5 rounded text-[11px] border transition-colors',
+                      on ? 'bg-primary/15 border-primary text-primary'
+                         : 'border-border text-muted-foreground hover:text-foreground')}
+                  >
+                    {t.label} <kbd className="opacity-60">{t.key}</kbd>
+                  </button>
+                )
+              })}
+            </div>
             <button onClick={handleCloseSlideOver} className="text-muted-foreground hover:text-foreground">
               <X className="h-4 w-4" />
             </button>
           </div>
+          <p className="px-4 pt-2 text-[11px] text-muted-foreground">
+            <kbd className="px-1 rounded bg-muted">↑</kbd>/<kbd className="px-1 rounded bg-muted">↓</kbd>
+            {' '}or <kbd className="px-1 rounded bg-muted">j</kbd>/<kbd className="px-1 rounded bg-muted">k</kbd>
+            {' '}to move through assets — the tab you are on stays put.
+          </p>
 
           {/* Pending exploits / spray banner — actions waiting on this host, with
               a jump to the Exploits queue to approve/release them. */}

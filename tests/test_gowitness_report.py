@@ -282,3 +282,91 @@ def test_frontend_sast_panel_badges_and_filters():
     assert "engagement_id" in panel, "the panel never reads engagement_id"
     # the active mode must be stated, not inferred from a checkbox
     assert "in scope" in panel.lower(), "the active scope mode is not labelled"
+
+
+# ── asset tags: the write path behind keyboard triage ──────────────────────
+
+def _asset_tags_handler():
+    src = API.read_text(encoding="utf-8")
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.FunctionDef) and node.name == "update_asset_tags":
+            return node, (ast.get_source_segment(src, node) or "")
+    pytest.fail("PATCH /assets/{asset_id}/tags is gone")
+
+
+def test_asset_tags_uses_the_array_normaliser():
+    """`assets.tags` is text[]. A bare string raises `malformed array literal`
+    at runtime and nowhere earlier (CLAUDE.md: a column's TYPE matters as much
+    as its name)."""
+    _, body = _asset_tags_handler()
+    assert "as_text_array" in body, "tag values are not normalised for a text[] column"
+
+
+def test_asset_tags_supports_add_remove_not_only_set():
+    """Triage toggles ONE tag. A set-only API would clobber tags written by a
+    scan, an import, or an earlier pass."""
+    node, body = _asset_tags_handler()
+    for field in ("add", "remove", "set"):
+        assert field in body, f"no {field} support"
+
+
+def test_clearing_all_tags_is_distinguishable_from_omitting_the_field():
+    """`set: []` means "clear everything". as_text_array returns None for an
+    empty list, so truthiness collapses that into "not provided" and the call
+    400s — which it did on first write."""
+    _, body = _asset_tags_handler()
+    assert "body.set is not None" in body, (
+        "presence of the field, not truthiness of its value, must decide "
+        "whether `set` was given")
+
+
+def test_asset_tags_is_engagement_checked():
+    """Tagging an asset that belongs to a different engagement must be refused,
+    not silently applied."""
+    _, body = _asset_tags_handler()
+    assert "_resolve_engagement_id" in body
+    assert "403" in body, "no engagement ownership check"
+
+
+def test_asset_tags_bff_checks_the_status():
+    """httpx does not raise on 4xx/5xx. Returning unconditionally would report
+    a refused tag as success and leave the UI showing one the database never
+    stored."""
+    bff = REPO / "dashboard" / "bff" / "routers" / "agents.py"
+    if not bff.exists():
+        pytest.skip(f"{bff} not present")
+    src = bff.read_text(encoding="utf-8")
+    fn = None
+    for node in ast.parse(src).body:
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name == "update_asset_tags":
+            fn = ast.get_source_segment(src, node) or ""
+    assert fn, "the BFF proxy is gone"
+    assert "status_code" in fn and "HTTPException" in fn
+
+
+def test_keyboard_triage_is_suppressed_while_typing():
+    """A global keydown handler that fires inside an input eats the operator's
+    search term — 'interesting' would tag three assets and type nothing."""
+    page = REPO / "dashboard" / "frontend" / "src" / "pages" / "AssetBrowser.tsx"
+    if not page.exists():
+        pytest.skip(f"{page} not present")
+    src = page.read_text(encoding="utf-8")
+    i = src.find("Keyboard triage")
+    assert i != -1, "the keyboard triage handler is gone"
+    block = src[i:i + 3000]
+    for guard in ("input", "textarea", "isContentEditable"):
+        assert guard in block, f"typing in a {guard} is not excluded"
+    assert "ctrlKey" in block and "metaKey" in block, (
+        "modifier combos are not excluded — the handler would eat real shortcuts")
+
+
+def test_keyboard_tagging_toggles_rather_than_only_adding():
+    """A pass that could only ADD makes the first mis-key permanent."""
+    page = REPO / "dashboard" / "frontend" / "src" / "pages" / "AssetBrowser.tsx"
+    if not page.exists():
+        pytest.skip(f"{page} not present")
+    src = page.read_text(encoding="utf-8")
+    i = src.find("Keyboard triage")
+    block = src[i:i + 3000]
+    assert "remove:" in block and "add:" in block, (
+        "the shortcut does not toggle — it can only add the tag")

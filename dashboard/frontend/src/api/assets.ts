@@ -1119,3 +1119,35 @@ export function useDeriveHint() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['poc-hints'] }),
   })
 }
+
+/** Add / remove / replace an asset's tags.
+ *
+ *  `add`/`remove` is the triage shape: toggling one tag must not clobber tags
+ *  another pass set, which a blind `set` would. `set: []` clears everything.
+ *  The server returns the resulting list, so callers reconcile from the
+ *  response rather than guessing what the write produced.
+ */
+export function useUpdateAssetTags() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ assetId, add, remove, set }: {
+      assetId: string; add?: string[]; remove?: string[]; set?: string[]
+    }) => apiFetch<{ ok: boolean; asset_id: string; tags: string[] }>(
+      `/assets/${assetId}/tags`,
+      { method: 'PATCH', body: JSON.stringify({ add, remove, set }) },
+    ),
+    onSuccess: () => {
+      // Refetch rather than patching the cache by hand: tags are also written
+      // by scans and imports, so the server's list is the truth.
+      qc.invalidateQueries({ queryKey: ['assets'] })
+    },
+  })
+}
+
+/** Tags offered by the keyboard triage pass, with the key that toggles each.
+ *  Deliberately few — a quick-look pass needs a verdict, not a taxonomy. */
+export const TRIAGE_TAGS: Array<{ key: string; tag: string; label: string }> = [
+  { key: 'r', tag: 'reviewed', label: 'Reviewed' },
+  { key: 'i', tag: 'interesting', label: 'Interesting' },
+  { key: 'x', tag: 'dismissed', label: 'Dismissed' },
+]
