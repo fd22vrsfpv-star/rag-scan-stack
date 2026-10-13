@@ -938,9 +938,16 @@ class SSHManager:
     async def remote_scan(
         self, node_id: str, host: str, user: str, ssh_port: int,
         key_file: str, tool_cmd: list[str], output_remote_path: str,
-        timeout: int = 600,
+        timeout: int = 600, elevate: bool = False,
     ) -> dict:
         """Run a scan tool on a remote host via SSH, then SCP the results back.
+
+        `elevate` prefixes the command with `sudo -n` for tools that need raw
+        sockets (masscan). Cloud images log in as `ubuntu`/`admin`, never root,
+        so without it masscan exits "FAIL: permission denied" and the operator
+        sees an empty scan. `-n` never prompts: a node without passwordless
+        sudo fails immediately with "sudo: a password is required" instead of
+        hanging until the timeout.
 
         Returns dict with ok, local_path, stdout, stderr, duration_ms.
         """
@@ -953,6 +960,11 @@ class SSHManager:
                 return {"ok": False, "error": f"Dangerous characters in arg: {arg}"}
 
         command = " ".join(str(a) for a in tool_cmd)
+
+        # Elevate AFTER the dangerous-character validation above, so the sudo
+        # prefix is ours and never something a caller smuggled in.
+        if elevate and (user or "").strip() not in ("root", ""):
+            command = "sudo -n " + command
 
         # Step 1: Execute scan on remote host
         exec_result = await self.exec_command(

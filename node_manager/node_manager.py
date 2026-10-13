@@ -243,8 +243,12 @@ def _emit_ip_event(event_type: str, node_id: str, data: dict = None):
             headers={"x-api-key": api_key},
             timeout=5, verify=False,
         )
-    except Exception:
-        pass
+    except Exception as e:  # fire-and-forget, but not invisible
+        # `requests` was missing from this image for the life of the service,
+        # so every emit raised ImportError into a bare `pass`. Nothing in any
+        # log said so. Fire-and-forget means "don't block the caller", not
+        # "never tell anyone".
+        log.warning("webhook emit %s failed: %s", event_type, e)
 
 
 def _emit_wireguard_event(event_type: str, node_id: str, data: dict = None):
@@ -260,8 +264,8 @@ def _emit_wireguard_event(event_type: str, node_id: str, data: dict = None):
             headers={"x-api-key": api_key},
             timeout=5, verify=False,
         )
-    except Exception:
-        pass  # Silent failure for fire-and-forget
+    except Exception as e:  # fire-and-forget, but not invisible — see above
+        log.warning("webhook emit %s failed: %s", event_type, e)
 
 
 def _create_tunnel(node_id: str, name: str, tunnel_method: str, metadata: dict,
@@ -2584,6 +2588,15 @@ REMOTE_SCAN_TEMPLATES = {
         "cmd": ["masscan", "-p", "{ports}", "--rate", "{rate}", "-oJ", "/tmp/scan_out.json"],
         "output": "/tmp/scan_out.json",
         "ingest": "masscan",
+        # masscan builds its own packets, so it needs CAP_NET_RAW. As a normal
+        # SSH user it exits non-zero with
+        #   [-] FAIL: permission denied
+        #   [hint] need to sudo or run as root or something
+        # which reads to the operator as a scan that found nothing. nmap is
+        # deliberately NOT marked: without root it silently falls back to a TCP
+        # connect scan and still works, so requiring sudo there would break
+        # nodes that scan fine today.
+        "needs_root": True,
     },
     "nmap": {
         "cmd": ["nmap", "-sV", "-oX", "/tmp/scan_out.xml", "-p", "{ports}"],
@@ -2958,6 +2971,7 @@ async def _remote_scan_bounded(node_id: str, req):
         tool_cmd=cmd,
         output_remote_path=tmpl["output"],
         timeout=req.timeout,
+        elevate=bool(tmpl.get("needs_root")),
     )
 
     duration_s = round(time.time() - t0, 2)

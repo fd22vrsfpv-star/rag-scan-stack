@@ -2362,6 +2362,14 @@ services:
     volumes:
       - ./etl:/app/etl:ro                              # shared scope gate for the remote-node path
       - ./common:/app/common:ro                        # shared scan-slot ceiling
+      # Audit trail. node_manager.py does `try: from audit_writer import
+      # write_audit / except ImportError: def write_audit(*a, **kw): pass`, and
+      # the module reached neither the image nor a mount — so every
+      # scan_started/scan_completed/scan_failed from a remote node was written
+      # to a no-op. Same two mounts every other runner uses (see the scanner
+      # and *-runner services above).
+      - ./scan_audit:/scan_audit
+      - ./scan_audit/audit_writer.py:/app/audit_writer.py:ro
       - ${SSH_KEY_PATH:-./ssh-keys}:/ssh-keys:ro
       # NOTE: ./node_manager is deliberately NOT mounted here.
       # It used to be mounted at /app/node_manager, which was actively

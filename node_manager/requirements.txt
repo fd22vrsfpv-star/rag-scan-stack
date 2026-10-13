@@ -6,3 +6,10 @@ sliver-py==0.0.19
 pydantic==2.10.4
 pydantic-settings==2.7.1
 boto3>=1.34.0
+# Used by the remote-scan ingest POST and the webhook emits in node_manager.py.
+# It was never declared, so every remote scan downloaded its results and then
+# threw them away with {"ok": false, "error": "No module named 'requests'"},
+# and every webhook emit died inside `except Exception: pass`. The image
+# already sets REQUESTS_CA_BUNDLE=/certs/ca-bundle.crt, which validates
+# rag-api — only the package was missing.
+requests==2.32.3
