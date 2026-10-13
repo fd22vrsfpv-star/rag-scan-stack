@@ -317,6 +317,48 @@ large change. Add the test in the same commit as the rule.
   run with `SLEEP(12)` would have blocked only 5s if the server wasn't
   actually executing the payload — immediate downgrade.
 
+### A repeated OUTCOME ends the approach, not just the iteration
+- The refine loop's duplicate detector compares the **command the model
+  proposes** (`_refine_signature`). Nothing compared the **outcome the target
+  returned**, so varying the payload reset the streak while the server
+  answered identically until `max_iters`.
+- **A repeated outcome is provably zero-information**: whatever changed never
+  reached the vulnerable code. After `REFINE_OUTCOME_REPEAT_AT` (default 2)
+  identical `_error_signature` values, the loop sets a REQUIRED AXIS and
+  **refuses a payload-only edit before dispatch** — same host, path, method,
+  parameters and proof mechanism (`_command_axes` / `_axes_differ`). A refused
+  command is not dispatched, so it costs no iteration; `_loop_passes` bounds
+  the re-asks, and `REFINE_AXIS_EXHAUST_AT` (default 2) stops the build with
+  `stop_reason=axis_exhausted`.
+- **Never `continue` out of the axis gate.** The top of the loop re-dispatches
+  `command`, so falling through spends a real target run re-confirming the
+  outcome that triggered the gate.
+- **Session plumbing is not an axis** and **percent-encoding is not a change.**
+  A nonce/CSRF/session parameter comes and goes with how the command scrapes
+  it, and the model freely swaps `x[1][1]=` for `x%5B1%5D%5B1%5D=`. Count
+  either and a cosmetic edit reads as a changed axis, so the gate never fires.
+- **The repeated outcome's tier names which axis is dead** — 404/probe →
+  endpoint, 401/403 → auth, waf → carrier, syntax/refusal → command shape,
+  anything else (the app answering *normally*) → parameter. The directive says
+  what to change, not "try something else".
+- **A signature prior builds hit ≥ `REFINE_KNOWN_DEAD_MIN` (default 3) times
+  and NEVER resolved is known-dead** — change axis immediately rather than
+  spend two iterations rediscovering it. "Hit often" is not "dead": a
+  signature builds got *past* is a solved problem, and the prior fix is the
+  useful thing, so `resolved == 0` is required. The lookup excludes the
+  current run and fails soft — an unavailable error memory is not evidence
+  that the approach works.
+- *Enforced by:* `tests/test_refine_loop_escalation.py` (the real
+  CVE-2024-4443 pair whose 423 characters differ only by
+  `--data-urlencode` → `--data`; plumbing and encoding normalisation; every
+  tier mapped; all four layers wired into `_run_refine_poc`; no `continue` in
+  the gate; known-dead semantics).
+- *Why:* 49 dispatched runs across the five loopers of the 2026-10-13
+  focused-10 produced **22 distinct outcomes** — CVE-2023-51483 answered the
+  same thing 6 times in 11 runs, CVE-2024-4443 5 times in 11. Every one ran to
+  `max_iters`. `error_memory_rows` was 7 on each, so we had already retrieved
+  the identical prior error and used it only as prompt advice.
+
 ### Scan volume
 - Any component that initiates OR triggers a scan MUST bound itself by
   `MAX_CONCURRENT_SCANS`. No component invents a private concurrency number.

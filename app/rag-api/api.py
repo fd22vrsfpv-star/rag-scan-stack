@@ -20643,6 +20643,195 @@ def _repair_unmeasurable_timing_assertion(assertion, command, canary):
             True)
 
 
+# ── Refine-loop escalation ────────────────────────────────────────────────
+# A repeated OUTCOME is provably zero-information: the target answered the same
+# thing, so whatever the model changed never reached the vulnerable surface.
+# The loop already notices this (`_stuck` near the similar-errors lookup) but
+# only uses it to fetch ADVICE for the prompt. These turn it into a control.
+#
+# Measured on the 2026-10-13 focused-10 run — 49 dispatched runs across the five
+# loopers produced 22 distinct outcomes:
+#   CVE-2023-51483  11 runs,  3 outcomes, one repeated 6x (shell refusal)
+#   CVE-2024-4443   11 runs,  5 outcomes, one repeated 5x (the normal HTML page)
+#   CVE-2024-5314   11 runs,  6 outcomes, one repeated 4x
+#   CVE-2024-36412   7 runs,  3 outcomes, one repeated 4x ("Thank you for accepting")
+#   CVE-2024-22120   9 runs,  5 outcomes, one repeated 4x
+# The existing duplicate detector compares `_refine_signature(_new_cmd)` — the
+# COMMAND the model proposes. Varying the payload resets that streak to 0 while
+# the server keeps returning the identical response, which is why these ran to
+# max_iters instead of stopping.
+_REFINE_OUTCOME_REPEAT_AT = int(os.environ.get("REFINE_OUTCOME_REPEAT_AT", "2") or "2")
+_REFINE_AXIS_EXHAUST_AT = int(os.environ.get("REFINE_AXIS_EXHAUST_AT", "2") or "2")
+_REFINE_KNOWN_DEAD_MIN = int(os.environ.get("REFINE_KNOWN_DEAD_MIN", "3") or "3")
+
+# tier -> (dead axis, what the model must change). The tier comes from
+# _error_signature(), so these names must stay in step with it.
+_DEAD_AXIS_BY_TIER = {
+    "syntax": ("command_shape",
+               "The shell refused to PARSE this command, so it never reached the "
+               "target. Do NOT adjust the payload. Rewrite as ONE minimal curl: "
+               "single-quoted, no $( ) substitution, no nested quotes, no "
+               "multi-stage && chains."),
+    "refusal": ("command_shape",
+                "The command was refused before dispatch. Re-express the same "
+                "request as a plain single-quoted curl with no wrapper."),
+    "probe": ("endpoint",
+              "The pre-run probe could not reach this URL. The ENDPOINT is wrong "
+              "— pick a different path from recon, not a different payload."),
+    "404": ("endpoint",
+            "Every attempt returned 404: this path does not exist. Change the "
+            "ENDPOINT. Do not re-send the same path with a new payload."),
+    "401": ("auth",
+            "The target answered 401. AUTH is the blocker, not the payload — "
+            "authenticate first, then re-attempt."),
+    "403": ("auth",
+            "The target answered 403. Either auth or a WAF is the blocker. "
+            "Change the AUTH or the carrier, not the payload."),
+    "waf": ("carrier",
+            "A WAF intercepted this. Change the CARRIER (different parameter, "
+            "method, or encoding), not the payload value."),
+    "500": ("parameter",
+            "The server errored identically every time. The request reaches the "
+            "app but the injection is not landing where you think — change the "
+            "PARAMETER you inject into."),
+}
+# Default when the body carries no error of its own: the app answered normally
+# (CVE-2024-36412's "Thank you for accepting" x4, CVE-2024-4443's HTML page x5).
+_DEAD_AXIS_DEFAULT = (
+    "parameter",
+    "The application returned its NORMAL response every time — the request is "
+    "being processed but the injection is not landing. Change the PARAMETER or "
+    "the ENDPOINT you inject into. Changing the payload again cannot help: the "
+    "server has already told you it does not reach the vulnerable code.")
+
+
+def _dead_axis_for_tier(tier):
+    """(axis, directive) naming WHICH axis the repeated outcome rules out."""
+    return _DEAD_AXIS_BY_TIER.get(str(tier or ""), _DEAD_AXIS_DEFAULT)
+
+
+def _outcome_repeat_streak(err_rows):
+    """How many times in a row the tail signature has now repeated.
+
+    0 = this outcome is new (or there is nothing to compare). 1 = seen twice in
+    a row. Blank signatures never count — an unparsed outcome is not evidence
+    that the outcome is the same (CLAUDE.md: "unreachable is not absent")."""
+    rows = [r for r in (err_rows or []) if isinstance(r, dict)]
+    if len(rows) < 2:
+        return 0
+    last = rows[-1].get("signature") or ""
+    if not last:
+        return 0
+    n = 0
+    for prev in reversed(rows[:-1]):
+        if (prev.get("signature") or "") == last:
+            n += 1
+        else:
+            break
+    return n
+
+
+def _command_axes(command):
+    """The STRUCTURAL axes of a PoC command — what it targets and how it proves.
+
+    Payload VALUES are deliberately excluded. Two commands that differ only in
+    the injected string have identical axes, and that is the whole point: when
+    the outcome has not changed, varying the payload is the move we need to be
+    able to detect and refuse.
+    """
+    import re as _re
+    s = str(command or "")
+    url = ""
+    m = (_re.search(r"""['"](https?://[^'"\s]+)['"]""", s)
+         or _re.search(r"(https?://[^\s'\"]+)", s))
+    if m:
+        url = m.group(1)
+    host, path = "", ""
+    if url:
+        um = _re.match(r"https?://([^/?#]+)([^?#]*)", url)
+        if um:
+            host, path = um.group(1), um.group(2) or "/"
+    meth = "GET"
+    mm = _re.search(r"-X\s*([A-Z]+)", s)
+    if mm:
+        meth = mm.group(1)
+    elif _re.search(r"(?:^|\s)(?:-d|--data|--data-raw|--data-urlencode|-F)\b", s):
+        meth = "POST"
+    # URL-DECODE before extracting names. The model freely swaps
+    # `listingfields[1][1]=` for `listingfields%5B1%5D%5B1%5D=` between
+    # iterations; without decoding, the second form does not match at all and
+    # the two commands read as different axes — the exact cosmetic churn this
+    # gate exists to see through (CVE-2024-4443 iterations 3 and 4).
+    from urllib.parse import unquote as _unq_ax
+    try:
+        dec = _unq_ax(s)
+    except Exception:  # noqa: BLE001
+        dec = s
+    params = set(_re.findall(r"[?&]([A-Za-z_][\w\[\]]*)=", dec))
+    for body in _re.findall(r"(?:-d|--data|--data-raw|--data-urlencode)\s*['\"]([^'\"]*)['\"]", dec):
+        params |= set(_re.findall(r"(?:^|&)([A-Za-z_][\w\[\]]*)=", body))
+    # Session plumbing is NOT an injection axis. A nonce/CSRF/session parameter
+    # comes and goes with how the command happens to scrape it, so counting it
+    # makes a cosmetic edit look like a changed axis and the gate never fires.
+    # Measured on CVE-2024-4443 runs 2 and 3 — consecutive near-identical
+    # commands whose only structural difference was that one `grep -oP` variant
+    # left `_wpnonce=` in the body and the other did not.
+    params = {p for p in params if not _re.match(
+        r"(?i)^(_?wpnonce|nonce|csrf[\w-]*|_?token|authenticity_token|sid|"
+        r"[a-z_]*sess(?:ion)?[a-z_]*|phpsessid|jsessionid|xsrf[\w-]*)$", p)}
+    try:
+        timing = _timing_payload_scale(s, delta=0)[1] is not None
+    except Exception:  # noqa: BLE001
+        timing = False
+    proof = "timing" if timing else ("read_back" if s.count("curl") > 1 else "inline")
+    return {"host": host, "path": path, "method": meth,
+            "params": frozenset(params), "proof": proof}
+
+
+def _axes_differ(a, b):
+    """True when two commands differ on at least one structural axis."""
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return True
+    return any(a.get(k) != b.get(k) for k in ("host", "path", "method", "params", "proof"))
+
+
+def _signature_known_dead(signature, min_occurrences=None, exclude_run_id=None):
+    """Has this exact error been hit before, across builds, and NEVER resolved?
+
+    build_poc_error_memory already records (signature, resolved) for every
+    iteration of every build — we pay to write and read it (error_memory_rows
+    was 7 on each of the four CVEs that ran to max_iters), but it only ever fed
+    the prompt as advice. A signature that N distinct prior runs hit and ZERO
+    ever got past is not advice; it is a known-dead approach, and the loop
+    should change axis immediately rather than spend two more iterations
+    rediscovering it.
+
+    Returns {"dead": bool, "runs": int, "resolved": int}. Fail-soft: any DB
+    problem returns dead=False, because an unavailable memory is not evidence
+    that the approach works.
+    """
+    out = {"dead": False, "runs": 0, "resolved": 0}
+    sig = (signature or "").strip()
+    if not sig:
+        return out
+    want = int(min_occurrences if min_occurrences is not None else _REFINE_KNOWN_DEAD_MIN)
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""SELECT COUNT(DISTINCT run_id)                                  AS runs,
+                                  COUNT(DISTINCT run_id) FILTER (WHERE resolved)          AS resolved
+                             FROM public.build_poc_error_memory
+                            WHERE signature = %s
+                              AND (%s IS NULL OR run_id <> %s)""",
+                        (sig, exclude_run_id, exclude_run_id))
+            row = cur.fetchone() or (0, 0)
+            out["runs"], out["resolved"] = int(row[0] or 0), int(row[1] or 0)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("known-dead lookup failed: %s", e)
+        return out
+    out["dead"] = out["runs"] >= want and out["resolved"] == 0
+    return out
+
+
 def _resolve_refine_assertion(la, prev_assertion, command, canary, timing_mode):
     """Decide the next-iteration PoC assertion from the LLM's proposed `la`.
 
@@ -26142,6 +26331,14 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
     # _similar_prior_errors when the loop is stuck (bounded lookups per build).
     _err_rows = []
     _similar_lookups = 0
+    # Escalation state. `_axis_required` is set to (axis, directive) the moment a
+    # repeated outcome (or a known-dead signature) proves the current approach
+    # cannot work; until the model changes that axis, a new command is refused
+    # BEFORE dispatch rather than spending an iteration re-confirming the answer
+    # we already have.
+    _axis_required = None
+    _axis_reject_streak = 0
+    _axes_tried = []
     _similar_seen_sigs = set()
     # Per-build injection budget for refine-pattern skills (2026-10-09): the
     # same guidance re-injected 27× in one build (method_not_allowed_405) and
@@ -26491,6 +26688,33 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         except Exception as _ese:  # noqa: BLE001
             _sig_now, _tier_now = "", "other"
             logging.debug("error signature failed: %s", _ese)
+        # ── ESCALATION: a repeated OUTCOME means the last edit never reached the
+        # vulnerable surface, so another payload tweak cannot help. Two ways in:
+        # the same signature twice in THIS build, or a signature that prior
+        # builds hit >= _REFINE_KNOWN_DEAD_MIN times and never once resolved.
+        # The second needs no repeat here — rediscovering a known-dead approach
+        # costs the same iterations every build.
+        if not success:
+            try:
+                _rep = _outcome_repeat_streak(_err_rows)
+                _dead = ({"dead": False, "runs": 0, "resolved": 0} if _rep
+                         else _signature_known_dead(_sig_now, exclude_run_id=run_id))
+                if _rep >= _REFINE_OUTCOME_REPEAT_AT or _dead["dead"]:
+                    _axis, _directive = _dead_axis_for_tier(_tier_now)
+                    if _axis_required is None or _axis_required[0] != _axis:
+                        _axis_required = (_axis, _directive)
+                        _axis_reject_streak = 0
+                    _why = ("known_dead_signature" if _dead["dead"]
+                            else f"same outcome {_rep + 1}x in a row")
+                    metrics["refine_axis_required"] = metrics.get("refine_axis_required", 0) + 1
+                    _poc_trace(run_id, "refine_axis_required", iteration=it,
+                               extra={"axis": _axis, "why": _why, "tier": _tier_now,
+                                      "outcome_repeat": _rep,
+                                      "prior_runs_with_signature": _dead["runs"],
+                                      "prior_runs_resolved": _dead["resolved"],
+                                      "signature": _sig_now[:200]})
+            except Exception as _axe:  # noqa: BLE001
+                logging.debug("axis escalation check failed: %s", _axe)
         _poc_trace(run_id, "run", iteration=it, run_output=output, assertion_passed=success,
                    extra={"target_family": list(fam), "drifted": drifted,
                           "method": verification_method,
@@ -26975,10 +27199,25 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         gather_note = (("\nGATHERED FACTS (verified before synth — endpoint, method and input are "
                         "AUTHORITATIVE; refine the payload/verification, do NOT invent other endpoints):\n"
                         + str(gather_facts)[:1500]) if gather_facts else "")
+        # The repeated outcome names WHICH axis is dead, so the instruction can
+        # be specific instead of "try something else". Placed last of the notes
+        # so it is the final thing read before the task line.
+        _axis_note = ""
+        if _axis_required:
+            _tried = ", ".join(sorted({a for a in _axes_tried if a})[:6])
+            _axis_note = (
+                f"\n\nSTOP REFINING THE PAYLOAD. The target returned the SAME "
+                f"response to every attempt so far, which means your edits are "
+                f"not reaching the vulnerable code at all.\n"
+                f"REQUIRED CHANGE — {_axis_required[0].upper()}: {_axis_required[1]}\n"
+                + (f"Already tried without effect: {_tried}.\n" if _tried else "")
+                + "A command that changes only the payload while keeping the same "
+                  "endpoint, method and parameter will be REJECTED before it is "
+                  "sent, and will not earn another iteration.")
         rprompt = (f"AUTHORIZED lab pentest. The PoC for {cve} on http://{ip}:{port} did NOT "
                    f"succeed.\nCommand: {command}\nOutput:\n{(output or '')[:1500]}{precond}{gather_note}"
                    f"{_refuted_note}"
-                   f"{shell_syntax_note}{refusal_note}{_assert_switch_note}{rag_pattern_notes}{regress_note}{model_switch_note}{path_discovery_note}{waf_hit_note}{similar_note}{escalation_guidance}{anchor_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
+                   f"{shell_syntax_note}{refusal_note}{_assert_switch_note}{rag_pattern_notes}{regress_note}{model_switch_note}{path_discovery_note}{waf_hit_note}{similar_note}{escalation_guidance}{anchor_note}{_axis_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
                    f"appear. Return ONE JSON object only: {{\"command\": \"<better command, may "
                    f"chain curl calls with ; and shell vars to fetch a token first>\", "
                    f"\"assertion\": {_assert_template}}}. No prose.")
@@ -27060,6 +27299,74 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         # Near-duplicate break: did the LLM just return essentially the same
         # command as the previous iteration(s)? If so, further iterations will
         # repeat the same shape and burn the budget. Stop and tell the operator.
+        # ── AXIS GATE ──────────────────────────────────────────────────────
+        # A repeated outcome already proved the current approach cannot work.
+        # If the model came back with a command that differs only in the
+        # payload — same host, path, method, parameters and proof mechanism —
+        # refuse it BEFORE dispatch. Not dispatching means no iteration is
+        # charged (`_dispatched_attempts`), so the re-ask is free; `_loop_passes`
+        # still bounds the whole thing. Re-ask once with the rejection
+        # prepended, exactly as the identical-command path does.
+        if _axis_required and _new_cmd:
+            try:
+                _ax_old = _command_axes(command)
+                _axes_tried.append(f"{_ax_old['method']} {_ax_old['path']} "
+                                   f"params={sorted(_ax_old['params'])[:4]}")
+                # Bounded re-ask. NEVER `continue` here: the top of the loop
+                # re-dispatches `command`, so falling through would spend a real
+                # target run re-confirming the answer we already have.
+                while not _axes_differ(_ax_old, _command_axes(_new_cmd)):
+                    _axis_reject_streak += 1
+                    metrics["refine_axis_rejected"] = metrics.get("refine_axis_rejected", 0) + 1
+                    _poc_trace(run_id, "refine_axis_rejected", iteration=it,
+                               extra={"axis": _axis_required[0],
+                                      "streak": _axis_reject_streak,
+                                      "unchanged": {k: (sorted(v) if isinstance(v, frozenset) else v)
+                                                    for k, v in _ax_old.items()},
+                                      "reason": "command changed only the payload; the "
+                                                "target has already answered identically"})
+                    if _axis_reject_streak >= _REFINE_AXIS_EXHAUST_AT:
+                        _stop_reason = "axis_exhausted"
+                        _poc_trace(run_id, "refine_axis_exhausted", iteration=it,
+                                   extra={"axis": _axis_required[0],
+                                          "rejections": _axis_reject_streak,
+                                          "reason": "the model would not change the dead "
+                                                    "axis; further iterations would re-run "
+                                                    "an approach the target has already "
+                                                    "refuted"})
+                        _new_cmd = None
+                        break
+                    _ax_prompt = (
+                        f"AXIS_CHANGE_REQUIRED: your command changed only the payload. The "
+                        f"target already returned the SAME response to that shape "
+                        f"({(output or '')[:200]!r}), so it cannot work. You MUST change "
+                        f"{_axis_required[0].upper()}. {_axis_required[1]} Keep the same "
+                        f"target and CVE. Same JSON shape, no prose.\n\n" + rprompt)
+                    _ra = _llm_for_model(_ax_prompt, model=_active_model,
+                                         caller="cve_poc_refine_axis")
+                    _ratext = _ra.get("response", "") if isinstance(_ra, dict) else str(_ra or "")
+                    _acc_llm_metrics(metrics, _ra)
+                    _obj3 = _poc_extract_json(_ratext)
+                    _c3 = (_obj3 or {}).get("command")
+                    _poc_trace(run_id, "refine_axis_reask", iteration=it,
+                               prompt=_ax_prompt[:300], response=_ratext[:400],
+                               llm_model=llm_model,
+                               extra={"got_command": bool(_c3)})
+                    if not _c3:
+                        _stop_reason = "axis_exhausted"
+                        _new_cmd = None
+                        break
+                    _new_cmd = _c3
+                    if isinstance(_obj3, dict) and _obj3.get("assertion") is not None:
+                        obj = _obj3
+                if _new_cmd is None:
+                    break           # exhausted — leave the refine loop entirely
+                # Axis changed: clear the requirement so the next repeat can set
+                # a fresh one, and let this command through to dispatch.
+                _axis_reject_streak = 0
+                _axis_required = None
+            except Exception as _age:  # noqa: BLE001
+                logging.debug("axis gate failed: %s", _age)
         _sig = _refine_signature(_new_cmd)
         if _cmd_signatures and _sig == _cmd_signatures[-1]:
             _refine_dup_streak += 1
