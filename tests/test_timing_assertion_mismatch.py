@@ -323,3 +323,50 @@ def test_exception_runs_before_the_downgrade():
         "the confirmed-timing exception must clear `reflection` BEFORE the "
         "downgrade, or it has no effect"
     )
+
+
+# ---- F12: PoC commands must run under bash, not dash
+#
+# kali-listener executes with subprocess.run(shell=True), which on POSIX uses
+# /bin/sh — a symlink to dash in this image. The model naturally writes bash:
+# process substitution <(...), [[ ]], arrays. Those die before reaching the
+# target. 37 trace files carry a shell syntax error ("redirection unexpected"
+# x24, "end of file unexpected" x4, "word unexpected" x2), and the pre-dispatch
+# shlex check cannot catch them — shlex parses tokens, not shell grammar.
+# Measured on the runner: <(...) and [[ ]] and arrays all FAIL under /bin/sh
+# and all pass under bash. bash 5.3.3 is already installed.
+
+
+def _listener_src():
+    p = pathlib.Path(__file__).resolve().parents[1] / "kali_listener" / "listener_service.py"
+    if not p.exists():
+        pytest.skip(f"{p} not present")
+    return p.read_text(encoding="utf-8", errors="replace")
+
+
+def test_vector_run_executes_under_bash():
+    src = _listener_src()
+    assert "_BASH" in src, "the bash path must be resolved"
+    assert 'shutil.which("bash")' in src, (
+        "resolve bash at import; a hardcoded path breaks on an image that "
+        "installs it elsewhere"
+    )
+    m = re.search(r"subprocess\.run\(\s*cmd,\s*shell=True[^)]*\)", src, re.S)
+    assert m, "the shell=True exec site is gone"
+    assert "executable=_BASH" in m.group(0), (
+        "shell=True without executable= uses /bin/sh (dash here), which "
+        "rejects the bash syntax the model writes"
+    )
+
+
+def test_bash_absence_falls_back_rather_than_failing():
+    """shutil.which returns None when bash is absent; subprocess then behaves
+    exactly as before. A hard failure would be worse than dash."""
+    src = _listener_src()
+    i = src.find("_BASH = ")
+    assert i != -1
+    window = src[max(0, i - 400):i + 120]
+    assert "None" in window, (
+        "the comment must record that None means the previous /bin/sh "
+        "behaviour, not a crash"
+    )

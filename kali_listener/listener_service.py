@@ -13,6 +13,7 @@ import ipaddress   # scope gate: CIDR membership
 import fnmatch     # scope gate: *.domain matching
 import uuid
 import signal
+import shutil
 import subprocess
 import asyncio
 import json
@@ -41,6 +42,12 @@ active_listeners: Dict[str, Dict[str, Any]] = {}
 
 
 # --- Pydantic Models ---
+
+
+#: Absolute path to bash, or None when it is absent (then subprocess falls back
+#: to /bin/sh exactly as before). Resolved once at import — the runner image
+#: does not change shells at runtime.
+_BASH = shutil.which("bash")
 
 class ListenerStartRequest(BaseModel):
     port: int = Field(..., ge=PORT_START, le=PORT_END, description="Port for listener")
@@ -2979,8 +2986,17 @@ def vectors_run(request: VectorRunRequest):
     to = max(5, min(int(request.timeout or VECTOR_RUN_DEFAULT_TIMEOUT),
                     VECTOR_RUN_MAX_TIMEOUT))
     try:
+        # EXECUTE UNDER BASH, NOT dash. subprocess(shell=True) uses /bin/sh,
+        # which here is a symlink to dash — so every bash-only construct the
+        # model naturally writes dies before reaching the target:
+        # process substitution <(...), &> redirection, [[ ]], arrays.
+        # 37 trace files carry a shell syntax error, "redirection unexpected"
+        # x24 among them, and the pre-dispatch shlex check cannot catch these
+        # (shlex parses tokens, not shell grammar). bash 5.3.3 is already
+        # installed at /usr/bin/bash; _BASH is None when it is not, which falls
+        # back to the previous /bin/sh behaviour rather than failing to run.
         proc = subprocess.run(cmd, shell=True, capture_output=True,
-                              text=True, timeout=to)
+                              text=True, timeout=to, executable=_BASH)
         out = (proc.stdout or "") + (proc.stderr or "")
         return {"ok": True, "exit_code": proc.returncode, "output": out[:20000]}
     except subprocess.TimeoutExpired as e:  # noqa: BLE001
