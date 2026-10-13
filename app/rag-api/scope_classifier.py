@@ -463,12 +463,21 @@ def classify_and_assign_engagement(cur, engagement_id: str,
     state: dict = {}
     if hosts:
         cur.execute(
+            # Ports follow the IP, not the hostname — masscan reports an IP, so
+            # its findings land on an IP-keyed asset row with a NULL hostname
+            # and the hostname's own row reads as dead. The sentinel IPs are
+            # excluded from the self-join or every unresolved host would
+            # inherit every other unresolved host's ports, since they all share
+            # 0.0.0.0.
             """SELECT a.hostname,
                       bool_or(host(a.ip) IN ('0.0.0.0', '::')) AS unresolved,
                       count(p.id) FILTER (WHERE p.is_open)     AS open_ports,
                       count(p.id)                              AS port_rows
                  FROM assets a
-                 LEFT JOIN ports p ON p.asset_id = a.id
+                 LEFT JOIN assets a2
+                        ON a2.ip = a.ip
+                       AND host(a.ip) NOT IN ('0.0.0.0', '::')
+                 LEFT JOIN ports p ON p.asset_id = a2.id
                 WHERE a.hostname = ANY(%s)
                 GROUP BY a.hostname""",
             (hosts,),

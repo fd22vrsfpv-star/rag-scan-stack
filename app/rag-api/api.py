@@ -41633,11 +41633,25 @@ def reclassify_engagement_scope(engagement_id: str, body: ReclassifyBody | None 
                  if n != "no_services" and n not in _NODISPATCH]
         if hosts:
             cur.execute(
+                # Ports follow the IP, not the hostname. masscan reports an IP,
+                # so its findings land on an IP-keyed asset row with a NULL
+                # hostname — the hostname's own row keeps 0 open ports and reads
+                # as dead. Sampled on redteam3: 6 of 50 reclassify candidates
+                # had a listening IP, i.e. a vhost you can still reach with a
+                # Host header, about to be filed as "no attack surface".
+                #
+                # The sentinel IPs are excluded from the self-join or every
+                # unresolved host would inherit the ports of every OTHER
+                # unresolved host, all of which share 0.0.0.0.
                 """SELECT a.hostname,
                           bool_or(host(a.ip) IN ('0.0.0.0','::')) AS unresolved,
                           count(p.id) FILTER (WHERE p.is_open) AS open_ports,
                           count(p.id)                          AS port_rows
-                     FROM assets a LEFT JOIN ports p ON p.asset_id = a.id
+                     FROM assets a
+                     LEFT JOIN assets a2
+                            ON a2.ip = a.ip
+                           AND host(a.ip) NOT IN ('0.0.0.0', '::')
+                     LEFT JOIN ports p ON p.asset_id = a2.id
                     WHERE a.hostname = ANY(%s) GROUP BY a.hostname""", (hosts,))
             # port_scanned separates "scanned, nothing listening" from "nobody
             # looked" — without it this pass would bury unscanned hosts.

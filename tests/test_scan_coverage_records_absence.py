@@ -31,6 +31,7 @@ Sabotage check: change the failure-path call's status to "completed" and
 """
 
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -135,3 +136,33 @@ def test_read_side_consults_coverage(rel):
     assert found, (
         f"{rel} never reads scope_coverage — port_scanned falls back to "
         "'has port rows', which a clean scan never produces")
+
+
+@pytest.mark.parametrize("rel", sorted(READERS))
+def test_open_ports_follow_the_ip_not_the_hostname(rel):
+    """A vhost on a listening IP has attack surface and must not be buried.
+
+    masscan reports an IP, so its ports land on an IP-keyed asset row with a
+    NULL hostname. Counting open ports on the hostname's OWN row alone showed 0
+    for 1,044 scope hostnames whose IP was listening; 6 of 50 sampled
+    reclassify candidates were in that set — each reachable with a Host header
+    and about to be filed as "no attack surface".
+
+    The self-join must also exclude the 0.0.0.0/:: sentinels, or every
+    unresolved host inherits every other unresolved host's ports.
+    """
+    path = REPO / rel
+    if not path.exists():
+        pytest.skip(f"{rel} not found")
+    sqls = [n.value for n in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)
+            and "FILTER (WHERE p.is_open)" in n.value]
+    assert sqls, f"{rel} has no open-port state query to check"
+    for sql in sqls:
+        flat = " ".join(sql.split())
+        assert re.search(r"\ba2\.ip\s*=\s*a\.ip\b", flat), (
+            f"{rel}: open ports counted on the hostname's own asset row only — "
+            "masscan's results live on the IP-keyed row")
+        assert re.search(r"host\(a\.ip\)\s+NOT\s+IN", flat, re.I), (
+            f"{rel}: the IP self-join does not exclude the unresolved "
+            "sentinels, so every 0.0.0.0 host inherits every other one's ports")
