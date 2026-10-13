@@ -41231,6 +41231,38 @@ def move_scope_targets(body: dict, authorized: bool = Depends(auth)):
                         to_move.add(st)
                         widened.append(st)
 
+        # PARENT PROTECTION. Refuse to move a domain that still has subdomains
+        # in the source scope, unless the caller says so explicitly.
+        #
+        # An apex is what DEFINES a scope: `examplecorp.com` and `legacycorp.net` sit
+        # above 900-odd targets in the examplecorp scope. Sweeping one into a
+        # 77-item selection splits the tree — the children keep claiming a
+        # scope whose root has left — and nothing in the dialog shows it,
+        # because the apex looks like any other row. There are 87 such entries
+        # in that one scope.
+        #
+        # Named explicitly and alone, a parent move is fine (that is how a
+        # whole branch gets retired), so this only fires when children remain
+        # BEHIND in the source scope.
+        orphaned: dict = {}
+        if not bool(body.get("allow_parent_removal")):
+            _staying = [t for t in source_targets if t not in to_move]
+            for item in sorted(to_move):
+                kids = [t for t in _staying if t.endswith('.' + item)]
+                if kids:
+                    orphaned[item] = kids[:10]
+            if orphaned:
+                raise HTTPException(409, {
+                    "error": "would orphan subdomains",
+                    "detail": ("These targets are parents of other targets staying in "
+                               f"'{from_scope}'. Moving them splits the scope. Re-send with "
+                               "allow_parent_removal=true to proceed."),
+                    "parents": {k: {"example_children": v,
+                                    "children_remaining": sum(
+                                        1 for t in _staying if t.endswith('.' + k))}
+                                for k, v in orphaned.items()},
+                })
+
         # Remove all matched targets from source scope
         move_list = list(to_move)
         # Capture each row's engagement BEFORE deleting it: a move must not drop

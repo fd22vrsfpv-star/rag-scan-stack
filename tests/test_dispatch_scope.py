@@ -311,3 +311,62 @@ def test_alias_lookup_is_not_dns(gate):
     for banned in ("gethostbyname", "getaddrinfo", "resolver", "dns"):
         assert banned not in code.lower(), f"alias lookup performs DNS via {banned!r}"
     assert "assets" in code, "alias lookup should read observed asset pairings"
+
+
+# ── customer tenants must not be scannable ────────────────────────────────
+
+def test_customer_scope_is_never_dispatchable():
+    """A SaaS estate is mostly OTHER PEOPLE's subdomains.
+    `altru1473.sky.examplecorp.com` is a customer's instance;
+    `wiki.examplecorp.com` is the client's own. Both sit under the client's apex
+    and only the second belongs in a pentest.
+
+    Filing a tenant into `customer_scope` did not keep it out:
+    `load_engagement_scope` selects on engagement_id with NO scope-name filter,
+    so all 5791 targets of one engagement -- 4067 of them customer tenants --
+    were dispatchable. Triage that changes nothing is worse than none, because
+    it looks like protection.
+    """
+    import pathlib
+    import re
+    gate = pathlib.Path(__file__).resolve().parents[1] / "etl" / "scope_gate.py"
+    if not gate.exists():
+        import pytest
+        pytest.skip(f"{gate} not present")
+    src = gate.read_text(encoding="utf-8")
+    m = re.search(r"NEVER_DISPATCHABLE_SCOPES\s*=\s*\(([^)]*)\)", src)
+    assert m, "NEVER_DISPATCHABLE_SCOPES is gone — the deny-list is inline again"
+    names = {n.strip().strip('\'"') for n in m.group(1).split(",") if n.strip()}
+    for required in ("customer_scope", "excluded", "typosquats", "new_for_review"):
+        assert required in names, f"{required} is dispatchable again"
+    # The loader must actually USE it. Scoped to the function via AST, not a
+    # character window — the first version used src[i:i+2500] and the
+    # docstring alone pushed the reference past it.
+    import ast as _ast
+    fn = None
+    for node in _ast.parse(src).body:
+        if isinstance(node, _ast.FunctionDef) and node.name == "load_not_in_scope_denylist":
+            fn = node
+    assert fn is not None, "load_not_in_scope_denylist is gone"
+    used = {n.id for n in _ast.walk(fn) if isinstance(n, _ast.Name)}
+    assert "NEVER_DISPATCHABLE_SCOPES" in used, (
+        "the deny-list loader does not reference the constant, so the names "
+        "are listed somewhere that does not affect the query")
+
+
+def test_no_services_stays_dispatchable():
+    """`no_services` records that nothing was listening AT ONE MOMENT. Blocking
+    it would stop the host ever being re-probed when that changes, so it is
+    deliberately NOT in the never-dispatchable set."""
+    import pathlib
+    import re
+    gate = pathlib.Path(__file__).resolve().parents[1] / "etl" / "scope_gate.py"
+    if not gate.exists():
+        import pytest
+        pytest.skip(f"{gate} not present")
+    src = gate.read_text(encoding="utf-8")
+    m = re.search(r"NEVER_DISPATCHABLE_SCOPES\s*=\s*\(([^)]*)\)", src)
+    names = {n.strip().strip('\'"') for n in m.group(1).split(",") if n.strip()}
+    assert "no_services" not in names, (
+        "no_services was added to the deny-list; a host that had nothing "
+        "listening can never be re-probed")

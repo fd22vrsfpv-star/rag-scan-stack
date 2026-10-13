@@ -105,6 +105,20 @@ def _host_from_url(value):
         return value
 
 
+# Scope NAMES whose targets are never dispatchable, whatever engagement they
+# belong to. Listed here rather than inline so the set is greppable, testable,
+# and obvious to an operator wondering why a host will not scan.
+#
+#   typosquats      lookalikes — blocking them is the point
+#   new_for_review  pivot staging; promote to a live scope to make scannable
+#   customer_scope  third-party tenants on the client's apex, not the client
+#   excluded        operator said no
+#
+# `no_services` is deliberately absent: it records that nothing was listening
+# at one moment, and blocking it would stop the host ever being re-probed.
+NEVER_DISPATCHABLE_SCOPES = ("typosquats", "new_for_review", "customer_scope", "excluded")
+
+
 def load_not_in_scope_denylist(cur):
     """Return a list of (target, target_type) for the deny-list, drawn
     from two sources:
@@ -126,6 +140,23 @@ def load_not_in_scope_denylist(cur):
          `typosquats`). Moving the target out of `new_for_review` into a
          live scope is what makes it dispatchable.
 
+      4. Every engagement's `customer_scope` and `excluded` scopes —
+         THIRD-PARTY TENANTS, not the client's own estate. A SaaS estate
+         is mostly other people's subdomains: `altru1473.sky.examplecorp.com`
+         is a customer's instance, while `wiki.examplecorp.com` is the
+         client's own. Both sit under the client's apex, and only the
+         second is in a pentest.
+
+         Filing a tenant into `customer_scope` did NOT keep it out before
+         this: `load_engagement_scope` selects on engagement_id with no
+         scope-name filter, so all 5791 targets across every scope of one
+         engagement -- 4067 of them customer tenants -- were dispatchable.
+         The triage looked effective and changed nothing.
+
+         `no_services` is deliberately NOT here. "We probed and found
+         nothing listening" is a statement about one moment; blocking it
+         would stop the host ever being re-probed when that changes.
+
     Returns [] on any query error (fail-open on the deny-list side: a
     deny-list that can't load must not accidentally refuse legitimate
     scope — the regular scope check still runs).
@@ -134,8 +165,9 @@ def load_not_in_scope_denylist(cur):
         cur.execute(
             "SELECT target, target_type FROM public.scope_targets "
             "WHERE (name = 'not_in_scope' AND engagement_id IS NULL "
-            "       OR name IN ('typosquats', 'new_for_review')) "
-            "AND target IS NOT NULL AND target <> ''"
+            "       OR name = ANY(%s)) "
+            "AND target IS NOT NULL AND target <> ''",
+            (list(NEVER_DISPATCHABLE_SCOPES),)
         )
         rows = cur.fetchall()
     except Exception as e:
