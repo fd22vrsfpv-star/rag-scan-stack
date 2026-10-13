@@ -645,3 +645,30 @@ per-row `triaged_at`/`verdict` column so the classifier skips rows a human or a
 probe has already decided. Until then, any deliberate placement in
 `unknown_scope` is undone by the next classifier run.
 **Enforced by:** not enforced
+
+### `metrics.target_runs` omits the timing-confirmation re-run
+**Found:** 2026-10-12
+**Evidence:** CVE-2024-3552's result records `metrics.target_runs = 1`, but its
+trace carries a `latency_confirmation` phase whose `scaled_cmd` was dispatched
+against the same host:
+
+    "first_s": 9.642, "second_s": 14.73, "expected_s": 12.0,
+    "scaled_payload_old": 6.0, "scaled_payload_new": 13.0,
+    "reason": "... SLEEP(6.0)->SLEEP(13.0) -> CONFIRMED"
+
+Two requests reached `172.19.14.251:9090`; the counter says one. Every
+`latency_confirmed` / `latency_unconfirmed` verdict in every archive is
+therefore undercounted by exactly one dispatch, and the per-CVE `TR=` figures
+used to compare fix sets are low by one wherever a timing confirmation ran.
+**Where:** the metrics increment around `_timing_confirmation_rerun` in
+`app/rag-api/api.py` — the confirmation dispatches without touching
+`metrics["target_runs"]`, unlike the main refine-loop run.
+**Done when:** a confirmed timing verdict reports `target_runs >= 2`, and a
+re-read of the 2026-10-12 archives reconciles TR against the count of `run` +
+`latency_confirmation` phases in each trace.
+**Enforced by:** not enforced. `tests/test_timing_confirmation.py` asserts the
+scaling behaviour and the verdict names, not the dispatch accounting.
+**Note:** this is a reporting defect only. The confirmation itself fires
+correctly and the invariant ("never accept a latency verdict on a single run")
+is being honoured — CVE-2024-3552's scaling is genuine, which is how the
+undercount was noticed.
