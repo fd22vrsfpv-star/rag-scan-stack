@@ -26077,8 +26077,35 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                              + "\n".join(_lines[:10]))
     except Exception:  # noqa: BLE001
         pass
-    for it in range(1, max(1, max_iters) + 1):
+    # THE BUDGET COUNTS ATTEMPTS THAT REACHED THE TARGET.
+    #
+    # Operator: "guessing creds should not count against iterations, or at
+    # least reset them to 0 tries". The same argument covers every pass that
+    # never dispatched — a credential probe, a command refused pre-dispatch, a
+    # missing runner program. None of them is an exploit attempt, and spending
+    # the exploit budget on them is why runs showed it=4 tr=1: three of four
+    # iterations never touched the target and the fourth was all that was left.
+    #
+    # So max_iters now bounds DISPATCHED attempts. A pass that did not dispatch
+    # does not advance it. _loop_passes is a separate, wider stop so a command
+    # that can never dispatch cannot spin forever.
+    _dispatched_attempts = 0
+    _loop_passes = 0
+    _max_loop_passes = max(3, max(1, max_iters) * 3)
+    while True:
+        _loop_passes += 1
+        if _loop_passes > _max_loop_passes:
+            _poc_trace(run_id, "loop_pass_cap", iteration=iters,
+                       extra={"passes": _loop_passes - 1,
+                              "dispatched": _dispatched_attempts,
+                              "reason": "too many passes that never reached the "
+                                        "target; stopping rather than spinning"})
+            break
+        it = _dispatched_attempts + 1
         iters = it
+        # Snapshot the dispatch counter: this pass "reached the target" only if
+        # metrics["target_runs"] moves before the pass ends.
+        _tr_before = (metrics.get("target_runs") or 0)
         # Enforce enumerated object-ids BEFORE running: the login proved these
         # (hostid, scriptid, …); the model is only allowed to vary what the
         # enumeration left ambiguous. Rewrites e.g. an invented hostid=1001 back
@@ -26460,7 +26487,20 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                               "iterations_saved": max_iters - it,
                               "last_output_preview": (output or "")[:300]})
             break
-        if success or it >= max_iters:
+        # Only a pass that REACHED THE TARGET spends the budget. The counter
+        # moving is the proof: it increments at exactly one place, immediately
+        # after the listener call returns.
+        _tr_after = (metrics.get("target_runs") or 0)
+        if _tr_after > _tr_before:
+            _dispatched_attempts += 1
+        else:
+            _poc_trace(run_id, "iteration_not_charged", iteration=iters,
+                       extra={"reason": "pass did not reach the target "
+                                        "(credential probe / refused pre-dispatch / "
+                                        "missing program); budget not spent",
+                              "dispatched_so_far": _dispatched_attempts,
+                              "loop_passes": _loop_passes})
+        if success or _dispatched_attempts >= max_iters:
             break
         # Status-cluster escalation: 2+ iters in a row returned the same
         # non-success HTTP status. Fire tier-specific guidance ONCE per build.

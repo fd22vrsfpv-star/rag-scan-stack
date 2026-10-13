@@ -346,17 +346,29 @@ def _listener_src():
 
 def test_vector_run_executes_under_bash():
     src = _listener_src()
-    assert "_BASH" in src, "the bash path must be resolved"
+    assert "_EXEC_SHELL" in src, "the exec shell must be resolved"
     assert 'shutil.which("bash")' in src, (
         "resolve bash at import; a hardcoded path breaks on an image that "
         "installs it elsewhere"
     )
     m = re.search(r"subprocess\.run\(\s*cmd,\s*shell=True[^)]*\)", src, re.S)
     assert m, "the shell=True exec site is gone"
-    assert "executable=_BASH" in m.group(0), (
+    assert "executable=_EXEC_SHELL" in m.group(0), (
         "shell=True without executable= uses /bin/sh (dash here), which "
         "rejects the bash syntax the model writes"
     )
+
+
+def test_runner_reports_its_own_runtime():
+    """The runner is the authority on its shell — same reasoning as
+    /tools/capabilities. Hardcoding the executor fixes the symptom; REPORTING
+    it is what lets the synthesiser write correct commands and lets the fact be
+    embedded into RAG instead of compiled into one branch."""
+    src = _listener_src()
+    assert '"/runtime/profile"' in src, "the runtime profile endpoint is gone"
+    for key in ("exec_shell", "sh_is_dash", "bash_available",
+                "binaries_present", "binaries_missing"):
+        assert f'"{key}"' in src, f"the profile must report {key}"
 
 
 def test_bash_absence_falls_back_rather_than_failing():
