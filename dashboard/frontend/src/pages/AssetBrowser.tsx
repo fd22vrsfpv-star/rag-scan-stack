@@ -1798,6 +1798,19 @@ export default function AssetBrowser() {
     // though matchesScope identity would normally cover it.
   }, [allAssets, isScopeFiltering, matchesScope, search, portsFilter, providerFilter, assetKindFilter, scopeFilter, accessSummary, pendingExploits, accessFilter])
 
+  // THE selected asset. Resolve by id first — ip is NOT unique.
+  //
+  // Shared hosting puts hundreds of domains behind one address: this database
+  // has 174 assets on 74.123.153.33 alone, and every unresolved domain sits on
+  // 0.0.0.0. `assets.find(a => a.ip === selectedIp)` therefore returns the
+  // FIRST asset with that address, not the selected one — so moving through
+  // those domains showed the same hostname and the same tab content every
+  // time, which looked like the drawer not refreshing.
+  const selectedAsset = useMemo(
+    () => (selectedAssetId ? assets.find(a => a.id === selectedAssetId) : undefined)
+      ?? assets.find(a => a.ip === selectedIp),
+    [assets, selectedAssetId, selectedIp])
+
   // One selection path for the mouse AND the keyboard, so arrowing to a row
   // behaves identically to clicking it.
   const selectAsset = useCallback((row: (typeof assets)[number]) => {
@@ -2892,8 +2905,8 @@ export default function AssetBrowser() {
           <div className="flex items-center justify-between p-4 border-b border-border">
             <div>
               <h3 className="text-sm font-semibold font-mono">{selectedIp}</h3>
-              {assets.find(a => a.ip === selectedIp)?.hostname && (
-                <p className="text-xs text-muted-foreground font-mono">{assets.find(a => a.ip === selectedIp)?.hostname}</p>
+              {selectedAsset?.hostname && (
+                <p className="text-xs text-muted-foreground font-mono">{selectedAsset.hostname}</p>
               )}
             </div>
             {/* Triage tags + the keys that toggle them. Clickable too, so the
@@ -2901,7 +2914,7 @@ export default function AssetBrowser() {
                 told about. */}
             <div className="flex items-center gap-1.5 ml-auto mr-3">
               {TRIAGE_TAGS.map(t => {
-                const row = assets.find(a => a.ip === selectedIp)
+                const row = selectedAsset
                 const on = (row?.tags || []).some(x => x.toLowerCase() === t.tag)
                 return (
                   <button
@@ -2989,7 +3002,7 @@ export default function AssetBrowser() {
 
           <div className="p-4 space-y-6">
             {detailTab === 'access' && <AccessSection ip={selectedIp} />}
-            {detailTab === 'facts' && <ConfirmedFactsSection ip={selectedIp} hostname={assets.find(a => a.ip === selectedIp)?.hostname} />}
+            {detailTab === 'facts' && <ConfirmedFactsSection ip={selectedIp} hostname={selectedAsset?.hostname} />}
             {detailTab === 'enumeration' && <EnumerationSection ip={selectedIp} />}
             {detailTab === 'ports' && (
               <div>
@@ -3012,11 +3025,11 @@ export default function AssetBrowser() {
             )}
 
             {detailTab === 'screenshots' && (
-              <AssetScreenshots ip={selectedIp} hostname={assets.find(a => a.ip === selectedIp)?.hostname} />
+              <AssetScreenshots ip={selectedIp} hostname={selectedAsset?.hostname} />
             )}
 
             {detailTab === 'recon' && (() => {
-              const asset = assets.find(a => a.id === selectedAssetId) ?? assets.find(a => a.ip === selectedIp)
+              const asset = selectedAsset
               const isCloudImport = (asset?.tags || []).includes('cloud_import')
               if (isCloudImport && asset?.id) {
                 return <CloudImportFindings assetId={asset.id} hostname={asset.hostname} />
