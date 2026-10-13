@@ -672,3 +672,69 @@ scaling behaviour and the verdict names, not the dispatch accounting.
 correctly and the invariant ("never accept a latency verdict on a single run")
 is being honoured — CVE-2024-3552's scaling is genuine, which is how the
 undercount was noticed.
+
+### An axis change that does not move the outcome must escalate further
+**Found:** 2026-10-13, first production run of the refine-loop escalation
+**Evidence:** CVE-2024-22120, pass 2. `refine_axis_required` fired at iterations
+4, 5, 6 and 7, and the repeat counter climbed with it:
+
+    it=4  why="same outcome 3x in a row"  outcome_repeat=2
+    it=5  why="same outcome 4x in a row"  outcome_repeat=3
+    it=6  why="same outcome 5x in a row"  outcome_repeat=4
+    it=7  why="same outcome 6x in a row"  outcome_repeat=5
+
+Each time the model changed something `_command_axes` measures, the gate cleared
+`_axis_required`, and the target returned the identical response anyway:
+
+    4x  CSRF_TOKEN= {"message":"Data uploaded successfully"}
+        {"message":"Attack unsuccessful.","sta...
+
+So the model satisfies the letter of the gate without moving the outcome, and
+the loop still spent every iteration. Outcome diversity DID improve (12 runs /
+9 distinct, against 9 / 5 on the 2026-10-12 run of the same CVE) — the gate is
+working mechanically; the policy is too easily satisfied.
+**Where:** the axis gate in `app/rag-api/api.py::_run_refine_poc` — on a
+successful axis change it sets `_axis_required = None`, forgetting that the
+previous axis change already failed.
+**Done when:** an axis change that is followed by the SAME outcome signature
+requires a DIFFERENT axis than the one just tried (track `_axes_tried` as the
+set of axis NAMES demanded, not just command shapes), and the build stops once
+the available axes are exhausted rather than cycling one.
+**Enforced by:** not enforced. `tests/test_refine_loop_escalation.py` pins that
+the gate fires and that a payload-only edit is refused; nothing asserts what
+happens when a GRANTED axis change produces no change in outcome.
+
+### `latency_too_fast` defaults to "change the parameter", which is usually wrong
+**Found:** 2026-10-13
+**Evidence:** CVE-2024-22120 produced `tier=latency_too_fast` on every repeat.
+That tier carries no error of its own, so `_dead_axis_for_tier` fell through to
+`_DEAD_AXIS_DEFAULT` = `parameter` ("the injection is not landing — change the
+PARAMETER or ENDPOINT"). The actual blocker on this CVE is the Zabbix
+`sid`/CSRF precondition, which is an AUTH/precondition problem; the run spent
+four forced axis changes being pointed at the wrong one. The app's own response
+during those runs was `{"message":"Data uploaded successfully"}` — i.e. the
+request was accepted and processed, which is precisely the signature of a
+precondition failure rather than a wrong parameter.
+**Where:** `_DEAD_AXIS_BY_TIER` / `_DEAD_AXIS_DEFAULT` in `app/rag-api/api.py`.
+**Done when:** a timing-tier verdict whose output shows a SUCCESSFUL
+application response maps to the precondition/auth axis, not the parameter
+axis. The two are distinguishable: a normal 200-with-success-body plus a timing
+miss means the payload was accepted and did not execute.
+**Enforced by:** not enforced. `test_every_tier_error_signature_emits_is_mapped_or_defaulted`
+asserts every tier HAS a directive, not that the directive is the right one.
+
+### Refine metrics are per-pass, so a build under-reports its own escalation
+**Found:** 2026-10-13
+**Evidence:** CVE-2024-22120's result records `refine_axis_required=4` and no
+`refine_axis_rejected` at all. The trace shows the build ran TWO passes: pass 1
+reached `refine_dup_exit` at it=5 having fired one `refine_axis_required` at
+it=3, one `refine_axis_rejected` and one `refine_axis_reask`; pass 2 fired four
+more. The result reports only pass 2, so the single most interesting event of
+the run — a payload-only command refused before dispatch and successfully
+re-asked — does not appear in the metrics at all and is visible only in the
+JSONL.
+**Where:** the `metrics` dict handed to `_run_refine_poc`; the second-pass
+go-around starts a fresh one.
+**Done when:** per-pass counters are summed into the stored result, or the
+result carries a `passes: [...]` list so a reader can see both.
+**Enforced by:** not enforced.
