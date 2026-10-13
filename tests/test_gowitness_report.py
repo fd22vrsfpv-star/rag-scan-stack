@@ -649,3 +649,77 @@ def test_screenshots_collapse_probes_of_the_same_page():
     assert "__ungrouped_" in code, (
         "a screenshot with no gowitness row must keep its own group — unknown "
         "is not the same as the others")
+
+
+# ── /scope/move: widening and timeout ──────────────────────────────────────
+
+def _move_handler():
+    src = API.read_text(encoding="utf-8")
+    for node in ast.parse(src).body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for d in node.decorator_list:
+            if (isinstance(d, ast.Call) and d.args and isinstance(d.args[0], ast.Constant)
+                    and d.args[0].value == "/scope/move"):
+                return ast.get_source_segment(src, node) or ""
+    pytest.fail("POST /scope/move handler is gone")
+
+
+def test_parent_widening_is_opt_in():
+    """Moving a subdomain silently moved its APEX out of the source scope.
+    An operator moved 77 `*.sky.examplecorp.com` targets and the widening took
+    `examplecorp.com` AND `legacycorp.net` with them — the two domains that define
+    the engagement — from a dialog that said "77 item(s) selected".
+
+    Useful for triaging a whole unknown_scope branch, destructive by default."""
+    body = _move_handler()
+    tree = ast.parse(body)
+    # Structural, not textual. The first version of this test looked for
+    # "include_parents" appearing before the widening loop, and the DOCSTRING
+    # satisfied it — replacing the condition with `if True:` still passed.
+    # What matters is that the loop is NESTED INSIDE an `if` whose test reads
+    # include_parents.
+    guarded = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        test_src = ast.dump(node.test)
+        if "include_parents" not in test_src:
+            continue
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call) and getattr(sub.func, "attr", "") == "endswith":
+                guarded = True
+    assert guarded, (
+        "the subdomain-widening loop is not nested inside an `if` that tests "
+        "include_parents, so it fires by default and silently relocates apex "
+        "domains")
+
+
+def test_move_reports_what_it_widened():
+    """A caller that does opt in must be able to SEE what else went."""
+    body = _move_handler()
+    assert re.search(r'"widened"\s*:\s*widened', body), (
+        "the response does not report the widened set")
+
+
+def test_move_proxy_timeout_outlives_the_work():
+    """The move does per-target rule distillation and an embedder call, so a
+    77-target move ran past the proxy's 15s timeout: httpx raised ReadTimeout,
+    the BFF 500'd, and the operator saw failure — while rag-api carried on and
+    COMPLETED the move. Reporting failure for a mutation that succeeded invites
+    a retry on data that already changed."""
+    bff = REPO / "dashboard" / "bff" / "routers" / "scope.py"
+    if not bff.exists():
+        pytest.skip(f"{bff} not present")
+    src = bff.read_text(encoding="utf-8")
+    fn = None
+    for node in ast.parse(src).body:
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name == "move_scope_targets":
+            fn = ast.get_source_segment(src, node) or ""
+    assert fn, "the move proxy is gone"
+    m = re.search(r"timeout\s*=\s*(\d+)", fn)
+    assert m and int(m.group(1)) >= 120, (
+        f"move proxy timeout is {m.group(1) if m else 'unset'}s; the work is "
+        "per-target and outlives a short timeout, and the UI then reports a "
+        "completed move as a failure")
+    assert "status_code" in fn, "a genuine upstream error is not surfaced as itself"

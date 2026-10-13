@@ -124,14 +124,28 @@ async def remove_from_scope(body: RemoveFromScopeBody):
 
 @router.post("/api/scope/move")
 async def move_scope_targets(request: Request):
+    """Move targets between scopes.
+
+    300s, not 15s. The move does per-target work — rule distillation and an
+    embedder call each — so a 77-target move ran well past 15 seconds. httpx
+    raised ReadTimeout, this proxy 500'd, and the operator saw
+    "API 500: Internal Server Error" — while rag-api carried on and COMPLETED
+    the move. The UI reported failure for a mutation that had succeeded, which
+    invites a retry on data that already changed.
+
+    The status is checked too, so a genuine upstream error is reported as that
+    error rather than as whatever safe_json makes of the body.
+    """
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(timeout=15) as c:
+    async with httpx.AsyncClient(timeout=300) as c:
         resp = await c.post(
             f"{s.rag_api_url}/scope/move",
             json=body,
             headers={"x-api-key": s.api_key, **engagement_headers()},
         )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text[:300])
         return safe_json(resp)
 
 

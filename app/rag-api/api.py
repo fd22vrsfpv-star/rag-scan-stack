@@ -41189,9 +41189,20 @@ def _distill(cur, target: str, scope: str, engagement_id=None, method="manual"):
 
 @app.post("/scope/move", tags=["Scope"])
 def move_scope_targets(body: dict, authorized: bool = Depends(auth)):
-    """Move targets from one scope to another. Body: {from_scope, to_scope, targets: [str]}
-    Matches exact targets AND targets that are in the source scope that the given items are subdomains of.
-    E.g. moving ['testdw.legacycorp.com'] from unknown_scope will also move 'legacycorp.com' if it's in unknown_scope.
+    """Move targets from one scope to another.
+
+    Body: {from_scope, to_scope, targets: [str], include_parents?: bool}
+
+    `include_parents` (default FALSE) widens the selection to any source-scope
+    target the named items are subdomains of — moving `testdw.legacycorp.net` would
+    also move `legacycorp.net`. That is useful when triaging a whole unknown_scope
+    branch, and silently destructive otherwise: on 2026-10-13 an operator moved
+    77 `*.sky.examplecorp.com` targets out of the examplecorp scope and the widening
+    took `examplecorp.com` AND `legacycorp.net` with them — the two apexes that define
+    the engagement — from a dialog that said "77 item(s) selected".
+
+    It is opt-in now, and the response reports `widened` so a caller that does
+    ask for it can see what else went.
     """
     from_scope = body.get("from_scope")
     to_scope = body.get("to_scope")
@@ -41210,13 +41221,15 @@ def move_scope_targets(body: dict, authorized: bool = Depends(auth)):
         cur.execute("SELECT target FROM scope_targets WHERE name = %s", [from_scope])
         source_targets = [r[0] for r in cur.fetchall()]
 
-        # For each selected item, find any source scope targets it's a subdomain of
-        for item in list(to_move):
-            for st in source_targets:
-                # If source scope has 'legacycorp.com' and we're moving 'testdw.legacycorp.com'
-                # then also move 'legacycorp.com'
-                if item.endswith('.' + st) or item == st:
-                    to_move.add(st)
+        # Widen to parent domains ONLY when asked. See the docstring: this
+        # silently relocated two apex domains out of a 909-target scope.
+        widened = []
+        if bool(body.get("include_parents")):
+            for item in list(to_move):
+                for st in source_targets:
+                    if item.endswith('.' + st) and st not in to_move:
+                        to_move.add(st)
+                        widened.append(st)
 
         # Remove all matched targets from source scope
         move_list = list(to_move)
@@ -41259,7 +41272,11 @@ def move_scope_targets(body: dict, authorized: bool = Depends(auth)):
 
         conn.commit()
     return {"ok": True, "from_scope": from_scope, "to_scope": to_scope,
-            "removed": removed, "added": added, "decisions_captured": len(targets)}
+            "removed": removed, "added": added, "decisions_captured": len(targets),
+            # What the widening added beyond what the caller named. Empty unless
+            # include_parents was requested — a caller must be able to SEE that
+            # moving 77 subdomains also took their apex.
+            "widened": widened}
 
 
 @app.post("/scope/cleanup-unknown", tags=["Scope"])
