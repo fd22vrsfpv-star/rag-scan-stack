@@ -219,3 +219,66 @@ def test_live_endpoint_executes():
     assert body.get("ok") is True
     assert isinstance(body.get("rows"), list)
     assert isinstance(body.get("status_counts"), dict)
+
+
+# ── SAST listing: attribution must be visible, scope must be filterable ────
+# Four leftover test uploads keyed to 172.18.0.11 showed under a examplecorp
+# scope on 2026-10-13 and read as a broken filter. The filter was correct —
+# NULL-engagement rows are shown in EVERY engagement by design so
+# pre-attribution data stays reachable — but nothing said so, and the scope
+# selector had no effect on that tab at all.
+
+def _sast_handler_src():
+    src = API.read_text(encoding="utf-8")
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.FunctionDef) and node.name == "list_sast_findings":
+            return node, (ast.get_source_segment(src, node) or "")
+    pytest.fail("/sast/findings handler is gone")
+
+
+def test_sast_listing_returns_engagement_id_so_the_ui_can_badge_it():
+    """Without engagement_id on the row the UI cannot tell an unattributed
+    finding from one that belongs to the selected engagement."""
+    _, body = _sast_handler_src()
+    select = body[body.find("SELECT id, scan_id"):body.find("FROM sast_findings")]
+    assert "engagement_id" in select, (
+        "the SELECT omits engagement_id — the unattributed badge has nothing "
+        "to key on, which is how the test rows looked like examplecorp findings")
+
+
+def test_sast_listing_keeps_null_engagement_rows_visible():
+    """Deliberate, per the read-path invariant: pre-attribution data stays
+    reachable in every engagement. The fix is to LABEL them, not hide them."""
+    _, body = _sast_handler_src()
+    assert "engagement_id IS NULL" in body
+
+
+def test_sast_listing_offers_an_opt_in_scope_filter():
+    node, body = _sast_handler_src()
+    args = [a.arg for a in node.args.args] + [a.arg for a in node.args.kwonlyargs]
+    assert "scope_only" in args, "no scope filter — the scope selector does nothing here"
+    assert "all_engagements" in args
+    assert "scope_targets" in body, "scope_only does not actually join scope_targets"
+    # default must be OFF: out-of-scope collected data stays reviewable
+    defaults = dict(zip(args[-len(node.args.defaults):], node.args.defaults)) if node.args.defaults else {}
+    d = defaults.get("scope_only")
+    assert isinstance(d, ast.Constant) and d.value is False, (
+        "scope_only must default to False — the default is engagement-only, "
+        "and a scope restriction is opt-in")
+
+
+def test_frontend_sast_panel_badges_and_filters():
+    tsx = REPO / "dashboard" / "frontend" / "src" / "pages" / "ExploitManager.tsx"
+    if not tsx.exists():
+        pytest.skip(f"{tsx} not present")
+    src = tsx.read_text(encoding="utf-8")
+    start = src.find("function SastFindingsPanel")
+    assert start != -1, "SastFindingsPanel is gone"
+    panel = src[start:start + 9000]
+    assert "unattributed" in panel, "no unattributed badge"
+    # the query string uses scope_only; the React state is scopeOnly, so this
+    # cannot pass on the state variable alone
+    assert "scope_only" in panel, "the panel never requests the scope filter"
+    assert "engagement_id" in panel, "the panel never reads engagement_id"
+    # the active mode must be stated, not inferred from a checkbox
+    assert "in scope" in panel.lower(), "the active scope mode is not labelled"

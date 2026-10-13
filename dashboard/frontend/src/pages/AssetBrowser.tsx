@@ -24,6 +24,7 @@ import { useProxyEndpoints, useProxiedPreview } from '@/api/recon'
 import { useScreenshots, useReconDomainOverview } from '@/api/recon'
 import { apiUrl } from '@/api/client'
 import { ScreenshotThumbnail } from '@/components/common/ScreenshotThumbnail'
+import { useGowitnessReport, type GowitnessRow } from '@/api/gowitness'
 import * as Dialog from '@radix-ui/react-dialog'
 
 // Decode a cloud-import asset's hostname (engagement_short/<filename>) into
@@ -2968,6 +2969,18 @@ function AssetScreenshots({ ip, hostname }: { ip: string; hostname?: string | nu
   const search = hostname || ip
   const { data, isLoading } = useScreenshots(search)
   const screenshots = data?.screenshots ?? []
+  // The screenshot files carry no status code — that lives in the gowitness
+  // recon_findings row. Join them here so a thumbnail says WHAT it is without
+  // having to open it: six near-identical filenames for one host tell you
+  // nothing, but "443 -> 200 ExampleCorp" vs "80 -> 400" tells you everything.
+  const { data: gw } = useGowitnessReport({ match: search, enabled: !!search })
+  const byShot = useMemo(() => {
+    const m = new Map<string, GowitnessRow>()
+    for (const r of gw?.rows ?? []) {
+      if (r.screenshot) m.set(r.screenshot.split('/').pop() || '', r)
+    }
+    return m
+  }, [gw])
 
   if (isLoading) return <p className="text-xs text-muted-foreground">Loading screenshots...</p>
   if (!screenshots.length) return <p className="text-xs text-muted-foreground">No screenshots found for {search}. Run GoWitness to capture.</p>
@@ -2976,12 +2989,39 @@ function AssetScreenshots({ ip, hostname }: { ip: string; hostname?: string | nu
     <div>
       <p className="text-xs text-muted-foreground mb-2">{screenshots.length} screenshots for {search}</p>
       <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
-        {screenshots.map((s, i) => (
-          <ScreenshotThumbnail key={i} path={s.path} filename={s.filename} />
-        ))}
+        {screenshots.map((s, i) => {
+          const meta = byShot.get(s.filename)
+          return (
+            <div key={i} className="space-y-1">
+              <ScreenshotThumbnail path={s.path} filename={s.filename} />
+              {meta && (
+                <div className="flex items-center gap-1.5 px-0.5">
+                  <span className={cn('px-1 py-0.5 rounded text-[10px] font-semibold text-white',
+                    statusTone(meta.status_code))}>
+                    {meta.status_code || '?'}
+                  </span>
+                  <span className="text-[10px] text-muted-foreground truncate" title={meta.title}>
+                    {meta.title || '(no title)'}
+                  </span>
+                </div>
+              )}
+            </div>
+          )
+        })}
       </div>
     </div>
   )
+}
+
+/** Colour a status by CLASS, not exact code — 2xx good, 3xx redirect,
+ *  4xx client, 5xx server. Matches the contact-sheet badges. */
+function statusTone(code: number | '' | undefined): string {
+  const n = typeof code === 'number' ? code : parseInt(String(code || ''), 10)
+  if (!n || Number.isNaN(n)) return 'bg-gray-500'
+  if (n < 300) return 'bg-green-600'
+  if (n < 400) return 'bg-blue-600'
+  if (n < 500) return 'bg-amber-600'
+  return 'bg-red-600'
 }
 
 

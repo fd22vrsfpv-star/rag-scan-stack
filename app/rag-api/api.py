@@ -5756,10 +5756,23 @@ def list_sast_findings(scan_id: Optional[str] = None,
                        target_host: Optional[str] = None,
                        engagement_id: Optional[str] = None,
                        all_engagements: bool = False,
+                       scope_only: bool = False,
                        limit: int = 100,
                        authorized: bool = Depends(auth)):
     """List SAST findings with filters. Web-relevant findings are also
-    in web_findings for the exploit workbench."""
+    in web_findings for the exploit workbench.
+
+    Engagement-filtered by default. `engagement_id IS NULL` rows are included
+    deliberately — pre-attribution data stays reachable — but the row now
+    CARRIES engagement_id so the UI can mark them unattributed rather than
+    letting them read as belonging to whatever engagement is selected. Four
+    leftover test uploads keyed to 172.18.0.11 appeared under a examplecorp scope
+    exactly that way (2026-10-13).
+
+    `scope_only=true` additionally restricts target_host to scope_targets for
+    the engagement — opt-in, matching /exploit-store, so out-of-scope collected
+    data stays reviewable by default.
+    """
     _ensure_sast_tables()
     eid = _resolve_engagement_id(engagement_id)
     where, args = [], []
@@ -5774,9 +5787,18 @@ def list_sast_findings(scan_id: Optional[str] = None,
     if eid and not all_engagements:
         where.append("(engagement_id = %s OR engagement_id IS NULL)")
         args.append(eid)
+    if scope_only and eid:
+        # Same shape as /exploit-store: keep only rows whose target_host matches
+        # an in-scope entry for this engagement.
+        where.append(
+            "EXISTS (SELECT 1 FROM scope_targets st "
+            "WHERE (st.engagement_id = %s OR st.engagement_id IS NULL) "
+            "AND sast_findings.target_host = st.target)"
+        )
+        args.append(eid)
     sql = ("SELECT id, scan_id, source_type, source_url, target_host, target_port, "
            "rule_id, severity, confidence, vuln_class, file_path, line_start, line_end, "
-           "matched_code, message, cwe, fingerprint, created_at "
+           "matched_code, message, cwe, fingerprint, created_at, engagement_id "
            "FROM sast_findings")
     if where:
         sql += " WHERE " + " AND ".join(where)

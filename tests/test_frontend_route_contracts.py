@@ -129,7 +129,13 @@ def test_base_prefix_unchanged():
         "client.ts no longer declares BASE = '/api'. This guard assumes "
         "apiFetch prepends '/api'; update both together."
     )
-    assert "${BASE}${path}" in src or "BASE + path" in src, (
+    # Structural rather than a pinned fragment: match a template literal or a
+    # concatenation that uses BOTH names, in either order, whatever the
+    # spacing. The property is "the URL is BASE composed with path", not one
+    # exact spelling of it.
+    composes = re.search(r"\$\{\s*BASE\s*\}\s*\$\{\s*path\s*\}", src) or \
+        re.search(r"\bBASE\b\s*\+\s*\bpath\b", src)
+    assert composes, (
         "client.ts no longer composes the URL as BASE + path; "
         "re-check what apiFetch prepends before trusting this guard."
     )
@@ -215,3 +221,40 @@ def test_guard_catches_a_planted_violation():
             "a doubled-prefix path unexpectedly matched a real route; "
             "the resolver would not catch this bug class"
         )
+
+
+def test_apiurl_is_called_never_interpolated():
+    """`apiUrl` is a FUNCTION. `${apiUrl}` in a template literal interpolates
+    its SOURCE TEXT, producing a URL like
+
+        function apiUrl(path){return `${BASE}${path}`;}/screenshots/foo.png
+
+    which no server answers. It fails silently: an <img> with a bad src renders
+    nothing and throws no error the page can see.
+
+    This broke EVERY screenshot thumbnail in the app — the asset drawer's
+    Screenshots tab showed six filename boxes and no pictures, which read as
+    "GoWitness captured nothing" rather than "the URL is malformed". Found
+    2026-10-13 from an operator screenshot.
+
+    Same family as the doubled-/api bug this module already guards: the path
+    looks plausible in source and resolves to nothing at runtime.
+    """
+    import pathlib
+    import re
+    root = pathlib.Path(__file__).resolve().parents[1] / "dashboard" / "frontend" / "src"
+    if not root.exists():
+        import pytest
+        pytest.skip(f"{root} not present")
+    bad = []
+    for p in sorted(root.rglob("*.ts")) + sorted(root.rglob("*.tsx")):
+        for n, line in enumerate(p.read_text(encoding="utf-8",
+                                             errors="replace").splitlines(), 1):
+            if re.search(r"\$\{\s*apiUrl\s*\}", line):
+                rel = p.relative_to(root.parents[2]).as_posix()
+                bad.append(f"{rel}:{n}: {line.strip()[:110]}")
+    assert not bad, (
+        "apiUrl interpolated instead of called — the resulting URL contains the "
+        "function's source and resolves to nothing:\n  " + "\n  ".join(bad)
+        + "\n\nUse apiUrl(`/path`) instead of `${apiUrl}/path`."
+    )
