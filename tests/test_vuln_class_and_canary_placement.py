@@ -500,3 +500,44 @@ def test_command_substitution_is_still_parsed():
         "the splitter no longer breaks on $( — command substitutions would "
         "stop being parsed for the programs they invoke"
     )
+
+
+# ---- F6c: a guard that never yields is a dead end
+#
+# Third variant of the same mistake. F6 refuses a canary placed only in a SQL
+# comment; F6b scoped it to reflected assertions. Neither stopped it being a
+# DEAD END: on CVE-2024-32511 it refused four consecutive iterations of the
+# same shape — TR=1 across five passes, stop=identical_resend — and nothing was
+# learned from the target. The model does not act on the refusal message, so
+# refusing again only trades a useless verdict for no verdict.
+#
+# Placement is ADVISORY: the command is executable, it just will not satisfy
+# its own assertion. After a couple of refusals, a real response is worth more.
+# Runnability failures (shell syntax, LLM refusal, empty) never yield.
+
+
+def test_canary_refusal_yields_after_a_limit():
+    src = _src()
+    fn = _func(src, "_run_refine_poc")
+    assert "_is_advisory_syntax_refusal" in fn, (
+        "the refine loop must distinguish an advisory refusal from one that "
+        "means the command cannot run"
+    )
+    assert "_CANARY_REFUSE_LIMIT" in fn, "there must be a bound on refusals"
+    assert "canary_refusal_yielded" in fn, (
+        "the yield must be traced — a guard silently standing down is worse "
+        "than one that refuses"
+    )
+
+
+def test_only_placement_refusals_yield():
+    """A command that cannot RUN must keep being refused."""
+    fn = _func(_src(), "_is_advisory_syntax_refusal")
+    assert '"canary" in e' in fn.replace("'", '"'), "must key on a canary refusal"
+    for word in ("comment", "placeholder"):
+        assert word in fn, f"must recognise the {word} refusal"
+    # It must NOT treat a shell-syntax failure as advisory.
+    assert "parenthes" not in fn and "syntax error" not in fn.lower().replace(
+        "shell-syntax error", ""), (
+        "a shell-syntax failure means the command cannot run; it must never yield"
+    )

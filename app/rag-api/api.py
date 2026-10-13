@@ -20909,6 +20909,26 @@ def _recon_discovered_knowledge(product, version, limit=20):
     return "\n".join(lines)
 
 
+
+#: How many times the canary-PLACEMENT rule may refuse before it yields and
+#: lets the command run. Placement is advisory — the command is executable, it
+#: just will not satisfy its own assertion — so refusing forever trades a
+#: useless verdict for no verdict at all.
+_CANARY_REFUSE_LIMIT = 2
+
+
+def _is_advisory_syntax_refusal(err: str) -> bool:
+    """Is this refusal about canary PLACEMENT rather than runnability?
+
+    A shell-syntax error or an LLM refusal means the command cannot run; those
+    must keep refusing. A misplaced canary means it CAN run and merely will not
+    prove anything — which, after a couple of tries, is worth more than another
+    refusal.
+    """
+    e = (err or "").lower()
+    return ("canary" in e) and ("comment" in e or "placeholder" in e)
+
+
 def _poc_shell_syntax_check(command, canary=None, assertion=None):
     """Dry-parse a shell command via shlex to catch quote-balance / escape
     errors BEFORE dispatch. Returns (ok: bool, error: str). On error the
@@ -26136,6 +26156,27 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         # at parse time. On fail: synthesize a syntax-error "output" so the
         # existing refine path kicks in with specific feedback.
         _syn_ok, _syn_err = _poc_shell_syntax_check(command, canary=canary, assertion=assertion)
+        # A GUARD THAT NEVER YIELDS IS A DEAD END. The canary-placement rule is
+        # right — a canary inside a SQL comment cannot satisfy an expect_regex
+        # assertion — but the model does not act on the message, so it returns
+        # the same shape and we refuse again. Observed on CVE-2024-32511:
+        # four consecutive refusals, TR=1 across five passes, stop=identical_resend.
+        # Nothing was learned from the target.
+        #
+        # After _CANARY_REFUSE_LIMIT refusals of the SAME advisory rule, let it
+        # through. The assertion will likely fail — but a real response teaches
+        # the loop something, and an honest "ran and the canary never appeared"
+        # beats a fifth refusal. Shell-syntax and LLM-refusal failures are NOT
+        # yielded: those cannot run at all.
+        if not _syn_ok and _is_advisory_syntax_refusal(_syn_err):
+            metrics["canary_placement_refusals"] = metrics.get("canary_placement_refusals", 0) + 1
+            if metrics["canary_placement_refusals"] > _CANARY_REFUSE_LIMIT:
+                _poc_trace(run_id, "canary_refusal_yielded", iteration=it,
+                           extra={"refusals": metrics["canary_placement_refusals"],
+                                  "err": _syn_err[:200],
+                                  "note": "dispatching anyway — repeated refusal taught "
+                                          "the loop nothing; a real response will"})
+                _syn_ok, _syn_err = True, ""
         if not _syn_ok:
             _refused_now, _ = _poc_detect_llm_refusal(command)
             if _refused_now:
