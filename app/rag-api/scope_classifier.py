@@ -156,6 +156,36 @@ class ScopeClassifier:
             except (ValueError, TypeError):
                 return False
 
+        elif rt == "asset_state":
+            # What we OBSERVED about the host, rather than what its name looks
+            # like: did it resolve, and is anything listening.
+            #
+            # `probed` is the load-bearing condition. "No open ports" is
+            # ambiguous on its own — a host with no asset row has never been
+            # looked at, and a host we scanned and found nothing on is a
+            # different animal. Filing the first as "no services" buries it
+            # before anyone has checked, so the default REQUIRES evidence that
+            # we looked, and a rule has to ask for the other behaviour on
+            # purpose.
+            #
+            # Conditions (all optional, ANDed):
+            #   unresolved:      true  -> ip is 0.0.0.0 / ::  / absent
+            #   max_open_ports:  N     -> at most N listening ports
+            #   probed:          true  -> an asset row exists (default true)
+            if cond.get("probed", True) and not context.get("has_asset"):
+                return False
+            if cond.get("unresolved") and not context.get("unresolved"):
+                return False
+            mx = cond.get("max_open_ports")
+            if mx is not None:
+                try:
+                    if int(context.get("open_ports") or 0) > int(mx):
+                        return False
+                except (TypeError, ValueError):
+                    return False
+            # An all-empty condition set must not match everything.
+            return any(k in cond for k in ("unresolved", "max_open_ports", "probed"))
+
         elif rt == "composite":
             op = cond.get("op", "and").lower()
             sub_conditions = cond.get("conditions", [])
@@ -414,10 +444,36 @@ def classify_and_assign_engagement(cur, engagement_id: str,
     )
     hosts = [r["target"] if isinstance(r, dict) else r[0] for r in cur.fetchall()]
 
+    # Observed state per host, fetched ONCE for the whole batch. Without this
+    # every rule saw an empty context, so a rule could only ever match on the
+    # NAME — there was no way to express "this host resolved to nothing and has
+    # nothing listening". Two queries beat 909 round trips.
+    state: dict = {}
+    if hosts:
+        cur.execute(
+            """SELECT a.hostname,
+                      bool_or(host(a.ip) IN ('0.0.0.0', '::')) AS unresolved,
+                      count(p.id) FILTER (WHERE p.is_open)     AS open_ports
+                 FROM assets a
+                 LEFT JOIN ports p ON p.asset_id = a.id
+                WHERE a.hostname = ANY(%s)
+                GROUP BY a.hostname""",
+            (hosts,),
+        )
+        for r in cur.fetchall():
+            hn = r["hostname"] if isinstance(r, dict) else r[0]
+            unres = r["unresolved"] if isinstance(r, dict) else r[1]
+            opn = r["open_ports"] if isinstance(r, dict) else r[2]
+            state[hn] = {"has_asset": True, "unresolved": bool(unres),
+                         "open_ports": int(opn or 0)}
+
     in_scope = unknown = 0
     per_scope: dict = {}
     for h in hosts:
-        sug = clf.classify_rules_only(h, {})
+        # A host with no asset row has never been probed — has_asset False, and
+        # the asset_state rule refuses it unless a rule opts in explicitly.
+        sug = clf.classify_rules_only(
+            h, state.get(h, {"has_asset": False, "unresolved": False, "open_ports": 0}))
         if sug and sug.confidence >= 0.9:
             scope, src = sug.scope, "auto-classified"
             in_scope += 1

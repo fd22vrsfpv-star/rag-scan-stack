@@ -585,3 +585,67 @@ def test_scope_picker_offers_engagement_scopes():
     assert "useScopeNames" in src, "the picker does not use the engagement-aware hook"
     assert "'/scope/names'" not in src, (
         "the picker still calls the global scope list directly")
+
+
+# ── ports and screenshots are per-ADDRESS, and must not double-count ───────
+
+def test_open_ports_are_deduped_per_address():
+    """A port belongs to the ADDRESS, but shared hosting gives many assets the
+    same address. Grouping by `p.id` returned one row per port ROW, so
+    20.242.117.232 showed 3 entries for 2 real ports and the tab header said
+    "Ports (3)".
+
+    Grouping must be on `a.ip` (the column), not `host(a.ip)` (an expression):
+    Postgres cannot prove the expression determines the column and raises
+    `subquery uses ungrouped column "a.ip"` for the per-port subqueries.
+    """
+    src = API.read_text(encoding="utf-8")
+    fn = None
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.FunctionDef) and node.name == "get_open_ports":
+            fn = ast.get_source_segment(src, node) or ""
+    assert fn, "/ports/open handler is gone"
+    assert re.search(r"GROUP BY\s+a\.ip,\s*p\.proto,\s*p\.port", fn), (
+        "open ports are not grouped per (address, proto, port) — a port "
+        "recorded against two assets on one IP is listed twice")
+    assert not re.search(r"GROUP BY[^\n]*\bp\.id\b", fn), (
+        "still grouping by the port ROW id, which is what duplicated them")
+    assert re.search(r"count\(DISTINCT\s*\(\s*host\(a\.ip\),\s*p\.proto,\s*p\.port\s*\)\)", fn), (
+        "the total still counts port rows rather than distinct ports")
+
+
+def test_command_exec_folds_over_merged_port_rows():
+    """has_command_exec references p.id, which is no longer a group key, so it
+    must fold with bool_or. Without it the query will not compile — and if it
+    were simply dropped, a proven shell on one of the merged rows would vanish
+    from the view."""
+    src = API.read_text(encoding="utf-8")
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.FunctionDef) and node.name == "get_open_ports":
+            fn = ast.get_source_segment(src, node) or ""
+    assert re.search(r"bool_or\(EXISTS", fn), (
+        "has_command_exec is not aggregated over the merged rows")
+
+
+def test_screenshots_collapse_probes_of_the_same_page():
+    """GoWitness shoots every scheme x port it is handed, so one host produced
+    http://h:80, http://h:443 and https://h:443 — three thumbnails of the same
+    Confluence login, all 200, all with the same final_url. Grouped by where
+    the probe ENDED UP, since that is what makes them the same page."""
+    page = REPO / "dashboard" / "frontend" / "src" / "pages" / "AssetBrowser.tsx"
+    if not page.exists():
+        pytest.skip(f"{page} not present")
+    src = page.read_text(encoding="utf-8")
+    i = src.find("function AssetScreenshots")
+    assert i != -1, "AssetScreenshots is gone"
+    block = src[i:i + 4000]
+    # Strip // comments first. The explanation above the code mentions
+    # final_url, so a bare substring check matches the COMMENT and passes even
+    # when the grouping is gone — which is exactly what happened on the first
+    # sabotage run of this test.
+    code = "\n".join(re.sub(r"//.*$", "", ln) for ln in block.splitlines())
+    assert re.search(r"meta\?\.final_url", code), (
+        "screenshots are not grouped by their destination")
+    assert "__ungrouped_" in code, (
+        "a screenshot with no gowitness row must keep its own group — unknown "
+        "is not the same as the others")

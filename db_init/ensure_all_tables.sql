@@ -4059,7 +4059,7 @@ CREATE TABLE IF NOT EXISTS scope_classification_rules (
     scope_name      text NOT NULL,
     priority        int NOT NULL DEFAULT 100,
     enabled         boolean NOT NULL DEFAULT true,
-    rule_type       text NOT NULL CHECK (rule_type IN ('domain_pattern','whois_org','asn','tls_issuer','ip_cidr','composite','typosquat')),
+    rule_type       text NOT NULL CHECK (rule_type IN ('domain_pattern','whois_org','asn','tls_issuer','ip_cidr','composite','typosquat','asset_state')),
     conditions      jsonb NOT NULL,
     auto_apply      boolean NOT NULL DEFAULT false,
     created_at      timestamptz DEFAULT now(),
@@ -4519,10 +4519,16 @@ DO $$ BEGIN ALTER TABLE scope_suggestions ADD COLUMN IF NOT EXISTS engagement_id
 -- helpers can write their rule/method values.
 -- (Existing dbs created BEFORE the typosquat work have a stale CHECK that
 -- would reject the new values; drop + re-add with the expanded allow-list.)
+--
+-- 2026-10-13: + 'asset_state' — rules that classify on what was OBSERVED about
+-- a host (did it resolve, is anything listening) rather than what its name
+-- looks like. Without this the INSERT fails with
+--   violates check constraint "scope_classification_rules_rule_type_check"
+-- and the rule type is unusable even though the classifier understands it.
 DO $$ BEGIN
   ALTER TABLE scope_classification_rules DROP CONSTRAINT IF EXISTS scope_classification_rules_rule_type_check;
   ALTER TABLE scope_classification_rules ADD CONSTRAINT scope_classification_rules_rule_type_check
-    CHECK (rule_type IN ('domain_pattern','whois_org','asn','tls_issuer','ip_cidr','composite','typosquat'));
+    CHECK (rule_type IN ('domain_pattern','whois_org','asn','tls_issuer','ip_cidr','composite','typosquat','asset_state'));
 EXCEPTION WHEN OTHERS THEN NULL; END $$;
 
 DO $$ BEGIN

@@ -3114,29 +3114,73 @@ function AssetScreenshots({ ip, hostname }: { ip: string; hostname?: string | nu
     return m
   }, [gw])
 
+  // Collapse probes that landed on the SAME PAGE. GoWitness shoots every
+  // scheme x port combination it is handed, so wiki.examplecorp.com produced
+  // http://host:80, http://host:443 and https://host:443 — three thumbnails of
+  // one Confluence login, all status 200, all with the same final_url. The
+  // http-on-443 probe is pure noise: it redirects to https anyway.
+  //
+  // Grouped by where the probe ENDED UP, not where it started, because that is
+  // what makes them the same page. A shot with no gowitness row keeps its own
+  // group — unknown is not "same as the others".
+  const groups = useMemo(() => {
+    const g = new Map<string, { shots: typeof screenshots; meta?: GowitnessRow }>()
+    screenshots.forEach((s, i) => {
+      const meta = byShot.get(s.filename)
+      const key = meta?.final_url || meta?.url || `__ungrouped_${i}`
+      const cur = g.get(key)
+      if (cur) cur.shots.push(s)
+      else g.set(key, { shots: [s], meta })
+    })
+    return [...g.values()]
+  }, [screenshots, byShot])
+
   if (isLoading) return <p className="text-xs text-muted-foreground">Loading screenshots...</p>
   if (!screenshots.length) return <p className="text-xs text-muted-foreground">No screenshots found for {search}. Run GoWitness to capture.</p>
 
+  const collapsed = screenshots.length - groups.length
+
   return (
     <div>
-      <p className="text-xs text-muted-foreground mb-2">{screenshots.length} screenshots for {search}</p>
+      <p className="text-xs text-muted-foreground mb-2">
+        {groups.length} page{groups.length === 1 ? '' : 's'} for {search}
+        {collapsed > 0 && (
+          <span className="ml-1 opacity-70">
+            ({screenshots.length} screenshots; {collapsed} duplicate probe{collapsed === 1 ? '' : 's'} of the same page collapsed)
+          </span>
+        )}
+      </p>
       <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
-        {screenshots.map((s, i) => {
-          const meta = byShot.get(s.filename)
+        {groups.map((grp, i) => {
+          const s = grp.shots[0]
+          const meta = grp.meta
+          // Which probes reached this page — "80, 443" tells the operator the
+          // port actually serves it, which the collapsed view would otherwise
+          // hide.
+          const probes = grp.shots
+            .map(x => (x.filename.match(/-(\d+)\.png$/) || [])[1])
+            .filter(Boolean)
+          const uniq = [...new Set(probes)]
           return (
             <div key={i} className="space-y-1">
               <ScreenshotThumbnail path={s.path} filename={s.filename} />
-              {meta && (
-                <div className="flex items-center gap-1.5 px-0.5">
+              <div className="flex items-center gap-1.5 px-0.5 flex-wrap">
+                {meta && (
                   <span className={cn('px-1 py-0.5 rounded text-[10px] font-semibold text-white',
                     statusTone(meta.status_code))}>
                     {meta.status_code || '?'}
                   </span>
-                  <span className="text-[10px] text-muted-foreground truncate" title={meta.title}>
-                    {meta.title || '(no title)'}
+                )}
+                {uniq.length > 0 && (
+                  <span className="text-[10px] font-mono text-muted-foreground"
+                        title={grp.shots.map(x => x.filename).join('\n')}>
+                    :{uniq.join(', :')}
                   </span>
-                </div>
-              )}
+                )}
+                <span className="text-[10px] text-muted-foreground truncate" title={meta?.title}>
+                  {meta?.title || '(no title)'}
+                </span>
+              </div>
             </div>
           )
         })}

@@ -2241,25 +2241,34 @@ def get_open_ports(
         where_sql = "WHERE " + " AND ".join(where)
         # Count total matching rows (independent of LIMIT/OFFSET) for pagination.
         cur.execute(
-            f"SELECT count(DISTINCT (p.id)) AS n FROM ports p JOIN assets a ON p.asset_id = a.id {where_sql}",
+            f"SELECT count(DISTINCT (host(a.ip), p.proto, p.port)) AS n "
+            f"FROM ports p JOIN assets a ON p.asset_id = a.id {where_sql}",
             params,
         )
         total = cur.fetchone()["n"]
         sql = f"""
             SELECT host(a.ip)::text AS ip,
                    p.proto, p.port,
-                   COALESCE(p.service,'?') AS service,
-                   p.product, p.version, p.banner,
-                   a.os,
+                   -- One row per (ip, proto, port). A port belongs to the
+                   -- ADDRESS, but shared hosting gives many assets the same
+                   -- address, so grouping by p.id listed 443 once per asset:
+                   -- 20.242.117.232 had 3 port rows for 2 real ports. Prefer a
+                   -- named service over the '?' placeholder when the same port
+                   -- was recorded by more than one scan.
+                   COALESCE(MAX(NULLIF(p.service, '?')), '?') AS service,
+                   MAX(p.product) AS product,
+                   MAX(p.version) AS version,
+                   MAX(p.banner)  AS banner,
+                   MAX(a.os)      AS os,
                    COALESCE(COUNT(DISTINCT v.id), 0)::int AS finding_count,
                    -- how many distinct tools have run against this exact port,
                    -- and whether there is enumeration data (a held shell, an
                    -- executed exploit, or a finding) worth opening for it.
-                   (SELECT COUNT(DISTINCT te.tool) FROM tool_executions te
-                     WHERE te.target = host(a.ip) AND te.port = p.port)::int AS tools_run,
-                   (SELECT COUNT(DISTINCT pe2.exploit_id) FROM pending_exploits pe2
+                   MAX((SELECT COUNT(DISTINCT te.tool) FROM tool_executions te
+                     WHERE te.target = host(a.ip) AND te.port = p.port))::int AS tools_run,
+                   MAX((SELECT COUNT(DISTINCT pe2.exploit_id) FROM pending_exploits pe2
                      WHERE host(pe2.target_ip) = host(a.ip)
-                       AND pe2.target_port = p.port)::int AS exploits_attempted,
+                       AND pe2.target_port = p.port))::int AS exploits_attempted,
                    (COUNT(DISTINCT v.id) > 0
                     OR EXISTS (SELECT 1 FROM obtained_access oa
                                 WHERE oa.target = host(a.ip) AND oa.port = p.port
@@ -2271,7 +2280,10 @@ def get_open_ports(
                    -- proven COMMAND EXECUTION on this port: an exploit-success
                    -- finding (record_exploit_success_finding writes script
                    -- 'exploit:<kind>') OR a held shell/session on the port.
-                   (EXISTS (SELECT 1 FROM vulns vex
+                   -- bool_or: p.id is no longer a group key (one row per
+                   -- ip/proto/port), so this per-row EXISTS must fold over the
+                   -- rows that merged. True if ANY of them proved execution.
+                   bool_or(EXISTS (SELECT 1 FROM vulns vex
                              WHERE vex.port_id = p.id AND vex.script LIKE 'exploit:%%')
                     OR EXISTS (SELECT 1 FROM obtained_access oa2
                                 WHERE oa2.target = host(a.ip) AND oa2.port = p.port
@@ -2301,7 +2313,11 @@ def get_open_ports(
             JOIN assets a ON p.asset_id = a.id
             LEFT JOIN vulns v ON v.port_id = p.id
             {where_sql}
-            GROUP BY a.ip, p.id, p.proto, p.port, p.service, p.product, p.version, p.banner, a.os
+            -- a.ip, not host(a.ip): Postgres cannot prove the expression
+            -- determines the column, so subqueries referencing a.ip would
+            -- raise "subquery uses ungrouped column". Grouping on the inet
+            -- column dedupes identically — equal addresses are equal values.
+            GROUP BY a.ip, p.proto, p.port
             ORDER BY a.ip, p.port
             LIMIT %s OFFSET %s
         """
