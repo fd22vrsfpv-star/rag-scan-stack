@@ -3,6 +3,17 @@ import { apiFetch } from './client'
 import type { ScopeResponse, ScopeName } from '@/lib/types'
 import { useUIStore } from '@/stores/ui'
 
+/** How many scope targets to pull for client-side filtering.
+ *
+ *  A scope-filtered view hides any row whose host is not in this list, so
+ *  fetching a PREFIX of the scope silently hides in-scope data. The server
+ *  defaults to 500 and allows up to 5000; take the maximum. Consumers should
+ *  also check `total` — see useScopeFilter, which fails OPEN when the list is
+ *  known to be incomplete, because a view filter is not an authorization gate
+ *  (that is etl/scope_gate.py, and it fails closed).
+ */
+export const SCOPE_FETCH_LIMIT = 5000
+
 export function useScopeNames() {
   const engagementId = useUIStore(s => s.selectedEngagementId)
   return useQuery({
@@ -39,12 +50,22 @@ export function useScope(name: string) {
         try {
           const scoped = await apiFetch<ScopeResponse>(
             `/engagements/${engagementId}/scopes/${encodeURIComponent(name)}`
+            + `?limit=${SCOPE_FETCH_LIMIT}`
           )
           if (scoped?.targets?.length) return scoped
         } catch { /* fall through to the global lookup */ }
       }
       // Global scope endpoint: the same scope, not filtered by engagement.
-      return apiFetch<ScopeResponse>(`/scope?name=${encodeURIComponent(name)}`)
+      //
+      // limit=SCOPE_FETCH_LIMIT, not the server's default of 500. Every
+      // scope-filtered VIEW in the app matches rows against this list, so a
+      // truncated list silently hides collected data: the examplecorp scope has
+      // 909 targets, the first 500 by added_at did NOT include the apex
+      // `examplecorp.com`, and Content Intelligence therefore showed 2 of 100
+      // extractions with "98 hidden by scope filter" while every one of them
+      // was in scope. 5000 is the endpoint's own maximum.
+      return apiFetch<ScopeResponse>(
+        `/scope?name=${encodeURIComponent(name)}&limit=${SCOPE_FETCH_LIMIT}`)
     },
     enabled: !!name,
     staleTime: 30000,

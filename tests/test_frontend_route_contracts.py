@@ -258,3 +258,71 @@ def test_apiurl_is_called_never_interpolated():
         "function's source and resolves to nothing:\n  " + "\n  ".join(bad)
         + "\n\nUse apiUrl(`/path`) instead of `${apiUrl}/path`."
     )
+
+
+def test_scope_is_fetched_whole_not_a_truncated_prefix():
+    """A scope-filtered VIEW hides any row whose host is not in the fetched
+    target list, so fetching a PREFIX of the scope silently hides in-scope
+    data.
+
+    The examplecorp scope has 909 targets. `/scope` defaults to 500, ordered by
+    added_at, and that first 500 did NOT contain the apex `examplecorp.com` — so
+    Content Intelligence reported "2 of 100 extractions (98 hidden by scope
+    filter)" while all 100 were in scope. The operator read it as "no data".
+    """
+    import pathlib
+    import re
+    api = (pathlib.Path(__file__).resolve().parents[1]
+           / "dashboard" / "frontend" / "src" / "api" / "scope.ts")
+    if not api.exists():
+        import pytest
+        pytest.skip(f"{api} not present")
+    src = api.read_text(encoding="utf-8")
+    m = re.search(r"SCOPE_FETCH_LIMIT\s*=\s*(\d+)", src)
+    assert m, "SCOPE_FETCH_LIMIT is gone — useScope would fall back to the server default of 500"
+    assert int(m.group(1)) >= 5000, (
+        f"SCOPE_FETCH_LIMIT is {m.group(1)}; the /scope endpoint allows 5000 and "
+        "anything less silently truncates a large scope")
+    # both legs must carry it — the engagement-scoped lookup and the global one
+    assert len(re.findall(r"limit=\$\{SCOPE_FETCH_LIMIT\}", src)) >= 2, (
+        "only one of the two scope lookups requests the full list; the other "
+        "still returns a truncated prefix")
+
+
+def test_scope_view_filter_fails_open_when_truncated():
+    """A view filter is NOT an authorization gate. If the target list is known
+    to be incomplete, showing an extra row costs a glance; hiding a real one
+    costs evidence the operator already collected. Authorization lives in
+    etl/scope_gate.py and fails CLOSED — these are different jobs."""
+    import pathlib
+    hook = (pathlib.Path(__file__).resolve().parents[1]
+            / "dashboard" / "frontend" / "src" / "hooks" / "useScopeFilter.ts")
+    if not hook.exists():
+        import pytest
+        pytest.skip(f"{hook} not present")
+    src = hook.read_text(encoding="utf-8")
+    assert "truncated" in src, "the hook does not detect a truncated target list"
+    i = src.find("if (truncated)")
+    assert i != -1, "nothing branches on truncation"
+    assert "return true" in src[i:i + 60], (
+        "truncation must fail OPEN (return true) — failing closed hides "
+        "in-scope rows, which is the bug this guards")
+
+
+def test_content_intel_matches_hosts_not_substrings():
+    """`url.includes(domain)` is both too loose and too tight: it matches
+    `evil-examplecorp.com.attacker.net`, and it only fires when the exact domain
+    is present in a list that was truncated."""
+    import pathlib
+    page = (pathlib.Path(__file__).resolve().parents[1]
+            / "dashboard" / "frontend" / "src" / "pages" / "ContentIntel.tsx")
+    if not page.exists():
+        import pytest
+        pytest.skip(f"{page} not present")
+    src = page.read_text(encoding="utf-8")
+    # Regex, not a pinned fragment: the PROPERTY is "no bare substring match on
+    # the url, and a real suffix match exists", in any spelling or spacing.
+    assert not re.search(r"\.url\s*\.includes\s*\(", src), (
+        "ContentIntel still substring-matches the URL against scope domains")
+    assert re.search(r"endsWith\s*\(\s*['\"]\.['\"]\s*\+", src), (
+        "no suffix match — a subdomain of an in-scope apex will be hidden")

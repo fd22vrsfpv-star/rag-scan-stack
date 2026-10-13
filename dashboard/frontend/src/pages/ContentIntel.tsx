@@ -275,8 +275,30 @@ function ExtractionsTab({ assetFilter, scopeDomains, selectedScope }: { assetFil
   const summary = summaryData?.summary
   const rawExtractions = extractionsData?.extractions ?? []
   // Filter by scope domains unless "Show All" is active
+  // Host-aware match, not a bare `url.includes(domain)`.
+  //
+  // `includes` is both too loose and too tight. Too loose: an unrelated host
+  // `evil-examplecorp.com.attacker.net` contains `examplecorp.com`. Too tight: it
+  // only fires when the matching domain is actually PRESENT in the list, and
+  // the list was a truncated prefix of the scope — the examplecorp scope has 909
+  // targets, the first 500 excluded the apex `examplecorp.com`, and this page
+  // reported "2 of 100 extractions (98 hidden by scope filter)" while all 100
+  // were in scope.
+  const inScope = (url: string): boolean => {
+    let host = ''
+    try {
+      host = new URL(url).hostname.toLowerCase()
+    } catch {
+      host = String(url || '').toLowerCase().replace(/^https?:\/\//, '').split('/')[0]
+    }
+    if (!host) return false
+    return (scopeDomains || []).some(d => {
+      const t = d.toLowerCase()
+      return host === t || host.endsWith('.' + t)
+    })
+  }
   const extractions = !showAll && scopeDomains && scopeDomains.length > 0
-    ? rawExtractions.filter(ext => scopeDomains.some(d => ext.url.includes(d)))
+    ? rawExtractions.filter(ext => inScope(ext.url))
     : rawExtractions
   const isFiltered = !showAll && scopeDomains && scopeDomains.length > 0 && rawExtractions.length > extractions.length
 
