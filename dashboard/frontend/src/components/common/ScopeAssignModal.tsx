@@ -1,6 +1,5 @@
 import { useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
-import { apiFetch } from '@/api/client'
+import { useScopeNames } from '@/api/scope'
 import { useAssignToScope, useMoveToScope } from '@/api/findings'
 import { Globe, X, ArrowRight } from 'lucide-react'
 
@@ -18,11 +17,14 @@ export function ScopeAssignModal({ targets, fromScope, onClose, onSuccess, label
   const move = useMoveToScope()
   const isMoving = !!fromScope
 
-  // Fetch existing scopes for quick-pick
-  const { data: scopesData } = useQuery({
-    queryKey: ['scope-names'],
-    queryFn: () => apiFetch<{ names: { name: string; target_count: number }[] }>('/scope/names'),
-  })
+  // Existing scopes for quick-pick — the ENGAGEMENT's, not every scope in the
+  // database. useScopeNames asks /engagements/{eid}/scopes when an engagement
+  // is selected and falls back to the global list otherwise. The raw
+  // /scope/names call this replaced listed every scope that has ever existed,
+  // so the picker offered cvebench-cve-2024-3408-url and friends alongside the
+  // operator's own — moving an asset into a benchmark scope is never what they
+  // meant.
+  const { data: scopesData } = useScopeNames()
   const scopes = (scopesData?.names ?? [])
     .map(s => ({ name: s.name, count: s.target_count }))
     .filter(s => s.name !== fromScope) // Don't show the source scope as a destination

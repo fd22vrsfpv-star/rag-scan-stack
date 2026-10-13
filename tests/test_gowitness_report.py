@@ -21,6 +21,7 @@ without it (CLAUDE.md: a skip says "cannot run here", an error says "broken").
 from __future__ import annotations
 
 import ast
+import re
 import csv
 import io
 import os
@@ -543,3 +544,44 @@ def test_scope_move_does_not_subscript_tuple_rows_by_name():
     assert not bad, (
         "rows from a plain cursor are subscripted by name — this raises "
         f"TypeError at runtime: {bad}")
+
+
+def test_scope_engagement_is_cursor_agnostic():
+    """`_scope_engagement` is called with whatever cursor its caller already
+    had. /scope/move uses a PLAIN conn.cursor(), whose rows are tuples, and
+    `.get()` on one raises
+
+        AttributeError: 'tuple' object has no attribute 'get'
+
+    This only surfaced when the DESTINATION SCOPE ALREADY EXISTED: with a new
+    scope the query matches nothing, `row` is None, and the broken line is
+    never reached. The first fix for /scope/move was verified against a fresh
+    destination and missed it for exactly that reason — so the guard pins the
+    helper, not the one call site.
+    """
+    src = API.read_text(encoding="utf-8")
+    fn = None
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.FunctionDef) and node.name == "_scope_engagement":
+            fn = node
+    assert fn is not None, "_scope_engagement is gone"
+    body = ast.get_source_segment(src, fn) or ""
+    assert re.search(r"isinstance\(\s*row\s*,\s*dict\s*\)", body), (
+        "the helper assumes a dict row — a plain cursor returns tuples and "
+        "this raises AttributeError at runtime")
+    # and it must not go back to the (row or {}).get() form
+    assert not re.search(r"\(\s*row\s+or\s+\{\}\s*\)\s*\.get", body), (
+        "the dict-only access is back")
+
+
+def test_scope_picker_offers_engagement_scopes():
+    """The Move-to-Scope picker listed every scope in the database, so it
+    offered cvebench-cve-2024-3408-url beside the operator's own scopes."""
+    modal = (REPO / "dashboard" / "frontend" / "src" / "components" / "common"
+             / "ScopeAssignModal.tsx")
+    if not modal.exists():
+        pytest.skip(f"{modal} not present")
+    src = modal.read_text(encoding="utf-8")
+    assert "useScopeNames" in src, "the picker does not use the engagement-aware hook"
+    assert "'/scope/names'" not in src, (
+        "the picker still calls the global scope list directly")

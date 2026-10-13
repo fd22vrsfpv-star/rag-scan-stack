@@ -40923,7 +40923,19 @@ def _scope_engagement(cur, scope_name, default=None):
         row = cur.fetchone()
     except Exception:  # noqa: BLE001
         return default
-    return (row or {}).get("eid") or default
+    if not row:
+        return default
+    # Cursor-agnostic. This helper is called with whatever cursor the caller
+    # already had: /scope/move uses a PLAIN conn.cursor(), whose rows are
+    # tuples, and `.get()` on one raises
+    #   AttributeError: 'tuple' object has no attribute 'get'
+    # The `AS eid` alias made it read like a RealDictCursor query. It only
+    # surfaced when the DESTINATION SCOPE ALREADY EXISTED — with a brand-new
+    # scope the query matches nothing, `row` is None, and the broken line is
+    # never reached. A first fix was verified against a fresh scope and missed
+    # it for exactly that reason.
+    eid = row["eid"] if isinstance(row, dict) else row[0]
+    return eid or default
 
 
 def auto_assign_unknown_scope(authorized: bool = Depends(auth)):
