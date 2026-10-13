@@ -26,6 +26,35 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 # Proxy helpers
 # ---------------------------------------------------------------------------
+def _nm_failure(exc: Exception, attempts: int, timeout: int) -> str:
+    """A reason the operator can act on.
+
+    Two problems with reporting `str(e)` directly. `str(httpx.ReadTimeout)` is
+    the EMPTY STRING, so the operator saw literally
+
+        Node manager unreachable after 4 attempts:
+
+    with nothing after the colon. And "unreachable" is wrong for a timeout:
+    node-manager was running and working — it was resolving 338 hostnames on
+    the event loop — so the request was still in flight while the UI declared
+    it dead. A timeout and a refused connection need different words because
+    they need different actions.
+    """
+    name = type(exc).__name__
+    detail = str(exc).strip()
+    if isinstance(exc, (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout,
+                        httpx.WriteTimeout, httpx.TimeoutException)):
+        return (f"Node manager did not respond within {timeout}s "
+                f"({attempts} attempts). It may be busy rather than down — the "
+                f"request may still be running. [{name}]")
+    if isinstance(exc, httpx.ConnectError):
+        return (f"Could not connect to node manager after {attempts} attempts — "
+                f"it is down or unreachable. [{name}]"
+                + (f" {detail}" if detail else ""))
+    return (f"Node manager call failed after {attempts} attempts: "
+            f"{detail or name}")
+
+
 async def _nm_get(path: str, retries: int = 3, backoff: float = 2.0) -> dict:
     """GET from node-manager with retry + exponential backoff."""
     s = get_settings()
@@ -58,8 +87,9 @@ async def _nm_get(path: str, retries: int = 3, backoff: float = 2.0) -> dict:
                 await asyncio.sleep(wait)
             else:
                 log.error("node-manager %s failed after %d attempts: %s", path, retries, e)
-                raise HTTPException(502, f"Node manager unreachable after {retries} attempts: {last_error}")
-    raise HTTPException(502, f"Node manager failed after {retries} attempts: {last_error}")
+                raise HTTPException(502, _nm_failure(e, retries, 30))
+    raise HTTPException(502, f"Node manager failed after {retries} attempts: "
+                            f"{last_error or 'no reason reported'}")
 
 
 async def _nm_post(path: str, payload: dict = None, retries: int = 2, backoff: float = 2.0) -> dict:
@@ -92,8 +122,9 @@ async def _nm_post(path: str, payload: dict = None, retries: int = 2, backoff: f
                 await asyncio.sleep(wait)
             else:
                 log.error("node-manager POST %s failed after %d attempts: %s", path, retries, e)
-                raise HTTPException(502, f"Node manager unreachable after {retries} attempts: {last_error}")
-    raise HTTPException(502, f"Node manager failed after {retries} attempts: {last_error}")
+                raise HTTPException(502, _nm_failure(e, retries, 30))
+    raise HTTPException(502, f"Node manager failed after {retries} attempts: "
+                            f"{last_error or 'no reason reported'}")
 
 
 async def _nm_delete(path: str) -> dict:

@@ -8,6 +8,7 @@ unique port. Commands can be executed on remote hosts via SSH.
 import asyncio
 import logging
 import os
+import shlex
 import re
 import subprocess
 import time
@@ -708,9 +709,23 @@ class SSHManager:
         if os.path.exists(ctrl):
             cmd.extend(["-o", f"ControlPath={ctrl}"])
 
+        # Privilege. Provisioning installs packages, so it needs root — but the
+        # SSH user on a cloud image is almost never root (`ubuntu` on EC2,
+        # `admin` on Debian AMIs). Without this every apt step failed with
+        #   /var/lib/apt/lists/lock - open (13: Permission denied)
+        # and provisioning a non-root node could not work at all. There were no
+        # occurrences of `sudo` anywhere in node_manager.
+        #
+        # `sudo -n`: never prompt. A node without passwordless sudo fails fast
+        # and says so, rather than hanging on a password prompt until the
+        # timeout and reporting something unrelated.
+        remote = command
+        if (user or "").strip() not in ("root", ""):
+            remote = "sudo -n bash -c " + shlex.quote(command)
+
         # SSH runs remote commands through the user's shell, so we pass the
         # entire command as a single string. No need for bash -c wrapper.
-        cmd.extend([dest, command])
+        cmd.extend([dest, remote])
 
         start = time.monotonic()
         try:

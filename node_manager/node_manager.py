@@ -2771,24 +2771,56 @@ async def _remote_scan_bounded(node_id: str, req):
     # Resolve hostnames to IPs for masscan (it only accepts IPs/CIDRs)
     targets = list(req.targets)
     if req.scan_type == "masscan":
-        resolved = []
-        for t in targets:
-            # Skip if already an IP or CIDR
-            if t.replace(".", "").replace("/", "").replace(":", "").isdigit():
-                resolved.append(t)
-                continue
+        # CONCURRENT, off the event loop, and bounded.
+        #
+        # This was a serial `socket.getaddrinfo` per target inside the request
+        # handler. A 338-target scan meant 338 blocking lookups on the event
+        # loop, 283 of which were dead names that each cost a resolver timeout.
+        # node-manager stopped answering /health for minutes, the BFF's probe
+        # gave up, and the operator was told
+        #   "Node manager unreachable after 4 attempts"
+        # for a service that was working — while the real failure (masscan not
+        # installed on the node) was still ahead of it.
+        import asyncio as _aio
+        import socket as _socket
+        import time as _time
+
+        _literals = [t for t in targets
+                     if t.replace(".", "").replace("/", "").replace(":", "").isdigit()]
+        _names = [t for t in targets if t not in _literals]
+
+        def _resolve_one(name: str):
             try:
-                import socket
-                infos = socket.getaddrinfo(t, None, socket.AF_INET)
-                ips = list({info[4][0] for info in infos})
-                if ips:
-                    log.info("Resolved %s → %s for masscan", t, ips)
-                    resolved.extend(ips)
-                else:
-                    log.warning("Could not resolve %s, skipping", t)
-            except Exception as e:
-                log.warning("DNS resolution failed for %s: %s", t, e)
-        targets = resolved
+                infos = _socket.getaddrinfo(name, None, _socket.AF_INET)
+                return name, sorted({i[4][0] for i in infos}), None
+            except Exception as e:  # noqa: BLE001
+                return name, [], str(e)
+
+        _sem = _aio.Semaphore(32)   # kind to the resolver, still ~30x faster
+
+        async def _bounded(name: str):
+            async with _sem:
+                try:
+                    return await _aio.wait_for(
+                        _aio.get_running_loop().run_in_executor(None, _resolve_one, name),
+                        timeout=5)
+                except _aio.TimeoutError:
+                    return name, [], "timeout after 5s"
+
+        _t0 = _time.monotonic()
+        _results = await _aio.gather(*[_bounded(n) for n in _names])
+        resolved = list(_literals)
+        _failed = 0
+        for name, ips, err in _results:
+            if ips:
+                resolved.extend(ips)
+            else:
+                _failed += 1
+                log.debug("DNS resolution failed for %s: %s", name, err)
+        log.info("masscan DNS: %d/%d names resolved, %d failed, %.1fs",
+                 len(_names) - _failed, len(_names), _failed,
+                 _time.monotonic() - _t0)
+        targets = sorted(set(resolved))
         if not targets:
             raise HTTPException(400, "No valid IP targets after DNS resolution")
 
