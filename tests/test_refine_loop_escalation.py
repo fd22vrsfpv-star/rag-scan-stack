@@ -66,13 +66,16 @@ CMD_ITER4 = (
 def _load():
     tree = ast.parse(API.read_text(encoding="utf-8"))
     fns = {"_timing_payload_scale", "_command_axes", "_axes_differ",
-           "_outcome_repeat_streak", "_dead_axis_for_tier"}
+           "_outcome_repeat_streak", "_dead_axis_for_tier",
+           "_output_shows_app_success"}
     body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in fns]
     missing = fns - {n.name for n in body}
     if missing:
         pytest.fail(f"function(s) gone from api.py: {sorted(missing)}")
     body += [n for n in tree.body if isinstance(n, ast.Assign)
-             and any(getattr(t, "id", "").startswith("_DEAD_AXIS") for t in n.targets)]
+             and any(getattr(t, "id", "").startswith(
+                 ("_DEAD_AXIS", "_AXIS_LADDER", "_PRECONDITION_AXIS",
+                  "_APP_SUCCESS")) for t in n.targets)]
     ns: dict = {}
     exec(compile(ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])),
                  "<api-subset>", "exec"), ns)
@@ -350,3 +353,150 @@ def test_known_dead_fails_soft():
     assert "except Exception" in fn and "return out" in fn
     handlers = [n for n in ast.walk(ast.parse(fn)) if isinstance(n, ast.ExceptHandler)]
     assert handlers, "no exception handler — a DB blip would kill the build"
+
+
+# ── round 2: the three defects the first production run exposed ────────────
+# CVE-2024-22120 (2026-10-13) was the first CVE to exercise this against a real
+# target. The gate fired correctly -- a payload-only edit was refused before
+# dispatch, re-asked, and the model complied -- and the build STILL burned every
+# iteration, for three separable reasons now fixed here.
+
+# The app's own success body, repeated 4x while the verdict was latency_too_fast.
+APP_SUCCESS_OUT = ('CSRF_TOKEN= {"message":"Data uploaded successfully"} '
+                   '{"message":"Attack unsuccessful.","status":"fail"}')
+
+
+def test_app_success_under_a_timing_miss_means_precondition(api):
+    """Defect 2. `latency_too_fast` carries no error of its own, so it fell to
+    the default "change the PARAMETER". But the app answered with its own
+    success body — the request was accepted and processed and the exploit still
+    did not fire. That is a missing precondition (the Zabbix sid/CSRF pair),
+    and the run spent four forced axis changes pointed at the wrong thing."""
+    assert api["_output_shows_app_success"](APP_SUCCESS_OUT)
+    axis, directive = api["_dead_axis_for_tier"]("latency_too_fast",
+                                                 output=APP_SUCCESS_OUT)
+    assert axis == "precondition", f"got {axis!r} — this is the CVE-2024-22120 case"
+    assert "token" in directive.lower() or "precondition" in directive.lower()
+
+
+def test_timing_miss_without_app_success_stays_parameter(api):
+    """The precondition reading is earned by the success body, not by the tier.
+    CVE-2024-22120's other outcome was a bare timing number."""
+    axis, _ = api["_dead_axis_for_tier"]("latency_too_fast", output="0.0074")
+    assert axis == "parameter"
+
+
+@pytest.mark.parametrize("out,expect", [
+    ('{"message":"Data uploaded successfully"}', True),
+    ('{"ok":true}', True),
+    ('{"status":"success"}', True),
+    ("Thank you for accepting", True),
+    ("0.0074", False),
+    ("", False),
+    (None, False),
+    ("<html><body>404 Not Found</body></html>", False),
+    ('{"message":"Attack unsuccessful."}', False),
+])
+def test_app_success_detection(api, out, expect):
+    """Deliberately explicit markers: a bare 200 is not success, because an
+    error page is also a 200."""
+    assert api["_output_shows_app_success"](out) is expect
+
+
+def test_an_explicit_tier_still_beats_the_success_heuristic(api):
+    """A 404 is a 404 even if the body happens to contain a success word."""
+    axis, _ = api["_dead_axis_for_tier"]("404", output=APP_SUCCESS_OUT)
+    assert axis == "endpoint"
+
+
+def test_spent_axes_escalate_down_the_ladder(api):
+    """Defect 1. An axis that was demanded, GRANTED, and left the outcome
+    unchanged is spent. Re-demanding it is what let CVE-2024-22120 cycle
+    "parameter" through iterations 4,5,6,7 while outcome_repeat climbed
+    2,3,4,5."""
+    d = api["_dead_axis_for_tier"]
+    assert d("latency_too_fast", output="0.0074", exclude=set())[0] == "parameter"
+    assert d("latency_too_fast", output="0.0074", exclude={"parameter"})[0] == "endpoint"
+    assert d("latency_too_fast", output="0.0074",
+             exclude={"parameter", "endpoint"})[0] == "precondition"
+
+
+def test_the_ladder_terminates_rather_than_cycling(api):
+    """When every axis has been granted and changed nothing, the approach is
+    refuted — not under-refined. None is the caller's signal to stop."""
+    d = api["_dead_axis_for_tier"]
+    seen = set()
+    for _ in range(12):
+        pick = d("latency_too_fast", output="0.0074", exclude=seen)
+        if pick is None:
+            break
+        assert pick[0] not in seen, f"ladder re-offered a spent axis: {pick[0]}"
+        seen.add(pick[0])
+    else:
+        pytest.fail(f"ladder never exhausted; offered {sorted(seen)}")
+    assert len(seen) >= 4, f"ladder gave up too early: {sorted(seen)}"
+
+
+def test_loop_records_a_granted_axis_as_spent():
+    """The ladder is useless unless the loop actually feeds it. On a granted
+    axis change the loop must add it to _axes_spent BEFORE clearing
+    _axis_required, and must pass that set back into _dead_axis_for_tier."""
+    loop = _loop_src()
+    tree = ast.parse(loop)
+    adds = [n for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "add"
+            and getattr(n.func.value, "id", "") == "_axes_spent"]
+    assert adds, "_axes_spent is never added to — a spent axis is re-demanded forever"
+    assert call_kwarg(loop, "_dead_axis_for_tier", "exclude"), (
+        "the escalation does not exclude spent axes, so the ladder cannot escalate")
+    assert call_kwarg(loop, "_dead_axis_for_tier", "output"), (
+        "the escalation does not pass the output, so a precondition failure "
+        "cannot be told from a wrong parameter")
+
+
+def test_loop_stops_when_the_ladder_is_exhausted():
+    """_dead_axis_for_tier returning None must end the build, not be ignored."""
+    loop = _loop_src()
+    assert "refine_axis_exhausted" in loop
+    tree = ast.parse(loop)
+    # find `if _pick is None:` and assert it breaks
+    none_checks = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.If) and isinstance(n.test, ast.Compare)
+        and getattr(n.test.left, "id", "") == "_pick"
+        and any(isinstance(c, ast.Constant) and c.value is None for c in n.test.comparators)
+    ]
+    assert none_checks, "nothing checks for an exhausted ladder"
+    assert any(isinstance(x, ast.Break) for n in none_checks for x in ast.walk(n)), (
+        "an exhausted ladder does not stop the build")
+
+
+def test_escalation_counters_survive_a_go_around():
+    """Defect 3. The second pass starts from a fresh built['metrics'], so
+    without carrying these forward the stored result reports only the LAST
+    pass. On CVE-2024-22120 that hid the refused-and-re-asked command entirely:
+    it happened in pass 1 and refine_axis_rejected was absent from the result."""
+    graph = (pathlib.Path(__file__).resolve().parents[1]
+             / "app" / "rag-api" / "build_poc_graph.py")
+    if not graph.exists():
+        pytest.skip(f"{graph} not present")
+    src = graph.read_text(encoding="utf-8")
+    node = None
+    for n in ast.parse(src).body:
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("node_run_refine"):
+            node = ast.get_source_segment(src, n) or ""
+    if node is None:
+        for n in ast.walk(ast.parse(src)):
+            if (isinstance(n, ast.FunctionDef)
+                    and any(isinstance(c, ast.Call) and getattr(c.func, "id", "") == "_run_refine_poc"
+                            for c in ast.walk(n))):
+                node = ast.get_source_segment(src, n) or ""
+    assert node, "could not find the node that calls _run_refine_poc"
+    consts = {c.value for c in ast.walk(ast.parse(node))
+              if isinstance(c, ast.Constant) and isinstance(c.value, str)}
+    assert "refine_axis_required" in consts and "refine_axis_rejected" in consts, (
+        "the go-around does not carry the escalation counters forward")
+    assert "refine_passes" in consts, (
+        "nothing records how many passes a build ran, so a reader cannot tell "
+        "a one-pass result from a two-pass one")

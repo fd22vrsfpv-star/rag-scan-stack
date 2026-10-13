@@ -469,6 +469,37 @@ def _build_litellm_kwargs(backend: str,
                 effort = None
         if effort:
             kwargs["reasoning_effort"] = str(effort).lower()
+        # A reasoning model with reasoning ACTIVE accepts only temperature=1
+        # and the default top_p. LiteLLM enforces this client-side and raises
+        # UnsupportedParamsError BEFORE any HTTP call, which fails the whole
+        # LiteLLM attempt and drops the call to the hand-rolled path:
+        #
+        #   litellm.UnsupportedParamsError: gpt-5-mini doesn't support
+        #   temperature=0.1 while reasoning is active. Only temperature=1 is
+        #   supported unless reasoning_effort resolves to 'none'
+        #
+        # The hand-rolled path then rediscovers the same thing REACTIVELY, one
+        # 400 at a time (max_tokens, then temperature), so a single gpt-5-mini
+        # call cost a failed LiteLLM attempt plus two wasted round-trips before
+        # it landed. Drop the overrides here instead, matching what the
+        # hand-rolled retry ends up sending.
+        #
+        # NOT `litellm.drop_params = True`: that is global and silently discards
+        # every unsupported param for every provider, turning a genuine bad
+        # request into a quietly different one. This drops exactly the two
+        # params that are known-unsupported, only on reasoning models, only when
+        # reasoning is actually on, and says so in the log.
+        _reasoning_on = bool(effort) and str(effort).lower() != "none"
+        if _reasoning_on:
+            _dropped = [k for k in ("temperature", "top_p")
+                        if k in kwargs and kwargs[k] not in (1, 1.0)]
+            for k in _dropped:
+                kwargs.pop(k, None)
+            if _dropped:
+                logging.info(
+                    "litellm_router: %s reasoning_effort=%s — dropping %s "
+                    "(only the default is accepted while reasoning is active)",
+                    model, str(effort).lower(), ", ".join(_dropped))
     b = (backend or "").lower()
     if b == "azure":
         # Mirrors entry_for_provider()'s three-case Azure handling:

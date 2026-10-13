@@ -20705,9 +20705,78 @@ _DEAD_AXIS_DEFAULT = (
     "server has already told you it does not reach the vulnerable code.")
 
 
-def _dead_axis_for_tier(tier):
-    """(axis, directive) naming WHICH axis the repeated outcome rules out."""
-    return _DEAD_AXIS_BY_TIER.get(str(tier or ""), _DEAD_AXIS_DEFAULT)
+_PRECONDITION_AXIS = (
+    "precondition",
+    "The application ACCEPTED and processed the request — it answered with its "
+    "own success body — and the exploit still did not fire. That is a missing "
+    "PRECONDITION, not a wrong payload or parameter: an anti-CSRF token the "
+    "server checks, a session/sid bound to the action, a required prior step, "
+    "or an object id you have not enumerated. Establish the precondition "
+    "first (fetch and submit the real token, complete the prior request, "
+    "enumerate the id) and only then re-send the payload.")
+
+# Order to escalate through once an axis has been granted and CHANGED NOTHING.
+# Cheapest and most-likely first; `command_shape` last because a command the
+# shell accepted is rarely the blocker.
+_AXIS_LADDER = ("parameter", "endpoint", "precondition", "auth",
+                "carrier", "command_shape")
+
+# Markers that the app answered with its OWN success, i.e. the request was
+# accepted and processed. Deliberately explicit: a generic "200" is not enough,
+# because an error page is also a 200.
+_APP_SUCCESS_MARKERS = (
+    "uploaded successfully", "\"success\":true", "'success':true",
+    "\"status\":\"success\"", "\"ok\":true", "thank you for",
+    "successfully updated", "successfully created", "successfully saved",
+    "data uploaded",
+)
+
+
+def _output_shows_app_success(output):
+    """True when the target answered with its own success body.
+
+    A timing/canary verdict ON TOP of an application success is the signature
+    of a missing precondition: the payload was accepted and did not execute.
+    Observed on CVE-2024-22120, where four consecutive runs returned
+    `{"message":"Data uploaded successfully"}` while the verdict was
+    `latency_too_fast` and the real blocker was the Zabbix sid/CSRF pair."""
+    low = str(output or "").lower()
+    if not low:
+        return False
+    return any(m in low for m in _APP_SUCCESS_MARKERS)
+
+
+def _dead_axis_for_tier(tier, output=None, exclude=()):
+    """(axis, directive) naming WHICH axis the repeated outcome rules out.
+
+    `output` lets a tier that carries no error of its own be read more
+    precisely: a latency/canary miss on top of an application SUCCESS is a
+    precondition problem, not a parameter problem. `exclude` holds axes already
+    demanded that produced no change in outcome — the next one down the ladder
+    is picked instead. Returns None when every axis has been tried, which is
+    the caller's signal to stop rather than cycle.
+    """
+    exclude = {str(x) for x in (exclude or ())}
+    tier_s = str(tier or "")
+    if tier_s in _DEAD_AXIS_BY_TIER:
+        first = _DEAD_AXIS_BY_TIER[tier_s]
+    elif _output_shows_app_success(output):
+        first = _PRECONDITION_AXIS
+    else:
+        first = _DEAD_AXIS_DEFAULT
+    if first[0] not in exclude:
+        return first
+    for axis in _AXIS_LADDER:
+        if axis in exclude:
+            continue
+        if axis == _PRECONDITION_AXIS[0]:
+            return _PRECONDITION_AXIS
+        for _t, pair in _DEAD_AXIS_BY_TIER.items():
+            if pair[0] == axis:
+                return pair
+        if axis == _DEAD_AXIS_DEFAULT[0]:
+            return _DEAD_AXIS_DEFAULT
+    return None
 
 
 def _outcome_repeat_streak(err_rows):
@@ -26339,6 +26408,11 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
     _axis_required = None
     _axis_reject_streak = 0
     _axes_tried = []
+    # Axis NAMES that were demanded, granted by the model, and still left the
+    # outcome unchanged. Each is spent: demanding it again cycles (see
+    # CVE-2024-22120, 2026-10-13, where "parameter" was re-demanded at
+    # iterations 4,5,6,7 while outcome_repeat climbed 2,3,4,5).
+    _axes_spent = set()
     _similar_seen_sigs = set()
     # Per-build injection budget for refine-pattern skills (2026-10-09): the
     # same guidance re-injected 27× in one build (method_not_allowed_405) and
@@ -26700,7 +26774,25 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                 _dead = ({"dead": False, "runs": 0, "resolved": 0} if _rep
                          else _signature_known_dead(_sig_now, exclude_run_id=run_id))
                 if _rep >= _REFINE_OUTCOME_REPEAT_AT or _dead["dead"]:
-                    _axis, _directive = _dead_axis_for_tier(_tier_now)
+                    # An axis already DEMANDED AND GRANTED that left the outcome
+                    # unchanged is spent — demanding it again is what let
+                    # CVE-2024-22120 cycle "parameter" through iterations 4-7
+                    # while outcome_repeat climbed 2,3,4,5. Escalate down the
+                    # ladder instead, and stop when it runs out.
+                    _pick = _dead_axis_for_tier(_tier_now, output=output,
+                                                exclude=_axes_spent)
+                    if _pick is None:
+                        _stop_reason = "axis_exhausted"
+                        metrics["refine_axis_all_spent"] = 1
+                        _poc_trace(run_id, "refine_axis_exhausted", iteration=it,
+                                   extra={"tried": list(_axes_spent),
+                                          "tier": _tier_now,
+                                          "reason": "every axis has been demanded, "
+                                                    "granted, and left the outcome "
+                                                    "unchanged — the approach is "
+                                                    "refuted, not under-refined"})
+                        break
+                    _axis, _directive = _pick
                     if _axis_required is None or _axis_required[0] != _axis:
                         _axis_required = (_axis, _directive)
                         _axis_reject_streak = 0
@@ -26710,6 +26802,8 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                     _poc_trace(run_id, "refine_axis_required", iteration=it,
                                extra={"axis": _axis, "why": _why, "tier": _tier_now,
                                       "outcome_repeat": _rep,
+                                      "axes_spent": list(_axes_spent),
+                                      "app_success": _output_shows_app_success(output),
                                       "prior_runs_with_signature": _dead["runs"],
                                       "prior_runs_resolved": _dead["resolved"],
                                       "signature": _sig_now[:200]})
@@ -27361,8 +27455,11 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                         obj = _obj3
                 if _new_cmd is None:
                     break           # exhausted — leave the refine loop entirely
-                # Axis changed: clear the requirement so the next repeat can set
-                # a fresh one, and let this command through to dispatch.
+                # Axis changed. Mark it SPENT before clearing: if the outcome
+                # repeats again after this, the problem is not that the model
+                # ignored us, it is that this axis was not the blocker, and the
+                # next escalation must ask for a different one.
+                _axes_spent.add(_axis_required[0])
                 _axis_reject_streak = 0
                 _axis_required = None
             except Exception as _age:  # noqa: BLE001
