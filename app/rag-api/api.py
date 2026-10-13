@@ -41646,6 +41646,21 @@ def reclassify_engagement_scope(engagement_id: str, body: ReclassifyBody | None 
                                      "open_ports": int(r["open_ports"] or 0),
                                      "port_scanned": int(r["port_rows"] or 0) > 0}
                      for r in cur.fetchall()}
+            # A port row is only one kind of proof, and it is the kind a clean
+            # scan never produces: masscan reports OPEN ports only, so a host
+            # that answered nothing leaves no asset and no port row. Of 268 IPs
+            # scanned here, 224 were invisible afterwards and looked exactly
+            # like hosts nobody had ever pointed a scanner at. `scope_coverage`
+            # is the record of the SCAN, so an empty result is a fact.
+            cur.execute(
+                """SELECT target FROM scope_coverage
+                    WHERE engagement_id = %s::uuid AND status = 'completed'
+                      AND stage_name = 'discovery' AND target = ANY(%s)""",
+                (engagement_id, hosts))
+            for r in cur.fetchall():
+                st = state.setdefault(r["target"], {
+                    "has_asset": False, "unresolved": False, "open_ports": 0})
+                st["port_scanned"] = True
         else:
             state = {}
         scope_of = {t: n for t, n in rows}

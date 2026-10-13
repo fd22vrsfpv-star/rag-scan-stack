@@ -482,6 +482,23 @@ def classify_and_assign_engagement(cur, engagement_id: str,
                          "open_ports": int(opn or 0),
                          "port_scanned": int(prows or 0) > 0}
 
+        # Port rows prove a scan only when the scan FOUND something. masscan
+        # reports open ports only, so a host that answered nothing produces no
+        # asset and no port row and is indistinguishable from one nobody ever
+        # scanned. scope_coverage records the scan itself, which is what makes
+        # an empty result usable evidence.
+        cur.execute(
+            """SELECT target FROM scope_coverage
+                WHERE engagement_id = %s::uuid AND status = 'completed'
+                  AND stage_name = 'discovery' AND target = ANY(%s)""",
+            (engagement_id, hosts),
+        )
+        for r in cur.fetchall():
+            tgt = r["target"] if isinstance(r, dict) else r[0]
+            st = state.setdefault(tgt, {"has_asset": False, "unresolved": False,
+                                        "open_ports": 0})
+            st["port_scanned"] = True
+
     in_scope = unknown = 0
     per_scope: dict = {}
     for h in hosts:

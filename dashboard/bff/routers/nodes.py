@@ -437,11 +437,23 @@ async def scan_through_node(node_id: str, req: NodeScanRequest):
             if hasattr(req, 'protocols') and req.protocols:
                 extra.extend(["-s", req.protocols])
             remote_payload["extra_args"] = extra
+        # Engagement attribution for the remote-exec branch. node-manager
+        # records which targets were port-scanned (scope_coverage), and that
+        # record is per-engagement — without it masscan's silent hosts stay
+        # indistinguishable from never-scanned ones. The header carries it for
+        # every node-manager endpoint; the body field is the explicit form for
+        # an automated caller with no request context.
+        from engagement import engagement_headers
+        _eng_hdrs = engagement_headers()
+        _eid = req.engagement_id or _eng_hdrs.get("X-Engagement-Id")
+        if _eid:
+            remote_payload["engagement_id"] = _eid
         s = get_settings()
         async with httpx.AsyncClient(timeout=660) as c:
             resp = await c.post(
                 f"{s.tunnel_manager_url}/ssh/{node_id}/remote-scan",
                 json=remote_payload,
+                headers=_eng_hdrs,
             )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)

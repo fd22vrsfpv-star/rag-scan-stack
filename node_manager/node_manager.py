@@ -1278,6 +1278,95 @@ app = FastAPI(title="Node Manager", version="1.0.0", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
+# Engagement attribution
+# ---------------------------------------------------------------------------
+# node_manager had NO engagement awareness at all: every audit row it wrote
+# carried "engagement_id": null and nothing it collected could be attributed.
+# The frontend's apiFetch already sends X-Engagement-Id on every call and the
+# BFF forwards it, so the header is there — nobody read it. This is the exact
+# middleware audit_writer's own docstring asks each runner to install.
+try:
+    from audit_writer import current_engagement_id as _current_engagement_id
+except ImportError:  # audit_writer not mounted — keep a local contextvar
+    import contextvars as _ctxvars
+    _current_engagement_id = _ctxvars.ContextVar("current_engagement_id", default=None)
+
+
+@app.middleware("http")
+async def _capture_engagement(request, call_next):
+    eid = request.headers.get("x-engagement-id")
+    token = _current_engagement_id.set(eid or None)
+    try:
+        return await call_next(request)
+    finally:
+        _current_engagement_id.reset(token)
+
+
+# Scan types that establish "this target was port-scanned". A clean result from
+# one of these is EVIDENCE OF ABSENCE — the host answered nothing — which is
+# what lets scope reclassification file it as no_services. Without a coverage
+# record, "scanned and nothing listening" is indistinguishable from "nobody ever
+# looked", and the classifier (correctly) refuses to move either.
+PORT_SCAN_TYPES = {"masscan", "nmap", "naabu", "rustscan"}
+
+
+def _record_scan_coverage(engagement_id, targets, scan_type, job_id, status):
+    """Record that these targets were port-scanned, so an empty result is a fact.
+
+    masscan only reports OPEN ports, so the 224 of 268 IPs that answered nothing
+    left no trace anywhere in the database — no asset row, no port row. Every
+    one of them looked exactly like a host that had never been scanned.
+    """
+    if scan_type not in PORT_SCAN_TYPES or not targets:
+        return 0
+    if not engagement_id:
+        log.warning("scan coverage for %s not recorded: no engagement "
+                    "(X-Engagement-Id absent and none in the request body)",
+                    scan_type)
+        return 0
+    try:
+        conn = _get_conn()
+        conn.autocommit = True
+        cur = conn.cursor()
+        rows = 0
+        for tgt in targets:
+            tgt = (tgt or "").strip()
+            if not tgt:
+                continue
+            # Upsert: scope_coverage is unique on
+            # (engagement_id, target, stage, scan_type) — the conflict target
+            # repeats those four columns exactly, or every insert after the
+            # first scan of a host raises
+            #   duplicate key value violates unique constraint
+            #     "scope_coverage_engagement_id_target_stage_scan_type_key"
+            # A re-scan must refresh the record, not be refused by it.
+            cur.execute(
+                """INSERT INTO scope_coverage
+                       (engagement_id, target, stage, stage_name, scan_type,
+                        job_id, status, started_at, completed_at)
+                   VALUES (%s::uuid, %s, 2, 'discovery', %s, %s, %s, now(),
+                           CASE WHEN %s = 'running' THEN NULL ELSE now() END)
+                   ON CONFLICT (engagement_id, target, stage, scan_type)
+                   DO UPDATE SET job_id = EXCLUDED.job_id,
+                                 status = EXCLUDED.status,
+                                 started_at = EXCLUDED.started_at,
+                                 completed_at = EXCLUDED.completed_at,
+                                 stage_name = EXCLUDED.stage_name""",
+                (engagement_id, tgt, scan_type, job_id, status, status),
+            )
+            rows += 1
+        cur.close()
+        conn.close()
+        log.info("scan coverage: %d %s targets recorded as %s (job %s)",
+                 rows, scan_type, status, job_id[:8])
+        return rows
+    except Exception as e:  # noqa: BLE001
+        log.warning("scan coverage write failed (%s, %d targets): %s",
+                    scan_type, len(targets), e)
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 def _get_conn():
@@ -1440,6 +1529,9 @@ class RemoteScanRequest(BaseModel):
     rate: Optional[int] = None
     extra_args: Optional[list[str]] = None  # additional CLI flags
     timeout: int = 600
+    # Falls back to the X-Engagement-Id header when omitted (see
+    # _capture_engagement). Collected data must be attributable.
+    engagement_id: Optional[str] = None
 
 
 class ChiselConfigRequest(BaseModel):
@@ -2868,6 +2960,10 @@ async def _remote_scan_bounded(node_id: str, req):
     job_id = str(uuid.uuid4())
     t0 = time.time()
 
+    # Request body wins over the header so a scheduled/automated caller can be
+    # explicit; the header covers every call the dashboard makes.
+    _eid = req.engagement_id or _current_engagement_id.get()
+
     write_audit("scan_started", req.scan_type, "node_manager", {
         "job_id": job_id, "execution_mode": "remote", "node_id": node_id,
         "targets": req.targets[:20], "targets_count": len(req.targets),
@@ -2984,6 +3080,10 @@ async def _remote_scan_bounded(node_id: str, req):
             "job_id": job_id, "execution_mode": "remote", "node_id": node_id,
             "error": error_detail[:500], "duration_s": duration_s,
         })
+        # Record the attempt as FAILED, never as coverage. A failed scan is not
+        # evidence the host has nothing listening — that conflation is how
+        # "unreachable" gets filed as "absent".
+        _record_scan_coverage(_eid, req.targets, req.scan_type, job_id, "failed")
         raise HTTPException(500, {
             "error": error_detail[:500],
             "stdout": result.get("stdout", "")[-500:],
@@ -3079,9 +3179,15 @@ async def _remote_scan_bounded(node_id: str, req):
         "duration_s": duration_s,
     })
 
+    # The scan completed, so every target it was pointed at WAS looked at —
+    # including the ones that reported nothing, which is the whole point.
+    covered = _record_scan_coverage(_eid, req.targets, req.scan_type,
+                                    job_id, "completed")
+
     return {
         "ok": True,
         "job_id": job_id,
+        "coverage_recorded": covered,
         "scan_type": req.scan_type,
         "node_id": node_id,
         "execution_mode": "remote",
