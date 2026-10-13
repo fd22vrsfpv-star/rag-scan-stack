@@ -3066,13 +3066,16 @@ export default function AssetBrowser() {
       {showScopeModal === 'assets' && (
         <ScopeAssignModal
           fromScope={scopeFilter || undefined}
-          targets={Object.keys(assetSelection).filter(k => assetSelection[k]).map(key => {
-            // key is the asset id (see getRowId); fall back to ip for rows
-            // that somehow have none, so an unidentified asset is still
-            // assignable rather than silently dropped.
+          targets={Object.keys(assetSelection).filter(k => assetSelection[k]).flatMap(key => {
+            // key is the asset id (see getRowId), with ip as a fallback for
+            // rows that have none. The modal sends `target` as a scope STRING,
+            // so an unresolved key must be dropped rather than passed through:
+            // since getRowId became the id, falling back to the key itself
+            // would write a UUID into scope_targets as if it were a hostname.
             const asset = assets.find(a => a.id === key) ?? assets.find(a => a.ip === key)
-            return { target: asset?.hostname || asset?.ip || key,
-                     target_type: asset?.hostname ? 'domain' : 'ip' }
+            const target = asset?.hostname || asset?.ip
+            if (!target) return []
+            return [{ target, target_type: asset?.hostname ? 'domain' : 'ip' }]
           })}
           onClose={() => setShowScopeModal(null)}
           onSuccess={() => setAssetSelection({})}

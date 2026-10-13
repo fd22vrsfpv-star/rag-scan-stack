@@ -41196,7 +41196,12 @@ def move_scope_targets(body: dict, authorized: bool = Depends(auth)):
         # attribution, and re-deriving it afterwards is guesswork.
         cur.execute("""SELECT target, engagement_id::text AS eid FROM scope_targets
                         WHERE name = %s AND target = ANY(%s)""", [from_scope, move_list])
-        moved_eid = {r["target"]: r["eid"] for r in cur.fetchall()}
+        # Index access: this is a PLAIN cursor (conn.cursor() above), so rows
+        # are tuples. Subscripting by name raised
+        #   TypeError: tuple indices must be integers or slices, not str
+        # on every call, so /scope/move had been 500-ing outright — the alias
+        # `AS eid` made it look like a RealDictCursor query.
+        moved_eid = {r[0]: r[1] for r in cur.fetchall()}
         dest_eid = _scope_engagement(cur, to_scope)
         cur.execute("DELETE FROM scope_targets WHERE name = %s AND target = ANY(%s)", [from_scope, move_list])
         removed = cur.rowcount

@@ -477,3 +477,69 @@ def test_delete_confirm_names_what_it_will_remove():
     import re as _re2
     assert _re2.search(r"deleteAssets\.mutate\(\s*ids\b", block), (
         "the delete still sends ips")
+
+
+def test_scope_move_does_not_subscript_tuple_rows_by_name():
+    """/scope/move 500'd on every call:
+
+        TypeError: tuple indices must be integers or slices, not str
+
+    The function opens a PLAIN `conn.cursor()`, so rows are tuples, but the
+    engagement-capture step read them as `r["target"]` / `r["eid"]`. The SQL
+    alias `AS eid` made it read like a RealDictCursor query, and nothing
+    executed the endpoint, so moving assets between scopes was broken outright.
+
+    Scoped to this function on purpose. A repo-wide version of this check needs
+    flow analysis to be correct — the same name `r` is used for RealDictCursor
+    rows and tuple rows in different blocks of one function, and a guard that
+    flags working code teaches people to add exemptions.
+    """
+    src = API.read_text(encoding="utf-8")
+    # Select by ROUTE, not by function name. Two different endpoints share the
+    # name `move_scope_targets` -- POST /scope/move and
+    # POST /engagements/{eid}/scopes/{scope_name}/move -- so a name lookup
+    # returns whichever is defined last and silently checks the wrong one.
+    # (That is exactly what the first version of this test did, and it passed
+    # its own sabotage as a result.)
+    fn = None
+    for node in ast.parse(src).body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for d in node.decorator_list:
+            if (isinstance(d, ast.Call) and d.args
+                    and isinstance(d.args[0], ast.Constant)
+                    and d.args[0].value == "/scope/move"):
+                fn = node
+    assert fn is not None, "POST /scope/move handler is gone"
+
+    plain = set()
+    for w in ast.walk(fn):
+        if isinstance(w, (ast.With, ast.AsyncWith)):
+            for item in w.items:
+                c = item.context_expr
+                if (isinstance(c, ast.Call) and getattr(c.func, "attr", "") == "cursor"
+                        and not c.keywords and isinstance(item.optional_vars, ast.Name)):
+                    plain.add(item.optional_vars.id)
+    assert plain, "expected a plain cursor in move_scope_targets"
+
+    rowvars = set()
+    for n in ast.walk(fn):
+        it = tgt = None
+        if isinstance(n, ast.For):
+            it, tgt = n.iter, n.target
+        elif isinstance(n, ast.comprehension):
+            it, tgt = n.iter, n.target
+        if it is None:
+            continue
+        f = it.func if isinstance(it, ast.Call) else None
+        if (f is not None and getattr(f, "attr", "") in ("fetchall", "fetchmany")
+                and getattr(f.value, "id", "") in plain and isinstance(tgt, ast.Name)):
+            rowvars.add(tgt.id)
+
+    bad = [(n.lineno, n.value.id, n.slice.value) for n in ast.walk(fn)
+           if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name)
+           and n.value.id in rowvars
+           and isinstance(n.slice, ast.Constant) and isinstance(n.slice.value, str)]
+    assert not bad, (
+        "rows from a plain cursor are subscripted by name — this raises "
+        f"TypeError at runtime: {bad}")
