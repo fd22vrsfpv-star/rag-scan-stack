@@ -717,8 +717,20 @@ def _alias_map():
     Same brief TTL as _scope_rows, for the same reason: the gate must reflect a
     scope change quickly, but not re-fetch per target.
     """
+    # Shared cache (common/query_cache.py) so an operator can force a re-read
+    # without waiting out the TTL: POST /cache/refresh?name=nmap_alias_map on
+    # rag-api, or the same endpoint here. The hand-rolled dict below is kept as
+    # the fallback for the case where common/ is not mounted.
+    try:
+        from common.query_cache import get_cache
+        _c = get_cache("nmap_alias_map", ttl=_SCOPE_TTL)
+        if _c.is_fresh():
+            return _c.peek({})
+    except Exception:  # noqa: BLE001
+        _c = None
     now = time.time()
-    if _ALIAS_CACHE["map"] is not None and (now - _ALIAS_CACHE["at"]) < _SCOPE_TTL:
+    if _c is None and _ALIAS_CACHE["map"] is not None \
+            and (now - _ALIAS_CACHE["at"]) < _SCOPE_TTL:
         return _ALIAS_CACHE["map"]
     amap: dict = {}
     try:
@@ -742,6 +754,13 @@ def _alias_map():
         return _ALIAS_CACHE["map"] or {}
     _ALIAS_CACHE["map"] = amap
     _ALIAS_CACHE["at"] = now
+    if _c is not None:
+        # Store through the shared cache so /cache/status reports its age and
+        # /cache/refresh can bust it.
+        try:
+            _c.get(lambda: amap, force=True)
+        except Exception:  # noqa: BLE001
+            pass
     return amap
 
 

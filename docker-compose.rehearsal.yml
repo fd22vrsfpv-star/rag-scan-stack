@@ -266,4 +266,5 @@ services:
       - ./certs:/certs:ro
       - ./knowledge:/knowledge:ro
       - ./etl:/app/bff/etl:ro
+      - ./common:/app/bff/common:ro
 

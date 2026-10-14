@@ -10205,6 +10205,46 @@ def control_note_dispatch(body: NoteDispatchRequest, authorized: bool = Depends(
     return {"ok": True, "counted": n, "over_budget": over, "controls": rows}
 
 
+@app.get("/cache/status", tags=["Control"])
+def cache_status(_: bool = Depends(auth)):
+    """What this service is holding in memory, and how old each entry is.
+
+    Every expensive query that is cached reports its age here, so an operator
+    can tell whether a page is showing a fresh read or a 29-second-old one
+    before deciding whether a number is wrong or merely stale.
+    """
+    try:
+        from common.query_cache import all_stats
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(503, f"query cache unavailable: {e}")
+    stats = all_stats()
+    return {"ok": True, "caches": stats,
+            "stale_serving": [c["name"] for c in stats if c.get("stale_serves")]}
+
+
+@app.post("/cache/refresh", tags=["Control"])
+def cache_refresh(name: Optional[str] = Query(
+        None, description="One cache by name; omit to refresh all of them."),
+        _: bool = Depends(auth)):
+    """Refresh on demand — the thing the hand-rolled TTL caches could not do.
+
+    Marks the named cache (or all of them) stale, so the NEXT read re-queries.
+    Nothing is dropped in the meantime: if that re-read then fails, the previous
+    value keeps being served rather than the page going empty.
+
+    Reports the names it actually marked, so asking for a cache that does not
+    exist returns an empty list instead of a cheerful lie.
+    """
+    try:
+        from common.query_cache import invalidate
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(503, f"query cache unavailable: {e}")
+    done = invalidate(name)
+    if name and not done:
+        raise HTTPException(404, f"no cache named {name!r}")
+    return {"ok": True, "refreshed": done, "count": len(done)}
+
+
 @app.get("/control/status", tags=["Control"])
 def control_status(engagement_id: Optional[str] = Query(default=None),
                    authorized: bool = Depends(auth)):
