@@ -97,6 +97,38 @@ def test_inclusion_is_a_noop_when_nothing_is_selected():
         "append a filter that matches nothing")
 
 
+BFF = REPO / "dashboard" / "bff" / "routers" / "followups.py"
+BFF_PROXIES = ("follow_up_stats", "follow_ups_grouped")
+
+
+@pytest.mark.parametrize("name", BFF_PROXIES)
+def test_bff_proxy_forwards_the_scope(name):
+    """The layer in the middle.
+
+    rag-api gained `scope_name` and the frontend started sending it, and the
+    BFF proxy between them did not — so the filter was accepted at both ends
+    and silently dropped. The panel kept showing 172.18.0.33, a cvebench
+    target, under the examplecorp scope, and the endpoint answered identically
+    with and without the parameter.
+
+    A proxy that accepts a parameter and does not forward it is the same as not
+    having it, and looks exactly like a working filter.
+    """
+    src = BFF.read_text(encoding="utf-8") if BFF.exists() else pytest.skip("bff router missing")
+    fn = next((n for n in ast.walk(ast.parse(src))
+               if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef)) and n.name == name), None)
+    assert fn, f"{name} not found in the BFF followups router"
+    args = {a.arg for a in fn.args.args} | {a.arg for a in fn.args.kwonlyargs}
+    assert "scope_name" in args, f"{name} does not accept scope_name"
+    # It must reach the outgoing params dict, not just the signature.
+    assigns = [n for n in ast.walk(fn) if isinstance(n, ast.Subscript)]
+    keys = {n.slice.value for n in assigns
+            if isinstance(n.slice, ast.Constant) and isinstance(n.slice.value, str)}
+    assert "scope_name" in keys, (
+        f"{name} accepts scope_name and never puts it in the upstream params — "
+        "the filter is dropped in the middle and both ends look correct")
+
+
 @pytest.mark.parametrize("hook", ["useFollowUpStats", "useFollowUpGrouped"])
 def test_frontend_hook_forwards_the_scope(hook):
     src = _read(API_TS)
@@ -107,6 +139,42 @@ def test_frontend_hook_forwards_the_scope(hook):
     assert "scope_name" in body, (
         f"{hook} does not forward the selected scope, so the server still "
         "answers for the whole engagement")
+
+
+def test_group_samples_are_filtered_client_side_too():
+    """Belt and braces on the row that leaked.
+
+    `host_samples` render straight from the grouped query. When the scope param
+    does not reach the server — an older bundle, a stale query, a caller that
+    forgot it — the group header shows hosts the operator's filter excludes.
+    That is how `172.18.0.33:9090` appeared under a examplecorp scope while the
+    table rows beneath it were correctly filtered.
+
+    Samples can carry a `:port`, so the host must be split out before matching.
+    """
+    page = _read(PAGE)
+    import re
+    m = re.search(r"host_samples.*?summary\s*=", page, re.S)
+    assert m, "the grouped summary no longer reads host_samples"
+    block = m.group(0)
+    assert "matchesAnyScope" in block, (
+        "group host_samples are rendered unfiltered — the header can show "
+        "hosts the table beneath it hides")
+    assert "split(':')" in block, (
+        "samples carry a :port; without stripping it the match fails and every "
+        "sample is hidden instead")
+
+
+def test_target_board_sends_the_scope_server_side():
+    """It had a scope filter and applied it only in the browser."""
+    tb = REPO / "dashboard" / "frontend" / "src" / "pages" / "TargetBoard.tsx"
+    src = _read(tb)
+    import re
+    m = re.search(r"useFollowUps\(\{(.*?)\}\)", src, re.S)
+    assert m, "useFollowUps not called in TargetBoard"
+    assert "scope_name" in m.group(1), (
+        "TargetBoard filters client-side only, so pagination drops in-scope "
+        "rows before the browser can keep them")
 
 
 def test_page_passes_the_selected_scope_to_both():

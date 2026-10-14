@@ -139,6 +139,47 @@ def test_read_side_consults_coverage(rel):
 
 
 @pytest.mark.parametrize("rel", sorted(READERS))
+def test_a_completed_scan_counts_as_having_been_probed(rel):
+    """An asset row only exists when something was FOUND.
+
+    The `probed` condition reads `has_asset`, which stood in for "did anyone
+    look". For a host that was scanned and answered nothing there is no asset
+    row at all, so `has_asset` said no while scope_coverage said yes — and the
+    host was neither filed nor counted.
+
+    Measured on redteam3 (2026-10-14): www.keys3.examplecorp.com,
+    www.education.examplecorp.com and mail.hi.examplecorp.com each had coverage=1
+    and asset_rows=0. None became a candidate, and each blocked its parent,
+    which is how all 49 reclassify candidates stayed put through two fixes.
+    """
+    path = REPO / rel
+    if not path.exists():
+        pytest.skip(f"{rel} not found")
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    # The coverage loop sets port_scanned; it must set has_asset too.
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.For):
+            continue
+        body = ast.dump(node)
+        if "port_scanned" not in body or "setdefault" not in body:
+            continue
+        assert "has_asset" in body, (
+            f"{rel}: the coverage loop marks port_scanned without marking the "
+            "host probed, so a scanned-but-empty host fails the `probed` "
+            "condition and is never classified")
+        # and it must be set TRUE, not defaulted False
+        falses = [n for n in ast.walk(node)
+                  if isinstance(n, ast.Constant) and n.value is False]
+        trues = [n for n in ast.walk(node)
+                 if isinstance(n, ast.Constant) and n.value is True]
+        assert trues, (
+            f"{rel}: has_asset is never set True in the coverage loop — a "
+            "completed scan is the strongest evidence that someone looked")
+        return
+    pytest.fail(f"{rel}: no coverage loop found that sets port_scanned")
+
+
+@pytest.mark.parametrize("rel", sorted(READERS))
 def test_open_ports_follow_the_ip_not_the_hostname(rel):
     """A vhost on a listening IP has attack surface and must not be buried.
 

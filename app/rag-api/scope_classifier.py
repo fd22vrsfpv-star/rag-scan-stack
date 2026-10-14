@@ -525,8 +525,12 @@ def classify_and_assign_engagement(cur, engagement_id: str,
         )
         for r in cur.fetchall():
             tgt = r["target"] if isinstance(r, dict) else r[0]
-            st = state.setdefault(tgt, {"has_asset": False, "unresolved": False,
+            # A completed scan IS the probe — see the same note in
+            # reclassify_engagement_scope. An asset row only exists when
+            # something was found, so it cannot stand in for "did anyone look".
+            st = state.setdefault(tgt, {"has_asset": True, "unresolved": False,
                                         "open_ports": 0})
+            st["has_asset"] = True
             st["port_scanned"] = True
 
     in_scope = unknown = 0

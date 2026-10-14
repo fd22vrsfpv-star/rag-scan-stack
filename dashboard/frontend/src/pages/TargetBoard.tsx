@@ -87,6 +87,9 @@ export default function TargetBoard() {
   const { data: fuData, isLoading: fuLoading } = useFollowUps({
     exclude_status: 'dismissed',
     engagement_id: engagementId ?? undefined,
+    // Server-side too. The board has a scope filter and only applied it
+    // client-side, so paging dropped in-scope rows before they arrived.
+    scope_name: scopeFilter || undefined,
   })
   const { data: recData, isLoading: recLoading } = useScanRecommendations('pending', engagementId)
 

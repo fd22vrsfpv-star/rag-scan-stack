@@ -48,7 +48,8 @@ class FeedbackBody(BaseModel):
 
 @router.get("/api/follow-ups/stats")
 async def follow_up_stats(engagement_id: Optional[str] = Query(None),
-                          exclude_scope: Optional[str] = Query(None)):
+                          exclude_scope: Optional[str] = Query(None),
+                          scope_name: Optional[str] = Query(None)):
     s = get_settings()
     params = {}
     if engagement_id:
@@ -56,6 +57,12 @@ async def follow_up_stats(engagement_id: Optional[str] = Query(None),
     # Same exclusion as the list, or the header contradicts the table below it.
     if exclude_scope:
         params["exclude_scope"] = exclude_scope
+    # The scope the operator SELECTED. rag-api and the frontend both gained this
+    # and this proxy did not, so the filter was accepted at both ends and
+    # dropped in the middle — the panel kept showing 172.18.0.33 (a cvebench
+    # target) under the examplecorp scope.
+    if scope_name:
+        params["scope_name"] = scope_name
     async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(
             f"{s.rag_api_url}/follow-ups/stats",
@@ -173,11 +180,14 @@ async def follow_ups_grouped(
     exclude_status: Optional[str] = Query(None),
     engagement_id: Optional[str] = Query(None),
     exclude_scope: Optional[str] = Query(None),
+    scope_name: Optional[str] = Query(None),
 ):
     s = get_settings()
     params: dict = {"group_by": group_by}
     if exclude_scope:
         params["exclude_scope"] = exclude_scope
+    if scope_name:
+        params["scope_name"] = scope_name
     if status:
         params["status"] = status
     if exclude_status:
@@ -204,6 +214,7 @@ async def list_follow_ups(
     search: Optional[str] = Query(None),
     exclude_status: Optional[str] = Query(None),
     exclude_scope: Optional[str] = Query(None),
+    scope_name: Optional[str] = Query(None),
     limit: int = Query(10000),
     offset: int = Query(0),
 ):
@@ -211,6 +222,8 @@ async def list_follow_ups(
     params = {"limit": limit, "offset": offset}
     if exclude_scope:
         params["exclude_scope"] = exclude_scope
+    if scope_name:
+        params["scope_name"] = scope_name
     if exclude_status:
         params["exclude_status"] = exclude_status
     if status:

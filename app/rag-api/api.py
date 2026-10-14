@@ -1551,7 +1551,7 @@ def get_assets(
                    a.last_seen,
                    a.provider,
                    a.provider_evidence,
-                   COUNT(DISTINCT p.id) AS open_ports_count,
+                   COUNT(DISTINCT (p.proto, p.port)) AS open_ports_count,
                    (SELECT count(*) FROM recon_findings rf WHERE rf.asset_id = a.id)
                        AS recon_findings_count
             FROM assets a
@@ -1564,14 +1564,23 @@ def get_assets(
             -- 23.185.0.4 carried 2 open ports on a hostname-less row, and two
             -- sibling vhosts on the same address each reported 2.
             --
-            -- Ports genuinely ARE per-IP: a vhost on a listening address can be
-            -- reached on those ports with a Host header, which is the same
-            -- reasoning the scope classifier uses. The sentinels are excluded or
-            -- every unresolved asset would inherit every other one's ports, since
-            -- they all share 0.0.0.0.
+            -- Take the host's OWN ports plus the ones on the IP-KEYED row
+            -- (hostname IS NULL) — where a scan that resolved no name landed.
+            -- NOT every sibling hostname: 52 names share 75.2.103.146 and each
+            -- carries its own 2 open ports, so joining all of them reported
+            -- examplecorp.info as 57 open when it has 2. Counting the whole
+            -- neighbourhood is as wrong as counting none of it.
+            --
+            -- DISTINCT on (proto, port), not p.id: the same port can exist as a
+            -- row on both the hostname and the IP-keyed asset, and those are one
+            -- port, not two.
+            --
+            -- Sentinels excluded or every unresolved asset inherits every other
+            -- one's ports, since they all share 0.0.0.0.
             LEFT JOIN assets a2
                    ON a2.ip = a.ip
                   AND host(a.ip) NOT IN ('0.0.0.0', '::')
+                  AND (a2.id = a.id OR a2.hostname IS NULL)
             LEFT JOIN ports p ON p.asset_id = COALESCE(a2.id, a.id)
                              AND COALESCE(p.is_open, true)
             LEFT JOIN LATERAL (
@@ -42140,8 +42149,20 @@ def reclassify_engagement_scope(engagement_id: str, body: ReclassifyBody | None 
                       AND stage_name = 'discovery' AND target = ANY(%s)""",
                 (engagement_id, hosts))
             for r in cur.fetchall():
+                # A COMPLETED SCAN IS THE PROBE, and better evidence of one
+                # than an asset row — which only exists when something was
+                # FOUND. masscan reports open ports only, so a host that
+                # answered nothing is scanned and has no asset at all.
+                #
+                # `probed` (has_asset) was standing in for "did anyone look",
+                # and for these hosts it said no while scope_coverage said yes.
+                # Measured on redteam3: www.keys3, www.education and
+                # mail.hi.examplecorp.com each had coverage=1 and asset_rows=0,
+                # so none of them became a candidate, and each one blocked its
+                # parent — which is how all 49 candidates stayed put.
                 st = state.setdefault(r["target"], {
-                    "has_asset": False, "unresolved": False, "open_ports": 0})
+                    "has_asset": True, "unresolved": False, "open_ports": 0})
+                st["has_asset"] = True
                 st["port_scanned"] = True
         else:
             state = {}
@@ -52781,9 +52802,17 @@ def asset_scan_coverage(ip: str, hostname: Optional[str] = Query(default=None),
         # What those scans left behind, so a completed scan with nothing to show
         # is reported as a measured zero rather than silence.
         cur.execute(
-            """SELECT count(*) FILTER (WHERE p.is_open)       AS open_ports,
-                      count(*)                                 AS port_rows
-                 FROM assets a LEFT JOIN ports p ON p.asset_id = a.id
+            # Same rule as the Assets list: own ports + the IP-keyed row's,
+            # deduped by (proto, port), never the whole neighbourhood.
+            """SELECT count(DISTINCT (p.proto, p.port))
+                        FILTER (WHERE p.is_open)                AS open_ports,
+                      count(p.id)                               AS port_rows
+                 FROM assets a
+                 LEFT JOIN assets a2
+                        ON a2.ip = a.ip
+                       AND host(a.ip) NOT IN ('0.0.0.0', '::')
+                       AND (a2.id = a.id OR a2.hostname IS NULL)
+                 LEFT JOIN ports p ON p.asset_id = COALESCE(a2.id, a.id)
                 WHERE host(a.ip) = ANY(%s) OR lower(a.hostname) = ANY(%s)""",
             (keys, keys))
         pr = cur.fetchone() or {}

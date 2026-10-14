@@ -77,6 +77,28 @@ def test_sentinels_are_excluded():
         "asset inherits every other unresolved asset's ports")
 
 
+def test_does_not_inherit_from_sibling_hostnames():
+    """Counting the whole neighbourhood is as wrong as counting none of it.
+
+    52 hostnames share 75.2.103.146 and each carries its own 2 open ports. A
+    join across every row on the address reported `examplecorp.info` as 57 open
+    when it has 2. Only the host's own row and the IP-KEYED row (hostname IS
+    NULL) — where a scan that resolved no name landed — may contribute.
+    """
+    sql = _assets_port_sql()
+    assert re.search(r"a2\.hostname\s+IS\s+NULL", sql, re.I), (
+        "the IP join admits sibling hostnames, so a host on shared hosting "
+        "reports the sum of its neighbours' ports")
+
+
+def test_counts_distinct_ports_not_rows():
+    """The same port can exist as a row on both assets; that is one port."""
+    sql = _assets_port_sql()
+    assert re.search(r"DISTINCT\s*\(\s*p\.proto\s*,\s*p\.port\s*\)", sql, re.I), (
+        "the count is over port ROWS, so a port present on both the hostname "
+        "asset and the IP-keyed asset is counted twice")
+
+
 def test_still_counts_only_open_ports():
     """Widening the join must not start counting closed ports."""
     sql = _assets_port_sql()

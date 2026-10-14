@@ -880,8 +880,27 @@ export default function FollowUps() {
                 /* Server-side grouped view — accurate counts across all items */
                 groupedData.groups.map((g: FollowUpGroup) => {
                   const isOpen = expandedGroups.has(g.group_key)
+                  // Filter the samples CLIENT-side as well as server-side.
+                  //
+                  // `host_samples` come straight from the grouped query. When
+                  // the scope param does not reach the server — an older
+                  // bundle, a stale query, a caller that forgot it — the row
+                  // renders hosts the operator's filter excludes, which is
+                  // exactly how `172.18.0.33:9090` appeared under a examplecorp
+                  // scope. The table rows below were already filtered this way;
+                  // the group header was not.
+                  //
+                  // host_samples may carry a :port, so strip it before matching.
+                  const rawSamples = g.host_samples || []
+                  const inScopeSamples = isScopeFiltering
+                    ? rawSamples.filter(h => matchesAnyScope(String(h).split(':')[0]))
+                    : rawSamples
+                  const hiddenBySample = rawSamples.length - inScopeSamples.length
                   const summary = groupBy === 'title'
-                    ? (g.host_samples || []).slice(0, 3).join(', ') + (g.unique_hosts && g.unique_hosts > 3 ? ` +${g.unique_hosts - 3}` : '')
+                    ? inScopeSamples.slice(0, 3).join(', ')
+                      + (g.unique_hosts && g.unique_hosts > 3 && !hiddenBySample
+                          ? ` +${g.unique_hosts - 3}` : '')
+                      + (hiddenBySample ? ` (${hiddenBySample} hidden by scope)` : '')
                     : (g.finding_names || []).slice(0, 3).join(', ')
                   return (
                     <Fragment key={g.group_key}>
