@@ -670,9 +670,16 @@ def _enforce_scope(targets, scan_type="scan"):
     # Alias-aware, matching the BFF gate and kali-listener: a host in scope
     # under its other observed identity (scope has the IP, request used the
     # hostname) must not be refused here alone.
-    blocked = [h for h in hosts
-               if not (_in_scope_aliased(h, rows, _scope_aliases(h))
-                       if _in_scope_aliased else _in_scope(h, rows))]
+    # Direct check FIRST: aliases only matter for a host the scope does not
+    # already list, and resolving them for every in-scope host is pure cost on
+    # a large dispatch.
+    blocked = []
+    for h in hosts:
+        if _in_scope(h, rows):
+            continue
+        if _in_scope_aliased and _in_scope_aliased(h, rows, _scope_aliases(h)):
+            continue
+        blocked.append(h)
     if blocked:
         logging.warning("scope gate BLOCKED %s for out-of-scope host(s): %s", scan_type, blocked)
         raise HTTPException(status_code=403, detail=(
@@ -692,6 +699,50 @@ except ImportError:
     _scope_host = None
     _in_scope_aliased = None
     _load_aliases = None
+
+
+_ALIAS_CACHE: dict = {"map": None, "at": 0.0}
+
+
+def _alias_map():
+    """{host-or-ip -> {observed identities}} built from ONE /assets fetch.
+
+    `_scope_aliases` used to fetch `/assets?limit=5000` on every call, and
+    `_enforce_scope` calls it once per target. A 762-host dispatch was therefore
+    762 full asset-list fetches: the request never finished validating, the
+    BFF's 30s client timeout fired, and the operator got a bare HTTP 500 with no
+    job created. Nothing was wrong with the scan — the gate could not be
+    evaluated in the time the caller was willing to wait.
+
+    Same brief TTL as _scope_rows, for the same reason: the gate must reflect a
+    scope change quickly, but not re-fetch per target.
+    """
+    now = time.time()
+    if _ALIAS_CACHE["map"] is not None and (now - _ALIAS_CACHE["at"]) < _SCOPE_TTL:
+        return _ALIAS_CACHE["map"]
+    amap: dict = {}
+    try:
+        r = requests.get(f"{API_BASE}/assets", params={"limit": 5000},
+                         headers={"x-api-key": API_KEY}, timeout=20, verify=False)
+        if r.status_code == 200:
+            for a in (r.json().get("assets") or []):
+                ip = str(a.get("ip") or "").strip().lower()
+                hn = str(a.get("hostname") or "").strip().lower()
+                pair = {x for x in (ip, hn) if x}
+                for key in pair:
+                    amap.setdefault(key, set()).update(pair)
+        else:
+            logging.warning("alias map fetch returned HTTP %s", r.status_code)
+            return _ALIAS_CACHE["map"] or {}
+    except Exception as e:  # noqa: BLE001
+        # Narrow, never widen. A failed lookup must not become "no aliases
+        # exist" for the rest of the TTL, so the previous map is kept and the
+        # cache is NOT stamped.
+        logging.warning("alias map fetch failed: %s", e)
+        return _ALIAS_CACHE["map"] or {}
+    _ALIAS_CACHE["map"] = amap
+    _ALIAS_CACHE["at"] = now
+    return amap
 
 
 def _scope_aliases(host):
@@ -715,19 +766,7 @@ def _scope_aliases(host):
     aliases = {h}
     if h in ("localhost", "127.0.0.1", "::1"):
         return aliases | {"localhost", "127.0.0.1", "::1"}
-    try:
-        r = requests.get(f"{API_BASE}/assets", params={"limit": 5000},
-                         headers={"x-api-key": API_KEY}, timeout=10, verify=False)
-        if r.status_code == 200:
-            for a in (r.json().get("assets") or []):
-                ip = str(a.get("ip") or "").strip().lower()
-                hn = str(a.get("hostname") or "").strip().lower()
-                if h in (ip, hn):
-                    aliases |= {x for x in (ip, hn) if x}
-    except Exception as e:
-        # Narrow, never widen: fall back to the host as given.
-        logging.warning("alias lookup failed for %r: %s", host, e)
-    return aliases
+    return aliases | _alias_map().get(h, set())
 
 
 class MasscanBody(BaseModel):
