@@ -1603,6 +1603,33 @@ def get_assets(
                         logger.warning("[assets] Source lookup for %s failed: %s", tbl, _src_err)
         except Exception:
             pass
+        # The PORT SCANNER by name, from the scan record rather than the guess
+        # above. `ports` has no source column, so the CASE expression labels
+        # every non-web port "nmap" — masscan discoveries included. Measured on
+        # bbgrantmaking.com: the asset detail panel (which reads scope_coverage)
+        # reports masscan AND nmap; this column reported neither. One extra
+        # query for the whole page, keyed by the identities the scan was
+        # dispatched against.
+        try:
+            _ident = {}
+            for row in rows:
+                for v in (str(row.get("ip") or "").strip(),
+                          str(row.get("hostname") or "").strip().lower()):
+                    if v and v not in ("0.0.0.0", "::"):
+                        _ident.setdefault(v, set()).add(str(row["id"]))
+            if _ident:
+                with get_db() as conn3, conn3.cursor() as cur3:
+                    cur3.execute(
+                        """SELECT lower(target), scan_type FROM scope_coverage
+                            WHERE lower(target) = ANY(%s)
+                              AND status = 'completed'
+                              AND scan_type IN ('masscan','nmap','naabu','rustscan')""",
+                        (list(_ident.keys()),))
+                    for tgt, tool in cur3.fetchall():
+                        for aid in _ident.get(tgt, ()):
+                            source_map.setdefault(aid, set()).add(tool)
+        except Exception as _sce:  # noqa: BLE001
+            logger.warning("[assets] port-scanner attribution failed: %s", _sce)
         for row in rows:
             row["discovered_by"] = sorted(source_map.get(str(row["id"]), set()))
 

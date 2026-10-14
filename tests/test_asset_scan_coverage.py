@@ -87,6 +87,33 @@ def test_endpoint_is_engagement_scoped():
         "other engagements under this one")
 
 
+@pytest.mark.parametrize("fn_name", ["asset_scan_coverage", "get_assets"])
+def test_port_scanner_is_named_from_the_record_not_guessed(fn_name):
+    """`ports` has no source column, so the scanner must come from the record.
+
+    /assets infers one with
+        CASE WHEN service IN ('http','https') THEN 'web-probe' ELSE 'nmap' END
+    which labels every masscan-discovered port "nmap". Measured on
+    bbgrantmaking.com (2026-10-14): the detail panel, which reads
+    scope_coverage, reported masscan AND nmap; the list column reported
+    neither. Both surfaces now take the tool from scope_coverage.
+    """
+    tree = ast.parse(_read(API))
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == fn_name), None)
+    # Fail, never skip: a guard that skips when its subject is renamed is
+    # not a guard. This one skipped silently on the wrong name until the
+    # sabotage check showed it passing while the code was broken.
+    assert fn is not None, (
+        f"{fn_name} not found in api.py — the handler was renamed and this "
+        "guard stopped watching anything")
+    sqls = [n.value for n in ast.walk(fn)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+    assert any("scope_coverage" in q and "scan_type" in q for q in sqls), (
+        f"{fn_name} does not read the port scanner from scope_coverage — a "
+        "masscan discovery is reported as nmap, or not at all")
+
+
 def test_bff_declares_the_route():
     src = _read(BFF)
     assert re.search(r'@router\.get\(\s*["\']/api/assets/\{ip\}/scan-coverage["\']', src), (
