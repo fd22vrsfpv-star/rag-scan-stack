@@ -27937,6 +27937,32 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                                     "timing re-run, not the canary -> reflection does not apply")
             if reflection:
                 verified = False
+    # A DRIFTED COMMAND CANNOT VERIFY ITSELF.
+    #
+    # `drifted` means the command attacked a DIFFERENT endpoint than the CVE's.
+    # It was recorded and traced and then ignored, so a local regex match on a
+    # drifted command counted as proof. CVE-2024-31611, 2026-10-14:
+    #
+    #   drift   : command target ('…:80', '/search.php') != CVE endpoint ('/admin_template.php')
+    #   run     : PRERUN_PROBE_FAIL … status=404 … exploit will all_404
+    #   output  : the canary, ten times, then MARKER_FOUND
+    #   result  : success=True verified=True drifted=True  -> STORED as a security_test
+    #
+    # The canary appearing proves the command printed the canary. On the CVE's
+    # own endpoint that is the agreed proof; on a different endpoint it is not
+    # evidence of anything. So a drifted command needs INDEPENDENT confirmation
+    # — the harness oracle below, or a method that is anchored by construction
+    # (timing, which measures the server, not our own output).
+    if verified and drifted and verification_method not in (
+            "benchmark_oracle", "latency_confirmed", "latency_confirmed_anchored"):
+        verified = False
+        _stop_reason = "drifted"
+        _poc_trace(run_id, "drift_blocked_verification", iteration=iters,
+                   response=f"method={verification_method} matched on a command that "
+                            "drifted off the CVE endpoint — a local marker match on a "
+                            "different endpoint is not proof. Needs the harness oracle "
+                            "or a timing proof to count.")
+
     # THE HARNESS'S OWN VERDICT OUTRANKS OURS.
     #
     # On a graded target the benchmark publishes whether an attack succeeded at
