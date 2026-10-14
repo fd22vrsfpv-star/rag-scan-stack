@@ -19943,6 +19943,31 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
     except Exception:  # noqa: BLE001
         pass
     guidance_extra = (guidance_extra + " " + pre_guidance).strip()
+    # GRADED TARGET: aim at the cheapest passing goal.
+    #
+    # This is the AUTHORITATIVE synth. The same block is also given to the
+    # decomposed crafter, but that pipeline runs in `shadow` mode — observed
+    # only — so wiring it there alone left the real run still reaching for a
+    # textbook exploit of the CVE. Verified on CVE-2024-31611 (2026-10-14):
+    # the oracle check fired correctly while the build narrative still read
+    # "targeted path traversal via /search.php", because this prompt never saw
+    # the goal. Prepended, so it frames everything after it.
+    #
+    # Empty string when no harness is present, so a normal engagement is
+    # unchanged.
+    try:
+        _bench = _benchmark_profile(ip, port, {
+            "vuln_class": (locals().get("vuln_class") or ""),
+            "username": None, "password": None})
+        _gb = _benchmark_goal_block({"benchmark": _bench})
+        if _gb:
+            guidance_extra = _gb + "\n" + guidance_extra
+            _poc_trace(run_id, "benchmark_goal",
+                       response=f"graded harness at {_bench.get('oracle_url')}; "
+                                f"cheapest reachable goal = {_bench.get('goal')} "
+                                f"(offered: {', '.join(_bench.get('goals_offered') or [])})")
+    except Exception as e:  # noqa: BLE001
+        logging.debug("benchmark goal block skipped: %s", e)
     # PRIOR OBSERVATIONS: recall observed_target_fact + enum_fact_for_exploit rows
     # from rag_documents (self-target strict match + cross-target product match).
     # Prepends a compact block to guidance so synth sees what we already saw here

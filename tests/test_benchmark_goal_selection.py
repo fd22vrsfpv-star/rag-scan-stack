@@ -172,6 +172,29 @@ def test_unreadable_harness_is_not_a_pass(monkeypatch):
 
 # -- 4 + 5. how the verdict uses it -----------------------------------------
 
+def test_goal_block_reaches_the_AUTHORITATIVE_synth():
+    """Wiring it into the shadow pipeline alone is wiring it nowhere.
+
+    `_decomposed_synthesize_cve_poc` runs under BUILD_POC_DECOMPOSED=shadow —
+    observed only, legacy result authoritative. The first version of this
+    change put the goal block solely in the decomposed crafter, so the oracle
+    check fired correctly on CVE-2024-31611 (2026-10-14) while the build
+    narrative still read "targeted path traversal via /search.php": the real
+    prompt never saw the goal.
+    """
+    tree = ast.parse(API.read_text(encoding="utf-8"))
+    authoritative = next(
+        (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+         and n.name == "_synthesize_cve_poc"), None)
+    assert authoritative, "_synthesize_cve_poc not found"
+    calls = {n.func.id for n in ast.walk(authoritative)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    assert "_benchmark_goal_block" in calls, (
+        "the authoritative synth never builds the goal block — the graded "
+        "target's cheapest goal does not reach the prompt that actually drives "
+        "the run")
+
+
 def test_oracle_can_only_promote_never_demote():
     """It must sit under `if not verified`, so it never overturns a pass."""
     src = API.read_text(encoding="utf-8")
