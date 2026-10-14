@@ -1550,8 +1550,23 @@ def _run_nmap_proxied_async(job_id: str, targets: List[str], ports: str, proxy: 
                 _cf.write("strict_chain\nproxy_dns\nremote_dns_subnet 224\n"
                           "tcp_read_time_out 15000\ntcp_connect_time_out 8000\n"
                           f"[ProxyList]\n{_pscheme} {_pip} {_pport}\n")
+            # --system-dns is REQUIRED here, not a tuning knob.
+            #
+            # nmap's own parallel resolver sends DNS itself; proxychains hooks
+            # the libc resolver via LD_PRELOAD and cannot intercept that, so
+            # every name resolution waits out a timeout before nmap falls back.
+            # Measured on this stack, two hostnames through the same proxy:
+            #     default resolver   13.12s
+            #     --system-dns        0.12s
+            # A 762-host scope therefore spent over an hour resolving before
+            # probing a single port — the job sat at zero output with 0.09s of
+            # CPU consumed, which reads as a hung scanner rather than a slow
+            # one. --system-dns routes resolution through the libc path
+            # proxychains DOES intercept (`proxy_dns` in the generated conf),
+            # so names resolve at the exit node, where a proxied scan wants
+            # them resolved anyway.
             cmd = ["proxychains4", "-q", "-f", pchains_cfg,
-                   "nmap", "-sT", "-Pn",
+                   "nmap", "-sT", "-Pn", "--system-dns",
                    "-p", ports, "-oA", outbase, "--open",
                    "--stats-every", "30s", f"-{timing}"]
         else:
