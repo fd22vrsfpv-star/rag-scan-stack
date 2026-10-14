@@ -35058,7 +35058,15 @@ def list_exploit_versions(exploit_id: str, authorized: bool = Depends(auth)):
     """List saved versions/variants of an exploit (newest first)."""
     _ensure_exploit_store()
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # `metadata` is part of the LIST, not just the detail. The bake-off
+        # deliberately records the per-model verdict and cost on each version —
+        # canary_hit, gen_seconds, prompt/completion/total tokens, llm_latency_ms
+        # (see _bakeoff_one: "so the diff view can show cost + speed per model") —
+        # and this query used to drop every one of them. The compare view
+        # therefore had nothing to show per model except `verified`, which is the
+        # snapshot's flag, not the run's verdict.
         cur.execute("""SELECT id, version, label, name, verified, llm_model, created_by, created_at,
+                              metadata,
                               (python_code IS NOT NULL) AS has_python, (http_request IS NOT NULL) AS has_http
                        FROM exploit_store_versions WHERE exploit_id = %s
                        ORDER BY version DESC""", (exploit_id,))
