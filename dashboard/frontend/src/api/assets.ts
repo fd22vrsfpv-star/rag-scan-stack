@@ -418,6 +418,44 @@ export function useAssetPortAdvice(ip: string) {
   })
 }
 
+/** One scan the platform ran against this asset. */
+export interface AssetScanRecord {
+  target: string
+  scan_type: string
+  stage_name?: string | null
+  status: string
+  job_id?: string | null
+  started_at?: string | null
+  completed_at?: string | null
+}
+
+export interface AssetScanCoverage {
+  ok: boolean
+  identities: string[]
+  scans: AssetScanRecord[]
+  tools: AssetScanRecord[]
+  discovered_by: string[]
+  port_scanned: boolean
+  open_ports: number
+  port_rows: number
+  vulns: number
+  /** The distinction the panel exists for. */
+  verdict: 'never_scanned' | 'scanned_nothing_listening' | 'scanned_ports_open'
+}
+
+/** What has been RUN against an asset — so "scanned, nothing listening" reads
+ *  differently from "nobody has looked". `discovered_by` names only the source
+ *  that first created the row, which is not the same question. */
+export function useAssetScanCoverage(ip: string, hostname?: string | null) {
+  return useQuery({
+    queryKey: ['asset-scan-coverage', ip, hostname],
+    queryFn: () => apiFetch<AssetScanCoverage>(
+      `/assets/${encodeURIComponent(ip)}/scan-coverage` +
+      (hostname ? `?hostname=${encodeURIComponent(hostname)}` : '')),
+    enabled: !!ip,
+  })
+}
+
 export function useAssetAccess(ip: string, includeDead = false) {
   return useQuery({
     queryKey: ['asset-access', ip, includeDead],

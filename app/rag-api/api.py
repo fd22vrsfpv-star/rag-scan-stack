@@ -52377,6 +52377,103 @@ def asset_access(ip: str, include_dead: bool = Query(False),
     }
 
 
+@app.get("/assets/{ip}/scan-coverage", tags=["Assets"])
+def asset_scan_coverage(ip: str, hostname: Optional[str] = Query(default=None),
+                        _: bool = Depends(auth)):
+    """What has actually been RUN against this asset, and what each run found.
+
+    "No open ports" and "nobody looked" render identically everywhere else in
+    the UI, and the operator cannot tell them apart from the asset view. They
+    are completely different facts: one is a finding, the other is a gap in the
+    work. `discovered_by` does not answer it either — it names the source that
+    first created the row, not what has been run since.
+
+    So this returns the scan RECORD (`scope_coverage`, written per dispatched
+    target) joined to what that scan left behind, for the hostname AND every IP
+    the asset is known by. An empty `scans` list is an explicit "nothing has
+    been run", not an empty result that reads as a clean bill of health.
+    """
+    eid = _resolve_engagement_id()
+    keys = [k for k in {(hostname or "").strip().lower(), (ip or "").strip()} if k]
+    if not keys:
+        raise HTTPException(400, "need an ip or hostname")
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # Every identity this asset is known by, so a scan recorded against the
+        # hostname is found from the IP view and the other way round.
+        cur.execute(
+            """SELECT DISTINCT host(ip) AS ip, hostname FROM assets
+                WHERE host(ip) = ANY(%s) OR lower(hostname) = ANY(%s)""",
+            (keys, keys))
+        for r in cur.fetchall():
+            for v in (r.get("ip"), (r.get("hostname") or "").lower()):
+                if v and v not in ("0.0.0.0", "::"):
+                    keys.append(v)
+        keys = sorted(set(keys))
+
+        params = [keys]
+        eng_clause = ""
+        if eid:
+            eng_clause = " AND (engagement_id = %s::uuid OR engagement_id IS NULL)"
+            params.append(eid)
+        cur.execute(
+            f"""SELECT target, scan_type, stage_name, status, job_id,
+                       started_at, completed_at
+                  FROM scope_coverage
+                 WHERE lower(target) = ANY(%s){eng_clause}
+                 ORDER BY completed_at DESC NULLS LAST, started_at DESC NULLS LAST""",
+            params)
+        scans = [dict(r) for r in cur.fetchall()]
+
+        # What those scans left behind, so a completed scan with nothing to show
+        # is reported as a measured zero rather than silence.
+        cur.execute(
+            """SELECT count(*) FILTER (WHERE p.is_open)       AS open_ports,
+                      count(*)                                 AS port_rows
+                 FROM assets a LEFT JOIN ports p ON p.asset_id = a.id
+                WHERE host(a.ip) = ANY(%s) OR lower(a.hostname) = ANY(%s)""",
+            (keys, keys))
+        pr = cur.fetchone() or {}
+        cur.execute(
+            """SELECT count(*) AS n FROM vulns v JOIN assets a ON a.id = v.asset_id
+                WHERE host(a.ip) = ANY(%s) OR lower(a.hostname) = ANY(%s)""",
+            (keys, keys))
+        vulns_n = (cur.fetchone() or {}).get("n") or 0
+        cur.execute(
+            """SELECT unnest(COALESCE(discovered_by, ARRAY[]::text[])) AS src
+                 FROM assets
+                WHERE host(ip) = ANY(%s) OR lower(hostname) = ANY(%s)""",
+            (keys, keys))
+        discovered_by = sorted({r["src"] for r in cur.fetchall() if r.get("src")})
+
+    by_tool: dict = {}
+    for s in scans:
+        t = s.get("scan_type") or "unknown"
+        cur_best = by_tool.get(t)
+        if not cur_best or str(s.get("completed_at") or "") > str(cur_best.get("completed_at") or ""):
+            by_tool[t] = s
+    port_scanned = any(t in ("masscan", "nmap", "naabu", "rustscan")
+                       and (v.get("status") == "completed")
+                       for t, v in by_tool.items())
+    return {
+        "ok": True,
+        "identities": keys,
+        "scans": scans[:200],
+        "tools": [{"scan_type": t, **{k: v[k] for k in
+                                      ("status", "stage_name", "completed_at", "started_at", "target")}}
+                  for t, v in sorted(by_tool.items())],
+        "discovered_by": discovered_by,
+        # The distinction the whole endpoint exists for.
+        "port_scanned": port_scanned,
+        "open_ports": int(pr.get("open_ports") or 0),
+        "port_rows": int(pr.get("port_rows") or 0),
+        "vulns": int(vulns_n),
+        "verdict": (
+            "never_scanned" if not port_scanned else
+            ("scanned_nothing_listening" if int(pr.get("open_ports") or 0) == 0
+             else "scanned_ports_open")),
+    }
+
+
 @app.get("/assets/{ip}/enumeration", tags=["Access"])
 def asset_enumeration(ip: str, _: bool = Depends(auth)):
     """Everything post-enumeration collected on this host, with the valuable

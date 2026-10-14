@@ -2,7 +2,7 @@ import { useState, useMemo, useEffect, useCallback, Fragment } from 'react'
 import { Link } from 'react-router-dom'
 import { useQueryClient, useQuery, useQueries } from '@tanstack/react-query'
 import PageHelp from '@/components/PageHelp'
-import { useAssets, useAssetPorts, useAssetVulns, usePortRecommendations, useSubdomains, useDeleteAssets, useDeleteSubdomains, useAssetCredentials, useAllCredentials, useUpdateCredentialStatus, useCreateCredential, useDeleteCredential, usePurgeDomain, usePurgePattern, useDetectedSoftware, useBulkDismissSoftware, useCveTuning, useUpdateCveTuning, useSearchsploit, getDdgSearchUrls, useResearchCache, useVulnxFindings, useResolveExploit, useBuildPoc, useAssetAccess, useRefreshAccess, useReviewAccess, useAccessSummary, usePendingExploitCounts, useAssetPortAdvice, useAssetEnumeration,
+import { useAssets, useAssetPorts, useAssetVulns, usePortRecommendations, useSubdomains, useDeleteAssets, useDeleteSubdomains, useAssetCredentials, useAllCredentials, useUpdateCredentialStatus, useCreateCredential, useDeleteCredential, usePurgeDomain, usePurgePattern, useDetectedSoftware, useBulkDismissSoftware, useCveTuning, useUpdateCveTuning, useSearchsploit, getDdgSearchUrls, useResearchCache, useVulnxFindings, useResolveExploit, useBuildPoc, useAssetAccess, useRefreshAccess, useReviewAccess, useAccessSummary, usePendingExploitCounts, useAssetPortAdvice, useAssetEnumeration, useAssetScanCoverage,
   useUpdateAssetTags, TRIAGE_TAGS,
   type ObtainedAccess, type DdgSearchResponse, type EnumHighlight, type EnumCredential, type EnumLoot, type EnumLoginAttempt, type EnumListeningPort } from '@/api/assets'
 import { apiFetch } from '@/api/client'
@@ -3696,6 +3696,105 @@ function AssetReconIntel({ hostname, ip, asset }: { hostname?: string | null; ip
               </span>
             ))}
           </div>
+        </div>
+      )}
+
+      <ScanCoveragePanel ip={ip} hostname={hostname} />
+    </div>
+  )
+}
+
+/** What has actually been RUN against this asset.
+ *
+ * Everywhere else, a host nobody has scanned and a host that was scanned and
+ * had nothing listening look identical — both render as no ports. They are
+ * completely different facts: one is a finding, the other is a gap in the work.
+ * `Discovered By` does not settle it either: it names the source that first
+ * created the row, not what has been run since.
+ */
+function ScanCoveragePanel({ ip, hostname }: { ip: string; hostname?: string | null }) {
+  const { data, isLoading, isError } = useAssetScanCoverage(ip, hostname)
+
+  const when = (s?: string | null) =>
+    s ? new Date(s).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'
+
+  return (
+    <div>
+      <h5 className="text-xs font-medium text-muted-foreground mb-2">Scan coverage</h5>
+      {isLoading && <div className="text-[11px] text-muted-foreground">checking what has been run…</div>}
+      {/* Three outcomes. An unreadable answer is not "never scanned". */}
+      {isError && (
+        <div className="text-[11px] text-amber-400">
+          could not read the scan record — this is not a statement that nothing ran
+        </div>
+      )}
+      {data && (
+        <div className="space-y-2">
+          <div className={cn('rounded-md border p-2 text-[11px]',
+            data.verdict === 'never_scanned' ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+              : data.verdict === 'scanned_nothing_listening' ? 'border-sky-500/30 bg-sky-500/10 text-sky-300'
+              : 'border-green-500/30 bg-green-500/10 text-green-300')}>
+            {data.verdict === 'never_scanned' && (
+              <><strong>Never port-scanned.</strong> No completed port scan is on record for this asset, so
+              "no open ports" below means nobody has looked — not that nothing is listening.</>
+            )}
+            {data.verdict === 'scanned_nothing_listening' && (
+              <><strong>Port-scanned, nothing listening.</strong> A port scan completed against this asset and
+              found no open ports. That is a measured result, not an absence of work.</>
+            )}
+            {data.verdict === 'scanned_ports_open' && (
+              <><strong>Port-scanned, {data.open_ports} open.</strong> {data.vulns > 0 ? `${data.vulns} vuln(s) recorded.` : 'No vulns recorded yet.'}</>
+            )}
+          </div>
+
+          {data.tools.length > 0 ? (
+            <div className="rounded-md border border-border overflow-hidden">
+              <table className="w-full text-[10px]">
+                <thead className="bg-muted/40 text-muted-foreground">
+                  <tr>
+                    <th className="text-left px-2 py-1 font-medium">Tool</th>
+                    <th className="text-left px-2 py-1 font-medium">Stage</th>
+                    <th className="text-left px-2 py-1 font-medium">Status</th>
+                    <th className="text-left px-2 py-1 font-medium">Last run</th>
+                    <th className="text-left px-2 py-1 font-medium">Against</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.tools.map(t => (
+                    <tr key={t.scan_type} className="border-t border-border">
+                      <td className="px-2 py-1 font-mono">{t.scan_type}</td>
+                      <td className="px-2 py-1 text-muted-foreground">{t.stage_name || '—'}</td>
+                      <td className="px-2 py-1">
+                        <span className={cn('px-1.5 rounded',
+                          t.status === 'completed' ? 'bg-green-500/15 text-green-400'
+                            : t.status === 'failed' ? 'bg-red-500/15 text-red-400'
+                            : 'bg-amber-500/15 text-amber-400')}>{t.status}</span>
+                      </td>
+                      <td className="px-2 py-1 text-muted-foreground">{when(t.completed_at || t.started_at)}</td>
+                      <td className="px-2 py-1 font-mono text-muted-foreground truncate max-w-[14rem]">{t.target}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="text-[11px] text-muted-foreground">
+              No scan has been recorded against {data.identities.join(' / ') || ip}.
+            </div>
+          )}
+
+          {data.discovered_by.length > 0 && (
+            <div className="text-[10px] text-muted-foreground">
+              <span className="opacity-70">first discovered by:</span>{' '}
+              <span className="font-mono">{data.discovered_by.join(', ')}</span>
+              <span className="opacity-70"> — the source that created this asset, not what has run since.</span>
+            </div>
+          )}
+          {data.scans.length > data.tools.length && (
+            <div className="text-[10px] text-muted-foreground">
+              {data.scans.length} runs on record across {data.tools.length} tool(s).
+            </div>
+          )}
         </div>
       )}
     </div>

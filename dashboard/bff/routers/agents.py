@@ -221,6 +221,19 @@ async def asset_enumeration(ip: str):
         return safe_json(resp)
 
 
+@router.get("/api/assets/{ip}/scan-coverage")
+async def asset_scan_coverage(ip: str, hostname: Optional[str] = None):
+    """What has been RUN against this asset, so "scanned and found nothing" is
+    distinguishable from "never scanned" in the Recon Intel panel."""
+    s = get_settings()
+    params = {"hostname": hostname} if hostname else {}
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.rag_api_url}/assets/{ip}/scan-coverage",
+                           params=params,
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
 @router.get("/api/assets/{ip}/port-advice")
 async def asset_port_advice(ip: str):
     """Non-default methods for dead ports the probe could not reach."""
