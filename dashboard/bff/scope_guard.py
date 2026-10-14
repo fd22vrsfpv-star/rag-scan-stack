@@ -82,6 +82,46 @@ def host_in_scope(host, rows, use_aliases: bool = True) -> bool:
     return bool(is_in_scope_with_aliases(h, rows, aliases_for(h)))
 
 
+# `source` values that mean "the scope could not be read", as opposed to "the
+# scope was read and is empty". Both produce zero rows and both MUST refuse —
+# but they are different problems with different fixes, and the generic
+# empty-scope message sends the operator to the wrong one.
+_UNREADABLE_SOURCES = {
+    "unavailable": (
+        "the scope could not be read ({src}) — refusing to dispatch. This is "
+        "NOT a scope-configuration problem: the gate failed closed because the "
+        "database did not answer. Check the database and retry."),
+    "halted": (
+        "dispatch is HALTED by the kill switch — refusing. Clear the halt to "
+        "resume; the scope itself is unchanged."),
+    "budget-exceeded": (
+        "the blast-radius budget for this engagement is exhausted — refusing. "
+        "Raise or reset the budget; the scope itself is unchanged."),
+}
+
+
+def refusal_reason_for_source(source):
+    """Refusal string when zero rows mean "could not read", else None.
+
+    Call this BEFORE `refusal_for` whenever `scope_rows_for` returned no rows.
+    `scope_rows_for` already distinguishes the causes and hands back `source`;
+    every caller was discarding it, so a database timeout was reported to the
+    operator as
+
+        no scope targets are configured — Configure the engagement scope first.
+
+    which is this repo's recurring "unreachable reported as absent" — the fix
+    it names is not the fix that is needed. Observed 2026-10-13:
+    `scope load failed (connection to server at "rag-postgres" ... timeout
+    expired) — treating everything as out of scope`, surfaced to the operator
+    as a 403 telling them to configure a scope that had 5,791 rows.
+
+    Refusing stays correct; only the explanation changes.
+    """
+    tmpl = _UNREADABLE_SOURCES.get(str(source or ""))
+    return tmpl.format(src=source) if tmpl else None
+
+
 def refusal_for(target, rows, command: str = ""):
     """Refusal string when this dispatch must be refused, else None.
 

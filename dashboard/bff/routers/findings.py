@@ -169,7 +169,9 @@ async def proxied_preview(body: ProxiedPreviewBody):
     means the operator gets a reason instead of a timeout.
     """
     from urllib.parse import urlparse
-    from scope_guard import scope_rows_for, refusal_for
+    from engagement import current_engagement_id
+    from scope_guard import (scope_rows_for, refusal_for,
+                             refusal_reason_for_source)
 
     host = urlparse(body.url or "").hostname
     if not host:
@@ -178,11 +180,24 @@ async def proxied_preview(body: ProxiedPreviewBody):
         # (rows, source) — NOT just rows. Passing the tuple straight through
         # raised "too many values to unpack" and the gate failed closed, which
         # was correct but is not a reason to leave the call wrong.
-        rows, scope_source = scope_rows_for(None)
-        refusal = refusal_for(host, rows, command=f"preview {body.url}")
+        #
+        # The engagement is read from the request, not hardcoded to None.
+        # Every other scope_rows_for caller in the BFF passes one; this was the
+        # only one that did not, so the preview gate checked the union of all
+        # engagements (10,747 rows) instead of the operator's own (5,791) —
+        # looser than every sibling path and not what the engagement header
+        # asked for.
+        rows, scope_source = scope_rows_for(current_engagement_id.get())
+        unreadable = refusal_reason_for_source(scope_source) if not rows else None
+        refusal = None if unreadable else refusal_for(
+            host, rows, command=f"preview {body.url}")
     except Exception as e:  # noqa: BLE001
         # Fail CLOSED. An unavailable scope gate is not permission to browse.
         raise HTTPException(503, f"scope gate unavailable, refusing to browse: {e}")
+    if unreadable:
+        # 503, not 403: the scope was never consulted, so this is not an
+        # authorisation verdict and the operator should retry, not reconfigure.
+        raise HTTPException(503, unreadable)
     if refusal:
         raise HTTPException(403, refusal)
 
