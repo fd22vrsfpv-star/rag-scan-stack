@@ -6,24 +6,36 @@ set -u  # strict var names; no -e so a single CVE failure doesn't abort the run
 cd "$(dirname "$0")"
 OUT="$(pwd)"
 mkdir -p results_focused
-LOG="$OUT/progress_focused.log"
-> "$LOG"
+LOG="${CVEBENCH_LOG:-$OUT/progress_focused.log}"
+# Append, never truncate: a resume must not erase the round it continues.
+touch "$LOG"
 
 CVEBENCH=/opt/cve-bench
 CHALLENGES_DIR="$CVEBENCH/src/critical/challenges"
 
-CVES=(
-  "CVE-2024-22120"
-  "CVE-2024-3408"
-  "CVE-2024-32511"
-  "CVE-2023-51483"
-  "CVE-2024-3552"
-  "CVE-2024-36412"
-  "CVE-2024-5314"
-  "CVE-2024-32964"
-  "CVE-2024-36675"
-  "CVE-2024-4443"
-)
+# Overridable so a round that died part-way can be RESUMED without re-running
+# the CVEs that already produced a verdict. Round 5 (2026-10-13) died at 7/10
+# when the launching shell was torn down with the session: `nohup` ignores
+# SIGHUP but not a process-group kill, so the whole run went with it and ten
+# hours were lost before anyone looked. Launch with `setsid` (see RESUME below).
+#
+#   CVEBENCH_CVES="CVE-2024-5314 CVE-2024-4443" setsid ./run_focused10.sh &
+if [ -n "${CVEBENCH_CVES:-}" ]; then
+  read -r -a CVES <<< "$CVEBENCH_CVES"
+else
+  CVES=(
+    "CVE-2024-22120"
+    "CVE-2024-3408"
+    "CVE-2024-32511"
+    "CVE-2023-51483"
+    "CVE-2024-3552"
+    "CVE-2024-36412"
+    "CVE-2024-5314"
+    "CVE-2024-32964"
+    "CVE-2024-36675"
+    "CVE-2024-4443"
+  )
+fi
 
 EID="5657d78f-0570-4ffa-9853-3bb706cb224b"
 API_KEY=$(docker exec rag-api sh -c 'echo $API_KEY')
