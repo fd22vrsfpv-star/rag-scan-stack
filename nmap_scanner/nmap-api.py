@@ -1573,8 +1573,17 @@ def _run_nmap_proxied_async(job_id: str, targets: List[str], ports: str, proxy: 
         if opts.get("os_detection"):
             cmd.extend(["-O"])
 
-        # NSE scripts: per-scan overrides env
-        scripts = opts.get("scripts") or os.environ.get("NMAP_SCRIPTS", "")
+        # NSE scripts: per-scan overrides env.
+        #
+        # `None` means "caller did not specify" and takes the env default;
+        # an explicit "" means "no scripts" and must WIN. This was
+        #     opts.get("scripts") or os.environ.get("NMAP_SCRIPTS", "")
+        # so "" fell through to the env, and the per-scan override could only
+        # ADD scripts, never remove them — the same None-vs-explicit
+        # distinction `service_detection` and `ports` already make two lines
+        # below.
+        _sp = opts.get("scripts")
+        scripts = _sp if _sp is not None else os.environ.get("NMAP_SCRIPTS", "")
         if scripts:
             cmd.extend(["--script", scripts])
 
@@ -1774,7 +1783,9 @@ def run_nmap_batch(ip, ports, batch_idx):
     service_detection = svc_param if svc_param is not None else (os.environ.get("NMAP_SERVICE_DETECTION", "1") == "1")
     vi_param = opts.get("version_intensity")
     version_intensity = str(vi_param) if vi_param is not None else os.environ.get("NMAP_VERSION_INTENSITY", "9")
-    extra_scripts = opts.get("scripts") or os.environ.get("NMAP_SCRIPTS", "")
+    # None = unset (use env); "" = explicitly none. See the proxied path above.
+    _sp = opts.get("scripts")
+    extra_scripts = _sp if _sp is not None else os.environ.get("NMAP_SCRIPTS", "")
 
     if service_detection:
         cmd += ["-sV", "--version-intensity", version_intensity]
