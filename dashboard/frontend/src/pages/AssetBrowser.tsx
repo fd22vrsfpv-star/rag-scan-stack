@@ -3542,8 +3542,14 @@ function AssetReconIntel({ hostname, ip, asset }: { hostname?: string | null; ip
     </div>
   )
 
+  // The coverage panel renders on EVERY branch, including the two early
+  // returns. The empty branch used to read "No recon data found — run a scan",
+  // which asserts both that nothing was found and that nothing was run while
+  // knowing neither. It is the exact ambiguity this panel exists to settle, so
+  // it is the one place it must not be missing.
   if (isLoading) return (
     <div className="space-y-4">
+      <ScanCoveragePanel ip={ip} hostname={hostname} />
       {osBadge}
       {providerBadge}
       <p className="text-xs text-muted-foreground">Loading recon data for {lookupDomain}...</p>
@@ -3551,9 +3557,13 @@ function AssetReconIntel({ hostname, ip, asset }: { hostname?: string | null; ip
   )
   if (!overview) return (
     <div className="space-y-4">
+      <ScanCoveragePanel ip={ip} hostname={hostname} />
       {osBadge}
       {providerBadge}
-      <p className="text-xs text-muted-foreground">No recon data found for {lookupDomain}. Run a passive recon or content recon scan.</p>
+      <p className="text-xs text-muted-foreground">
+        No recon <em>findings</em> stored for {lookupDomain} — see the scan record above for whether
+        anything has been run against it.
+      </p>
     </div>
   )
 
@@ -3567,6 +3577,10 @@ function AssetReconIntel({ hostname, ip, asset }: { hostname?: string | null; ip
 
   return (
     <div className="space-y-4">
+      {/* First, not last: "has anything actually been run here?" frames
+          everything below it. A reader who sees ports and findings before
+          knowing whether the host was ever scanned reads absence as a result. */}
+      <ScanCoveragePanel ip={ip} hostname={hostname} />
       {osBadge}
       {providerBadge}
       {/* Stats summary */}
@@ -3699,7 +3713,6 @@ function AssetReconIntel({ hostname, ip, asset }: { hostname?: string | null; ip
         </div>
       )}
 
-      <ScanCoveragePanel ip={ip} hostname={hostname} />
     </div>
   )
 }
