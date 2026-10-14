@@ -83,7 +83,7 @@ export default function FollowUps() {
   const { matchesAnyScope, isFiltering: isScopeFiltering } = useScopeFilter(scopeFilter)
   const excludeScope = hideCustomerHosted ? 'customer_scope' : undefined
   const activeEngagementId = filterByEngagement && engagementId ? engagementId : undefined
-  const { data: statsData } = useFollowUpStats(activeEngagementId, excludeScope)
+  const { data: statsData } = useFollowUpStats(activeEngagementId, excludeScope, scopeFilter || undefined)
   // Unfiltered-by-scope counts, so the toggle can say how many it is hiding
   // rather than silently shrinking the list.
   const { data: unscopedStats } = useFollowUpStats(activeEngagementId, undefined)
@@ -94,13 +94,16 @@ export default function FollowUps() {
   // nothing until the operator actually filters.
   const { data: allStatsData } = useFollowUpStats(undefined)
   const excludeStatus = hideDismissed && filters.status !== 'dismissed' ? 'dismissed' : undefined
-  const { data: groupedData } = useFollowUpGrouped(groupBy, filters.status, activeEngagementId, excludeStatus, excludeScope)
+  const { data: groupedData } = useFollowUpGrouped(groupBy, filters.status, activeEngagementId, excludeStatus, excludeScope, scopeFilter || undefined)
   const { data, isLoading } = useFollowUps({
     ...filters,
     exclude_status: excludeStatus,
     search: searchFilter.trim() || undefined,
     engagement_id: filterByEngagement && engagementId ? engagementId : undefined,
     exclude_scope: excludeScope,
+    // Server-side as well as the client filter below: the client one cannot
+    // fix the counts, and paging over an unfiltered set hides in-scope rows.
+    scope_name: scopeFilter || undefined,
   })
   const { data: agentStatsData } = useAgentStats()
   const { data: rulesData } = useAgentRules()

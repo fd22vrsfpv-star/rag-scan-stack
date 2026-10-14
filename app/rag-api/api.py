@@ -476,6 +476,36 @@ def _scope_exclusion_clause(host_expr: str, exclude_scope: Optional[str]):
             f"AND lower(st.target) = {host_expr})"), [names]
 
 
+def _scope_inclusion_clause(host_expr: str, scope_name: Optional[str]):
+    """(sql_fragment, params) keeping ONLY rows whose host sits in a named scope.
+
+    The inverse of _scope_exclusion_clause, and the one that was missing. The
+    follow-ups list filtered by the selected scope CLIENT-side, but the stats
+    header and the grouped view are server queries that only ever received
+    `exclude_scope` — so selecting the `examplecorp` scope left the counts and the
+    grouped `host_samples` showing hosts from the whole engagement, IP addresses
+    among them, none of which are in that scope (it holds 760 targets, all
+    hostnames, zero IPs).
+
+    Dot-boundary suffix match, unlike the exclusion. The reasoning inverts with
+    the direction: an over-generous EXCLUDE hides the operator's real work,
+    while an over-strict INCLUDE hides it just as surely — and a scope naming
+    `examplecorp.com` is understood to cover `www.examplecorp.com`. The scope
+    filter is a VIEW, not an authorization boundary (etl/scope_gate.py is that,
+    and it fails closed).
+
+    Returns ("", []) when no scope is selected, so callers can append
+    unconditionally.
+    """
+    name = (scope_name or "").strip()
+    if not name:
+        return "", []
+    return (f"EXISTS (SELECT 1 FROM scope_targets st "
+            f"WHERE st.name = %s AND st.target <> '' "
+            f"AND ({host_expr} = lower(st.target) "
+            f"     OR {host_expr} LIKE '%%.' || lower(st.target)))"), [name]
+
+
 def _validate_engagement_uuid(eid: Optional[str]) -> Optional[str]:
     """Validate that a resolved engagement_id is a well-formed UUID before it
     reaches the SQL layer (the column is ``uuid``). Returns the value unchanged
@@ -48824,6 +48854,11 @@ def follow_up_stats(
     engagement_id: Optional[str] = Query(None),
     exclude_scope: Optional[str] = Query(
         None, description="Comma-separated scope list names whose hosts to omit"),
+    scope_name: Optional[str] = Query(
+        None, description="Keep ONLY hosts in this scope list. The selected-scope "
+                          "filter was client-side on the list and absent from the "
+                          "stats and grouped views, so both showed the whole "
+                          "engagement under a scope header."),
     _: bool = Depends(auth),
 ):
     """Aggregate counts by status, priority, and flagged_by.
@@ -48840,6 +48875,12 @@ def follow_up_stats(
     if _ex:
         stat_clauses.append(_ex)
         params.extend(_exp)
+    # Keep ONLY the selected scope. A header counting the whole engagement
+    # under a scope's name is the same lie as a table showing it.
+    _in, _inp = _scope_inclusion_clause(HOST_EXPR_FOLLOWUP, scope_name)
+    if _in:
+        stat_clauses.append(_in)
+        params.extend(_inp)
     eng_clause = ("WHERE " + " AND ".join(stat_clauses)) if stat_clauses else ""
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(f"""
@@ -48898,6 +48939,11 @@ def follow_ups_grouped(
     status: Optional[str] = Query(None),
     exclude_status: Optional[str] = Query(None),
     engagement_id: Optional[str] = Query(None),
+    scope_name: Optional[str] = Query(
+        None, description="Keep ONLY hosts in this scope list. The selected-scope "
+                          "filter was client-side on the list and absent from the "
+                          "stats and grouped views, so both showed the whole "
+                          "engagement under a scope header."),
     exclude_scope: Optional[str] = Query(
         None, description="Comma-separated scope list names whose hosts to omit"),
     authorized: bool = Depends(auth),
@@ -48919,6 +48965,12 @@ def follow_ups_grouped(
         if _ex:
             where_clauses.append(_ex)
             params.extend(_exp)
+        # The grouped view renders host_samples — unfiltered, those are the
+        # out-of-scope IPs the operator reported seeing under a scope header.
+        _in, _inp = _scope_inclusion_clause(HOST_EXPR_FOLLOWUP, scope_name)
+        if _in:
+            where_clauses.append(_in)
+            params.extend(_inp)
         where = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
         if group_by == "target":
@@ -49004,6 +49056,11 @@ def list_follow_ups(
     priority: Optional[str] = Query(None),
     flagged_by: Optional[str] = Query(None),
     engagement_id: Optional[str] = Query(None),
+    scope_name: Optional[str] = Query(
+        None, description="Keep ONLY hosts in this scope list. The selected-scope "
+                          "filter was client-side on the list and absent from the "
+                          "stats and grouped views, so both showed the whole "
+                          "engagement under a scope header."),
     rule_id: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
     exclude_scope: Optional[str] = Query(
@@ -49036,6 +49093,12 @@ def list_follow_ups(
     if _ex:
         clauses.append(_ex)
         params.extend(_exp)
+    # Server-side too, not only the client filter: the client one cannot fix
+    # the counts, and pagination over an unfiltered set hides in-scope rows.
+    _in, _inp = _scope_inclusion_clause(HOST_EXPR_FOLLOWUP, scope_name)
+    if _in:
+        clauses.append(_in)
+        params.extend(_inp)
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     params.extend([limit, offset])
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
