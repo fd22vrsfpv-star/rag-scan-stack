@@ -185,6 +185,23 @@ class ScopeClassifier:
                 return False
             if cond.get("port_scanned") and not context.get("port_scanned"):
                 return False
+            #   retired: true -> the host serves a decommissioned-service page
+            #
+            # Measured, not assumed. The obvious signal is the TLS certificate,
+            # and it does NOT work here: of 508 scope hosts on 443, the
+            # `*.examplecorp.com` wildcard is served by 32 RETIRED hosts and 15
+            # LIVE ones — www.examplecorp.com, forums, tableau, forms, livehelp
+            # among them. The issuer is identical on both (GeoTrust TLS RSA CA
+            # G1, 33 retired / 263 live) and one certificate SERIAL is shared
+            # between retired and live hosts, so they are literally the same
+            # cert. A cert-based rule would file the main website as retired.
+            #
+            # What does discriminate is the response: the retirement redirect,
+            # 33/33 with no false positives. `detect_retired_hosts` probes for
+            # it and records the verdict as the `retired` asset tag, which is
+            # the fact this condition reads.
+            if cond.get("retired") and not context.get("retired"):
+                return False
             if cond.get("unresolved") and not context.get("unresolved"):
                 return False
             mx = cond.get("max_open_ports")
@@ -472,7 +489,9 @@ def classify_and_assign_engagement(cur, engagement_id: str,
             """SELECT a.hostname,
                       bool_or(host(a.ip) IN ('0.0.0.0', '::')) AS unresolved,
                       count(p.id) FILTER (WHERE p.is_open)     AS open_ports,
-                      count(p.id)                              AS port_rows
+                      count(p.id)                              AS port_rows,
+                      bool_or('retired' = ANY(COALESCE(a.tags, ARRAY[]::text[])))
+                                                               AS retired
                  FROM assets a
                  LEFT JOIN assets a2
                         ON a2.ip = a.ip
@@ -487,9 +506,11 @@ def classify_and_assign_engagement(cur, engagement_id: str,
             unres = r["unresolved"] if isinstance(r, dict) else r[1]
             opn = r["open_ports"] if isinstance(r, dict) else r[2]
             prows = r["port_rows"] if isinstance(r, dict) else r[3]
+            ret = r["retired"] if isinstance(r, dict) else r[4]
             state[hn] = {"has_asset": True, "unresolved": bool(unres),
                          "open_ports": int(opn or 0),
-                         "port_scanned": int(prows or 0) > 0}
+                         "port_scanned": int(prows or 0) > 0,
+                         "retired": bool(ret)}
 
         # Port rows prove a scan only when the scan FOUND something. masscan
         # reports open ports only, so a host that answered nothing produces no

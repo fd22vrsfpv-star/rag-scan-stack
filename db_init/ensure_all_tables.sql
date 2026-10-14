@@ -4066,6 +4066,43 @@ CREATE TABLE IF NOT EXISTS scope_classification_rules (
     updated_at      timestamptz DEFAULT now()
 );
 
+-- Baseline "no attack surface" rules.
+--
+-- These existed only as rows somebody created against a live database, so a
+-- clean build had an empty rule set and `/scope/reclassify` filed nothing. A
+-- rule that is not in the installer is not a feature of the product.
+--
+-- Matched on `name`, which is not unique, so the guard is a NOT EXISTS rather
+-- than ON CONFLICT. Re-running is a no-op; an operator edit is never reverted.
+INSERT INTO scope_classification_rules (name, scope_name, priority, rule_type, conditions, auto_apply)
+SELECT 'no-services:unresolved-and-no-open-ports', 'no_services', 20, 'asset_state',
+       '{"probed": true, "unresolved": true, "max_open_ports": 0}'::jsonb, true
+ WHERE NOT EXISTS (SELECT 1 FROM scope_classification_rules
+                    WHERE name = 'no-services:unresolved-and-no-open-ports');
+
+INSERT INTO scope_classification_rules (name, scope_name, priority, rule_type, conditions, auto_apply)
+SELECT 'no-services:scanned-but-nothing-listening', 'no_services', 21, 'asset_state',
+       '{"probed": true, "port_scanned": true, "max_open_ports": 0}'::jsonb, true
+ WHERE NOT EXISTS (SELECT 1 FROM scope_classification_rules
+                    WHERE name = 'no-services:scanned-but-nothing-listening');
+
+-- A retired host answers, and what it answers is "this service is gone". It has
+-- ports open, so the no_services rules above correctly refuse it; the fact that
+-- separates it is the RESPONSE, recorded as the `retired` asset tag by
+-- POST /engagements/{id}/scope/detect-retired.
+--
+-- NOT the certificate, which was the obvious candidate and does not work:
+-- across 508 scope hosts on 443, CN=*.examplecorp.com was served by 32 retired
+-- AND 15 live hosts (www.examplecorp.com among them), the issuer was identical
+-- on both, and one certificate serial appeared on retired and live hosts
+-- alike. Priority 19 so it outranks the no_services rules, which cannot match
+-- a host with open ports anyway but would be the wrong answer if they did.
+INSERT INTO scope_classification_rules (name, scope_name, priority, rule_type, conditions, auto_apply)
+SELECT 'retired:decommissioned-service', 'retired', 19, 'asset_state',
+       '{"probed": true, "retired": true}'::jsonb, true
+ WHERE NOT EXISTS (SELECT 1 FROM scope_classification_rules
+                    WHERE name = 'retired:decommissioned-service');
+
 CREATE TABLE IF NOT EXISTS scope_decisions (
     id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     target          text NOT NULL,

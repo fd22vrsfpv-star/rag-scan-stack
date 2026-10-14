@@ -41586,6 +41586,162 @@ class ReclassifyBody(BaseModel):
     limit: int = 5000
 
 
+class DetectRetiredBody(BaseModel):
+    apply: bool = False
+    limit: int = 2000
+    timeout: int = 10
+    concurrency: int = 16
+    # Response markers that identify a decommissioned service. Operator-editable
+    # because every estate retires things to its own landing page.
+    markers: list[str] = ["retired.html", "unavailable."]
+
+
+# The host the retirement redirect lands on is itself a scope host; probing it
+# would tag the landing page as retired and then file it away, taking the
+# evidence with it.
+_RETIRED_SELF_EXCLUDE = ("unavailable.",)
+
+
+def _probe_retired(host: str, markers: list[str], timeout: int) -> tuple[str, bool, str]:
+    """(host, is_retired, evidence). Three outcomes, never two.
+
+    A host that does not answer is NOT retired — it is unknown, and saying
+    otherwise is the mistake this repo keeps making (Docs/Memories.md,
+    "unreachable is not absent"). Only an actual response carrying a retirement
+    marker counts.
+    """
+    import subprocess
+    for scheme in ("https", "http"):
+        try:
+            out = subprocess.run(
+                ["curl", "-sk", "-m", str(timeout), "-o", "/dev/null",
+                 "-w", "%{http_code} %{redirect_url}", f"{scheme}://{host}/"],
+                capture_output=True, text=True, timeout=timeout + 5).stdout.strip()
+        except Exception as e:  # noqa: BLE001
+            return host, False, f"probe failed: {type(e).__name__}"
+        if not out or out.startswith("000"):
+            continue
+        low = out.lower()
+        if any(m.lower() in low for m in markers):
+            return host, True, out[:200]
+        return host, False, out[:200]
+    return host, False, "no answer on 443 or 80"
+
+
+@app.post("/engagements/{engagement_id}/scope/detect-retired",
+          tags=["Scope Classification"])
+def detect_retired_hosts(engagement_id: str, body: DetectRetiredBody | None = None,
+                         _: bool = Depends(auth)):
+    """Find hosts serving a decommissioned-service page and tag them `retired`.
+
+    A retired host has no application behind it: nothing to test, nothing to
+    report, and it occupies a slot in the testable scope. This records the fact
+    as the `retired` asset tag, which `scope_classifier` reads, so the
+    `retired:decommissioned-service` rule can file them without any further
+    probing.
+
+    **Why the response and not the certificate.** The certificate is the
+    obvious signal and it does not work. Measured over 508 scope hosts on 443
+    for the examplecorp estate:
+
+      * `CN=*.examplecorp.com` — **32 retired, 15 live**, the live ones including
+        `www.examplecorp.com`, `forums`, `tableau`, `forms`, `livehelp`.
+      * issuer `GeoTrust TLS RSA CA G1` — 33 retired, 263 live.
+      * certificate **serial** `038CAFBE9B...611C` appears on both retired and
+        live hosts: literally the same certificate.
+
+    A cert rule would have filed the main website as retired. The retirement
+    redirect matched 33/33 with no false positives, so that is what is probed.
+
+    Scope-gated (it sends traffic) and bounded by `MAX_CONCURRENT_SCANS`;
+    `apply` defaults to FALSE and reports what would be tagged.
+    """
+    import concurrent.futures as _cf
+
+    body = body or DetectRetiredBody()
+    if not _api_scan_slots.acquire(blocking=False):
+        raise HTTPException(
+            429, f"{_MAX_CONCURRENT_SCANS} concurrent scans already in flight "
+                 "(MAX_CONCURRENT_SCANS) — nothing was probed, retry when one "
+                 "finishes.")
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT DISTINCT s.target
+                     FROM scope_targets s
+                     JOIN assets a ON a.hostname = s.target
+                     JOIN ports p ON p.asset_id = a.id
+                                 AND p.is_open AND p.port IN (80, 443)
+                    WHERE s.engagement_id = %s::uuid AND s.target <> ''
+                      AND s.name <> 'retired'
+                    ORDER BY 1 LIMIT %s""",
+                (engagement_id, body.limit))
+            hosts = [r["target"] for r in cur.fetchall()
+                     if not any(x in r["target"] for x in _RETIRED_SELF_EXCLUDE)]
+
+        # Same gate every other traffic-sending path uses. A host that is in
+        # scope_targets is not automatically dispatchable — the deny-list and
+        # the never-dispatchable scopes still apply.
+        refused = []
+        try:
+            from etl.scope_gate import load_dispatch_scope, check_dispatch, \
+                load_not_in_scope_denylist
+            with get_db() as conn, conn.cursor() as cur:
+                rows, _src = load_dispatch_scope(cur, engagement_id)
+                denylist = load_not_in_scope_denylist(cur)
+            if not rows:
+                raise HTTPException(403, "scope unavailable — refusing to probe")
+            allowed = []
+            for h in hosts:
+                if check_dispatch(h, rows, denylist=denylist):
+                    refused.append(h)
+                else:
+                    allowed.append(h)
+            hosts = allowed
+        except HTTPException:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(403, f"scope gate unavailable ({e}) — refusing to probe")
+
+        results = []
+        if hosts:
+            with _cf.ThreadPoolExecutor(max_workers=max(1, min(body.concurrency, 32))) as ex:
+                results = list(ex.map(
+                    lambda h: _probe_retired(h, body.markers, body.timeout), hosts))
+        retired = [(h, ev) for h, is_r, ev in results if is_r]
+
+        tagged = 0
+        if body.apply and retired:
+            with get_db() as conn, conn.cursor() as cur:
+                for h, _ev in retired:
+                    cur.execute(
+                        """UPDATE assets
+                              SET tags = (SELECT array_agg(DISTINCT t)
+                                            FROM unnest(
+                                              COALESCE(tags, ARRAY[]::text[])
+                                              || ARRAY['retired']::text[]) t)
+                            WHERE hostname = %s""", (h,))
+                    tagged += cur.rowcount
+                conn.commit()
+    finally:
+        _api_scan_slots.release()
+
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("scope_retired_hosts_detected", "scope_classifier",
+                     {"engagement_id": engagement_id, "applied": bool(body.apply),
+                      "probed": len(results), "retired": len(retired),
+                      "assets_tagged": tagged, "refused_by_gate": len(refused)})
+    except Exception:  # noqa: BLE001
+        pass
+
+    return {"ok": True, "applied": bool(body.apply), "probed": len(results),
+            "retired": len(retired), "assets_tagged": tagged,
+            "refused_by_gate": len(refused),
+            "targets": [h for h, _ in retired][:200],
+            "evidence": {h: ev for h, ev in retired[:5]}}
+
+
 @app.post("/engagements/{engagement_id}/scope/reclassify", tags=["Scope Classification"])
 def reclassify_engagement_scope(engagement_id: str, body: ReclassifyBody | None = None,
                                 _: bool = Depends(auth)):
@@ -41629,8 +41785,13 @@ def reclassify_engagement_scope(engagement_id: str, body: ReclassifyBody | None 
         in_scope_names = {}
         for t, n in rows:
             in_scope_names.setdefault(n, []).append(t)
+        # Destinations this pass may file INTO. Both mean "no attack surface
+        # here": nothing listening, or an application that has been
+        # decommissioned. A host already sitting in one of them is not a
+        # candidate — that is what makes the pass idempotent.
+        _FILED = ("no_services", "retired")
         hosts = [t for t, n in rows
-                 if n != "no_services" and n not in _NODISPATCH]
+                 if n not in _FILED and n not in _NODISPATCH]
         if hosts:
             cur.execute(
                 # Ports follow the IP, not the hostname. masscan reports an IP,
@@ -41646,7 +41807,9 @@ def reclassify_engagement_scope(engagement_id: str, body: ReclassifyBody | None 
                 """SELECT a.hostname,
                           bool_or(host(a.ip) IN ('0.0.0.0','::')) AS unresolved,
                           count(p.id) FILTER (WHERE p.is_open) AS open_ports,
-                          count(p.id)                          AS port_rows
+                          count(p.id)                          AS port_rows,
+                          bool_or('retired' = ANY(COALESCE(a.tags, ARRAY[]::text[])))
+                                                               AS retired
                      FROM assets a
                      LEFT JOIN assets a2
                             ON a2.ip = a.ip
@@ -41658,7 +41821,8 @@ def reclassify_engagement_scope(engagement_id: str, body: ReclassifyBody | None 
             state = {r["hostname"]: {"has_asset": True,
                                      "unresolved": bool(r["unresolved"]),
                                      "open_ports": int(r["open_ports"] or 0),
-                                     "port_scanned": int(r["port_rows"] or 0) > 0}
+                                     "port_scanned": int(r["port_rows"] or 0) > 0,
+                                     "retired": bool(r["retired"])}
                      for r in cur.fetchall()}
             # A port row is only one kind of proof, and it is the kind a clean
             # scan never produces: masscan reports OPEN ports only, so a host
@@ -41681,20 +41845,27 @@ def reclassify_engagement_scope(engagement_id: str, body: ReclassifyBody | None 
         for host in hosts:
             ctx = state.get(host, {"has_asset": False, "unresolved": False, "open_ports": 0})
             sug = clf.classify_rules_only(host, ctx)
-            if not sug or sug.scope != "no_services":
+            if not sug or sug.scope not in _FILED:
                 continue
             candidates += 1
             siblings = in_scope_names.get(scope_of[host], [])
             if any(t != host and t.endswith("." + host) for t in siblings):
                 skipped_parent.append(host)
                 continue
-            moved.append({"target": host, "from": scope_of[host]})
+            moved.append({"target": host, "from": scope_of[host], "to": sug.scope})
         if body.apply and moved:
-            cur.execute(
-                """UPDATE scope_targets SET name = 'no_services', source = 'reclassified'
-                    WHERE engagement_id = %s::uuid AND target = ANY(%s)
-                      AND name <> 'no_services'""",
-                (engagement_id, [m["target"] for m in moved]))
+            # One UPDATE per destination, because the destination is per-host
+            # now: a single hardcoded 'no_services' would file retired hosts
+            # under the wrong name and lose the distinction the rule drew.
+            for dest in _FILED:
+                batch = [m["target"] for m in moved if m["to"] == dest]
+                if not batch:
+                    continue
+                cur.execute(
+                    """UPDATE scope_targets SET name = %s, source = 'reclassified'
+                        WHERE engagement_id = %s::uuid AND target = ANY(%s)
+                          AND name <> %s""",
+                    (dest, engagement_id, batch, dest))
             conn.commit()
     try:
         from webhooks import emit_webhook
