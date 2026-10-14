@@ -401,12 +401,29 @@ async def scan_through_node(node_id: str, req: NodeScanRequest):
     _to_check = list(targets) + [str(u).strip() for u in _url_raw if str(u).strip()]
     if _to_check:
         try:
-            from scope_guard import scope_rows_for, refusal_for
+            from scope_guard import (scope_rows_for, aliases_for_many,
+                                     check_dispatch, SCOPE_GATE_AVAILABLE)
+            if not SCOPE_GATE_AVAILABLE:
+                # Same refusal refusal_for() would have given. Fail closed.
+                raise HTTPException(
+                    403, "scope gate is unavailable (etl/scope_gate not "
+                         "importable) — refusing")
             _rows, _src = scope_rows_for(req.engagement_id)
+            # Resolve every target's aliases over ONE connection first.
+            # refusal_for() opens its own per call, and the database is remote
+            # with SSL required, so a 760-target dispatch meant 760 TLS
+            # handshakes inside this loop — the request sat here for over
+            # twelve minutes and node-manager logged nothing, which reads as a
+            # hung scanner rather than a slow gate.
+            _alias_map = aliases_for_many(_to_check)
             for _t in _to_check:
                 # host_in_scope wants a host; refusal_for handles URL forms and
                 # also inspects the command string, so pass the raw value.
-                _refusal = refusal_for(_t, _rows, f"{req.scan_type} via node {node_id}")
+                # Same checks in the same order — deny-list, then scope — just
+                # with the aliases already in hand.
+                _refusal = check_dispatch(
+                    _t, _rows, f"{req.scan_type} via node {node_id}",
+                    aliases=_alias_map.get(_t) or set())
                 if _refusal:
                     log.warning("REFUSED node scan %s for %s: %s",
                                 req.scan_type, _t, _refusal)

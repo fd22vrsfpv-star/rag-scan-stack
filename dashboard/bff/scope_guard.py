@@ -65,6 +65,39 @@ def aliases_for(host):
         return set()
 
 
+def aliases_for_many(hosts):
+    """{host: aliases} for a batch, over ONE database connection.
+
+    `aliases_for` opens its own connection, and the dispatch gate calls it once
+    per target. The database is remote and the DSN requires SSL, so a 760-target
+    masscan of the examplecorp scope meant 760 TLS handshakes before a single
+    packet left the stack: the request sat in the gate for over twelve minutes
+    and node-manager logged nothing at all, which reads as a hung scanner rather
+    than a slow authorisation check.
+
+    Same verdicts, same lookups — one connection instead of N. Fails soft per
+    host: a lookup that could not run narrows that host to itself (the stricter
+    answer), never widens it.
+    """
+    out = {}
+    wanted = [h for h in dict.fromkeys(hosts) if h]
+    if not SCOPE_GATE_AVAILABLE or not wanted:
+        return {h: set() for h in wanted}
+    try:
+        from db import get_db
+        with get_db() as conn, conn.cursor() as cur:
+            for h in wanted:
+                try:
+                    out[h] = load_host_aliases(cur, h)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("alias lookup failed for %r (%s)", h, e)
+                    out[h] = set()
+    except Exception as e:  # noqa: BLE001
+        log.warning("alias batch failed (%s) — checking each host as given", e)
+        return {h: set() for h in wanted}
+    return out
+
+
 def host_in_scope(host, rows, use_aliases: bool = True) -> bool:
     """True if `host`, or any observed alias of it, matches the scope.
 
