@@ -1555,7 +1555,25 @@ def get_assets(
                    (SELECT count(*) FROM recon_findings rf WHERE rf.asset_id = a.id)
                        AS recon_findings_count
             FROM assets a
-            LEFT JOIN ports p ON p.asset_id = a.id AND COALESCE(p.is_open, true)
+            -- PORTS FOLLOW THE IP, NOT THE HOSTNAME.
+            --
+            -- A port scan reports an IP, so its results land on whichever asset
+            -- row the ingest resolved to — often an IP-keyed row with a NULL
+            -- hostname. Counting only the hostname's OWN row showed 0 for hosts
+            -- whose IP is plainly listening: blog.examplecorp.com reported 0 while
+            -- 23.185.0.4 carried 2 open ports on a hostname-less row, and two
+            -- sibling vhosts on the same address each reported 2.
+            --
+            -- Ports genuinely ARE per-IP: a vhost on a listening address can be
+            -- reached on those ports with a Host header, which is the same
+            -- reasoning the scope classifier uses. The sentinels are excluded or
+            -- every unresolved asset would inherit every other one's ports, since
+            -- they all share 0.0.0.0.
+            LEFT JOIN assets a2
+                   ON a2.ip = a.ip
+                  AND host(a.ip) NOT IN ('0.0.0.0', '::')
+            LEFT JOIN ports p ON p.asset_id = COALESCE(a2.id, a.id)
+                             AND COALESCE(p.is_open, true)
             LEFT JOIN LATERAL (
                 SELECT metadata->>'hostname' AS hostname
                 FROM credential_findings
