@@ -3734,9 +3734,18 @@ function ScanCoveragePanel({ ip, hostname }: { ip: string; hostname?: string | n
             data.verdict === 'never_scanned' ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
               : data.verdict === 'scanned_nothing_listening' ? 'border-sky-500/30 bg-sky-500/10 text-sky-300'
               : 'border-green-500/30 bg-green-500/10 text-green-300')}>
-            {data.verdict === 'never_scanned' && (
-              <><strong>Never port-scanned.</strong> No completed port scan is on record for this asset, so
-              "no open ports" below means nobody has looked — not that nothing is listening.</>
+            {/* Ports can exist with no scan on record — coverage recording
+                started 2026-10-13, so anything found before that has results
+                but no provenance. Saying "nobody has looked" there would be
+                wrong in the other direction. */}
+            {data.verdict === 'never_scanned' && data.open_ports > 0 && (
+              <><strong>No port scan on record</strong> — but {data.open_ports} open port(s) are stored
+              against this asset, from a run that predates scan-coverage recording. Re-scan for a
+              current answer; the ports below may be stale.</>
+            )}
+            {data.verdict === 'never_scanned' && data.open_ports === 0 && (
+              <><strong>Never port-scanned.</strong> No completed port scan is on record and no ports are
+              stored, so "nothing listening" here means nobody has looked — not that nothing is there.</>
             )}
             {data.verdict === 'scanned_nothing_listening' && (
               <><strong>Port-scanned, nothing listening.</strong> A port scan completed against this asset and

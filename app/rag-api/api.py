@@ -52398,17 +52398,21 @@ def asset_scan_coverage(ip: str, hostname: Optional[str] = Query(default=None),
     if not keys:
         raise HTTPException(400, "need an ip or hostname")
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        # Every identity this asset is known by, so a scan recorded against the
-        # hostname is found from the IP view and the other way round.
-        cur.execute(
-            """SELECT DISTINCT host(ip) AS ip, hostname FROM assets
-                WHERE host(ip) = ANY(%s) OR lower(hostname) = ANY(%s)""",
-            (keys, keys))
-        for r in cur.fetchall():
-            for v in (r.get("ip"), (r.get("hostname") or "").lower()):
-                if v and v not in ("0.0.0.0", "::"):
-                    keys.append(v)
-        keys = sorted(set(keys))
+        # Expand the HOSTNAME to the IPs it resolves to, so a scan recorded
+        # against the IP is found from the hostname view.
+        #
+        # Deliberately NOT the other direction. 61 hostnames share
+        # 209.160.102.17 on this estate; expanding an IP to its hostnames would
+        # report a web scan of some unrelated vhost as coverage of this asset.
+        # Ports are per-IP, so IP->hostname adds nothing for the port question
+        # and is actively wrong for everything else.
+        if (hostname or "").strip():
+            cur.execute(
+                """SELECT DISTINCT host(ip) AS ip FROM assets
+                    WHERE lower(hostname) = %s AND host(ip) NOT IN ('0.0.0.0','::')""",
+                ((hostname or "").strip().lower(),))
+            keys.extend(r["ip"] for r in cur.fetchall() if r.get("ip"))
+        keys = sorted(set(k for k in keys if k))
 
         params = [keys]
         eng_clause = ""
@@ -52438,12 +52442,28 @@ def asset_scan_coverage(ip: str, hostname: Optional[str] = Query(default=None),
                 WHERE host(a.ip) = ANY(%s) OR lower(a.hostname) = ANY(%s)""",
             (keys, keys))
         vulns_n = (cur.fetchone() or {}).get("n") or 0
-        cur.execute(
-            """SELECT unnest(COALESCE(discovered_by, ARRAY[]::text[])) AS src
-                 FROM assets
-                WHERE host(ip) = ANY(%s) OR lower(hostname) = ANY(%s)""",
-            (keys, keys))
-        discovered_by = sorted({r["src"] for r in cur.fetchall() if r.get("src")})
+        # `discovered_by` is NOT a column — /assets derives it per request by
+        # unioning the `source` of the rows that reference the asset (see the
+        # source_map build in list_assets). Derive it the same way here rather
+        # than selecting a column that does not exist.
+        discovered_by = set()
+        for tbl, src_col in (
+                ("ports", "CASE WHEN service IN ('http','https') THEN 'web-probe' ELSE 'nmap' END"),
+                ("web_findings", "source"),
+                ("recon_findings", "source"),
+                ("credential_findings", "source")):
+            try:
+                cur.execute(
+                    f"""SELECT DISTINCT {src_col} AS src
+                          FROM {tbl} t JOIN assets a ON a.id = t.asset_id
+                         WHERE host(a.ip) = ANY(%s) OR lower(a.hostname) = ANY(%s)""",
+                    (keys, keys))
+                discovered_by.update(r["src"] for r in cur.fetchall() if r.get("src"))
+            except Exception as _e:  # noqa: BLE001
+                # One missing source table must not blank the whole panel.
+                logging.debug("scan-coverage source lookup on %s failed: %s", tbl, _e)
+                conn.rollback()
+        discovered_by = sorted(discovered_by)
 
     by_tool: dict = {}
     for s in scans:
