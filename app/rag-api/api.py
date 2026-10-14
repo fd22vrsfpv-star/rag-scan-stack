@@ -42098,17 +42098,38 @@ def reclassify_engagement_scope(engagement_id: str, body: ReclassifyBody | None 
         else:
             state = {}
         scope_of = {t: n for t, n in rows}
+        # TWO PASSES. The parent rule has to know whether a host's children are
+        # themselves dead, which is only knowable once every host is judged.
+        verdicts = {}
         for host in hosts:
             ctx = state.get(host, {"has_asset": False, "unresolved": False, "open_ports": 0})
             sug = clf.classify_rules_only(host, ctx)
-            if not sug or sug.scope not in _FILED:
-                continue
+            if sug and sug.scope in _FILED:
+                verdicts[host] = sug.scope
+
+        for host, dest in verdicts.items():
             candidates += 1
+            # Parent protection, narrowed to the case it was built for.
+            #
+            # It used to skip any host another scope entry sat under, which
+            # blocked ALL 49 candidates on redteam3 — every one of them. But
+            # `keys3.examplecorp.com` is a "parent" only because
+            # `www.keys3.examplecorp.com` exists, and that child is dead too;
+            # `hi.examplecorp.com` has six children, all equally dead. Filing a
+            # dead host whose whole subtree is dead splits nothing.
+            #
+            # The hazard this guards against is relocating a LIVE subtree's
+            # apex — the examplecorp.com / legacycorp.net incident. So skip only when
+            # a child is NOT also being filed: still listening, or never
+            # evaluated, which are both reasons to leave the parent alone.
             siblings = in_scope_names.get(scope_of[host], [])
-            if any(t != host and t.endswith("." + host) for t in siblings):
+            live_children = [t for t in siblings
+                             if t != host and t.endswith("." + host)
+                             and t not in verdicts]
+            if live_children:
                 skipped_parent.append(host)
                 continue
-            moved.append({"target": host, "from": scope_of[host], "to": sug.scope})
+            moved.append({"target": host, "from": scope_of[host], "to": dest})
         if body.apply and moved:
             # One UPDATE per destination, because the destination is per-host
             # now: a single hardcoded 'no_services' would file retired hosts
