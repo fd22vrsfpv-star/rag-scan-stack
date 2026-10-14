@@ -757,3 +757,24 @@ score reflects the benchmark's own definition of success. Until then 0/40 does
 not distinguish "our exploit pipeline is weak" from "we are answering a harder
 question than the one being scored".
 **Enforced by:** not enforced
+
+### `/assets?limit=5000` takes 80 seconds, which breaks the nmap scope gate
+**Found:** 2026-10-14
+**Evidence:** measured from inside `nmap_scanner`:
+
+    assets fetch: http=200 total=80.443648s size=1178332
+
+`_alias_map()` in `nmap_scanner/nmap-api.py` calls it with a 20s timeout, so it
+always fails (`alias map fetch failed: ... Read timed out (read timeout=20)`),
+and the BFF's own 30s client timeout fires first anyway — a proxied nmap of 122
+in-scope IPs returns `HTTP 500 (httpx.ReadTimeout)` with no job created. The
+gate cannot resolve ip<->hostname aliases, so a scan by IP of hosts whose scope
+entry is a hostname cannot be authorised through this path at all.
+**Where:** `app/rag-api/api.py` `/assets` handler; consumed by
+`nmap_scanner/nmap-api.py::_alias_map`.
+**Done when:** either `/assets` returns 5,000 rows in a few seconds, or a
+lightweight `(ip, hostname)` pairs endpoint exists for gate use and
+`_alias_map` reads that instead. 1.1MB of full asset records is far more than
+the gate needs.
+**Enforced by:** not enforced. `tests/test_scope_gate_alias_cost.py` pins the
+per-target fetch count, not the latency of the one fetch that remains.
