@@ -6,6 +6,7 @@ import {
   useCampaignEvents, useCreateCampaignEvent, useUpdateCampaignEvent, useCampaignSummary,
   useEngagementScopes, useEngagementScopeTargets, useAddScopeTargets, useDeleteScope,
   useRenameScope, useMoveTargets, useMoveEntireScope, downloadScopeTargetsCsv,
+  useReclassifyScope, type ReclassifyResult,
   type EngagementScope, type ScopeTarget, type EngagementDeleteResult,
 } from '@/api/engagements'
 import { useScopeNames } from '@/api/scope'
@@ -413,6 +414,8 @@ function ScopeTab({ engagementId }: { engagementId: string }) {
   }
 
   return (
+    <div className="space-y-3">
+    <ReclassifyControl engagementId={engagementId} />
     <div className="flex gap-4" style={{ minHeight: 400 }}>
       {/* Scope List */}
       <div className="w-56 shrink-0 space-y-2">
@@ -638,6 +641,108 @@ function ScopeTab({ engagementId }: { engagementId: string }) {
       <div className="rounded-lg border border-border bg-card p-3">
         <ScopePivotPanel engagementId={engagementId} />
       </div>
+    </div>
+    </div>
+  )
+}
+
+/** Re-file scoped hosts that no longer have an attack surface.
+ *
+ * Two clicks on purpose. The pass rewrites the scope label on up to hundreds
+ * of rows, so the operator reads WHICH hosts first and applies second — the
+ * dry run is not a preview of a thing already decided, it is the decision.
+ */
+function ReclassifyControl({ engagementId }: { engagementId: string }) {
+  const reclassify = useReclassifyScope(engagementId)
+  const [preview, setPreview] = useState<ReclassifyResult | null>(null)
+  const [applied, setApplied] = useState<ReclassifyResult | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+
+  const run = async (apply: boolean) => {
+    setErr(null)
+    try {
+      const r = await reclassify.mutateAsync(apply)
+      if (apply) { setApplied(r); setPreview(null) } else { setPreview(r); setApplied(null) }
+    } catch (e: unknown) {
+      // An error is not "nothing to move" — say which it was.
+      setErr(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  return (
+    <div className="rounded-lg border border-border bg-card p-3 space-y-2">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <div>
+          <div className="text-xs font-medium">Reclassify dead hosts</div>
+          <div className="text-[10px] text-muted-foreground">
+            Re-files hosts that were port-scanned with nothing listening, or that serve a
+            retirement page, into <span className="font-mono">no_services</span> /{' '}
+            <span className="font-mono">retired</span>. Only ever moves INTO those; never out of
+            a customer or excluded scope.
+          </div>
+        </div>
+        <div className="flex items-center gap-1 shrink-0">
+          <button
+            onClick={() => run(false)}
+            disabled={reclassify.isPending}
+            className="h-7 px-2 text-xs rounded border border-border hover:bg-accent disabled:opacity-40 inline-flex items-center gap-1">
+            {reclassify.isPending && !preview ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+            Dry run
+          </button>
+          <button
+            onClick={() => run(true)}
+            disabled={reclassify.isPending || !preview || preview.would_move === 0}
+            title={!preview ? 'Run the dry run first — you decide from the list, not from a count'
+                            : preview.would_move === 0 ? 'Nothing to move' : undefined}
+            className="h-7 px-2 text-xs rounded bg-primary text-primary-foreground hover:bg-primary/80 disabled:opacity-40">
+            Apply{preview && preview.would_move > 0 ? ` (${preview.would_move})` : ''}
+          </button>
+        </div>
+      </div>
+
+      {err && (
+        <div className="text-[11px] text-red-400 border border-red-500/30 bg-red-500/10 rounded p-2">
+          reclassify failed — nothing was moved: {err}
+        </div>
+      )}
+
+      {applied && (
+        <div className="text-[11px] text-green-400 border border-green-500/30 bg-green-500/10 rounded p-2">
+          Moved {applied.moved} host(s). Reversible from the scope list — these rows carry
+          <span className="font-mono"> source=reclassified</span>.
+        </div>
+      )}
+
+      {preview && (
+        <div className="space-y-1">
+          <div className="text-[11px]">
+            <span className="font-medium">{preview.would_move}</span> would move
+            {preview.candidates > preview.would_move && (
+              <span className="text-muted-foreground">
+                {' '}· {preview.candidates - preview.would_move} held back (a child is still
+                listening, or has never been scanned)
+              </span>
+            )}
+          </div>
+          {preview.would_move > 0 ? (
+            <div className="max-h-48 overflow-auto rounded border border-border bg-background/50 p-2">
+              {preview.targets.map(t => (
+                <div key={t} className="text-[10px] font-mono text-muted-foreground">{t}</div>
+              ))}
+              {preview.would_move > preview.targets.length && (
+                <div className="text-[10px] text-muted-foreground italic mt-1">
+                  … and {preview.would_move - preview.targets.length} more not listed in the response
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="text-[11px] text-muted-foreground">
+              Nothing to move — every scoped host either still has something listening or has not
+              been scanned yet.
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
