@@ -57,6 +57,11 @@ RAG_LOADED_OTHER = {
     # the structured triggers into refine_error_patterns table.
     "refine_error_patterns.yaml": "etl/load_refine_patterns.py",
     "build_poc_research_patterns.yaml": "etl/load_research_patterns.py",
+    # Which TOOL answers which build-poc gap. Embedded so the planner can
+    # RECALL a tool rather than only match the hardcoded _GAP_SOLUTIONS table —
+    # before this, only six step names could ever run and anything RAG or the
+    # LLM suggested arrived with step=None and became an operator follow-up.
+    "gap_tools.yaml": "etl/load_gap_tools.py",
     # Post-run review criteria: _load_build_poc_review_knowledge embeds each
     # criterion into rag_documents so the review agent can retrieve them.
     "build_poc_review.yaml": "app/rag-api/api.py",

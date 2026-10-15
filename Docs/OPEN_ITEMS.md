@@ -710,6 +710,38 @@ not distinguish "our exploit pipeline is weak" from "we are answering a harder
 question than the one being scored".
 **Enforced by:** not enforced
 
+### 4 of 17 news sources return nothing, and all 4 report no error
+**Found:** 2026-10-15
+**Evidence:** the latest completed ingest fetched 280 articles across 17
+sources. Four of them contributed **0 articles with `error: None`**, which is
+indistinguishable in the run record from a feed that genuinely had nothing new.
+Fetched directly from `news-runner`:
+
+    GitHub Security Advisories  https://github.com/advisories.atom   HTTP 406
+    Microsoft MSRC              https://msrc.microsoft.com/blog/feed HTTP 301
+    Assetnote Research          https://www.assetnote.io/feed.xml    HTTP 301
+    CSO Online                  https://www.csoonline.com/index.rss  HTTP 404
+
+One bot-block (406 — the Accept/User-Agent we send is rejected), two
+un-followed redirects, and one dead URL that serves 176KB of HTML error page.
+The feed has therefore been running at **13 of 17 sources**; the 2,324 items
+collected come from those 13.
+**Where:** `news_runner/news_agent.py` — the per-source fetch records
+`articles: 0, error: None` rather than checking the HTTP status. The `error`
+field exists and is carried all the way into `news_runs.per_source`; nothing
+populates it for a non-200.
+**Done when:** a non-2xx response is recorded in that source's `error` field
+instead of being flattened to an empty result, redirects are followed, and the
+two stale URLs are corrected. The 406 needs a browser-like `User-Agent` and
+`Accept: application/atom+xml` — GitHub serves the feed to a normal client.
+**Enforced by:** not enforced. A guard would assert that a source whose fetch
+returns non-2xx records a non-null `error`.
+*Why it matters:* this is the repo's recurring "unreachable is not absent", in
+the news fetcher. A blocked source and an idle source look identical, so four
+feeds have been silently contributing nothing and the operator's reasonable
+read of the panel — "nothing is happening" — was closer to the truth than the
+run record was.
+
 ### News asset-matching pivots through `vulns.cve`, which can never contain tomorrow's CVE
 **Found:** 2026-10-15
 **Evidence:** `asset_matches` is empty on **all 2,313** `news_items` — not one
@@ -761,6 +793,30 @@ version-qualified should say so rather than imply the host is vulnerable.
 **Enforced by:** not enforced. A guard would need a fixture news item whose
 product matches a seeded `detected_software` row and assert a non-empty
 `asset_matches`.
+
+**Spec already worked out (2026-10-15, parked before wiring):** the product
+match belongs in `news_agent.py` beside `_match_assets`, reading
+`detected_software` grouped by product and testing word-boundary containment
+against the item's title+summary (a bare `find()` fires `PHP` on `graphql`).
+Longest product name first, so "Apache HTTP Server" beats "Apache" on the same
+story.
+
+The junk products that must be excluded were identified by inspection —
+neither `detection_type` nor `source` separates them from real software (both
+appear under `tech_detection`/`whatweb` and `tech_detection`/`httpx`), so an
+explicit deny-list is required:
+
+    hsts, http, https, ip, country, title, cookies, httpserver,
+    redirectlocation, uncommonheaders, via-proxy, x-frame-options,
+    x-powered-by, strict-transport-security, content-security-policy,
+    email, script, meta, frame, html5, open-graph-protocol,
+    x-ua-compatible, allow, probably-linux, unix, linux, windows,
+    server, header, headers, charset
+
+plus a 4-character minimum and a requirement that the name contains a letter.
+"Country" alone appears on 66 hosts and in a large share of headlines — match
+on it and every story reports an asset hit, which is worse than matching
+nothing because the operator learns to ignore the feature.
 
 ### News ingest reports only a boolean while it is running
 **Found:** 2026-10-15

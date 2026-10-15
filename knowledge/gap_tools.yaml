@@ -1,0 +1,152 @@
+# Which TOOL answers which build-poc GAP.
+#
+# Why this file exists
+# --------------------
+# When a PoC build is stuck, `_solutions_for_gaps` asks "what do I need, and
+# how do I get it". It answers from a hardcoded table, then RAG, then an LLM —
+# but only a solution whose `step` is one of SIX hardcoded names could ever
+# RUN:
+#
+#     _DEEP_RECON_STEPS = ("default_creds", "auth_crawl", "access_inventory",
+#                          "zap_spider", "arjun_params", "verb_sweep")
+#
+# Everything RAG or the model suggested arrived with `step: None` and became an
+# operator follow-up. So retrieval already worked and acting on it did not:
+# knowledge/ describes 239 distinct tool invocations and the stack runs
+# wafw00f, nikto, nuclei, gobuster, ffuf, httpx, whatweb and more, none of
+# which build-poc could reach. Adding one meant editing a tuple and an
+# `if step == ...` chain in api.py — the branching-logic edit CLAUDE.md's
+# RAG-first rule exists to prevent:
+#
+#   "New knowledge should take effect by being loaded and embedded, not by
+#    editing branching logic."
+#
+# So the vocabulary lives here, as data. Add a tool by adding an entry and
+# re-running the loader; no code change, no redeploy of logic.
+#
+# Contract for every entry
+# ------------------------
+#   id          stable name, used as the step name in a deep-recon plan
+#   gaps        the manifest `missing` entries this tool can answer
+#   indicators  OPTIONAL. Only suggest when one of these is observed — this is
+#               how "check for a WAF when something smells like a WAF" works
+#               without making wafw00f an always-on stage.
+#   yields      what a successful run produces, in gather-manifest terms
+#   command     argv template. {ip} {port} {scheme} {base_url} {path} are
+#               substituted; NOTHING else is interpolated, and the command is
+#               scope-gated before dispatch like every other target-bound
+#               command in the stack.
+#   cost        rough seconds, used to order the plan cheapest-first
+#   safe        true = read-only reconnaissance. false = may write/alter, and
+#               is never auto-run; it becomes an operator follow-up.
+#
+# The deterministic `_GAP_SOLUTIONS` table in api.py stays as the backstop
+# (CLAUDE.md: "the deterministic rules engine stays as the execution
+# backstop"). This widens what can run; it does not replace the gate.
+version: 1
+
+tools:
+  - id: wafw00f_detect
+    # NOT installed in kali-listener (checked 2026-10-15); it lives in
+    # osint-runner, which exposes it at POST /jobs/wafw00f. `runner` names the
+    # service a step must be dispatched to, so the executor refuses rather
+    # than shelling out to a binary that is not there and reporting an empty
+    # result as "the tool found nothing".
+    runner: osint-runner
+    gaps: [carrier, blocked, evidence]
+    indicators: ["403", "406", "waf", "challenge", "captcha", "cloudflare",
+                 "akamai", "incapsula", "request blocked", "access denied"]
+    yields: waf_family
+    command: "wafw00f -a -o - {scheme}://{ip}:{port}"
+    cost: 20
+    safe: true
+    why: >
+      A refine loop that keeps getting 403 on a request the app should accept
+      is usually arguing with a WAF, not with the application. The refine
+      loop's own error tiering already calls this the CARRIER axis; knowing the
+      family turns "change the carrier" from a guess into a specific one.
+
+  - id: whatweb_fingerprint
+    gaps: [product, version, evidence]
+    yields: product_version
+    command: "whatweb -a 3 --color=never {scheme}://{ip}:{port}"
+    cost: 25
+    safe: true
+    why: >
+      product=unknown was carried through every CVE-Bench run of 2026-10-15.
+      A product name is what selects the advisory, the default credentials and
+      the exploit family, so an unknown product degrades every later stage.
+      NOTE: deliberately NOT --no-errors. That flag suppressed the single line
+      explaining why a run returned nothing ("Connection refused - connect(2)
+      ... port 80"), so the executor recorded "no usable output" and the
+      operator could not tell a wrong port from a tool that is not installed.
+      An error message is more useful than silence.
+
+  - id: httpx_probe
+    # MUST run on pd-runner / osint-runner, NOT kali-listener. The listener's
+    # `httpx` is the PYTHON HTTP LIBRARY's CLI, not ProjectDiscovery's scanner
+    # — same binary name, different program. Dispatching this template there
+    # returns "Error: No such option: -u" (found 2026-10-15 by running it,
+    # which `command -v httpx` could never have told us).
+    runner: pd-runner
+    gaps: [target_reachable, product, endpoint]
+    yields: tech_stack
+    command: "httpx -u {scheme}://{ip}:{port} -title -tech-detect -status-code -no-color -silent"
+    cost: 15
+    safe: true
+    why: >
+      Cheapest possible answer to "is it up, and what is it" — run before
+      anything expensive when the manifest cannot even confirm reachability.
+
+  - id: gobuster_paths
+    gaps: [endpoint]
+    indicators: ["404", "no endpoint", "path not served"]
+    yields: candidate_paths
+    command: "gobuster dir -u {scheme}://{ip}:{port} -w /usr/share/wordlists/seclists/Discovery/Web-Content/common.txt -q -t 20 --timeout 10s"
+    cost: 120
+    safe: true
+    why: >
+      The advisory path often does not exist at the deployment's prefix. A
+      bounded content sweep finds the real one. Deliberately `common.txt` and
+      20 threads — a deep brute is a separate, operator-approved decision.
+      The path is the SecLists one that exists in kali-listener; the first
+      version pointed at /wordlists/common.txt, which is the operator's
+      generated-wordlist mount and contains no such file, so every run would
+      have died on a missing wordlist.
+
+  - id: nuclei_targeted
+    gaps: [evidence, artifact]
+    yields: template_evidence
+    command: "nuclei -u {scheme}://{ip}:{port} -severity critical,high -silent -nc"
+    cost: 90
+    safe: true
+    why: >
+      When the gap is EVIDENCE rather than access, a template hit is
+      third-party confirmation the vulnerability class is present, which the
+      canary chain can then anchor against.
+
+  - id: searchsploit_lookup
+    # NOT installed in kali-listener (checked 2026-10-15).
+    runner: exploitdb
+    gaps: [evidence, artifact, advisory_poc]
+    yields: public_poc
+    command: "searchsploit --json {product}"
+    cost: 5
+    safe: true
+    local_only: true
+    why: >
+      A local database lookup — no traffic to the target at all. Answers "has
+      someone already written this exploit" before the loop spends iterations
+      deriving one.
+
+  - id: nikto_scan
+    gaps: [endpoint, evidence]
+    yields: server_findings
+    command: "nikto -h {scheme}://{ip}:{port} -maxtime 180s -nointeractive"
+    cost: 180
+    safe: true
+    noisy: true
+    why: >
+      Broad and loud. Last resort for endpoint discovery when the cheaper
+      sweeps have produced nothing; `noisy` so a planner can prefer anything
+      else first.

@@ -307,7 +307,14 @@ def enforce_facts(command: str, required: dict) -> Optional[str]:
 # mistaken for coverage.
 _UNIVERSAL_TOKENS = {"/", "//", ".", "..", "-", "_", "?", "&", "=",
                      "http", "https", "www", "com", "html", "php", "/ ", "''",
-                     "curl", "get", "post", "index", "index.php", "index.html"}
+                     "curl", "get", "post", "index", "index.php", "index.html",
+                     # Front controllers and default documents: on the stacks
+                     # we actually test (WordPress, PHP apps, Tomcat) every
+                     # request reaches one of these, so insisting on it refuses
+                     # nothing. Stored normalised — `is_enforceable_value`
+                     # strips slashes before comparing.
+                     "index.htm", "default.aspx", "index.jsp", "index.asp",
+                     "wp-admin", "admin.php", "home", "main.php", "app.php"}
 _MIN_DISCRIMINATING_LEN = 3
 
 
@@ -317,11 +324,23 @@ def is_enforceable_value(value) -> bool:
     A value is enforceable when it is long enough to be distinctive and is not
     a token every HTTP command carries anyway. Everything else is dropped from
     the armed set rather than silently passing every check.
+
+    The stoplist is matched against the value NORMALISED, not raw. The first
+    version compared raw, so `index.php` was caught and `/index.php` was not —
+    and CVE-2024-36412 duly armed `{'endpoint_exists': '/index.php'}` on a
+    WordPress target where every single request hits that path. That is the
+    same "guard that cannot fail" this function exists to prevent, reintroduced
+    by the fix for it. Leading/trailing slashes and a leading dot carry no
+    discriminating power, so they are stripped before the comparison.
     """
     v = str(value or "").strip()
     if len(v) < _MIN_DISCRIMINATING_LEN:
         return False
-    if v.lower() in _UNIVERSAL_TOKENS:
+    norm = v.lower().strip("/").lstrip(".")
+    if v.lower() in _UNIVERSAL_TOKENS or norm in _UNIVERSAL_TOKENS:
+        return False
+    # Normalising can empty the value ("/", "///", "..") — nothing left to match.
+    if len(norm) < _MIN_DISCRIMINATING_LEN:
         return False
     # A path whose only content is separators ("/", "/ /", "//") discriminates
     # nothing even though it clears the length bar.

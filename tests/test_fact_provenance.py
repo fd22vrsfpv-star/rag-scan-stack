@@ -362,6 +362,33 @@ def test_degenerate_values_are_not_enforceable():
         assert is_enforceable_value(real), f"{real!r} was dropped"
 
 
+@pytest.mark.parametrize("leaked", [
+    "/index.php", "/index.html", "/wp-admin", "/default.aspx", "/..", "///"])
+def test_the_stoplist_is_matched_normalised(leaked):
+    """The first filter compared the RAW value against the stoplist.
+
+    `index.php` was caught; `/index.php` was not. CVE-2024-36412 duly armed
+    {'endpoint_exists': '/index.php'} on a WordPress target, where every single
+    request hits that path — so the constraint could never refuse anything.
+    That is the exact "guard that cannot fail" the filter exists to prevent,
+    reintroduced by the fix for it.
+    """
+    from fact_probes import is_enforceable_value
+    assert not is_enforceable_value(leaked), (
+        f"{leaked!r} is armable again — a leading slash or dot must not let a "
+        "universal path through the stoplist")
+
+
+def test_normalisation_does_not_eat_real_paths():
+    """The stripping must not turn a discriminating path into junk."""
+    from fact_probes import is_enforceable_value
+    for real in ("/admin/dict.php", "/wp-json/wp/v2/users", "/business-directory",
+                 "sortfield", "per_page", "/admin1", "listingfields"):
+        assert is_enforceable_value(real), (
+            f"{real!r} was dropped — these are the values actually armed on "
+            "real runs; losing them disables the gate entirely")
+
+
 def test_required_facts_filters_degenerate_values():
     """Imported AND called — the import line alone satisfies a text search.
 
