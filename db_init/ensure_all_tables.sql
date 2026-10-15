@@ -2020,9 +2020,30 @@ CREATE TABLE IF NOT EXISTS public.node_scan_jobs (
     completed_at   timestamptz,
     updated_at     timestamptz NOT NULL DEFAULT now()
 );
+-- A remote scan is collected target data, so the job row carries the
+-- engagement (CLAUDE.md: engagement attribution is mandatory). Nullable
+-- because a scan dispatched with no X-Engagement-Id and none in the body still
+-- gets a job row -- losing the history is worse than an unattributed row, and
+-- the purge also deletes by target IP.
+--
+-- NO FK HERE. public.engagements is created ~750 lines below this point, so a
+-- REFERENCES clause fails on a FRESH database -- and inside the BEGIN/COMMIT
+-- block it takes every following statement with it. The constraint is attached
+-- after engagements exists, in the engagement-FK block near the end of this
+-- file, which is the same thing security_tests does.
+ALTER TABLE public.node_scan_jobs
+    ADD COLUMN IF NOT EXISTS engagement_id uuid;
 CREATE INDEX IF NOT EXISTS idx_node_scan_jobs_node_id ON public.node_scan_jobs(node_id);
 CREATE INDEX IF NOT EXISTS idx_node_scan_jobs_status ON public.node_scan_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_node_scan_jobs_created_at ON public.node_scan_jobs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_node_scan_jobs_engagement ON public.node_scan_jobs(engagement_id);
+-- The dispatcher INSERTs 'running' and the completion/failure paths UPDATE the
+-- same row, both keyed by job_id, so job_id must be unique or a retried
+-- dispatch silently forks the history into two rows. Plain, not partial: a
+-- partial index would have to repeat its predicate in every ON CONFLICT, and
+-- Postgres leaves NULLs unconstrained in either case. node_manager always
+-- supplies a job_id (a uuid4 it generated), so no NULL is ever written.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_node_scan_jobs_job_id ON public.node_scan_jobs(job_id);
 
 -- ad_attack_results
 CREATE TABLE IF NOT EXISTS public.ad_attack_results (
@@ -2297,6 +2318,38 @@ FROM public.exploit_results er JOIN public.pending_exploits pe ON er.pending_exp
 
 -- Detected software inventory (aggregates versions from ports, web_findings, recon_findings)
 CREATE OR REPLACE VIEW public.detected_software AS
+-- DEDUPLICATED. The branches below are UNION ALL over tables that get a NEW
+-- ROW PER SCAN -- recon_findings and web_findings accumulate one row per httpx
+-- / gowitness / ZAP / whatweb run against the same host -- so the same piece of
+-- software appeared once per run, not once per host. Measured 2026-10-14:
+--
+--   detected_software rows: 15407   distinct software: 11268
+--   redundant copies:        4139   (27% of the view)
+--
+--   n=778  Apache         zap    server_header   172.18.0.36
+--   n=709  Apache-Coyote  zap    server_header   65.61.137.117
+--   n=207  Amazon CloudFront / HSTS / AWS  httpx tech_detection 20.49.104.29
+--
+-- Every consumer inherited that: the asset Software panel listed "Apache" 778
+-- times, and because each listed product drives its own CVE lookup, the CVE
+-- list repeated with it. Nothing was wrong with the CVE data -- the inventory
+-- feeding it was 27% copies.
+--
+-- UNION ALL (not UNION) is kept on purpose: it is cheaper, the branches are
+-- disjoint by `source`, and deduplication belongs in ONE place where it can
+-- also fold the timestamps. GROUP BY, not DISTINCT, so first_seen is the
+-- EARLIEST sighting and last_seen the LATEST -- the per-run rows are the
+-- evidence that produces that range, and collapsing them with DISTINCT would
+-- have kept an arbitrary one of each.
+--
+-- The `nmap` branch reads `ports`, which is already unique per (asset, port),
+-- and measured 0 redundant rows -- it is unaffected by the wrapper.
+SELECT
+    asset_id, ip, hostname, port, protocol, product, version, source,
+    detection_type,
+    min(first_seen) AS first_seen,
+    max(last_seen)  AS last_seen
+FROM (
 -- Source 1: Nmap/Masscan service detection (ports table)
 SELECT
     a.id AS asset_id,
@@ -2648,7 +2701,10 @@ SELECT
 FROM public.web_findings wf
 LEFT JOIN public.assets a ON wf.asset_id = a.id
 WHERE wf.url ~ '/\d+\.\d+\.\d+/_/download/'
-  AND substring(wf.url from '/(\d+\.\d+\.\d+)/_/download/') IS NOT NULL;
+  AND substring(wf.url from '/(\d+\.\d+\.\d+)/_/download/') IS NOT NULL
+) _software
+GROUP BY asset_id, ip, hostname, port, protocol, product, version, source,
+         detection_type;
 
 -- ============================================================================
 -- software_research_cache (persists AI exploit research results per product+version)
@@ -2766,6 +2822,16 @@ ALTER TABLE public.playwright_findings ADD COLUMN IF NOT EXISTS engagement_id uu
 -- because they are created before this point. Attach it here.
 -- ADD COLUMN IF NOT EXISTS would not do it: the column already exists, so the
 -- statement is a no-op and the constraint never appears.
+-- node_scan_jobs.engagement_id is declared above without the FK (engagements
+-- did not exist yet). ON DELETE CASCADE: a remote scan's job row is collected
+-- data belonging to that engagement, so purging the engagement removes it.
+DO $NSJFK$ BEGIN
+    ALTER TABLE public.node_scan_jobs
+      ADD CONSTRAINT node_scan_jobs_engagement_fk
+      FOREIGN KEY (engagement_id) REFERENCES public.engagements(id) ON DELETE CASCADE;
+EXCEPTION WHEN duplicate_object THEN NULL; WHEN undefined_table THEN NULL;
+          WHEN undefined_column THEN NULL; END $NSJFK$;
+
 DO $STFK$ BEGIN
     ALTER TABLE public.security_tests
       ADD CONSTRAINT security_tests_engagement_fk

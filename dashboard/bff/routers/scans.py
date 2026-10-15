@@ -1361,21 +1361,36 @@ except Exception:                                # pragma: no cover
 
 
 async def _host_aliases(host: str) -> set:
-    """Observed ip<->hostname pairings for `host`, from rag-api's assets."""
+    """Observed ip<->hostname pairings for `host`, from rag-api.
+
+    Reads `/assets/alias-pairs`, not `/assets?limit=5000`. The full asset list
+    takes 80 seconds to build — eight times the timeout below — so this lookup
+    raised ReadTimeout on EVERY call and returned `{host}`, which is "this host
+    has no aliases". Silent and in the safe direction, but it meant a scan by
+    IP of a host whose scope entry is its hostname could not be authorised
+    through this path at all. The pairs endpoint answers in 0.2s.
+    """
     aliases = {host}
     if host in ("localhost", "127.0.0.1", "::1"):
         aliases |= {"localhost", "127.0.0.1", "::1"}
     s = get_settings()
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get(f"{s.rag_api_url}/assets", params={"limit": 5000},
+            r = await c.get(f"{s.rag_api_url}/assets/alias-pairs",
                             headers={"x-api-key": s.api_key})
-            if r.status_code == 200:
-                for a in (r.json().get("assets") or []):
-                    ip = str(a.get("ip") or "").strip().lower()
-                    hn = _host_only(str(a.get("hostname") or "")) if _host_only else ""
-                    if host in (ip, hn):
-                        aliases |= {x for x in (ip, hn) if x}
+            if r.status_code != 200:
+                # Not an exception — httpx does not raise on 4xx/5xx. Say so,
+                # or an unreachable alias source reads as "no aliases exist".
+                log.warning("alias lookup for %r: /assets/alias-pairs returned "
+                            "HTTP %s — checking the host as given",
+                            host, r.status_code)
+                return aliases
+            for ip_h in (r.json().get("pairs") or []):
+                ip = str((ip_h or [None, None])[0] or "").strip().lower()
+                raw = str((ip_h or [None, None])[-1] or "")
+                hn = (_host_only(raw) or "").strip().lower() if _host_only else ""
+                if host in (ip, hn):
+                    aliases |= {x for x in (ip, hn) if x}
     except Exception as e:
         log.warning("alias lookup failed for %r: %s", host, e)
     return aliases

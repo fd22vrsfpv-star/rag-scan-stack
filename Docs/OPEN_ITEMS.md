@@ -673,54 +673,6 @@ correctly and the invariant ("never accept a latency verdict on a single run")
 is being honoured — CVE-2024-3552's scaling is genuine, which is how the
 undercount was noticed.
 
-### `node_scan_jobs` is declared, indexed, and never written
-**Found:** 2026-10-13
-**Evidence:** `SELECT count(*) FROM node_scan_jobs` → **0**, while
-`scan_audit/audit.jsonl` and `scope_coverage` both record remote scans from the
-same code path. The table has the full job shape (`node_id`, `scan_type`,
-`job_id`, `status`, `targets`, `parameters`, `result_summary`, `error`,
-`created_at`/`started_at`/`completed_at`), so a remote scan's history is
-reconstructable only from JSONL and the per-target coverage rows.
-**Where:** `node_manager/node_manager.py::_remote_scan_bounded` — writes
-`write_audit(...)` and `_record_scan_coverage(...)` but never inserts a job row.
-No INSERT against `node_scan_jobs` exists anywhere in the repo.
-**Done when:** a remote scan writes one `node_scan_jobs` row at dispatch
-(`status='running'`) and updates it to `completed`/`failed` with
-`result_summary`, OR the table is dropped from `db_init/` as unused. Either is
-fine; the third state (declared, empty, nobody knows why) is not.
-**Enforced by:** not enforced
-
-### `osint_runner` is importable by node-manager in source only
-**Found:** 2026-10-13
-**Evidence:** `docker exec node-manager python -c "import osint_runner"` →
-`ModuleNotFoundError: No module named 'osint_runner'`. The WHOIS ingest branch
-in `_remote_scan_bounded` does
-`from osint_runner.osint_runner import _parse_whois_domain` inside
-`except ImportError: _parse_whois_domain = None`, so a remote `whois` scan
-downloads its output and parses none of it — silently.
-**Where:** `node_manager/Dockerfile` copies only
-`osint_runner/service_enum_cli.py`; the WHOIS branch is in
-`node_manager/node_manager.py`.
-**Done when:** either `osint_runner.py` ships into the image (as a package with
-`__init__.py`, since the import is dotted) and a remote WHOIS scan ingests, or
-the branch is deleted and WHOIS stays a local-runner job.
-**Enforced by:** not enforced. `tests/test_node_manager_requirements.py` covers
-pip declarations only — a repo module that reaches neither the image nor a mount
-is the same class of bug with a different fix.
-
-### `idm.examplecorp.com` answers on 401 of ~1,150 ports
-**Found:** 2026-10-13
-**Evidence:** the wide masscan of the redteam3 estate recorded **401 open ports**
-on `66.45.103.92` (`idm.examplecorp.com`) — ports 6, 15, 16, 19, 32, 33, 35, 40,
-42, 43, 45, 48, 51, 52, 54, 55 and on up. Every other host in the estate
-returned at most 4. The next-busiest host had 4.
-**Where:** `ports` rows for asset `66.45.103.92`; ingested via
-`/ingest/masscan` from the remote node run `2b04d810`.
-**Done when:** the host is confirmed as a tarpit/SYN-ACK-everything firewall and
-its port rows are either excluded from service-selection heuristics or flagged,
-so the enumeration planner does not queue 401 service probes against one host.
-**Enforced by:** not enforced
-
 ### CVE-Bench grades on 8 alternative goals; we only attempt the hardest one
 **Found:** 2026-10-14
 **Evidence:** every challenge's `eval.yml` offers the SAME eight ways to pass,
@@ -758,23 +710,3 @@ not distinguish "our exploit pipeline is weak" from "we are answering a harder
 question than the one being scored".
 **Enforced by:** not enforced
 
-### `/assets?limit=5000` takes 80 seconds, which breaks the nmap scope gate
-**Found:** 2026-10-14
-**Evidence:** measured from inside `nmap_scanner`:
-
-    assets fetch: http=200 total=80.443648s size=1178332
-
-`_alias_map()` in `nmap_scanner/nmap-api.py` calls it with a 20s timeout, so it
-always fails (`alias map fetch failed: ... Read timed out (read timeout=20)`),
-and the BFF's own 30s client timeout fires first anyway — a proxied nmap of 122
-in-scope IPs returns `HTTP 500 (httpx.ReadTimeout)` with no job created. The
-gate cannot resolve ip<->hostname aliases, so a scan by IP of hosts whose scope
-entry is a hostname cannot be authorised through this path at all.
-**Where:** `app/rag-api/api.py` `/assets` handler; consumed by
-`nmap_scanner/nmap-api.py::_alias_map`.
-**Done when:** either `/assets` returns 5,000 rows in a few seconds, or a
-lightweight `(ip, hostname)` pairs endpoint exists for gate use and
-`_alias_map` reads that instead. 1.1MB of full asset records is far more than
-the gate needs.
-**Enforced by:** not enforced. `tests/test_scope_gate_alias_cost.py` pins the
-per-target fetch count, not the latency of the one fetch that remains.

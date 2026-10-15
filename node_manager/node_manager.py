@@ -1310,6 +1310,65 @@ async def _capture_engagement(request, call_next):
 PORT_SCAN_TYPES = {"masscan", "nmap", "naabu", "rustscan"}
 
 
+def _record_scan_job(job_id, node_id, scan_type, targets, parameters,
+                     engagement_id, status, result_summary=None, error=None):
+    """Write/advance the `node_scan_jobs` row for a remote scan.
+
+    `node_scan_jobs` was declared, indexed, triggered — and never written:
+    `SELECT count(*) FROM node_scan_jobs` returned **0** while the same code
+    path was filling `scan_audit/audit.jsonl` and `scope_coverage`. A remote
+    scan's history was reconstructable only from a JSONL file on disk plus the
+    per-target coverage rows, neither of which records which node ran it, what
+    parameters it was given, or why it failed.
+
+    Keyed by `job_id` (unique index `uq_node_scan_jobs_job_id`), so dispatch
+    INSERTs `running` and the completion/failure paths UPDATE that same row.
+    Without the unique index a retried dispatch forks the history in two.
+
+    Fails soft and says so. This is bookkeeping: a scan that ran must not be
+    refused or lost because its job row could not be written, but a silent
+    failure here is exactly how the table got to zero rows in the first place.
+    """
+    if not job_id:
+        log.warning("scan job not recorded: no job_id (%s)", scan_type)
+        return False
+    try:
+        conn = _get_conn()
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO node_scan_jobs
+                   (node_id, scan_type, job_id, status, targets, parameters,
+                    engagement_id, result_summary, error, started_at, completed_at)
+               VALUES (%s::uuid, %s, %s, %s, %s::jsonb, %s::jsonb,
+                       %s::uuid, %s::jsonb, %s,
+                       now(),
+                       CASE WHEN %s IN ('completed', 'failed', 'cancelled')
+                            THEN now() ELSE NULL END)
+               ON CONFLICT (job_id) DO UPDATE
+                   SET status         = EXCLUDED.status,
+                       result_summary = COALESCE(EXCLUDED.result_summary,
+                                                 node_scan_jobs.result_summary),
+                       error          = COALESCE(EXCLUDED.error,
+                                                 node_scan_jobs.error),
+                       completed_at   = EXCLUDED.completed_at""",
+            (node_id, scan_type, job_id, status,
+             json.dumps(list(targets or [])[:200]),
+             json.dumps(parameters or {}),
+             engagement_id or None,
+             json.dumps(result_summary) if result_summary is not None else None,
+             (error or None) and str(error)[:4000],
+             status),
+        )
+        cur.close()
+        conn.close()
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("scan job write failed (%s %s, status=%s): %s",
+                    scan_type, str(job_id)[:8], status, e)
+        return False
+
+
 def _record_scan_coverage(engagement_id, targets, scan_type, job_id, status):
     """Record that these targets were port-scanned, so an empty result is a fact.
 
@@ -2970,6 +3029,13 @@ async def _remote_scan_bounded(node_id: str, req):
         "parameters": {"ports": req.ports, "rate": req.rate},
     })
 
+    # The durable half of the same record. write_audit appends to a JSONL file;
+    # this is the row an operator can query, join and purge with the engagement.
+    _record_scan_job(job_id, node_id, req.scan_type, req.targets,
+                     {"ports": req.ports, "rate": req.rate,
+                      "timeout": req.timeout, "extra_args": req.extra_args},
+                     _eid, "running")
+
     log.info("Remote scan %s on node %s: %s", req.scan_type, node_id, " ".join(cmd))
 
     # Per-target mode: run command once per target, collect stdout as results
@@ -3000,10 +3066,20 @@ async def _remote_scan_bounded(node_id: str, req):
         # Parse and ingest WHOIS results locally
         ingest_result = {}
         if tmpl.get("_whois_ingest"):
-            try:
-                from osint_runner.osint_runner import _parse_whois_domain, _parse_whois_ip
-            except ImportError:
-                _parse_whois_domain = None
+            # One implementation, shared with osint_runner via the ./common
+            # mount. This branch used to import osint_runner's parsers inside
+            # `except ImportError:` — the module is not in this image, so the
+            # import always failed — and then not use them anyway: underneath
+            # was a re-typed, SHORTER copy of the same field maps (8 fields
+            # against 11 for a domain, with the domain and IP maps merged into
+            # one). A remote WHOIS therefore recorded org/registrar and
+            # silently dropped expiry, registrant, DNSSEC and status, while a
+            # local WHOIS of the same host recorded all of them.
+            #
+            # Hard import, no soft fallback: a WHOIS parsed by a different map
+            # than every other caller is worse than one that refuses, because
+            # the gap only shows up as missing fields nobody is looking for.
+            from common.whois_parse import parse_whois
             ingested = 0
             conn = _get_conn()
             conn.autocommit = True
@@ -3013,28 +3089,10 @@ async def _remote_scan_bounded(node_id: str, req):
                     continue
                 import re as _re
                 is_ip = bool(_re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', tgt))
-                # Simple field extraction
-                parsed = {"raw_length": len(raw), "target": tgt, "type": "ip" if is_ip else "domain"}
-                field_map = {
-                    "org": ["OrgName:", "org:", "Registrant Organization:"],
-                    "registrar": ["Registrar:", "registrar:"],
-                    "creation_date": ["Creation Date:", "created:"],
-                    "country": ["Country:", "country:", "Registrant Country:"],
-                    "net_range": ["NetRange:", "inetnum:"],
-                    "cidr": ["CIDR:", "route:"],
-                    "asn": ["OriginAS:", "origin:"],
-                    "name_servers": ["Name Server:", "nserver:"],
-                }
-                for key, patterns in field_map.items():
-                    values = []
-                    for pat in patterns:
-                        for line in raw.splitlines():
-                            if line.strip().lower().startswith(pat.lower()):
-                                val = line.split(":", 1)[1].strip()
-                                if val and val not in values:
-                                    values.append(val)
-                    if values:
-                        parsed[key] = values if key == "name_servers" else values[0]
+                parsed = parse_whois(raw, tgt, is_ip)
+                # `target` is what the recon_findings row is keyed by; the
+                # shared parser names the key `ip` or `domain`, so keep both.
+                parsed["target"] = tgt
                 finding_type = "whois_ip" if is_ip else "whois_record"
                 cur.execute(
                     "INSERT INTO recon_findings (source, finding_type, target, data, severity) "
@@ -3050,6 +3108,11 @@ async def _remote_scan_bounded(node_id: str, req):
             "job_id": job_id, "execution_mode": "remote", "node_id": node_id,
             "duration_s": duration_s, "targets": len(req.targets),
         })
+        _record_scan_job(job_id, node_id, req.scan_type, req.targets, None,
+                         _eid, "completed",
+                         result_summary={"duration_s": duration_s,
+                                         "targets_processed": len(all_results),
+                                         "ingest": ingest_result})
         return {
             "ok": True, "job_id": job_id, "scan_type": req.scan_type,
             "node_id": node_id, "execution_mode": "remote",
@@ -3084,6 +3147,11 @@ async def _remote_scan_bounded(node_id: str, req):
         # evidence the host has nothing listening — that conflation is how
         # "unreachable" gets filed as "absent".
         _record_scan_coverage(_eid, req.targets, req.scan_type, job_id, "failed")
+        _record_scan_job(job_id, node_id, req.scan_type, req.targets, None,
+                         _eid, "failed",
+                         result_summary={"duration_s": duration_s,
+                                         "exit_code": result.get("exit_code")},
+                         error=error_detail)
         raise HTTPException(500, {
             "error": error_detail[:500],
             "stdout": result.get("stdout", "")[-500:],
@@ -3183,6 +3251,11 @@ async def _remote_scan_bounded(node_id: str, req):
     # including the ones that reported nothing, which is the whole point.
     covered = _record_scan_coverage(_eid, req.targets, req.scan_type,
                                     job_id, "completed")
+    _record_scan_job(job_id, node_id, req.scan_type, req.targets, None,
+                     _eid, "completed",
+                     result_summary={"duration_s": duration_s,
+                                     "coverage_recorded": covered,
+                                     "ingest": ingest_result})
 
     return {
         "ok": True,

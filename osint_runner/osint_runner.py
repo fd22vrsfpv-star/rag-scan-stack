@@ -4551,63 +4551,35 @@ def _whois_query(target: str, proxy: str = None, timeout: int = 30) -> str:
             return ""
 
 
+# WHOIS field extraction lives in common/whois_parse.py so node_manager's
+# remote-WHOIS branch can use the SAME maps. It used to carry a re-typed,
+# shorter copy (8 domain fields against 11), which is how a remote WHOIS
+# silently recorded less than a local one. These thin wrappers keep this
+# module's own callers unchanged.
+try:
+    from common.whois_parse import parse_whois_domain as _wp_domain, \
+        parse_whois_ip as _wp_ip
+except ImportError:  # pragma: no cover — ./common not mounted
+    _wp_domain = _wp_ip = None
+
+
 def _parse_whois_domain(raw: str, domain: str) -> dict:
     """Parse WHOIS output for a domain."""
-    parsed = {"raw_length": len(raw), "domain": domain, "type": "domain"}
-    field_map = {
-        "registrar": ["Registrar:", "registrar:"],
-        "org": ["Registrant Organization:", "org:", "OrgName:"],
-        "creation_date": ["Creation Date:", "created:", "Registration Date:"],
-        "expiry_date": ["Registry Expiry Date:", "Expiry Date:", "paid-till:"],
-        "updated_date": ["Updated Date:", "last-modified:"],
-        "name_servers": ["Name Server:", "nserver:"],
-        "registrant_name": ["Registrant Name:"],
-        "registrant_email": ["Registrant Email:", "e-mail:"],
-        "registrant_country": ["Registrant Country:", "Registrant State/Province:"],
-        "dnssec": ["DNSSEC:"],
-        "status": ["Domain Status:", "status:"],
-    }
-    for key, patterns in field_map.items():
-        values = []
-        for pat in patterns:
-            for line in raw.splitlines():
-                if line.strip().lower().startswith(pat.lower()):
-                    val = line.split(":", 1)[1].strip()
-                    if val and val not in values:
-                        values.append(val)
-        if values:
-            parsed[key] = values if key in ("name_servers", "status") else values[0]
-    return parsed
+    if _wp_domain is None:
+        raise RuntimeError(
+            "common/whois_parse.py is not importable — add ./common:/app/common "
+            "to osint-runner. Refusing to parse with a silent fallback, which "
+            "would store a different shape than every other caller.")
+    return _wp_domain(raw, domain)
 
 
 def _parse_whois_ip(raw: str, ip: str) -> dict:
     """Parse WHOIS output for an IP address (ARIN/RIPE/APNIC format)."""
-    parsed = {"raw_length": len(raw), "ip": ip, "type": "ip"}
-    field_map = {
-        "org": ["OrgName:", "org-name:", "Organization:", "org:", "descr:"],
-        "org_id": ["OrgId:", "org:"],
-        "net_range": ["NetRange:", "inetnum:"],
-        "cidr": ["CIDR:", "route:"],
-        "net_name": ["NetName:", "netname:"],
-        "country": ["Country:", "country:"],
-        "abuse_email": ["OrgAbuseEmail:", "abuse-mailbox:"],
-        "tech_email": ["OrgTechEmail:", "tech-c:"],
-        "ref": ["Ref:", "source:"],
-        "asn": ["OriginAS:", "origin:"],
-        "net_handle": ["NetHandle:"],
-        "parent": ["Parent:"],
-    }
-    for key, patterns in field_map.items():
-        values = []
-        for pat in patterns:
-            for line in raw.splitlines():
-                if line.strip().lower().startswith(pat.lower()):
-                    val = line.split(":", 1)[1].strip()
-                    if val and val not in values:
-                        values.append(val)
-        if values:
-            parsed[key] = values[0] if key not in ("country",) else values[0]
-    return parsed
+    if _wp_ip is None:
+        raise RuntimeError(
+            "common/whois_parse.py is not importable — add ./common:/app/common "
+            "to osint-runner.")
+    return _wp_ip(raw, ip)
 
 
 @app.post("/jobs/whois")

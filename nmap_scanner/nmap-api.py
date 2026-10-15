@@ -734,17 +734,31 @@ def _alias_map():
         return _ALIAS_CACHE["map"]
     amap: dict = {}
     try:
-        r = requests.get(f"{API_BASE}/assets", params={"limit": 5000},
+        # /assets/alias-pairs, not /assets?limit=5000. The full asset list is
+        # 1.1MB and takes 80s to build (open-port counts, recon counts, a
+        # lateral join into credential_findings) — far past the 20s timeout
+        # below, so this fetch ALWAYS failed and the gate ran with no aliases
+        # at all. The pairs endpoint returns the same ip<->hostname
+        # observations in 0.2s because it selects the two columns the gate
+        # needs and nothing else.
+        r = requests.get(f"{API_BASE}/assets/alias-pairs",
                          headers={"x-api-key": API_KEY}, timeout=20, verify=False)
         if r.status_code == 200:
-            for a in (r.json().get("assets") or []):
-                ip = str(a.get("ip") or "").strip().lower()
-                hn = str(a.get("hostname") or "").strip().lower()
+            for ip_h in (r.json().get("pairs") or []):
+                ip = str((ip_h or [None, None])[0] or "").strip().lower()
+                hn = str((ip_h or [None, None])[-1] or "").strip().lower()
                 pair = {x for x in (ip, hn) if x}
                 for key in pair:
                     amap.setdefault(key, set()).update(pair)
         else:
-            logging.warning("alias map fetch returned HTTP %s", r.status_code)
+            # No fallback to /assets. It is the endpoint this replaced and it
+            # cannot answer inside any caller's timeout, so a "fallback" there
+            # is a guaranteed second failure that costs 20 more seconds and
+            # still yields nothing. Keep the previous map instead: narrow,
+            # never widen.
+            logging.warning("alias map fetch returned HTTP %s from "
+                            "/assets/alias-pairs — keeping the previous map",
+                            r.status_code)
             return _ALIAS_CACHE["map"] or {}
     except Exception as e:  # noqa: BLE001
         # Narrow, never widen. A failed lookup must not become "no aliases

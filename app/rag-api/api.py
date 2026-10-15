@@ -1490,6 +1490,48 @@ def resolve_asset_target(target: str, authorized: bool = Depends(auth)):
             "asset_id": row["id"], "engagement_id": row["engagement_id"]}
 
 
+@app.get("/assets/alias-pairs", tags=["Assets"])
+def get_asset_alias_pairs(authorized: bool = Depends(auth)):
+    """Every observed (ip, hostname) pairing — the scope gate's alias source.
+
+    The gate resolves ip<->hostname aliases so a scan by IP of a host whose
+    scope entry is a hostname (or the reverse) can be authorised. It was doing
+    that by fetching `/assets?limit=5000`, which returns 1.1MB of full asset
+    records — open-port counts, recon-finding counts, provider evidence, a
+    lateral join into credential_findings — and takes **80 seconds** measured
+    from inside nmap_scanner:
+
+        assets fetch: http=200 total=80.443648s size=1178332
+
+    Every caller gave up long before that: nmap_scanner's client timeout is
+    20s, the BFF's is 10s, and the BFF's own 30s server timeout fired first in
+    any case. So a proxied nmap of 122 in-scope IPs returned HTTP 500 with no
+    job created, and the BFF's `_host_aliases` silently returned the host
+    itself for every lookup. The gate could not be evaluated at all — not a
+    scope problem, a latency one.
+
+    This returns the two columns the gate actually needs. Measured on the same
+    database, same moment: **0.200s for 2,258 pairs**.
+
+    Sentinels are excluded. `0.0.0.0` is the address every unresolved asset
+    carries, so pairing on it would make a single alias bucket containing every
+    nameless host in the estate — and an alias bucket is an authorisation
+    widening, which is the one direction this must never go.
+
+    Unscoped by engagement, deliberately: aliases are observations about the
+    network, and narrowing them to one engagement would refuse a scan the
+    operator is authorised to run. The scope rows do the authorising; this only
+    says which names denote the same host.
+    """
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """SELECT DISTINCT host(ip)::text AS ip, lower(hostname) AS hostname
+                 FROM assets
+                WHERE host(ip) NOT IN ('0.0.0.0', '::')""")
+        pairs = [[r[0], r[1]] for r in cur.fetchall()]
+    return {"pairs": pairs, "count": len(pairs)}
+
+
 @app.get("/assets")
 def get_assets(
     search: Optional[str] = Query(None, description="Substring match on hostname or IP (case-insensitive)"),

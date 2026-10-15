@@ -133,12 +133,29 @@ def test_matcher_requires_the_retired_fact():
 @pytest.mark.parametrize("path", [
     "app/rag-api/api.py", "app/rag-api/scope_classifier.py"])
 def test_both_state_readers_surface_the_tag(path):
-    """A rule that nothing feeds is a rule that never fires."""
+    """A rule that nothing feeds is a rule that never fires.
+
+    A scope-state query is one that computes the per-host FACTS the classifier
+    evaluates — `unresolved` alongside the open-port count. Selecting on
+    `FILTER (WHERE p.is_open)` alone was too broad: `/assets/{ip}/scan-coverage`
+    counts open ports for the Recon Intel panel using the identical
+    own-ports-plus-the-IP-keyed-row expression, and has nothing to do with
+    scope classification. Requiring a `'retired' = ANY` there would be
+    cargo-culting a tag read into a query that feeds no rule.
+
+    The `assert matched` below is what keeps this narrowing honest: if the
+    marker ever stops identifying the real readers, this fails as "no
+    scope-state query found" rather than passing vacuously.
+    """
     src = (REPO / path).read_text(encoding="utf-8")
     sqls = [n.value for n in ast.walk(ast.parse(src))
             if isinstance(n, ast.Constant) and isinstance(n.value, str)
-            and "FILTER (WHERE p.is_open)" in n.value]
-    assert sqls, f"{path}: no scope-state query found"
+            and "FILTER (WHERE p.is_open)" in n.value
+            and "unresolved" in n.value]
+    assert sqls, (
+        f"{path}: no scope-state query found (a query computing `unresolved` "
+        "alongside the open-port count). Either the reader was deleted or it "
+        "no longer derives the facts the classifier evaluates")
     for sql in sqls:
         flat = " ".join(sql.split())
         assert re.search(r"'retired'\s*=\s*ANY", flat), (
