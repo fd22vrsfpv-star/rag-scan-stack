@@ -1261,6 +1261,23 @@ def node_gather_check(state: BuildPocState) -> Dict[str, Any]:
                 for g, v in dr["solutions"].items() if g in (man.get("missing") or [])]
     rec = _record_gather_manifest(man, state["cve"], state["ip"], state["port"],
                                   eid=state.get("eid"), run_id=state["run_id"])
+    # PROVE the gathered facts before synthesis uses them. Until this ran, a
+    # fact's confidence reflected only where it came from; now it reflects
+    # whether a test case confirmed it. A confirmed fact becomes enforceable
+    # at dispatch (the fact gate), a refuted one stops being retried, and one
+    # the probe could not decide stays exactly as unproven as it was.
+    try:
+        from api import _preflight_prove_facts
+        _probe_results = _preflight_prove_facts(
+            man, state["cve"], state["ip"], state["port"],
+            eid=state.get("eid"), run_id=state["run_id"],
+            product=state.get("product"))
+    except Exception as _pfe:  # noqa: BLE001
+        # Never fail the build on the prover. A probe that did not run is not
+        # evidence of anything; synthesis continues with the facts as gathered.
+        _probe_results = {}
+        _poc_trace(state["run_id"], "preflight_facts",
+                   response=f"(skipped: {type(_pfe).__name__}: {_pfe})")
     # Pass 2 (after deep_recon) must not prepend a second manifest onto pass 1's
     # output: compose from the pre-gather guidance captured on pass 1.
     base = state.get("guidance_base") if state.get("guidance_base") else (state.get("guidance") or "")

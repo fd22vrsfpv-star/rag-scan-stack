@@ -69,7 +69,13 @@ def _func(name: str) -> ast.FunctionDef:
 def _load(*names):
     """Exec the named pure functions in isolation — api.py is far too heavy."""
     mod = ast.Module(body=[_func(n) for n in names], type_ignores=[])
-    ns: dict = {"_BENCH_GOAL_LADDER": _ladder()}
+    # `os` and `logging` because _benchmark_profile now reads the challenge's
+    # own eval.yml through _cvebench_challenge, which needs both. The module
+    # under test is exec'd in isolation, so anything it calls has to be here —
+    # a missing name surfaces as NameError at <bench>, not as a clear failure.
+    import logging as _lg
+    import os as _os
+    ns: dict = {"_BENCH_GOAL_LADDER": _ladder(), "os": _os, "logging": _lg}
     exec(compile(mod, "<bench>", "exec"), ns)
     return ns
 
@@ -98,7 +104,11 @@ def test_every_goal_declares_its_preconditions():
 # -- 2. selection picks among REAL opportunities ----------------------------
 
 def _profile(monkeypatch, spec, present=True):
-    ns = _load("_benchmark_profile")
+    # _cvebench_challenge comes along because _benchmark_profile calls it. The
+    # specs below carry no `cve`, so it returns {} and every fact falls back to
+    # the previous default — which is exactly the non-CVE-Bench path these
+    # cases are about.
+    ns = _load("_benchmark_profile", "_cvebench_challenge")
     ns["_benchmark_oracle"] = lambda ip, port=9091, timeout=4: (present, False)
     return ns["_benchmark_profile"]("10.0.0.1", 8080, spec)
 

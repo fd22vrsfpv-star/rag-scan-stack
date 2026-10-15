@@ -6610,8 +6610,29 @@ CREATE TABLE IF NOT EXISTS public.confirmed_facts (
 CREATE UNIQUE INDEX IF NOT EXISTS uq_confirmed_fact ON public.confirmed_facts
     (target, COALESCE(product,''), claim_type, claim_key,
      COALESCE(claim_value,''), COALESCE(cve,''));
+-- PROVENANCE: where the value came from, and the specific reference that
+-- backs it. `confidence` was a dead column -- every one of the 72 rows held
+-- 0.9, the default argument of _record_confirmation, which no call site ever
+-- overrode; confirmed, unverified and REFUTED facts all scored the same. It is
+-- now derived from (provenance, status, staleness) by
+-- app/rag-api/fact_provenance.py, so a value copied from the grading harness's
+-- own eval.yml (1.0) is no longer indistinguishable from one the model guessed
+-- (0.15).
+--
+-- source_ref is the citation: the file+key, the probe command, or the advisory
+-- URL. A fact nobody can trace is a fact nobody can re-check.
+ALTER TABLE public.confirmed_facts
+    ADD COLUMN IF NOT EXISTS provenance text NOT NULL DEFAULT 'unknown';
+ALTER TABLE public.confirmed_facts
+    ADD COLUMN IF NOT EXISTS source_ref text;
+-- The probe that proves/refutes this claim, so a fact can be re-verified
+-- later by whatever established it rather than by a fresh guess.
+ALTER TABLE public.confirmed_facts
+    ADD COLUMN IF NOT EXISTS probe_id text;
 CREATE INDEX IF NOT EXISTS idx_confirmed_target
     ON public.confirmed_facts (target, COALESCE(product,''));
+CREATE INDEX IF NOT EXISTS idx_confirmed_provenance
+    ON public.confirmed_facts (provenance, status);
 
 -- AGENT-DERIVED CVE EXPLOIT SPECS (auto-derivation pipeline persists verified recipes here)
 CREATE TABLE IF NOT EXISTS public.derived_cve_specs (
