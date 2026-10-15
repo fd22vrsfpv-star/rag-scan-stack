@@ -27317,6 +27317,39 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         # 2 of 11 PARTIAL cases ran all 5 iters on commands that /bin/sh refused
         # at parse time. On fail: synthesize a syntax-error "output" so the
         # existing refine path kicks in with specific feedback.
+        # ── PRE-DISPATCH FACT CHECK (covers the FIRST command too) ─────────
+        #
+        # The gate further down only sees commands a REFINE produced, so the
+        # command synth wrote was dispatched unchecked. On CVE-2024-22120
+        # (2026-10-15) that meant iterations 1-2 reached the target before the
+        # gate first looked, at iteration 3.
+        #
+        # This does NOT dispatch and does NOT fake a syntax error: it is its
+        # own branch below, so `_consecutive_syntax_fails` is untouched (that
+        # counter drives the model-fallback swap, and a fact violation is not
+        # evidence the model cannot write shell). Costs no iteration —
+        # `_dispatched_attempts` only moves after a real listener call.
+        #
+        # Bounded by _REFINE_FACT_REJECT_MAX: after that it stops interfering
+        # and the command goes, because this is a quality check and a stuck
+        # model must not deadlock a build.
+        _fact_block = ""
+        if _required_facts and command:
+            try:
+                from fact_probes import enforce_facts as _ef_pre
+                _maybe = _ef_pre(command, _required_facts) or ""
+            except Exception:  # noqa: BLE001
+                _maybe = ""
+            if _maybe:
+                if metrics.get("fact_predispatch_refusals", 0) < _REFINE_FACT_REJECT_MAX:
+                    _fact_block = _maybe
+                else:
+                    _poc_trace(run_id, "fact_predispatch_opened", iteration=it,
+                               extra={"required": _required_facts,
+                                      "refusals": metrics.get("fact_predispatch_refusals", 0),
+                                      "reason": "the model would not build around the "
+                                                "proven fact; dispatching anyway "
+                                                "(quality gate, fails open)"})
         _syn_ok, _syn_err = _poc_shell_syntax_check(command, canary=canary, assertion=assertion)
         # A GUARD THAT NEVER YIELDS IS A DEAD END. The canary-placement rule is
         # right — a canary inside a SQL comment cannot satisfy an expect_regex
@@ -27339,9 +27372,21 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                                   "note": "dispatching anyway — repeated refusal taught "
                                           "the loop nothing; a real response will"})
                 _syn_ok, _syn_err = True, ""
-        if not _syn_ok:
+        if _fact_block or not _syn_ok:
             _refused_now, _ = _poc_detect_llm_refusal(command)
-            if _refused_now:
+            if _fact_block:
+                # A proven fact the command ignores. Not a syntax problem, so
+                # it must not bump _consecutive_syntax_fails (that counter
+                # swaps the model out) — hence its own branch.
+                metrics["fact_predispatch_refusals"] = metrics.get(
+                    "fact_predispatch_refusals", 0) + 1
+                output = "PROVEN_FACT_UNUSED (pre-dispatch): " + _fact_block
+                _poc_trace(run_id, "fact_predispatch_refused", iteration=it,
+                           response=command[:400],
+                           extra={"required": _required_facts,
+                                  "refusals": metrics["fact_predispatch_refusals"],
+                                  "reason": _fact_block[:300]})
+            elif _refused_now:
                 output = (f"REFUSE: I cannot provide (pre-dispatch detected LLM "
                           f"refusal prose instead of a shell command): {_syn_err}")
                 metrics.setdefault("skipped_runs_llm_refusal", 0)
@@ -27361,7 +27406,13 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             # Never-regress tracking: this iter FAILED the syntax check.
             # Bump the consecutive-fail counter so the refine prompt below
             # can inject the last-known-good command as a recovery base.
-            _consecutive_syntax_fails += 1
+            #
+            # NOT for a fact block: that counter drives the model-fallback
+            # swap, and "the command ignores a proven fact" is no evidence
+            # that this model cannot write shell. Counting it would swap the
+            # model out for a reason that has nothing to do with the model.
+            if not _fact_block:
+                _consecutive_syntax_fails += 1
             # Model fallback: this model is clearly stuck. After N fails
             # swap to BUILD_POC_MODEL_FALLBACK (or routed cloud default) —
             # once per build; subsequent iters stay on the backup.
@@ -37537,9 +37588,17 @@ def _required_facts_for(target, cve=None, product=None, min_confidence=0.8):
                     ORDER BY confidence DESC""",
                 (str(target), list(_ENFORCEABLE), float(min_confidence),
                  cve, product, product))
+            try:
+                from fact_probes import is_enforceable_value as _enforceable
+            except Exception:  # noqa: BLE001
+                _enforceable = lambda v: bool(v)  # noqa: E731
             for ct, ck, cv, _conf in cur.fetchall():
                 val = cv or ck
-                if val:
+                # Drop values that cannot discriminate. `endpoint_exists = '/'`
+                # was armed on a real run: every URL contains "/", so enforcing
+                # it can never refuse anything — it just pads the armed set and
+                # makes the gate look like it checks more than it does.
+                if val and _enforceable(val):
                     out.setdefault(ct, str(val))
     except Exception as e:  # noqa: BLE001
         logging.debug("required-facts lookup failed for %s: %s", target, e)

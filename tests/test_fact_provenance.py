@@ -342,3 +342,88 @@ def test_the_fact_gate_fails_open():
         "the fact gate has no fail-open path — an unreadable ledger or a "
         "stubborn model would stall the build entirely")
     assert "_REFINE_FACT_REJECT_MAX" in src, "the re-asks are unbounded"
+
+
+# ── 6. the two flaws found on the first live run (2026-10-15) ─────────────────
+
+def test_degenerate_values_are_not_enforceable():
+    """`endpoint_exists = '/'` was armed on a real run.
+
+    Every URL contains "/", so enforcing it can never refuse anything. It is
+    not harmful, but it pads the armed set and makes the gate look like it
+    checks more than it does — a guard that cannot fail, mistaken for coverage.
+    """
+    from fact_probes import is_enforceable_value
+    for junk in ("/", "//", ".", "-", "", None, "  ", "/ /", "id", "a1",
+                 "http", "index.php"):
+        assert not is_enforceable_value(junk), f"{junk!r} was armed"
+    for real in ("listingfields", "/business-directory", "10084",
+                 "wpbdp_view", "/admin1"):
+        assert is_enforceable_value(real), f"{real!r} was dropped"
+
+
+def test_required_facts_filters_degenerate_values():
+    """Imported AND called — the import line alone satisfies a text search.
+
+    Checked on the AST: reverting the call site to `if val:` while leaving the
+    import in place passed a substring check, which is the same trap that let
+    a deleted `enforce_facts` import through earlier.
+    """
+    fn = _func("_required_facts_for")
+    imported = {a.asname or a.name
+                for n in ast.walk(fn) if isinstance(n, ast.ImportFrom)
+                and n.module == "fact_probes"
+                for a in n.names if a.name == "is_enforceable_value"}
+    assert imported, (
+        "_required_facts_for does not import the enforceability filter")
+    called = {n.func.id for n in ast.walk(fn)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    assert imported & called, (
+        f"the filter is imported as {sorted(imported)} but never called — "
+        "_required_facts_for still arms every confirmed value, including ones "
+        "like '/' that cannot refuse anything")
+
+
+def test_the_first_command_is_checked_before_dispatch():
+    """The gate used to see only REFINE-produced commands.
+
+    On CVE-2024-22120 that meant iterations 1-2 reached the target before the
+    gate first looked, at iteration 3.
+    """
+    fn = _func("_run_refine_poc")
+    src = ast.get_source_segment(_api_src(), fn) or ""
+    assert "_fact_block" in src, (
+        "there is no pre-dispatch fact check, so the command synth wrote is "
+        "dispatched without ever being checked against the proven facts")
+    assert "fact_predispatch_refused" in src, "the refusal is not traced"
+    # It must take the NON-dispatching branch. The dispatch path is the `else`
+    # of the syntax-check test, so the fact block has to join its condition.
+    assert "if _fact_block or not _syn_ok:" in src, (
+        "the fact block does not join the non-dispatch branch — setting a "
+        "variable without diverting control flow lets the command dispatch "
+        "anyway, which is the bug this test exists to catch")
+
+
+def test_a_fact_block_does_not_count_as_a_syntax_failure():
+    """`_consecutive_syntax_fails` drives the MODEL FALLBACK swap.
+
+    "The command ignores a proven fact" is no evidence that this model cannot
+    write shell. Counting it would swap the model out for an unrelated reason.
+    """
+    fn = _func("_run_refine_poc")
+    src = ast.get_source_segment(_api_src(), fn) or ""
+    i = src.find("_consecutive_syntax_fails += 1")
+    assert i > 0, "the syntax-fail counter is gone"
+    guard = src[max(0, i - 220):i]
+    assert "if not _fact_block" in guard, (
+        "a fact block still increments _consecutive_syntax_fails, so enough "
+        "of them silently swap the model out mid-build")
+
+
+def test_the_predispatch_check_is_bounded_and_fails_open():
+    fn = _func("_run_refine_poc")
+    src = ast.get_source_segment(_api_src(), fn) or ""
+    assert "_REFINE_FACT_REJECT_MAX" in src
+    assert "fact_predispatch_opened" in src, (
+        "the pre-dispatch check never gives up — a model that will not use the "
+        "fact would spin until the loop-pass cap instead of dispatching")

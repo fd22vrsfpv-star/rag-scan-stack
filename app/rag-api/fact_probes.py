@@ -297,3 +297,34 @@ def enforce_facts(command: str, required: dict) -> Optional[str]:
         "CVE-2024-4443 the parameter `listingfields` was proven and then absent "
         "from all 26 dispatched commands, every one of which failed. Rebuild "
         "the command around the proven fact(s)." % bits)
+
+
+# Values that cannot discriminate. `endpoint_exists = '/'` was armed on a real
+# run (CVE-2024-22120, 2026-10-15): every URL contains "/", so enforcing it can
+# never refuse anything. It is not harmful, but it pads the armed set and makes
+# the gate look like it is checking more than it is — and a guard that cannot
+# fail is the thing CLAUDE.md warns is worse than no guard, because it is
+# mistaken for coverage.
+_UNIVERSAL_TOKENS = {"/", "//", ".", "..", "-", "_", "?", "&", "=",
+                     "http", "https", "www", "com", "html", "php", "/ ", "''",
+                     "curl", "get", "post", "index", "index.php", "index.html"}
+_MIN_DISCRIMINATING_LEN = 3
+
+
+def is_enforceable_value(value) -> bool:
+    """True when insisting on `value` could actually refuse a command.
+
+    A value is enforceable when it is long enough to be distinctive and is not
+    a token every HTTP command carries anyway. Everything else is dropped from
+    the armed set rather than silently passing every check.
+    """
+    v = str(value or "").strip()
+    if len(v) < _MIN_DISCRIMINATING_LEN:
+        return False
+    if v.lower() in _UNIVERSAL_TOKENS:
+        return False
+    # A path whose only content is separators ("/", "/ /", "//") discriminates
+    # nothing even though it clears the length bar.
+    if not any(ch.isalnum() for ch in v):
+        return False
+    return True
