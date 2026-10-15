@@ -8,6 +8,7 @@ unique port. Commands can be executed on remote hosts via SSH.
 import asyncio
 import logging
 import os
+import shlex
 import re
 import subprocess
 import time
@@ -708,9 +709,23 @@ class SSHManager:
         if os.path.exists(ctrl):
             cmd.extend(["-o", f"ControlPath={ctrl}"])
 
+        # Privilege. Provisioning installs packages, so it needs root — but the
+        # SSH user on a cloud image is almost never root (`ubuntu` on EC2,
+        # `admin` on Debian AMIs). Without this every apt step failed with
+        #   /var/lib/apt/lists/lock - open (13: Permission denied)
+        # and provisioning a non-root node could not work at all. There were no
+        # occurrences of `sudo` anywhere in node_manager.
+        #
+        # `sudo -n`: never prompt. A node without passwordless sudo fails fast
+        # and says so, rather than hanging on a password prompt until the
+        # timeout and reporting something unrelated.
+        remote = command
+        if (user or "").strip() not in ("root", ""):
+            remote = "sudo -n bash -c " + shlex.quote(command)
+
         # SSH runs remote commands through the user's shell, so we pass the
         # entire command as a single string. No need for bash -c wrapper.
-        cmd.extend([dest, command])
+        cmd.extend([dest, remote])
 
         start = time.monotonic()
         try:
@@ -923,9 +938,16 @@ class SSHManager:
     async def remote_scan(
         self, node_id: str, host: str, user: str, ssh_port: int,
         key_file: str, tool_cmd: list[str], output_remote_path: str,
-        timeout: int = 600,
+        timeout: int = 600, elevate: bool = False,
     ) -> dict:
         """Run a scan tool on a remote host via SSH, then SCP the results back.
+
+        `elevate` prefixes the command with `sudo -n` for tools that need raw
+        sockets (masscan). Cloud images log in as `ubuntu`/`admin`, never root,
+        so without it masscan exits "FAIL: permission denied" and the operator
+        sees an empty scan. `-n` never prompts: a node without passwordless
+        sudo fails immediately with "sudo: a password is required" instead of
+        hanging until the timeout.
 
         Returns dict with ok, local_path, stdout, stderr, duration_ms.
         """
@@ -938,6 +960,11 @@ class SSHManager:
                 return {"ok": False, "error": f"Dangerous characters in arg: {arg}"}
 
         command = " ".join(str(a) for a in tool_cmd)
+
+        # Elevate AFTER the dangerous-character validation above, so the sudo
+        # prefix is ours and never something a caller smuggled in.
+        if elevate and (user or "").strip() not in ("root", ""):
+            command = "sudo -n " + command
 
         # Step 1: Execute scan on remote host
         exec_result = await self.exec_command(

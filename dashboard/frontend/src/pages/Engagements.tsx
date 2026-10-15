@@ -6,12 +6,14 @@ import {
   useCampaignEvents, useCreateCampaignEvent, useUpdateCampaignEvent, useCampaignSummary,
   useEngagementScopes, useEngagementScopeTargets, useAddScopeTargets, useDeleteScope,
   useRenameScope, useMoveTargets, useMoveEntireScope, downloadScopeTargetsCsv,
+  useReclassifyScope, type ReclassifyResult,
   type EngagementScope, type ScopeTarget, type EngagementDeleteResult,
 } from '@/api/engagements'
 import { useScopeNames } from '@/api/scope'
+import { useEngagementControl, useSetEngagementScans, useControlStatus } from '@/api/control'
 import { cn } from '@/lib/utils'
 import type { Engagement, CampaignEvent, KillChainPhase } from '@/lib/types'
-import { Briefcase, Plus, X, ChevronRight, Eye, Trash2, Pencil, ArrowRight, Loader2, Upload, FileText, Download } from 'lucide-react'
+import { Briefcase, Plus, X, ChevronRight, Eye, Trash2, Pencil, ArrowRight, Loader2, Upload, FileText, Download, Ban, Play } from 'lucide-react'
 import { ReconAgentPanel } from '@/components/common/ReconAgentPanel'
 import { GapAnalysisAgentPanel } from '@/components/common/GapAnalysisPanel'
 import { ScopePivotPanel } from '@/components/ScopePivotPanel'
@@ -87,6 +89,11 @@ function EngagementList({ onSelect }: { onSelect: (id: string) => void }) {
   const [statusFilter, setStatusFilter] = useState<string | undefined>()
   const { data, isLoading } = useEngagements(statusFilter)
   const engagements = data?.engagements ?? []
+  // One query for the whole list: /control/status already returns every scope's
+  // row, so a badge per card costs nothing extra.
+  const { data: control } = useControlStatus()
+  const haltedScopes = new Set(
+    (control?.controls ?? []).filter(c => c.halted).map(c => c.scope))
 
   return (
     <div className="space-y-3">
@@ -114,11 +121,23 @@ function EngagementList({ onSelect }: { onSelect: (id: string) => void }) {
               onClick={() => onSelect(eng.id)}
               className="text-left p-4 rounded-lg border border-border bg-card hover:border-primary/50 transition-colors"
             >
-              <div className="flex items-start justify-between">
+              <div className="flex items-start justify-between gap-2">
                 <div className="font-medium text-sm">{eng.name}</div>
-                <span className={cn('px-2 py-0.5 text-xs rounded-full capitalize', STATUS_COLORS[eng.status] || 'bg-muted')}>
-                  {eng.status}
-                </span>
+                <div className="flex items-center gap-1 shrink-0">
+                  {/* Derived from the ONE control-status query above, not a
+                      query per card. A disabled engagement that looks identical
+                      to a live one is how an operator waits on scans that will
+                      never dispatch. */}
+                  {haltedScopes.has(eng.id) && (
+                    <span className="px-2 py-0.5 text-xs rounded-full bg-red-500/10 text-red-400 border border-red-500/30"
+                          title="Scans are disabled for this engagement — the next dispatch will be refused.">
+                      scans off
+                    </span>
+                  )}
+                  <span className={cn('px-2 py-0.5 text-xs rounded-full capitalize', STATUS_COLORS[eng.status] || 'bg-muted')}>
+                    {eng.status}
+                  </span>
+                </div>
               </div>
               {eng.client && <div className="text-xs text-muted-foreground mt-1">{eng.client}</div>}
               <div className="flex items-center gap-2 mt-2 text-xs text-muted-foreground">
@@ -395,6 +414,8 @@ function ScopeTab({ engagementId }: { engagementId: string }) {
   }
 
   return (
+    <div className="space-y-3">
+    <ReclassifyControl engagementId={engagementId} />
     <div className="flex gap-4" style={{ minHeight: 400 }}>
       {/* Scope List */}
       <div className="w-56 shrink-0 space-y-2">
@@ -621,6 +642,108 @@ function ScopeTab({ engagementId }: { engagementId: string }) {
         <ScopePivotPanel engagementId={engagementId} />
       </div>
     </div>
+    </div>
+  )
+}
+
+/** Re-file scoped hosts that no longer have an attack surface.
+ *
+ * Two clicks on purpose. The pass rewrites the scope label on up to hundreds
+ * of rows, so the operator reads WHICH hosts first and applies second — the
+ * dry run is not a preview of a thing already decided, it is the decision.
+ */
+function ReclassifyControl({ engagementId }: { engagementId: string }) {
+  const reclassify = useReclassifyScope(engagementId)
+  const [preview, setPreview] = useState<ReclassifyResult | null>(null)
+  const [applied, setApplied] = useState<ReclassifyResult | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+
+  const run = async (apply: boolean) => {
+    setErr(null)
+    try {
+      const r = await reclassify.mutateAsync(apply)
+      if (apply) { setApplied(r); setPreview(null) } else { setPreview(r); setApplied(null) }
+    } catch (e: unknown) {
+      // An error is not "nothing to move" — say which it was.
+      setErr(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  return (
+    <div className="rounded-lg border border-border bg-card p-3 space-y-2">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <div>
+          <div className="text-xs font-medium">Reclassify dead hosts</div>
+          <div className="text-[10px] text-muted-foreground">
+            Re-files hosts that were port-scanned with nothing listening, or that serve a
+            retirement page, into <span className="font-mono">no_services</span> /{' '}
+            <span className="font-mono">retired</span>. Only ever moves INTO those; never out of
+            a customer or excluded scope.
+          </div>
+        </div>
+        <div className="flex items-center gap-1 shrink-0">
+          <button
+            onClick={() => run(false)}
+            disabled={reclassify.isPending}
+            className="h-7 px-2 text-xs rounded border border-border hover:bg-accent disabled:opacity-40 inline-flex items-center gap-1">
+            {reclassify.isPending && !preview ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+            Dry run
+          </button>
+          <button
+            onClick={() => run(true)}
+            disabled={reclassify.isPending || !preview || preview.would_move === 0}
+            title={!preview ? 'Run the dry run first — you decide from the list, not from a count'
+                            : preview.would_move === 0 ? 'Nothing to move' : undefined}
+            className="h-7 px-2 text-xs rounded bg-primary text-primary-foreground hover:bg-primary/80 disabled:opacity-40">
+            Apply{preview && preview.would_move > 0 ? ` (${preview.would_move})` : ''}
+          </button>
+        </div>
+      </div>
+
+      {err && (
+        <div className="text-[11px] text-red-400 border border-red-500/30 bg-red-500/10 rounded p-2">
+          reclassify failed — nothing was moved: {err}
+        </div>
+      )}
+
+      {applied && (
+        <div className="text-[11px] text-green-400 border border-green-500/30 bg-green-500/10 rounded p-2">
+          Moved {applied.moved} host(s). Reversible from the scope list — these rows carry
+          <span className="font-mono"> source=reclassified</span>.
+        </div>
+      )}
+
+      {preview && (
+        <div className="space-y-1">
+          <div className="text-[11px]">
+            <span className="font-medium">{preview.would_move}</span> would move
+            {preview.candidates > preview.would_move && (
+              <span className="text-muted-foreground">
+                {' '}· {preview.candidates - preview.would_move} held back (a child is still
+                listening, or has never been scanned)
+              </span>
+            )}
+          </div>
+          {preview.would_move > 0 ? (
+            <div className="max-h-48 overflow-auto rounded border border-border bg-background/50 p-2">
+              {preview.targets.map(t => (
+                <div key={t} className="text-[10px] font-mono text-muted-foreground">{t}</div>
+              ))}
+              {preview.would_move > preview.targets.length && (
+                <div className="text-[10px] text-muted-foreground italic mt-1">
+                  … and {preview.would_move - preview.targets.length} more not listed in the response
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="text-[11px] text-muted-foreground">
+              Nothing to move — every scoped host either still has something listening or has not
+              been scanned yet.
+            </div>
+          )}
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -722,6 +845,75 @@ function DeleteEngagementControl({ id, name, onDeleted }: {
   )
 }
 
+/** Enable / disable dispatch for ONE engagement.
+ *
+ * Writes the same `platform_control` row the global kill switch uses, so it is
+ * enforced at `load_dispatch_scope` — the one chokepoint every gated dispatcher
+ * passes. Nothing here re-implements the gate.
+ *
+ * Two things the operator has to be able to see, or the control lies:
+ *   - a GLOBAL halt overrides this engagement being enabled, so the button
+ *     renders the EFFECTIVE state and says which level is holding it;
+ *   - this refuses the NEXT dispatch. It does not pause a scan already running.
+ */
+function ScanToggle({ id }: { id: string }) {
+  const { data: ctl, isLoading, isError } = useEngagementControl(id)
+  const setScans = useSetEngagementScans(id)
+
+  if (isLoading) {
+    return <span className="px-2 py-1 text-xs text-muted-foreground">checking scans...</span>
+  }
+  // "Could not read it" is not "scans are enabled" — say so rather than
+  // rendering a confident toggle over an unknown state.
+  if (isError || !ctl) {
+    return (
+      <span className="px-2 py-1 text-xs rounded-full bg-muted text-muted-foreground"
+            title="The control state could not be read. This is not a verdict — retry.">
+        scans: unknown
+      </span>
+    )
+  }
+
+  const globalOverride = ctl.globalHalted && !ctl.engagementHalted
+  const enabled = !ctl.halted
+  const busy = setScans.isPending
+
+  return (
+    <div className="flex items-center gap-2">
+      {globalOverride && (
+        <span className="px-2 py-0.5 text-[10px] rounded-full bg-red-500/10 text-red-400 border border-red-500/30"
+              title="The global kill switch is on. This engagement is enabled, but nothing will dispatch until the global halt is cleared.">
+          global halt
+        </span>
+      )}
+      <button
+        onClick={() => setScans.mutate(!ctl.engagementHalted ? false : true)}
+        disabled={busy}
+        title={
+          ctl.engagementHalted
+            ? `Scans are DISABLED for this engagement${ctl.reason ? ` — ${ctl.reason}` : ''}. Enabling refuses nothing further; it does not restart anything.`
+            : 'Scans are enabled. Disabling refuses the NEXT dispatch for this engagement; a scan already running is not interrupted.'
+        }
+        className={cn(
+          'flex items-center gap-1.5 px-2 py-1 text-xs rounded-full font-medium transition-colors disabled:opacity-50',
+          ctl.engagementHalted
+            ? 'bg-red-500/10 text-red-400 hover:bg-red-500/20'
+            : 'bg-green-500/10 text-green-400 hover:bg-green-500/20',
+        )}
+      >
+        {busy ? <Loader2 className="h-3 w-3 animate-spin" />
+              : ctl.engagementHalted ? <Ban className="h-3 w-3" /> : <Play className="h-3 w-3" />}
+        {ctl.engagementHalted ? 'scans disabled' : 'scans enabled'}
+      </button>
+      {!enabled && ctl.reason && (
+        <span className="text-[10px] text-muted-foreground max-w-48 truncate" title={ctl.reason}>
+          {ctl.reason}
+        </span>
+      )}
+    </div>
+  )
+}
+
 function EngagementDetail({ id, onBack }: { id: string; onBack: () => void }) {
   const [detailTab, setDetailTab] = useState<DetailTab>('overview')
   const { data: eng } = useEngagement(id)
@@ -743,6 +935,7 @@ function EngagementDetail({ id, onBack }: { id: string; onBack: () => void }) {
           {eng.client && <div className="text-xs text-muted-foreground">{eng.client}</div>}
         </div>
         <div className="flex items-center gap-2">
+          <ScanToggle id={id} />
           <select
             value={eng.status}
             onChange={e => update.mutate({ id, status: e.target.value })}

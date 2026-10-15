@@ -124,14 +124,28 @@ async def remove_from_scope(body: RemoveFromScopeBody):
 
 @router.post("/api/scope/move")
 async def move_scope_targets(request: Request):
+    """Move targets between scopes.
+
+    300s, not 15s. The move does per-target work — rule distillation and an
+    embedder call each — so a 77-target move ran well past 15 seconds. httpx
+    raised ReadTimeout, this proxy 500'd, and the operator saw
+    "API 500: Internal Server Error" — while rag-api carried on and COMPLETED
+    the move. The UI reported failure for a mutation that had succeeded, which
+    invites a retry on data that already changed.
+
+    The status is checked too, so a genuine upstream error is reported as that
+    error rather than as whatever safe_json makes of the body.
+    """
     s = get_settings()
     body = await request.json()
-    async with httpx.AsyncClient(timeout=15) as c:
+    async with httpx.AsyncClient(timeout=300) as c:
         resp = await c.post(
             f"{s.rag_api_url}/scope/move",
             json=body,
             headers={"x-api-key": s.api_key, **engagement_headers()},
         )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text[:300])
         return safe_json(resp)
 
 
@@ -303,4 +317,64 @@ async def review_pivot_suggestions_bulk(body: BulkReviewPivotBody):
             json=body.model_dump(),
             headers={"x-api-key": s.api_key, **engagement_headers()},
         )
+        return safe_json(resp)
+
+
+class AutoClassifyBody(BaseModel):
+    """Mirrors rag-api's AutoClassifyBody. `generate_rules` defaults to FALSE
+    here: seeding rules is a side effect the operator should ask for, not
+    something a classify button does quietly."""
+    generate_rules: bool = False
+    unknown_scope: str = "unknown_scope"
+    limit: Optional[int] = None
+
+
+@router.post("/api/engagements/{engagement_id}/scope/auto-classify")
+async def auto_classify_engagement_scope(engagement_id: str, body: AutoClassifyBody | None = None):
+    """Classify every DISCOVERED host for this engagement into a scope.
+
+    Only touches hosts that are not already in `scope_targets` for the
+    engagement — it assigns newly discovered hosts and never re-files existing
+    ones, which is worth knowing before expecting it to reorganise a scope.
+
+    This route existed on rag-api with no proxy, so the dashboard got a 404 and
+    the whole feature was CLI-only. Long timeout: it walks every discovered host
+    (145 candidates took a few seconds, but a first run on a large engagement
+    walks thousands).
+    """
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=600) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/engagements/{engagement_id}/scope/auto-classify",
+            json=(body or AutoClassifyBody()).model_dump(),
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text[:300])
+        return safe_json(resp)
+
+
+class ReclassifyBody(BaseModel):
+    """`apply` defaults to FALSE — the first call reports what would move."""
+    apply: bool = False
+    limit: int = 5000
+
+
+@router.post("/api/engagements/{engagement_id}/scope/reclassify")
+async def reclassify_engagement_scope(engagement_id: str, body: ReclassifyBody | None = None):
+    """Re-file already-scoped hosts that no longer have an attack surface.
+
+    auto-classify only sees hosts with NO scope yet, so a name that resolved
+    when first seen and is dead now keeps its original scope forever. This is
+    the pass that revisits them, and it only ever moves INTO no_services.
+    """
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=600) as c:
+        resp = await c.post(
+            f"{s.rag_api_url}/engagements/{engagement_id}/scope/reclassify",
+            json=(body or ReclassifyBody()).model_dump(),
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text[:300])
         return safe_json(resp)

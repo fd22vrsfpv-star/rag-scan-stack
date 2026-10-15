@@ -60,7 +60,15 @@ _READS_SOURCE = re.compile(r'read_text\(|_src\(|open\([^)]*\.py')
 #
 # The ratchet still bites — a new violation fails by name against 387, it just
 # starts from today's truth instead of one two weeks stale. Shrink this.
-BASELINE = 387
+#
+# 387 -> 386 on 2026-10-12. The ratchet did its job within hours of being set:
+# the bash-executor and pre-auth-gate guards added 3 (390), the build failed by
+# name, and converting 4 to tests/_ast_assert.py landed at 386. Both
+# conversions were sabotage-proven — removing `executable=` from the
+# subprocess.run site fails test_vector_run_executes_under_bash, and replacing
+# `_privileges_required(details)` at its call site fails
+# test_gather_manifest_fills_cheap_gaps_before_judging.
+BASELINE = 386
 
 
 def _is_code_fragment(literal: str) -> bool:

@@ -182,18 +182,36 @@ class TestLoadNotInScopeDenylist:
         assert "not_in_scope" in sql
         assert "engagement_id is null" in sql
 
-    def test_loader_reads_new_for_review_scope(self):
+    def test_loader_reads_every_never_dispatchable_scope(self):
         """cert-pivot / asn-pivot accepts land in a per-engagement
-        `new_for_review` STAGING scope; the deny-list loader MUST read it
-        so the gate refuses dispatch until the operator promotes the
-        target. Sabotage: drop 'new_for_review' from the loader's WHERE
-        and this fails."""
+        `new_for_review` STAGING scope, and customer tenants land in
+        `customer_scope`; the deny-list loader MUST read every scope the
+        gate considers never-dispatchable, so dispatch is refused until
+        the operator promotes the target.
+
+        The scope names moved out of the SQL text and into a bound
+        parameter (`name = ANY(%s)`) when the list became
+        `etl.scope_gate.NEVER_DISPATCHABLE_SCOPES`, so the names are
+        checked where they now live. Sabotage: drop an entry from that
+        tuple, or stop passing it, and this fails by name."""
+        from etl.scope_gate import NEVER_DISPATCHABLE_SCOPES
+
         cur = MagicMock()
         cur.fetchall.return_value = []
         load_not_in_scope_denylist(cur)
+
         sql = cur.execute.call_args[0][0].lower()
-        assert "new_for_review" in sql
-        assert "typosquats" in sql
+        assert "not_in_scope" in sql
+        params = cur.execute.call_args[0][1]
+        # The parameter carrying the scope-name list, whatever its position.
+        passed = next((set(p) for p in params
+                       if isinstance(p, (list, tuple, set))), set())
+        for scope in ("new_for_review", "typosquats", "customer_scope"):
+            assert scope in NEVER_DISPATCHABLE_SCOPES, (
+                f"{scope} is no longer never-dispatchable — a staging or "
+                "customer-tenant scope the gate will now let through")
+            assert scope in passed, (
+                f"the loader does not read {scope}; it passed {sorted(passed)}")
 
     def test_new_for_review_cidr_refused_even_when_in_scope(self):
         """A host inside a new_for_review CIDR is refused even if it also

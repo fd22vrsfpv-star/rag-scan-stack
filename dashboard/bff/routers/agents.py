@@ -172,6 +172,34 @@ async def reconnect_watcher_status():
         return safe_json(resp)
 
 
+class AssetTagsBody(BaseModel):
+    add: Optional[list[str]] = None
+    remove: Optional[list[str]] = None
+    set: Optional[list[str]] = None
+
+
+@router.patch("/api/assets/{asset_id}/tags")
+async def update_asset_tags(asset_id: str, body: AssetTagsBody):
+    """Add / remove / replace an asset's tags — the write behind keyboard
+    triage on the Assets page.
+
+    The status is CHECKED. httpx does not raise on 4xx/5xx, so returning
+    unconditionally would report a refused tag (a 403 from the engagement
+    check, say) as success and leave the UI showing a tag the database never
+    stored.
+    """
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.patch(
+            f"{s.rag_api_url}/assets/{asset_id}/tags",
+            json=body.model_dump(exclude_none=True),
+            headers={"x-api-key": s.api_key, **engagement_headers()},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text[:300])
+        return safe_json(resp)
+
+
 @router.get("/api/assets/{ip}/access")
 async def asset_access(ip: str, include_dead: bool = False):
     s = get_settings()
@@ -189,6 +217,19 @@ async def asset_enumeration(ip: str):
     s = get_settings()
     async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
         resp = await c.get(f"{s.rag_api_url}/assets/{ip}/enumeration",
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        return safe_json(resp)
+
+
+@router.get("/api/assets/{ip}/scan-coverage")
+async def asset_scan_coverage(ip: str, hostname: Optional[str] = None):
+    """What has been RUN against this asset, so "scanned and found nothing" is
+    distinguishable from "never scanned" in the Recon Intel panel."""
+    s = get_settings()
+    params = {"hostname": hostname} if hostname else {}
+    async with httpx.AsyncClient(timeout=TIMEOUT_NORMAL) as c:
+        resp = await c.get(f"{s.rag_api_url}/assets/{ip}/scan-coverage",
+                           params=params,
                            headers={"x-api-key": s.api_key, **engagement_headers()})
         return safe_json(resp)
 

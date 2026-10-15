@@ -670,9 +670,16 @@ def _enforce_scope(targets, scan_type="scan"):
     # Alias-aware, matching the BFF gate and kali-listener: a host in scope
     # under its other observed identity (scope has the IP, request used the
     # hostname) must not be refused here alone.
-    blocked = [h for h in hosts
-               if not (_in_scope_aliased(h, rows, _scope_aliases(h))
-                       if _in_scope_aliased else _in_scope(h, rows))]
+    # Direct check FIRST: aliases only matter for a host the scope does not
+    # already list, and resolving them for every in-scope host is pure cost on
+    # a large dispatch.
+    blocked = []
+    for h in hosts:
+        if _in_scope(h, rows):
+            continue
+        if _in_scope_aliased and _in_scope_aliased(h, rows, _scope_aliases(h)):
+            continue
+        blocked.append(h)
     if blocked:
         logging.warning("scope gate BLOCKED %s for out-of-scope host(s): %s", scan_type, blocked)
         raise HTTPException(status_code=403, detail=(
@@ -692,6 +699,83 @@ except ImportError:
     _scope_host = None
     _in_scope_aliased = None
     _load_aliases = None
+
+
+_ALIAS_CACHE: dict = {"map": None, "at": 0.0}
+
+
+def _alias_map():
+    """{host-or-ip -> {observed identities}} built from ONE /assets fetch.
+
+    `_scope_aliases` used to fetch `/assets?limit=5000` on every call, and
+    `_enforce_scope` calls it once per target. A 762-host dispatch was therefore
+    762 full asset-list fetches: the request never finished validating, the
+    BFF's 30s client timeout fired, and the operator got a bare HTTP 500 with no
+    job created. Nothing was wrong with the scan — the gate could not be
+    evaluated in the time the caller was willing to wait.
+
+    Same brief TTL as _scope_rows, for the same reason: the gate must reflect a
+    scope change quickly, but not re-fetch per target.
+    """
+    # Shared cache (common/query_cache.py) so an operator can force a re-read
+    # without waiting out the TTL: POST /cache/refresh?name=nmap_alias_map on
+    # rag-api, or the same endpoint here. The hand-rolled dict below is kept as
+    # the fallback for the case where common/ is not mounted.
+    try:
+        from common.query_cache import get_cache
+        _c = get_cache("nmap_alias_map", ttl=_SCOPE_TTL)
+        if _c.is_fresh():
+            return _c.peek({})
+    except Exception:  # noqa: BLE001
+        _c = None
+    now = time.time()
+    if _c is None and _ALIAS_CACHE["map"] is not None \
+            and (now - _ALIAS_CACHE["at"]) < _SCOPE_TTL:
+        return _ALIAS_CACHE["map"]
+    amap: dict = {}
+    try:
+        # /assets/alias-pairs, not /assets?limit=5000. The full asset list is
+        # 1.1MB and takes 80s to build (open-port counts, recon counts, a
+        # lateral join into credential_findings) — far past the 20s timeout
+        # below, so this fetch ALWAYS failed and the gate ran with no aliases
+        # at all. The pairs endpoint returns the same ip<->hostname
+        # observations in 0.2s because it selects the two columns the gate
+        # needs and nothing else.
+        r = requests.get(f"{API_BASE}/assets/alias-pairs",
+                         headers={"x-api-key": API_KEY}, timeout=20, verify=False)
+        if r.status_code == 200:
+            for ip_h in (r.json().get("pairs") or []):
+                ip = str((ip_h or [None, None])[0] or "").strip().lower()
+                hn = str((ip_h or [None, None])[-1] or "").strip().lower()
+                pair = {x for x in (ip, hn) if x}
+                for key in pair:
+                    amap.setdefault(key, set()).update(pair)
+        else:
+            # No fallback to /assets. It is the endpoint this replaced and it
+            # cannot answer inside any caller's timeout, so a "fallback" there
+            # is a guaranteed second failure that costs 20 more seconds and
+            # still yields nothing. Keep the previous map instead: narrow,
+            # never widen.
+            logging.warning("alias map fetch returned HTTP %s from "
+                            "/assets/alias-pairs — keeping the previous map",
+                            r.status_code)
+            return _ALIAS_CACHE["map"] or {}
+    except Exception as e:  # noqa: BLE001
+        # Narrow, never widen. A failed lookup must not become "no aliases
+        # exist" for the rest of the TTL, so the previous map is kept and the
+        # cache is NOT stamped.
+        logging.warning("alias map fetch failed: %s", e)
+        return _ALIAS_CACHE["map"] or {}
+    _ALIAS_CACHE["map"] = amap
+    _ALIAS_CACHE["at"] = now
+    if _c is not None:
+        # Store through the shared cache so /cache/status reports its age and
+        # /cache/refresh can bust it.
+        try:
+            _c.get(lambda: amap, force=True)
+        except Exception:  # noqa: BLE001
+            pass
+    return amap
 
 
 def _scope_aliases(host):
@@ -715,19 +799,7 @@ def _scope_aliases(host):
     aliases = {h}
     if h in ("localhost", "127.0.0.1", "::1"):
         return aliases | {"localhost", "127.0.0.1", "::1"}
-    try:
-        r = requests.get(f"{API_BASE}/assets", params={"limit": 5000},
-                         headers={"x-api-key": API_KEY}, timeout=10, verify=False)
-        if r.status_code == 200:
-            for a in (r.json().get("assets") or []):
-                ip = str(a.get("ip") or "").strip().lower()
-                hn = str(a.get("hostname") or "").strip().lower()
-                if h in (ip, hn):
-                    aliases |= {x for x in (ip, hn) if x}
-    except Exception as e:
-        # Narrow, never widen: fall back to the host as given.
-        logging.warning("alias lookup failed for %r: %s", host, e)
-    return aliases
+    return aliases | _alias_map().get(h, set())
 
 
 class MasscanBody(BaseModel):
@@ -1511,8 +1583,23 @@ def _run_nmap_proxied_async(job_id: str, targets: List[str], ports: str, proxy: 
                 _cf.write("strict_chain\nproxy_dns\nremote_dns_subnet 224\n"
                           "tcp_read_time_out 15000\ntcp_connect_time_out 8000\n"
                           f"[ProxyList]\n{_pscheme} {_pip} {_pport}\n")
+            # --system-dns is REQUIRED here, not a tuning knob.
+            #
+            # nmap's own parallel resolver sends DNS itself; proxychains hooks
+            # the libc resolver via LD_PRELOAD and cannot intercept that, so
+            # every name resolution waits out a timeout before nmap falls back.
+            # Measured on this stack, two hostnames through the same proxy:
+            #     default resolver   13.12s
+            #     --system-dns        0.12s
+            # A 762-host scope therefore spent over an hour resolving before
+            # probing a single port — the job sat at zero output with 0.09s of
+            # CPU consumed, which reads as a hung scanner rather than a slow
+            # one. --system-dns routes resolution through the libc path
+            # proxychains DOES intercept (`proxy_dns` in the generated conf),
+            # so names resolve at the exit node, where a proxied scan wants
+            # them resolved anyway.
             cmd = ["proxychains4", "-q", "-f", pchains_cfg,
-                   "nmap", "-sT", "-Pn",
+                   "nmap", "-sT", "-Pn", "--system-dns",
                    "-p", ports, "-oA", outbase, "--open",
                    "--stats-every", "30s", f"-{timing}"]
         else:
@@ -1534,8 +1621,17 @@ def _run_nmap_proxied_async(job_id: str, targets: List[str], ports: str, proxy: 
         if opts.get("os_detection"):
             cmd.extend(["-O"])
 
-        # NSE scripts: per-scan overrides env
-        scripts = opts.get("scripts") or os.environ.get("NMAP_SCRIPTS", "")
+        # NSE scripts: per-scan overrides env.
+        #
+        # `None` means "caller did not specify" and takes the env default;
+        # an explicit "" means "no scripts" and must WIN. This was
+        #     opts.get("scripts") or os.environ.get("NMAP_SCRIPTS", "")
+        # so "" fell through to the env, and the per-scan override could only
+        # ADD scripts, never remove them — the same None-vs-explicit
+        # distinction `service_detection` and `ports` already make two lines
+        # below.
+        _sp = opts.get("scripts")
+        scripts = _sp if _sp is not None else os.environ.get("NMAP_SCRIPTS", "")
         if scripts:
             cmd.extend(["--script", scripts])
 
@@ -1735,7 +1831,9 @@ def run_nmap_batch(ip, ports, batch_idx):
     service_detection = svc_param if svc_param is not None else (os.environ.get("NMAP_SERVICE_DETECTION", "1") == "1")
     vi_param = opts.get("version_intensity")
     version_intensity = str(vi_param) if vi_param is not None else os.environ.get("NMAP_VERSION_INTENSITY", "9")
-    extra_scripts = opts.get("scripts") or os.environ.get("NMAP_SCRIPTS", "")
+    # None = unset (use env); "" = explicitly none. See the proxied path above.
+    _sp = opts.get("scripts")
+    extra_scripts = _sp if _sp is not None else os.environ.get("NMAP_SCRIPTS", "")
 
     if service_detection:
         cmd += ["-sV", "--version-intensity", version_intensity]

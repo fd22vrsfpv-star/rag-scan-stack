@@ -13,6 +13,7 @@ import ipaddress   # scope gate: CIDR membership
 import fnmatch     # scope gate: *.domain matching
 import uuid
 import signal
+import shutil
 import subprocess
 import asyncio
 import json
@@ -41,6 +42,18 @@ active_listeners: Dict[str, Dict[str, Any]] = {}
 
 
 # --- Pydantic Models ---
+
+
+#: The shell PoC commands are parsed by. Resolved once at import — the runner
+#: image does not change shells at runtime — and REPORTED by /runtime/profile
+#: so the synthesiser can write for it instead of guessing, rather than this
+#: being a fact compiled into one branch of one service.
+#:
+#: Prefers bash because that is what the model writes. None when no shell is
+#: found at all, which falls back to subprocess's own /bin/sh behaviour rather
+#: than failing to run.
+_EXEC_SHELL = shutil.which("bash") or shutil.which("sh")
+_BASH = _EXEC_SHELL  # back-compat name
 
 class ListenerStartRequest(BaseModel):
     port: int = Field(..., ge=PORT_START, le=PORT_END, description="Port for listener")
@@ -2979,8 +2992,17 @@ def vectors_run(request: VectorRunRequest):
     to = max(5, min(int(request.timeout or VECTOR_RUN_DEFAULT_TIMEOUT),
                     VECTOR_RUN_MAX_TIMEOUT))
     try:
+        # EXECUTE UNDER BASH, NOT dash. subprocess(shell=True) uses /bin/sh,
+        # which here is a symlink to dash — so every bash-only construct the
+        # model naturally writes dies before reaching the target:
+        # process substitution <(...), &> redirection, [[ ]], arrays.
+        # 37 trace files carry a shell syntax error, "redirection unexpected"
+        # x24 among them, and the pre-dispatch shlex check cannot catch these
+        # (shlex parses tokens, not shell grammar). bash 5.3.3 is already
+        # installed at /usr/bin/bash; _BASH is None when it is not, which falls
+        # back to the previous /bin/sh behaviour rather than failing to run.
         proc = subprocess.run(cmd, shell=True, capture_output=True,
-                              text=True, timeout=to)
+                              text=True, timeout=to, executable=_EXEC_SHELL)
         out = (proc.stdout or "") + (proc.stderr or "")
         return {"ok": True, "exit_code": proc.returncode, "output": out[:20000]}
     except subprocess.TimeoutExpired as e:  # noqa: BLE001
@@ -2991,6 +3013,70 @@ def vectors_run(request: VectorRunRequest):
         return {"ok": False, "exit_code": None,
                 "output": f"[error] {type(e).__name__}: {e}"[:2000]}
 
+
+
+#: Programs a PoC command is likely to reach for. Reported so the synthesiser
+#: writes for what is HERE instead of guessing, and so a missing one is a known
+#: fact rather than a PRERUN_TOOL_MISSING surprise at dispatch time.
+_RUNTIME_PROBE_BINARIES = (
+    "curl", "wget", "python3", "bash", "sh", "jq", "grep", "sed", "awk",
+    "openssl", "nc", "socat", "xxd", "base64", "mktemp", "date", "timeout",
+    "sqlmap", "nuclei", "ffuf", "gobuster", "nmap", "git", "perl", "php",
+)
+
+
+@app.get("/runtime/profile")
+def runtime_profile():
+    """What this runner actually IS — shell, version, and which programs exist.
+
+    The listener is the authority on this and nothing else is, the same
+    reasoning as /tools/capabilities: only the machine that will run the
+    command knows what will parse and what is installed.
+
+    Why it exists: PoC commands execute via subprocess(shell=True), which uses
+    /bin/sh — here a symlink to DASH. The model naturally writes bash
+    (process substitution, [[ ]], arrays), so those commands died in the shell
+    before reaching the target. 37 trace files carry a shell syntax error.
+    Hardcoding bash in the executor fixes the symptom; REPORTING the shell lets
+    the synthesiser write correct commands in the first place, and lets the
+    fact be embedded into RAG rather than compiled into a branch.
+    """
+    import platform as _plat
+    import shutil as _sh
+    import subprocess as _sp
+
+    def _ver(path, args):
+        try:
+            r = _sp.run([path] + args, capture_output=True, text=True, timeout=5)
+            return ((r.stdout or r.stderr or "").strip().splitlines() or [""])[0][:120]
+        except Exception:  # noqa: BLE001
+            return ""
+
+    sh_path = _sh.which("sh") or "/bin/sh"
+    real_sh = ""
+    try:
+        real_sh = os.path.realpath(sh_path)
+    except Exception:  # noqa: BLE001
+        real_sh = sh_path
+    bash_path = _sh.which("bash")
+    # The shell a command will ACTUALLY be parsed by, which is what the
+    # synthesiser needs to know.
+    exec_shell = bash_path or sh_path
+    present, missing = [], []
+    for b in _RUNTIME_PROBE_BINARIES:
+        (present if _sh.which(b) else missing).append(b)
+    return {
+        "ok": True,
+        "runner": os.environ.get("HOSTNAME", "kali-listener"),
+        "os": f"{_plat.system()} {_plat.release()}",
+        "exec_shell": exec_shell,
+        "exec_shell_version": _ver(exec_shell, ["--version"]),
+        "sh_is": real_sh,
+        "sh_is_dash": real_sh.endswith("dash"),
+        "bash_available": bool(bash_path),
+        "binaries_present": present,
+        "binaries_missing": missing,
+    }
 
 @app.get("/tools/capabilities")
 def tool_capabilities(tool: str, category: str = ""):

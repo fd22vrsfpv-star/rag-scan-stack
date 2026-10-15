@@ -937,6 +937,11 @@ services:
     volumes:
       - ./nmap_out:/app/nmap_out
       - ./etl:/app/etl:ro
+      # common/query_cache.py — the shared TTL cache with refresh on
+      # demand. _alias_map falls back to its own dict without this, so
+      # the mount is what makes its cache show up in /cache/status and
+      # be bustable rather than only expiring.
+      - ./common:/app/common:ro
       - ./app:/app/app:ro
       - ./scan_results:/scan_results
       - ./scan_audit:/scan_audit
@@ -2362,6 +2367,14 @@ services:
     volumes:
       - ./etl:/app/etl:ro                              # shared scope gate for the remote-node path
       - ./common:/app/common:ro                        # shared scan-slot ceiling
+      # Audit trail. node_manager.py does `try: from audit_writer import
+      # write_audit / except ImportError: def write_audit(*a, **kw): pass`, and
+      # the module reached neither the image nor a mount — so every
+      # scan_started/scan_completed/scan_failed from a remote node was written
+      # to a no-op. Same two mounts every other runner uses (see the scanner
+      # and *-runner services above).
+      - ./scan_audit:/scan_audit
+      - ./scan_audit/audit_writer.py:/app/audit_writer.py:ro
       - ${SSH_KEY_PATH:-./ssh-keys}:/ssh-keys:ro
       # NOTE: ./node_manager is deliberately NOT mounted here.
       # It used to be mounted at /app/node_manager, which was actively
@@ -2559,6 +2572,10 @@ services:
       # this lands on its import path and `from etl.scope_gate import is_in_scope`
       # resolves to the SAME fail-closed matcher the discovery ingests use.
       - ./etl:/app/bff/etl:ro
+      # common/ carries the shared query cache (and llm_settings). The BFF is
+      # the other service that bursts database work, so it gets the same
+      # refresh-on-demand cache the 13 services with this mount already have.
+      - ./common:/app/bff/common:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro  # Enable docker exec for WireGuard status querying
     networks:
       - agents_net

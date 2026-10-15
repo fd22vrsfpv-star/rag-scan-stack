@@ -83,7 +83,7 @@ export default function FollowUps() {
   const { matchesAnyScope, isFiltering: isScopeFiltering } = useScopeFilter(scopeFilter)
   const excludeScope = hideCustomerHosted ? 'customer_scope' : undefined
   const activeEngagementId = filterByEngagement && engagementId ? engagementId : undefined
-  const { data: statsData } = useFollowUpStats(activeEngagementId, excludeScope)
+  const { data: statsData } = useFollowUpStats(activeEngagementId, excludeScope, scopeFilter || undefined)
   // Unfiltered-by-scope counts, so the toggle can say how many it is hiding
   // rather than silently shrinking the list.
   const { data: unscopedStats } = useFollowUpStats(activeEngagementId, undefined)
@@ -94,13 +94,16 @@ export default function FollowUps() {
   // nothing until the operator actually filters.
   const { data: allStatsData } = useFollowUpStats(undefined)
   const excludeStatus = hideDismissed && filters.status !== 'dismissed' ? 'dismissed' : undefined
-  const { data: groupedData } = useFollowUpGrouped(groupBy, filters.status, activeEngagementId, excludeStatus, excludeScope)
+  const { data: groupedData } = useFollowUpGrouped(groupBy, filters.status, activeEngagementId, excludeStatus, excludeScope, scopeFilter || undefined)
   const { data, isLoading } = useFollowUps({
     ...filters,
     exclude_status: excludeStatus,
     search: searchFilter.trim() || undefined,
     engagement_id: filterByEngagement && engagementId ? engagementId : undefined,
     exclude_scope: excludeScope,
+    // Server-side as well as the client filter below: the client one cannot
+    // fix the counts, and paging over an unfiltered set hides in-scope rows.
+    scope_name: scopeFilter || undefined,
   })
   const { data: agentStatsData } = useAgentStats()
   const { data: rulesData } = useAgentRules()
@@ -877,8 +880,27 @@ export default function FollowUps() {
                 /* Server-side grouped view — accurate counts across all items */
                 groupedData.groups.map((g: FollowUpGroup) => {
                   const isOpen = expandedGroups.has(g.group_key)
+                  // Filter the samples CLIENT-side as well as server-side.
+                  //
+                  // `host_samples` come straight from the grouped query. When
+                  // the scope param does not reach the server — an older
+                  // bundle, a stale query, a caller that forgot it — the row
+                  // renders hosts the operator's filter excludes, which is
+                  // exactly how `172.18.0.33:9090` appeared under a examplecorp
+                  // scope. The table rows below were already filtered this way;
+                  // the group header was not.
+                  //
+                  // host_samples may carry a :port, so strip it before matching.
+                  const rawSamples = g.host_samples || []
+                  const inScopeSamples = isScopeFiltering
+                    ? rawSamples.filter(h => matchesAnyScope(String(h).split(':')[0]))
+                    : rawSamples
+                  const hiddenBySample = rawSamples.length - inScopeSamples.length
                   const summary = groupBy === 'title'
-                    ? (g.host_samples || []).slice(0, 3).join(', ') + (g.unique_hosts && g.unique_hosts > 3 ? ` +${g.unique_hosts - 3}` : '')
+                    ? inScopeSamples.slice(0, 3).join(', ')
+                      + (g.unique_hosts && g.unique_hosts > 3 && !hiddenBySample
+                          ? ` +${g.unique_hosts - 3}` : '')
+                      + (hiddenBySample ? ` (${hiddenBySample} hidden by scope)` : '')
                     : (g.finding_names || []).slice(0, 3).join(', ')
                   return (
                     <Fragment key={g.group_key}>

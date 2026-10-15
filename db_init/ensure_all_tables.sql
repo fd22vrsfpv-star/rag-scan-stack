@@ -2020,9 +2020,30 @@ CREATE TABLE IF NOT EXISTS public.node_scan_jobs (
     completed_at   timestamptz,
     updated_at     timestamptz NOT NULL DEFAULT now()
 );
+-- A remote scan is collected target data, so the job row carries the
+-- engagement (CLAUDE.md: engagement attribution is mandatory). Nullable
+-- because a scan dispatched with no X-Engagement-Id and none in the body still
+-- gets a job row -- losing the history is worse than an unattributed row, and
+-- the purge also deletes by target IP.
+--
+-- NO FK HERE. public.engagements is created ~750 lines below this point, so a
+-- REFERENCES clause fails on a FRESH database -- and inside the BEGIN/COMMIT
+-- block it takes every following statement with it. The constraint is attached
+-- after engagements exists, in the engagement-FK block near the end of this
+-- file, which is the same thing security_tests does.
+ALTER TABLE public.node_scan_jobs
+    ADD COLUMN IF NOT EXISTS engagement_id uuid;
 CREATE INDEX IF NOT EXISTS idx_node_scan_jobs_node_id ON public.node_scan_jobs(node_id);
 CREATE INDEX IF NOT EXISTS idx_node_scan_jobs_status ON public.node_scan_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_node_scan_jobs_created_at ON public.node_scan_jobs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_node_scan_jobs_engagement ON public.node_scan_jobs(engagement_id);
+-- The dispatcher INSERTs 'running' and the completion/failure paths UPDATE the
+-- same row, both keyed by job_id, so job_id must be unique or a retried
+-- dispatch silently forks the history into two rows. Plain, not partial: a
+-- partial index would have to repeat its predicate in every ON CONFLICT, and
+-- Postgres leaves NULLs unconstrained in either case. node_manager always
+-- supplies a job_id (a uuid4 it generated), so no NULL is ever written.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_node_scan_jobs_job_id ON public.node_scan_jobs(job_id);
 
 -- ad_attack_results
 CREATE TABLE IF NOT EXISTS public.ad_attack_results (
@@ -2297,6 +2318,38 @@ FROM public.exploit_results er JOIN public.pending_exploits pe ON er.pending_exp
 
 -- Detected software inventory (aggregates versions from ports, web_findings, recon_findings)
 CREATE OR REPLACE VIEW public.detected_software AS
+-- DEDUPLICATED. The branches below are UNION ALL over tables that get a NEW
+-- ROW PER SCAN -- recon_findings and web_findings accumulate one row per httpx
+-- / gowitness / ZAP / whatweb run against the same host -- so the same piece of
+-- software appeared once per run, not once per host. Measured 2026-10-14:
+--
+--   detected_software rows: 15407   distinct software: 11268
+--   redundant copies:        4139   (27% of the view)
+--
+--   n=778  Apache         zap    server_header   172.18.0.36
+--   n=709  Apache-Coyote  zap    server_header   65.61.137.117
+--   n=207  Amazon CloudFront / HSTS / AWS  httpx tech_detection 20.49.104.29
+--
+-- Every consumer inherited that: the asset Software panel listed "Apache" 778
+-- times, and because each listed product drives its own CVE lookup, the CVE
+-- list repeated with it. Nothing was wrong with the CVE data -- the inventory
+-- feeding it was 27% copies.
+--
+-- UNION ALL (not UNION) is kept on purpose: it is cheaper, the branches are
+-- disjoint by `source`, and deduplication belongs in ONE place where it can
+-- also fold the timestamps. GROUP BY, not DISTINCT, so first_seen is the
+-- EARLIEST sighting and last_seen the LATEST -- the per-run rows are the
+-- evidence that produces that range, and collapsing them with DISTINCT would
+-- have kept an arbitrary one of each.
+--
+-- The `nmap` branch reads `ports`, which is already unique per (asset, port),
+-- and measured 0 redundant rows -- it is unaffected by the wrapper.
+SELECT
+    asset_id, ip, hostname, port, protocol, product, version, source,
+    detection_type,
+    min(first_seen) AS first_seen,
+    max(last_seen)  AS last_seen
+FROM (
 -- Source 1: Nmap/Masscan service detection (ports table)
 SELECT
     a.id AS asset_id,
@@ -2648,7 +2701,10 @@ SELECT
 FROM public.web_findings wf
 LEFT JOIN public.assets a ON wf.asset_id = a.id
 WHERE wf.url ~ '/\d+\.\d+\.\d+/_/download/'
-  AND substring(wf.url from '/(\d+\.\d+\.\d+)/_/download/') IS NOT NULL;
+  AND substring(wf.url from '/(\d+\.\d+\.\d+)/_/download/') IS NOT NULL
+) _software
+GROUP BY asset_id, ip, hostname, port, protocol, product, version, source,
+         detection_type;
 
 -- ============================================================================
 -- software_research_cache (persists AI exploit research results per product+version)
@@ -2713,7 +2769,7 @@ INSERT INTO public.app_settings (key, value, category) VALUES
   -- /api/settings/build-poc-limits (Settings -> Scan Timeouts). The deep-recon
   -- go-around used to be a hard 10, which was the binding cap on every CVE
   -- that needed deep recon: a request for 50 was clamped to 10.
-  ('build_poc_second_pass_iters',                  '50',   'config'),
+  ('build_poc_second_pass_iters',                  '7',    'config'),
   -- 2026-10-10 db-txn-watchdog (rag-api): alert on transactions older than N min;
   -- terminate when > 0 (Postgres 16 has no transaction_timeout of its own).
   ('db_txn_alert_after_min',                       '15',   'config'),
@@ -2766,6 +2822,16 @@ ALTER TABLE public.playwright_findings ADD COLUMN IF NOT EXISTS engagement_id uu
 -- because they are created before this point. Attach it here.
 -- ADD COLUMN IF NOT EXISTS would not do it: the column already exists, so the
 -- statement is a no-op and the constraint never appears.
+-- node_scan_jobs.engagement_id is declared above without the FK (engagements
+-- did not exist yet). ON DELETE CASCADE: a remote scan's job row is collected
+-- data belonging to that engagement, so purging the engagement removes it.
+DO $NSJFK$ BEGIN
+    ALTER TABLE public.node_scan_jobs
+      ADD CONSTRAINT node_scan_jobs_engagement_fk
+      FOREIGN KEY (engagement_id) REFERENCES public.engagements(id) ON DELETE CASCADE;
+EXCEPTION WHEN duplicate_object THEN NULL; WHEN undefined_table THEN NULL;
+          WHEN undefined_column THEN NULL; END $NSJFK$;
+
 DO $STFK$ BEGIN
     ALTER TABLE public.security_tests
       ADD CONSTRAINT security_tests_engagement_fk
@@ -4059,12 +4125,49 @@ CREATE TABLE IF NOT EXISTS scope_classification_rules (
     scope_name      text NOT NULL,
     priority        int NOT NULL DEFAULT 100,
     enabled         boolean NOT NULL DEFAULT true,
-    rule_type       text NOT NULL CHECK (rule_type IN ('domain_pattern','whois_org','asn','tls_issuer','ip_cidr','composite','typosquat')),
+    rule_type       text NOT NULL CHECK (rule_type IN ('domain_pattern','whois_org','asn','tls_issuer','ip_cidr','composite','typosquat','asset_state')),
     conditions      jsonb NOT NULL,
     auto_apply      boolean NOT NULL DEFAULT false,
     created_at      timestamptz DEFAULT now(),
     updated_at      timestamptz DEFAULT now()
 );
+
+-- Baseline "no attack surface" rules.
+--
+-- These existed only as rows somebody created against a live database, so a
+-- clean build had an empty rule set and `/scope/reclassify` filed nothing. A
+-- rule that is not in the installer is not a feature of the product.
+--
+-- Matched on `name`, which is not unique, so the guard is a NOT EXISTS rather
+-- than ON CONFLICT. Re-running is a no-op; an operator edit is never reverted.
+INSERT INTO scope_classification_rules (name, scope_name, priority, rule_type, conditions, auto_apply)
+SELECT 'no-services:unresolved-and-no-open-ports', 'no_services', 20, 'asset_state',
+       '{"probed": true, "unresolved": true, "max_open_ports": 0}'::jsonb, true
+ WHERE NOT EXISTS (SELECT 1 FROM scope_classification_rules
+                    WHERE name = 'no-services:unresolved-and-no-open-ports');
+
+INSERT INTO scope_classification_rules (name, scope_name, priority, rule_type, conditions, auto_apply)
+SELECT 'no-services:scanned-but-nothing-listening', 'no_services', 21, 'asset_state',
+       '{"probed": true, "port_scanned": true, "max_open_ports": 0}'::jsonb, true
+ WHERE NOT EXISTS (SELECT 1 FROM scope_classification_rules
+                    WHERE name = 'no-services:scanned-but-nothing-listening');
+
+-- A retired host answers, and what it answers is "this service is gone". It has
+-- ports open, so the no_services rules above correctly refuse it; the fact that
+-- separates it is the RESPONSE, recorded as the `retired` asset tag by
+-- POST /engagements/{id}/scope/detect-retired.
+--
+-- NOT the certificate, which was the obvious candidate and does not work:
+-- across 508 scope hosts on 443, CN=*.examplecorp.com was served by 32 retired
+-- AND 15 live hosts (www.examplecorp.com among them), the issuer was identical
+-- on both, and one certificate serial appeared on retired and live hosts
+-- alike. Priority 19 so it outranks the no_services rules, which cannot match
+-- a host with open ports anyway but would be the wrong answer if they did.
+INSERT INTO scope_classification_rules (name, scope_name, priority, rule_type, conditions, auto_apply)
+SELECT 'retired:decommissioned-service', 'retired', 19, 'asset_state',
+       '{"probed": true, "retired": true}'::jsonb, true
+ WHERE NOT EXISTS (SELECT 1 FROM scope_classification_rules
+                    WHERE name = 'retired:decommissioned-service');
 
 CREATE TABLE IF NOT EXISTS scope_decisions (
     id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -4519,10 +4622,16 @@ DO $$ BEGIN ALTER TABLE scope_suggestions ADD COLUMN IF NOT EXISTS engagement_id
 -- helpers can write their rule/method values.
 -- (Existing dbs created BEFORE the typosquat work have a stale CHECK that
 -- would reject the new values; drop + re-add with the expanded allow-list.)
+--
+-- 2026-10-13: + 'asset_state' — rules that classify on what was OBSERVED about
+-- a host (did it resolve, is anything listening) rather than what its name
+-- looks like. Without this the INSERT fails with
+--   violates check constraint "scope_classification_rules_rule_type_check"
+-- and the rule type is unusable even though the classifier understands it.
 DO $$ BEGIN
   ALTER TABLE scope_classification_rules DROP CONSTRAINT IF EXISTS scope_classification_rules_rule_type_check;
   ALTER TABLE scope_classification_rules ADD CONSTRAINT scope_classification_rules_rule_type_check
-    CHECK (rule_type IN ('domain_pattern','whois_org','asn','tls_issuer','ip_cidr','composite','typosquat'));
+    CHECK (rule_type IN ('domain_pattern','whois_org','asn','tls_issuer','ip_cidr','composite','typosquat','asset_state'));
 EXCEPTION WHEN OTHERS THEN NULL; END $$;
 
 DO $$ BEGIN

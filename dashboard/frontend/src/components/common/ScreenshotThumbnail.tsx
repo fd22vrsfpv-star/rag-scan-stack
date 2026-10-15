@@ -10,7 +10,7 @@ function openScreenshotPopup(src: string) {
 
 /** Standard thumbnail with filename — for grids and detail panels */
 export function ScreenshotThumbnail({ path, filename }: { path: string; filename: string }) {
-  const src = `${apiUrl}/screenshots/${path}`
+  const src = apiUrl(`/screenshots/${path}`)
 
   return (
     <button
@@ -25,7 +25,7 @@ export function ScreenshotThumbnail({ path, filename }: { path: string; filename
 
 /** Micro thumbnail for inline display in table rows — 48x30px clickable preview */
 export function MicroScreenshot({ path, alt }: { path: string; alt?: string }) {
-  const src = `${apiUrl}/screenshots/${path}`
+  const src = apiUrl(`/screenshots/${path}`)
 
   return (
     <button

@@ -169,7 +169,9 @@ async def proxied_preview(body: ProxiedPreviewBody):
     means the operator gets a reason instead of a timeout.
     """
     from urllib.parse import urlparse
-    from scope_guard import scope_rows_for, refusal_for
+    from engagement import current_engagement_id
+    from scope_guard import (scope_rows_for, refusal_for,
+                             refusal_reason_for_source)
 
     host = urlparse(body.url or "").hostname
     if not host:
@@ -178,11 +180,24 @@ async def proxied_preview(body: ProxiedPreviewBody):
         # (rows, source) — NOT just rows. Passing the tuple straight through
         # raised "too many values to unpack" and the gate failed closed, which
         # was correct but is not a reason to leave the call wrong.
-        rows, scope_source = scope_rows_for(None)
-        refusal = refusal_for(host, rows, command=f"preview {body.url}")
+        #
+        # The engagement is read from the request, not hardcoded to None.
+        # Every other scope_rows_for caller in the BFF passes one; this was the
+        # only one that did not, so the preview gate checked the union of all
+        # engagements (10,747 rows) instead of the operator's own (5,791) —
+        # looser than every sibling path and not what the engagement header
+        # asked for.
+        rows, scope_source = scope_rows_for(current_engagement_id.get())
+        unreadable = refusal_reason_for_source(scope_source) if not rows else None
+        refusal = None if unreadable else refusal_for(
+            host, rows, command=f"preview {body.url}")
     except Exception as e:  # noqa: BLE001
         # Fail CLOSED. An unavailable scope gate is not permission to browse.
         raise HTTPException(503, f"scope gate unavailable, refusing to browse: {e}")
+    if unreadable:
+        # 503, not 403: the scope was never consulted, so this is not an
+        # authorisation verdict and the operator should retry, not reconfigure.
+        raise HTTPException(503, unreadable)
     if refusal:
         raise HTTPException(403, refusal)
 
@@ -536,6 +551,47 @@ async def get_screenshot_metadata(
             params=params,
             headers={"x-api-key": s.api_key, **engagement_headers()},
         )
+        return safe_json(resp)
+
+
+# NOTE: must stay ABOVE /api/screenshots/{path:path} for the same reason the
+# metadata route does — the catch-all would swallow it.
+@router.get("/api/recon/gowitness-report")
+async def gowitness_report(
+    match: Optional[str] = None,
+    status: Optional[str] = None,
+    fmt: str = "json",
+    all_engagements: bool = False,
+    limit: int = 2000,
+):
+    """One combined GoWitness view: every screenshot with its status code and
+    title. `fmt=json` feeds the UI; `csv` and `html` are downloads.
+
+    Not `safe_json` for the download formats — that would discard the
+    Content-Disposition and hand the browser a JSON blob instead of a file.
+    Same pattern as the scope CSV export.
+    """
+    s = get_settings()
+    params: dict = {"fmt": fmt, "all_engagements": str(all_engagements).lower(),
+                    "limit": limit}
+    if match:
+        params["match"] = match
+    if status:
+        params["status"] = status
+    async with httpx.AsyncClient(timeout=120) as c:
+        resp = await c.get(f"{s.rag_api_url}/recon/gowitness-report",
+                           params=params,
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text[:500])
+        if fmt in ("csv", "html"):
+            return Response(
+                content=resp.content,
+                media_type=resp.headers.get("content-type",
+                                            "text/csv" if fmt == "csv" else "text/html"),
+                headers={"Content-Disposition":
+                         resp.headers.get("content-disposition",
+                                          f'attachment; filename="gowitness.{fmt}"')})
         return safe_json(resp)
 
 

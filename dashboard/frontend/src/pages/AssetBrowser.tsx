@@ -1,8 +1,9 @@
-import { useState, useMemo, useEffect, Fragment } from 'react'
+import { useState, useMemo, useEffect, useCallback, Fragment } from 'react'
 import { Link } from 'react-router-dom'
 import { useQueryClient, useQuery, useQueries } from '@tanstack/react-query'
 import PageHelp from '@/components/PageHelp'
-import { useAssets, useAssetPorts, useAssetVulns, usePortRecommendations, useSubdomains, useDeleteAssets, useDeleteSubdomains, useAssetCredentials, useAllCredentials, useUpdateCredentialStatus, useCreateCredential, useDeleteCredential, usePurgeDomain, usePurgePattern, useDetectedSoftware, useBulkDismissSoftware, useCveTuning, useUpdateCveTuning, useSearchsploit, getDdgSearchUrls, useResearchCache, useVulnxFindings, useResolveExploit, useBuildPoc, useAssetAccess, useRefreshAccess, useReviewAccess, useAccessSummary, usePendingExploitCounts, useAssetPortAdvice, useAssetEnumeration,
+import { useAssets, useAssetPorts, useAssetVulns, usePortRecommendations, useSubdomains, useDeleteAssets, useDeleteSubdomains, useAssetCredentials, useAllCredentials, useUpdateCredentialStatus, useCreateCredential, useDeleteCredential, usePurgeDomain, usePurgePattern, useDetectedSoftware, useBulkDismissSoftware, useCveTuning, useUpdateCveTuning, useSearchsploit, getDdgSearchUrls, useResearchCache, useVulnxFindings, useResolveExploit, useBuildPoc, useAssetAccess, useRefreshAccess, useReviewAccess, useAccessSummary, usePendingExploitCounts, useAssetPortAdvice, useAssetEnumeration, useAssetScanCoverage,
+  useUpdateAssetTags, TRIAGE_TAGS,
   type ObtainedAccess, type DdgSearchResponse, type EnumHighlight, type EnumCredential, type EnumLoot, type EnumLoginAttempt, type EnumListeningPort } from '@/api/assets'
 import { apiFetch } from '@/api/client'
 import { useTargetedReconLookup, useTargetedReconExecute } from '@/api/targeted-recon'
@@ -24,6 +25,7 @@ import { useProxyEndpoints, useProxiedPreview } from '@/api/recon'
 import { useScreenshots, useReconDomainOverview } from '@/api/recon'
 import { apiUrl } from '@/api/client'
 import { ScreenshotThumbnail } from '@/components/common/ScreenshotThumbnail'
+import { useGowitnessReport, type GowitnessRow } from '@/api/gowitness'
 import * as Dialog from '@radix-ui/react-dialog'
 
 // Decode a cloud-import asset's hostname (engagement_short/<filename>) into
@@ -61,7 +63,34 @@ const assetColumns: ColumnDef<Asset, unknown>[] = [
         </div>
       )
     }
-    return <span className="font-mono text-sm font-medium">{String(row.original.hostname ?? '-')}</span>
+    // Label the scope, and mark it when the gate will refuse a scan. A blocked
+    // target that looks identical to a runnable one reads as a bug when it does
+    // nothing (CLAUDE.md, Authorization gates).
+    const scope = row.original.scope_name
+    const blocked = row.original.scannable === false
+    return (
+      <span className="flex items-center gap-1.5 min-w-0">
+        <span className={cn('font-mono text-sm font-medium truncate',
+          blocked && 'text-muted-foreground')}>
+          {String(row.original.hostname ?? '-')}
+        </span>
+        {blocked && (
+          <span
+            title={`In the "${scope}" scope, which the dispatch gate never scans. `
+                 + `Visible for reference; scans against it are refused.`}
+            className="shrink-0 px-1 py-0.5 rounded text-[9px] font-sans border border-amber-500/40 bg-amber-500/10 text-amber-400"
+          >
+            not scannable
+          </span>
+        )}
+        {scope && !blocked && (
+          <span className="shrink-0 px-1 py-0.5 rounded text-[9px] font-sans text-muted-foreground border border-border"
+                title={`Scope: ${scope}`}>
+            {scope}
+          </span>
+        )}
+      </span>
+    )
   }},
   { accessorKey: 'os', header: 'OS / Type / Provider', size: 160, cell: ({ row }) => {
     const tags = row.original.tags || []
@@ -1385,11 +1414,16 @@ function PortDetailDialog({
   ip,
   vulns,
   onClose,
+  scannable = true,
 }: {
   port: Port
   ip: string
   vulns: Vuln[]
   onClose: () => void
+  /** False when this host sits in a never-dispatchable scope. The gate refuses
+   *  the command anyway; disabling it here means the operator is told BEFORE
+   *  clicking rather than reading a refusal as a failure. */
+  scannable?: boolean
 }) {
   const portVulns = vulns
     .filter(v => v.port === port.port && v.proto === port.proto)
@@ -1518,7 +1552,10 @@ function PortDetailDialog({
                               onError: (e) => setExecResults(prev => ({ ...prev, [cmd.command]: { ok: false, stdout: '', stderr: String(e) } })),
                             })
                           }}
-                          disabled={!selectedNode || reconExecute.isPending}
+                          disabled={!selectedNode || reconExecute.isPending || !scannable}
+                          title={!scannable
+                            ? 'This host is in a scope the dispatch gate never scans — the command would be refused.'
+                            : undefined}
                           className="px-1.5 py-0.5 text-[9px] font-medium rounded bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
                         >Run</button>
                       </div>
@@ -1595,7 +1632,23 @@ export default function AssetBrowser() {
   const [selectedIp, setSelectedIp] = useState<string | null>(null)
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null)
   const [selectedPort, setSelectedPort] = useState<Port | null>(null)
-  const [detailTab, setDetailTab] = useState<'ports' | 'credentials' | 'access' | 'facts' | 'enumeration' | 'screenshots' | 'recon'>('ports')
+  type DetailTab = 'ports' | 'credentials' | 'access' | 'facts' | 'enumeration' | 'screenshots' | 'recon'
+  const DETAIL_TABS: DetailTab[] = ['ports', 'recon', 'credentials', 'access', 'facts', 'enumeration', 'screenshots']
+  // Persisted so a refresh does not bounce back to Ports mid-triage. Fail-soft
+  // on both read and write: localStorage throws in a private window and in
+  // some embedded views, and a remembered tab is a convenience, never state
+  // the page needs to render.
+  const [detailTab, setDetailTab] = useState<DetailTab>(() => {
+    try {
+      const v = localStorage.getItem('assets-detail-tab')
+      if (v && (DETAIL_TABS as string[]).includes(v)) return v as DetailTab
+    } catch { /* unavailable — fall through to the default */ }
+    return 'ports'
+  })
+  useEffect(() => {
+    try { localStorage.setItem('assets-detail-tab', detailTab) } catch { /* ignore */ }
+  }, [detailTab])
+
   const [search, setSearch] = useState('')
   const [credStatusFilter, setCredStatusFilter] = useState<string>('')
   // Track which credential rows have their audit panel expanded.  Keyed by
@@ -1738,6 +1791,15 @@ export default function AssetBrowser() {
         }
 
         // Both identities: the scope may name either the hostname or the IP.
+        // Prefer the scope the asset is actually FILED IN. Suffix matching
+        // against the scope's targets is not the same question: `examplecorp.com`
+        // is a examplecorp target, so `*.examplecorp.com` matched it — and the 40
+        // hosts filed in no_services showed up under examplecorp anyway, which
+        // read as "the move didn't work".
+        //
+        // Fall back to suffix matching only when the asset is in NO scope, so
+        // a host that has never been triaged still appears somewhere.
+        if (a.scope_name) return a.scope_name === scopeFilter
         return matchesAnyScope(a.hostname, a.ip)
       })
     }
@@ -1780,6 +1842,87 @@ export default function AssetBrowser() {
     // though matchesScope identity would normally cover it.
   }, [allAssets, isScopeFiltering, matchesScope, search, portsFilter, providerFilter, assetKindFilter, scopeFilter, accessSummary, pendingExploits, accessFilter])
 
+  // THE selected asset. Resolve by id first — ip is NOT unique.
+  //
+  // Shared hosting puts hundreds of domains behind one address: this database
+  // has 174 assets on 74.123.153.33 alone, and every unresolved domain sits on
+  // 0.0.0.0. `assets.find(a => a.ip === selectedIp)` therefore returns the
+  // FIRST asset with that address, not the selected one — so moving through
+  // those domains showed the same hostname and the same tab content every
+  // time, which looked like the drawer not refreshing.
+  const selectedAsset = useMemo(
+    () => (selectedAssetId ? assets.find(a => a.id === selectedAssetId) : undefined)
+      ?? assets.find(a => a.ip === selectedIp),
+    [assets, selectedAssetId, selectedIp])
+
+  // One selection path for the mouse AND the keyboard, so arrowing to a row
+  // behaves identically to clicking it.
+  const selectAsset = useCallback((row: (typeof assets)[number]) => {
+    setSelectedPort(null)
+    // A cloud_import asset's IP is a synthetic 127.0.x.x marker and its real
+    // identity is the asset id (one row per imported file), so ports and
+    // screenshots are empty and `recon` is the only tab with content.
+    const isCloudImport = (row.tags || []).includes('cloud_import') ||
+      row.ip === '127.0.1.1' || row.ip === '127.0.0.1' ||
+      (row.tags || []).some(tag => ['microburst', 'azurehound', 'prowler', 'scoutsuite', 'pacu', 'cloudfox'].includes(tag))
+    // KEEP the operator's tab. Resetting to 'ports' on every selection made it
+    // impossible to walk a list comparing one thing.
+    setDetailTab(prev => (isCloudImport ? 'recon' : prev))
+    setSelectedAssetId(row.id || null)
+    setSelectedIp(row.ip)
+  }, [])
+
+  // ── Keyboard triage ──────────────────────────────────────────────────────
+  // Walk the asset list with the arrow keys and tag without reaching for the
+  // mouse. Combined with the tab now surviving a selection change, this is the
+  // "arrow down the list and mark each one" pass: j/k or Up/Down moves, r/i/x
+  // toggles a tag on the selected asset.
+  //
+  // Bound to window rather than the table so it works while the detail drawer
+  // has focus — the whole point is to keep reading the drawer while moving.
+  // Suppressed whenever the operator is typing, or a modifier is held, so it
+  // never eats a real shortcut or a search term.
+  const tagMutation = useUpdateAssetTags()
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey || e.altKey) return
+      const el = e.target as HTMLElement | null
+      const tag = (el?.tagName || '').toLowerCase()
+      if (tag === 'input' || tag === 'textarea' || tag === 'select' || el?.isContentEditable) return
+      if (!assets.length) return
+      const key = e.key.toLowerCase()
+
+      if (key === 'arrowdown' || key === 'j' || key === 'arrowup' || key === 'k') {
+        const down = key === 'arrowdown' || key === 'j'
+        const cur = assets.findIndex(a => (selectedAssetId ? a.id === selectedAssetId : a.ip === selectedIp))
+        // No selection yet → Down starts at the top, Up at the bottom.
+        const next = cur === -1
+          ? (down ? 0 : assets.length - 1)
+          : Math.min(assets.length - 1, Math.max(0, cur + (down ? 1 : -1)))
+        const row = assets[next]
+        if (row) {
+          e.preventDefault()
+          selectAsset(row)
+        }
+        return
+      }
+
+      const hit = TRIAGE_TAGS.find(t => t.key === key)
+      if (hit && selectedAssetId) {
+        e.preventDefault()
+        const row = assets.find(a => a.id === selectedAssetId)
+        const has = (row?.tags || []).some(t => t.toLowerCase() === hit.tag)
+        // Toggle: tagging twice is how an operator corrects a mis-key, and a
+        // pass that could only ADD would make the first slip permanent.
+        tagMutation.mutate(has
+          ? { assetId: selectedAssetId, remove: [hit.tag] }
+          : { assetId: selectedAssetId, add: [hit.tag] })
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [assets, selectedAssetId, selectedIp, tagMutation, selectAsset])
+
   // Available provider chips derived from the current asset set, sorted by
   // count desc — operators see what tags exist without us hardcoding the list.
   const providerCounts = useMemo(() => {
@@ -1814,10 +1957,18 @@ export default function AssetBrowser() {
   const selectedSubdomainCount = Object.values(subdomainSelection).filter(Boolean).length
 
   const handleDeleteAssets = () => {
-    const ips = Object.keys(assetSelection).filter(k => assetSelection[k])
-    if (!ips.length) return
-    if (!window.confirm(`Delete ${ips.length} asset(s) and all related ports, vulns, and findings? This cannot be undone.`)) return
-    deleteAssets.mutate(ips, { onSuccess: () => setAssetSelection({}) })
+    const ids = Object.keys(assetSelection).filter(k => assetSelection[k])
+    if (!ids.length) return
+    // Name what is going. The old dialog said "Delete 1 asset(s)" while the
+    // request deleted every asset sharing that IP, so the count the operator
+    // confirmed was not the count that was removed.
+    const rows = ids.map(id => assets.find(a => a.id === id)).filter(Boolean)
+    const names = rows.slice(0, 8).map(a => a!.hostname || a!.ip).join('\n  ')
+    const more = rows.length > 8 ? `\n  ...and ${rows.length - 8} more` : ''
+    if (!window.confirm(
+      `Delete ${ids.length} asset(s) and all related ports, vulns, and findings?\n\n  ${names}${more}\n\nThis cannot be undone.`
+    )) return
+    deleteAssets.mutate(ids, { onSuccess: () => setAssetSelection({}) })
   }
 
   const handleDeleteSubdomains = () => {
@@ -2163,25 +2314,16 @@ export default function AssetBrowser() {
         <DataTable
           data={assets}
           columns={assetColumns}
-          onRowClick={(row) => {
-            setSelectedPort(null)
-            // For cloud_import assets the IP is a synthetic marker (127.0.x.x)
-            // and the meaningful identity is the asset id (one row per CSV).
-            // Open the recon tab directly so the operator sees the linked
-            // findings instead of empty ports/screenshots.
-            const isCloudImport = (row.tags || []).includes('cloud_import') ||
-              row.ip === '127.0.1.1' || row.ip === '127.0.0.1' ||
-              (row.tags || []).some(tag => ['microburst', 'azurehound', 'prowler', 'scoutsuite', 'pacu', 'cloudfox'].includes(tag))
-            setDetailTab(isCloudImport ? 'recon' : 'ports')
-            setSelectedAssetId(row.id || null)
-            setSelectedIp(row.ip)
-          }}
+          onRowClick={selectAsset}
           globalFilter={search}
           onGlobalFilterChange={setSearch}
           selectable
           rowSelection={assetSelection}
           onRowSelectionChange={setAssetSelection}
-          getRowId={(row) => row.ip}
+          // The ASSET id, not the ip. 174 assets share 74.123.153.33 here, so
+          // an ip-keyed row id made one checkbox select all of them — and the
+          // selection keys fed a DELETE.
+          getRowId={(row) => row.id || row.ip}
           rowClassName={(row) => (row.pending_exploits ?? 0) > 0
             ? 'bg-amber-500/5 border-l-2 border-l-amber-500/60'
             : (row.spray_ready ?? 0) > 0
@@ -2818,14 +2960,50 @@ export default function AssetBrowser() {
           <div className="flex items-center justify-between p-4 border-b border-border">
             <div>
               <h3 className="text-sm font-semibold font-mono">{selectedIp}</h3>
-              {assets.find(a => a.ip === selectedIp)?.hostname && (
-                <p className="text-xs text-muted-foreground font-mono">{assets.find(a => a.ip === selectedIp)?.hostname}</p>
+              {selectedAsset?.hostname && (
+                <p className="text-xs text-muted-foreground font-mono">{selectedAsset.hostname}</p>
               )}
+            </div>
+            {/* Triage tags + the keys that toggle them. Clickable too, so the
+                shortcut is discoverable rather than something you have to be
+                told about. */}
+            <div className="flex items-center gap-1.5 ml-auto mr-3">
+              {TRIAGE_TAGS.map(t => {
+                const row = selectedAsset
+                const on = (row?.tags || []).some(x => x.toLowerCase() === t.tag)
+                return (
+                  <button
+                    key={t.tag}
+                    onClick={() => row?.id && tagMutation.mutate(
+                      on ? { assetId: row.id, remove: [t.tag] }
+                         : { assetId: row.id, add: [t.tag] })}
+                    title={`${t.label} — press ${t.key}`}
+                    className={cn('px-2 py-0.5 rounded text-[11px] border transition-colors',
+                      on ? 'bg-primary/15 border-primary text-primary'
+                         : 'border-border text-muted-foreground hover:text-foreground')}
+                  >
+                    {t.label} <kbd className="opacity-60">{t.key}</kbd>
+                  </button>
+                )
+              })}
             </div>
             <button onClick={handleCloseSlideOver} className="text-muted-foreground hover:text-foreground">
               <X className="h-4 w-4" />
             </button>
           </div>
+          {selectedAsset?.scannable === false && (
+            <div className="mx-4 mt-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+              <span className="font-semibold">Not scannable.</span>{' '}
+              This host is in the <span className="font-mono">{selectedAsset.scope_name}</span> scope,
+              which the dispatch gate never scans — it is kept visible for reference, and any scan
+              against it is refused.
+            </div>
+          )}
+          <p className="px-4 pt-2 text-[11px] text-muted-foreground">
+            <kbd className="px-1 rounded bg-muted">↑</kbd>/<kbd className="px-1 rounded bg-muted">↓</kbd>
+            {' '}or <kbd className="px-1 rounded bg-muted">j</kbd>/<kbd className="px-1 rounded bg-muted">k</kbd>
+            {' '}to move through assets — the tab you are on stays put.
+          </p>
 
           {/* Pending exploits / spray banner — actions waiting on this host, with
               a jump to the Exploits queue to approve/release them. */}
@@ -2887,7 +3065,7 @@ export default function AssetBrowser() {
 
           <div className="p-4 space-y-6">
             {detailTab === 'access' && <AccessSection ip={selectedIp} />}
-            {detailTab === 'facts' && <ConfirmedFactsSection ip={selectedIp} hostname={assets.find(a => a.ip === selectedIp)?.hostname} />}
+            {detailTab === 'facts' && <ConfirmedFactsSection ip={selectedIp} hostname={selectedAsset?.hostname} />}
             {detailTab === 'enumeration' && <EnumerationSection ip={selectedIp} />}
             {detailTab === 'ports' && (
               <div>
@@ -2910,11 +3088,11 @@ export default function AssetBrowser() {
             )}
 
             {detailTab === 'screenshots' && (
-              <AssetScreenshots ip={selectedIp} hostname={assets.find(a => a.ip === selectedIp)?.hostname} />
+              <AssetScreenshots ip={selectedIp} hostname={selectedAsset?.hostname} />
             )}
 
             {detailTab === 'recon' && (() => {
-              const asset = assets.find(a => a.id === selectedAssetId) ?? assets.find(a => a.ip === selectedIp)
+              const asset = selectedAsset
               const isCloudImport = (asset?.tags || []).includes('cloud_import')
               if (isCloudImport && asset?.id) {
                 return <CloudImportFindings assetId={asset.id} hostname={asset.hostname} />
@@ -2931,6 +3109,7 @@ export default function AssetBrowser() {
           port={selectedPort}
           ip={selectedIp}
           vulns={vulnsData?.vulns ?? []}
+          scannable={selectedAsset?.scannable !== false}
           onClose={() => setSelectedPort(null)}
         />
       )}
@@ -2940,9 +3119,16 @@ export default function AssetBrowser() {
       {showScopeModal === 'assets' && (
         <ScopeAssignModal
           fromScope={scopeFilter || undefined}
-          targets={Object.keys(assetSelection).filter(k => assetSelection[k]).map(ip => {
-            const asset = assets.find(a => a.ip === ip)
-            return { target: asset?.hostname || ip, target_type: asset?.hostname ? 'domain' : 'ip' }
+          targets={Object.keys(assetSelection).filter(k => assetSelection[k]).flatMap(key => {
+            // key is the asset id (see getRowId), with ip as a fallback for
+            // rows that have none. The modal sends `target` as a scope STRING,
+            // so an unresolved key must be dropped rather than passed through:
+            // since getRowId became the id, falling back to the key itself
+            // would write a UUID into scope_targets as if it were a hostname.
+            const asset = assets.find(a => a.id === key) ?? assets.find(a => a.ip === key)
+            const target = asset?.hostname || asset?.ip
+            if (!target) return []
+            return [{ target, target_type: asset?.hostname ? 'domain' : 'ip' }]
           })}
           onClose={() => setShowScopeModal(null)}
           onSuccess={() => setAssetSelection({})}
@@ -2968,20 +3154,103 @@ function AssetScreenshots({ ip, hostname }: { ip: string; hostname?: string | nu
   const search = hostname || ip
   const { data, isLoading } = useScreenshots(search)
   const screenshots = data?.screenshots ?? []
+  // The screenshot files carry no status code — that lives in the gowitness
+  // recon_findings row. Join them here so a thumbnail says WHAT it is without
+  // having to open it: six near-identical filenames for one host tell you
+  // nothing, but "443 -> 200 ExampleCorp" vs "80 -> 400" tells you everything.
+  const { data: gw } = useGowitnessReport({ match: search, enabled: !!search })
+  const byShot = useMemo(() => {
+    const m = new Map<string, GowitnessRow>()
+    for (const r of gw?.rows ?? []) {
+      if (r.screenshot) m.set(r.screenshot.split('/').pop() || '', r)
+    }
+    return m
+  }, [gw])
+
+  // Collapse probes that landed on the SAME PAGE. GoWitness shoots every
+  // scheme x port combination it is handed, so wiki.examplecorp.com produced
+  // http://host:80, http://host:443 and https://host:443 — three thumbnails of
+  // one Confluence login, all status 200, all with the same final_url. The
+  // http-on-443 probe is pure noise: it redirects to https anyway.
+  //
+  // Grouped by where the probe ENDED UP, not where it started, because that is
+  // what makes them the same page. A shot with no gowitness row keeps its own
+  // group — unknown is not "same as the others".
+  const groups = useMemo(() => {
+    const g = new Map<string, { shots: typeof screenshots; meta?: GowitnessRow }>()
+    screenshots.forEach((s, i) => {
+      const meta = byShot.get(s.filename)
+      const key = meta?.final_url || meta?.url || `__ungrouped_${i}`
+      const cur = g.get(key)
+      if (cur) cur.shots.push(s)
+      else g.set(key, { shots: [s], meta })
+    })
+    return [...g.values()]
+  }, [screenshots, byShot])
 
   if (isLoading) return <p className="text-xs text-muted-foreground">Loading screenshots...</p>
   if (!screenshots.length) return <p className="text-xs text-muted-foreground">No screenshots found for {search}. Run GoWitness to capture.</p>
 
+  const collapsed = screenshots.length - groups.length
+
   return (
     <div>
-      <p className="text-xs text-muted-foreground mb-2">{screenshots.length} screenshots for {search}</p>
+      <p className="text-xs text-muted-foreground mb-2">
+        {groups.length} page{groups.length === 1 ? '' : 's'} for {search}
+        {collapsed > 0 && (
+          <span className="ml-1 opacity-70">
+            ({screenshots.length} screenshots; {collapsed} duplicate probe{collapsed === 1 ? '' : 's'} of the same page collapsed)
+          </span>
+        )}
+      </p>
       <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
-        {screenshots.map((s, i) => (
-          <ScreenshotThumbnail key={i} path={s.path} filename={s.filename} />
-        ))}
+        {groups.map((grp, i) => {
+          const s = grp.shots[0]
+          const meta = grp.meta
+          // Which probes reached this page — "80, 443" tells the operator the
+          // port actually serves it, which the collapsed view would otherwise
+          // hide.
+          const probes = grp.shots
+            .map(x => (x.filename.match(/-(\d+)\.png$/) || [])[1])
+            .filter(Boolean)
+          const uniq = [...new Set(probes)]
+          return (
+            <div key={i} className="space-y-1">
+              <ScreenshotThumbnail path={s.path} filename={s.filename} />
+              <div className="flex items-center gap-1.5 px-0.5 flex-wrap">
+                {meta && (
+                  <span className={cn('px-1 py-0.5 rounded text-[10px] font-semibold text-white',
+                    statusTone(meta.status_code))}>
+                    {meta.status_code || '?'}
+                  </span>
+                )}
+                {uniq.length > 0 && (
+                  <span className="text-[10px] font-mono text-muted-foreground"
+                        title={grp.shots.map(x => x.filename).join('\n')}>
+                    :{uniq.join(', :')}
+                  </span>
+                )}
+                <span className="text-[10px] text-muted-foreground truncate" title={meta?.title}>
+                  {meta?.title || '(no title)'}
+                </span>
+              </div>
+            </div>
+          )
+        })}
       </div>
     </div>
   )
+}
+
+/** Colour a status by CLASS, not exact code — 2xx good, 3xx redirect,
+ *  4xx client, 5xx server. Matches the contact-sheet badges. */
+function statusTone(code: number | '' | undefined): string {
+  const n = typeof code === 'number' ? code : parseInt(String(code || ''), 10)
+  if (!n || Number.isNaN(n)) return 'bg-gray-500'
+  if (n < 300) return 'bg-green-600'
+  if (n < 400) return 'bg-blue-600'
+  if (n < 500) return 'bg-amber-600'
+  return 'bg-red-600'
 }
 
 
@@ -3273,8 +3542,14 @@ function AssetReconIntel({ hostname, ip, asset }: { hostname?: string | null; ip
     </div>
   )
 
+  // The coverage panel renders on EVERY branch, including the two early
+  // returns. The empty branch used to read "No recon data found — run a scan",
+  // which asserts both that nothing was found and that nothing was run while
+  // knowing neither. It is the exact ambiguity this panel exists to settle, so
+  // it is the one place it must not be missing.
   if (isLoading) return (
     <div className="space-y-4">
+      <ScanCoveragePanel ip={ip} hostname={hostname} />
       {osBadge}
       {providerBadge}
       <p className="text-xs text-muted-foreground">Loading recon data for {lookupDomain}...</p>
@@ -3282,9 +3557,13 @@ function AssetReconIntel({ hostname, ip, asset }: { hostname?: string | null; ip
   )
   if (!overview) return (
     <div className="space-y-4">
+      <ScanCoveragePanel ip={ip} hostname={hostname} />
       {osBadge}
       {providerBadge}
-      <p className="text-xs text-muted-foreground">No recon data found for {lookupDomain}. Run a passive recon or content recon scan.</p>
+      <p className="text-xs text-muted-foreground">
+        No recon <em>findings</em> stored for {lookupDomain} — see the scan record above for whether
+        anything has been run against it.
+      </p>
     </div>
   )
 
@@ -3298,6 +3577,10 @@ function AssetReconIntel({ hostname, ip, asset }: { hostname?: string | null; ip
 
   return (
     <div className="space-y-4">
+      {/* First, not last: "has anything actually been run here?" frames
+          everything below it. A reader who sees ports and findings before
+          knowing whether the host was ever scanned reads absence as a result. */}
+      <ScanCoveragePanel ip={ip} hostname={hostname} />
       {osBadge}
       {providerBadge}
       {/* Stats summary */}
@@ -3427,6 +3710,113 @@ function AssetReconIntel({ hostname, ip, asset }: { hostname?: string | null; ip
               </span>
             ))}
           </div>
+        </div>
+      )}
+
+    </div>
+  )
+}
+
+/** What has actually been RUN against this asset.
+ *
+ * Everywhere else, a host nobody has scanned and a host that was scanned and
+ * had nothing listening look identical — both render as no ports. They are
+ * completely different facts: one is a finding, the other is a gap in the work.
+ * `Discovered By` does not settle it either: it names the source that first
+ * created the row, not what has been run since.
+ */
+function ScanCoveragePanel({ ip, hostname }: { ip: string; hostname?: string | null }) {
+  const { data, isLoading, isError } = useAssetScanCoverage(ip, hostname)
+
+  const when = (s?: string | null) =>
+    s ? new Date(s).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'
+
+  return (
+    <div>
+      <h5 className="text-xs font-medium text-muted-foreground mb-2">Scan coverage</h5>
+      {isLoading && <div className="text-[11px] text-muted-foreground">checking what has been run…</div>}
+      {/* Three outcomes. An unreadable answer is not "never scanned". */}
+      {isError && (
+        <div className="text-[11px] text-amber-400">
+          could not read the scan record — this is not a statement that nothing ran
+        </div>
+      )}
+      {data && (
+        <div className="space-y-2">
+          <div className={cn('rounded-md border p-2 text-[11px]',
+            data.verdict === 'never_scanned' ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+              : data.verdict === 'scanned_nothing_listening' ? 'border-sky-500/30 bg-sky-500/10 text-sky-300'
+              : 'border-green-500/30 bg-green-500/10 text-green-300')}>
+            {/* Ports can exist with no scan on record — coverage recording
+                started 2026-10-13, so anything found before that has results
+                but no provenance. Saying "nobody has looked" there would be
+                wrong in the other direction. */}
+            {data.verdict === 'never_scanned' && data.open_ports > 0 && (
+              <><strong>No port scan on record</strong> — but {data.open_ports} open port(s) are stored
+              against this asset, from a run that predates scan-coverage recording. Re-scan for a
+              current answer; the ports below may be stale.</>
+            )}
+            {data.verdict === 'never_scanned' && data.open_ports === 0 && (
+              <><strong>Never port-scanned.</strong> No completed port scan is on record and no ports are
+              stored, so "nothing listening" here means nobody has looked — not that nothing is there.</>
+            )}
+            {data.verdict === 'scanned_nothing_listening' && (
+              <><strong>Port-scanned, nothing listening.</strong> A port scan completed against this asset and
+              found no open ports. That is a measured result, not an absence of work.</>
+            )}
+            {data.verdict === 'scanned_ports_open' && (
+              <><strong>Port-scanned, {data.open_ports} open.</strong> {data.vulns > 0 ? `${data.vulns} vuln(s) recorded.` : 'No vulns recorded yet.'}</>
+            )}
+          </div>
+
+          {data.tools.length > 0 ? (
+            <div className="rounded-md border border-border overflow-hidden">
+              <table className="w-full text-[10px]">
+                <thead className="bg-muted/40 text-muted-foreground">
+                  <tr>
+                    <th className="text-left px-2 py-1 font-medium">Tool</th>
+                    <th className="text-left px-2 py-1 font-medium">Stage</th>
+                    <th className="text-left px-2 py-1 font-medium">Status</th>
+                    <th className="text-left px-2 py-1 font-medium">Last run</th>
+                    <th className="text-left px-2 py-1 font-medium">Against</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.tools.map(t => (
+                    <tr key={t.scan_type} className="border-t border-border">
+                      <td className="px-2 py-1 font-mono">{t.scan_type}</td>
+                      <td className="px-2 py-1 text-muted-foreground">{t.stage_name || '—'}</td>
+                      <td className="px-2 py-1">
+                        <span className={cn('px-1.5 rounded',
+                          t.status === 'completed' ? 'bg-green-500/15 text-green-400'
+                            : t.status === 'failed' ? 'bg-red-500/15 text-red-400'
+                            : 'bg-amber-500/15 text-amber-400')}>{t.status}</span>
+                      </td>
+                      <td className="px-2 py-1 text-muted-foreground">{when(t.completed_at || t.started_at)}</td>
+                      <td className="px-2 py-1 font-mono text-muted-foreground truncate max-w-[14rem]">{t.target}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="text-[11px] text-muted-foreground">
+              No scan has been recorded against {data.identities.join(' / ') || ip}.
+            </div>
+          )}
+
+          {data.discovered_by.length > 0 && (
+            <div className="text-[10px] text-muted-foreground">
+              <span className="opacity-70">first discovered by:</span>{' '}
+              <span className="font-mono">{data.discovered_by.join(', ')}</span>
+              <span className="opacity-70"> — the source that created this asset, not what has run since.</span>
+            </div>
+          )}
+          {data.scans.length > data.tools.length && (
+            <div className="text-[10px] text-muted-foreground">
+              {data.scans.length} runs on record across {data.tools.length} tool(s).
+            </div>
+          )}
         </div>
       )}
     </div>

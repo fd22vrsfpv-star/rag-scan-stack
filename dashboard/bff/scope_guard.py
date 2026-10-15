@@ -65,6 +65,39 @@ def aliases_for(host):
         return set()
 
 
+def aliases_for_many(hosts):
+    """{host: aliases} for a batch, over ONE database connection.
+
+    `aliases_for` opens its own connection, and the dispatch gate calls it once
+    per target. The database is remote and the DSN requires SSL, so a 760-target
+    masscan of the examplecorp scope meant 760 TLS handshakes before a single
+    packet left the stack: the request sat in the gate for over twelve minutes
+    and node-manager logged nothing at all, which reads as a hung scanner rather
+    than a slow authorisation check.
+
+    Same verdicts, same lookups — one connection instead of N. Fails soft per
+    host: a lookup that could not run narrows that host to itself (the stricter
+    answer), never widens it.
+    """
+    out = {}
+    wanted = [h for h in dict.fromkeys(hosts) if h]
+    if not SCOPE_GATE_AVAILABLE or not wanted:
+        return {h: set() for h in wanted}
+    try:
+        from db import get_db
+        with get_db() as conn, conn.cursor() as cur:
+            for h in wanted:
+                try:
+                    out[h] = load_host_aliases(cur, h)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("alias lookup failed for %r (%s)", h, e)
+                    out[h] = set()
+    except Exception as e:  # noqa: BLE001
+        log.warning("alias batch failed (%s) — checking each host as given", e)
+        return {h: set() for h in wanted}
+    return out
+
+
 def host_in_scope(host, rows, use_aliases: bool = True) -> bool:
     """True if `host`, or any observed alias of it, matches the scope.
 
@@ -80,6 +113,46 @@ def host_in_scope(host, rows, use_aliases: bool = True) -> bool:
     if not use_aliases:
         return False
     return bool(is_in_scope_with_aliases(h, rows, aliases_for(h)))
+
+
+# `source` values that mean "the scope could not be read", as opposed to "the
+# scope was read and is empty". Both produce zero rows and both MUST refuse —
+# but they are different problems with different fixes, and the generic
+# empty-scope message sends the operator to the wrong one.
+_UNREADABLE_SOURCES = {
+    "unavailable": (
+        "the scope could not be read ({src}) — refusing to dispatch. This is "
+        "NOT a scope-configuration problem: the gate failed closed because the "
+        "database did not answer. Check the database and retry."),
+    "halted": (
+        "dispatch is HALTED by the kill switch — refusing. Clear the halt to "
+        "resume; the scope itself is unchanged."),
+    "budget-exceeded": (
+        "the blast-radius budget for this engagement is exhausted — refusing. "
+        "Raise or reset the budget; the scope itself is unchanged."),
+}
+
+
+def refusal_reason_for_source(source):
+    """Refusal string when zero rows mean "could not read", else None.
+
+    Call this BEFORE `refusal_for` whenever `scope_rows_for` returned no rows.
+    `scope_rows_for` already distinguishes the causes and hands back `source`;
+    every caller was discarding it, so a database timeout was reported to the
+    operator as
+
+        no scope targets are configured — Configure the engagement scope first.
+
+    which is this repo's recurring "unreachable reported as absent" — the fix
+    it names is not the fix that is needed. Observed 2026-10-13:
+    `scope load failed (connection to server at "rag-postgres" ... timeout
+    expired) — treating everything as out of scope`, surfaced to the operator
+    as a 403 telling them to configure a scope that had 5,791 rows.
+
+    Refusing stays correct; only the explanation changes.
+    """
+    tmpl = _UNREADABLE_SOURCES.get(str(source or ""))
+    return tmpl.format(src=source) if tmpl else None
 
 
 def refusal_for(target, rows, command: str = ""):

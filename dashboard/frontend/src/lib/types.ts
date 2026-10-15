@@ -4,6 +4,15 @@ export interface Asset {
   os?: string
   hostname?: string
   tags?: string[]
+  /** The scope this asset is actually FILED IN, resolved server-side from
+   *  scope_targets. Not the same as "a scope whose apex this host sits under":
+   *  `examplecorp.com` is in the examplecorp scope, so suffix matching put every
+   *  `*.examplecorp.com` host under it — including the 40 filed in no_services. */
+  scope_name?: string | null
+  /** False when that scope is never dispatchable (customer tenants, typosquats,
+   *  staging, operator-excluded). The gate refuses these, so they must look
+   *  different from runnable rows rather than just failing when clicked. */
+  scannable?: boolean
   engagement_id?: string | null
   open_ports_count?: number
   recon_findings_count?: number

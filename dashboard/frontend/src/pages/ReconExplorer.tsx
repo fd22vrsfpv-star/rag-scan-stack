@@ -901,9 +901,9 @@ function FindingsTab() {
                   {d.screenshot && (
                     <div>
                       <h5 className="text-xs font-medium text-muted-foreground mb-1">Screenshot</h5>
-                      <a href={`${apiUrl}/screenshots/${String(d.screenshot)}`} target="_blank" rel="noopener noreferrer"
+                      <a href={apiUrl(`/screenshots/${String(d.screenshot)}`)} target="_blank" rel="noopener noreferrer"
                         className="block border border-border rounded overflow-hidden hover:border-primary transition-colors">
-                        <img src={`${apiUrl}/screenshots/${String(d.screenshot)}`} alt={selected.target}
+                        <img src={apiUrl(`/screenshots/${String(d.screenshot)}`)} alt={selected.target}
                           className="w-full h-auto" loading="lazy" />
                       </a>
                     </div>

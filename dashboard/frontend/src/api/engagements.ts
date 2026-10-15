@@ -210,6 +210,40 @@ export function useEngagementScopes(eid: string | undefined) {
   })
 }
 
+export interface ReclassifyResult {
+  ok: boolean
+  applied: boolean
+  candidates: number
+  moved: number
+  would_move: number
+  /** Truncated to 20 by the API — `candidates - moved` is the true skip count. */
+  skipped_parents: string[]
+  targets: string[]
+}
+
+/** Re-file already-scoped hosts that no longer have an attack surface.
+ *
+ *  `apply` defaults to FALSE and the caller must opt in: this rewrites the
+ *  scope label on up to hundreds of rows, so the operator sees the list before
+ *  anything moves. It only ever moves INTO no_services / retired, and never
+ *  out of a never-dispatchable scope. */
+export function useReclassifyScope(eid: string | undefined) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (apply: boolean) =>
+      apiFetch<ReclassifyResult>(`/engagements/${eid}/scope/reclassify`, {
+        method: 'POST',
+        body: JSON.stringify({ apply }),
+      }),
+    onSuccess: (_d, apply) => {
+      if (apply) {
+        qc.invalidateQueries({ queryKey: ['engagement-scopes', eid] })
+        qc.invalidateQueries({ queryKey: ['engagement-scope-targets'] })
+      }
+    },
+  })
+}
+
 export function useEngagementScopeTargets(eid: string | undefined, scopeName: string | undefined) {
   return useQuery({
     queryKey: ['engagement-scope-targets', eid, scopeName],

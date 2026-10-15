@@ -26,6 +26,35 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 # Proxy helpers
 # ---------------------------------------------------------------------------
+def _nm_failure(exc: Exception, attempts: int, timeout: int) -> str:
+    """A reason the operator can act on.
+
+    Two problems with reporting `str(e)` directly. `str(httpx.ReadTimeout)` is
+    the EMPTY STRING, so the operator saw literally
+
+        Node manager unreachable after 4 attempts:
+
+    with nothing after the colon. And "unreachable" is wrong for a timeout:
+    node-manager was running and working — it was resolving 338 hostnames on
+    the event loop — so the request was still in flight while the UI declared
+    it dead. A timeout and a refused connection need different words because
+    they need different actions.
+    """
+    name = type(exc).__name__
+    detail = str(exc).strip()
+    if isinstance(exc, (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout,
+                        httpx.WriteTimeout, httpx.TimeoutException)):
+        return (f"Node manager did not respond within {timeout}s "
+                f"({attempts} attempts). It may be busy rather than down — the "
+                f"request may still be running. [{name}]")
+    if isinstance(exc, httpx.ConnectError):
+        return (f"Could not connect to node manager after {attempts} attempts — "
+                f"it is down or unreachable. [{name}]"
+                + (f" {detail}" if detail else ""))
+    return (f"Node manager call failed after {attempts} attempts: "
+            f"{detail or name}")
+
+
 async def _nm_get(path: str, retries: int = 3, backoff: float = 2.0) -> dict:
     """GET from node-manager with retry + exponential backoff."""
     s = get_settings()
@@ -58,8 +87,9 @@ async def _nm_get(path: str, retries: int = 3, backoff: float = 2.0) -> dict:
                 await asyncio.sleep(wait)
             else:
                 log.error("node-manager %s failed after %d attempts: %s", path, retries, e)
-                raise HTTPException(502, f"Node manager unreachable after {retries} attempts: {last_error}")
-    raise HTTPException(502, f"Node manager failed after {retries} attempts: {last_error}")
+                raise HTTPException(502, _nm_failure(e, retries, 30))
+    raise HTTPException(502, f"Node manager failed after {retries} attempts: "
+                            f"{last_error or 'no reason reported'}")
 
 
 async def _nm_post(path: str, payload: dict = None, retries: int = 2, backoff: float = 2.0) -> dict:
@@ -92,8 +122,9 @@ async def _nm_post(path: str, payload: dict = None, retries: int = 2, backoff: f
                 await asyncio.sleep(wait)
             else:
                 log.error("node-manager POST %s failed after %d attempts: %s", path, retries, e)
-                raise HTTPException(502, f"Node manager unreachable after {retries} attempts: {last_error}")
-    raise HTTPException(502, f"Node manager failed after {retries} attempts: {last_error}")
+                raise HTTPException(502, _nm_failure(e, retries, 30))
+    raise HTTPException(502, f"Node manager failed after {retries} attempts: "
+                            f"{last_error or 'no reason reported'}")
 
 
 async def _nm_delete(path: str) -> dict:
@@ -370,12 +401,29 @@ async def scan_through_node(node_id: str, req: NodeScanRequest):
     _to_check = list(targets) + [str(u).strip() for u in _url_raw if str(u).strip()]
     if _to_check:
         try:
-            from scope_guard import scope_rows_for, refusal_for
+            from scope_guard import (scope_rows_for, aliases_for_many,
+                                     check_dispatch, SCOPE_GATE_AVAILABLE)
+            if not SCOPE_GATE_AVAILABLE:
+                # Same refusal refusal_for() would have given. Fail closed.
+                raise HTTPException(
+                    403, "scope gate is unavailable (etl/scope_gate not "
+                         "importable) — refusing")
             _rows, _src = scope_rows_for(req.engagement_id)
+            # Resolve every target's aliases over ONE connection first.
+            # refusal_for() opens its own per call, and the database is remote
+            # with SSL required, so a 760-target dispatch meant 760 TLS
+            # handshakes inside this loop — the request sat here for over
+            # twelve minutes and node-manager logged nothing, which reads as a
+            # hung scanner rather than a slow gate.
+            _alias_map = aliases_for_many(_to_check)
             for _t in _to_check:
                 # host_in_scope wants a host; refusal_for handles URL forms and
                 # also inspects the command string, so pass the raw value.
-                _refusal = refusal_for(_t, _rows, f"{req.scan_type} via node {node_id}")
+                # Same checks in the same order — deny-list, then scope — just
+                # with the aliases already in hand.
+                _refusal = check_dispatch(
+                    _t, _rows, f"{req.scan_type} via node {node_id}",
+                    aliases=_alias_map.get(_t) or set())
                 if _refusal:
                     log.warning("REFUSED node scan %s for %s: %s",
                                 req.scan_type, _t, _refusal)
@@ -406,11 +454,23 @@ async def scan_through_node(node_id: str, req: NodeScanRequest):
             if hasattr(req, 'protocols') and req.protocols:
                 extra.extend(["-s", req.protocols])
             remote_payload["extra_args"] = extra
+        # Engagement attribution for the remote-exec branch. node-manager
+        # records which targets were port-scanned (scope_coverage), and that
+        # record is per-engagement — without it masscan's silent hosts stay
+        # indistinguishable from never-scanned ones. The header carries it for
+        # every node-manager endpoint; the body field is the explicit form for
+        # an automated caller with no request context.
+        from engagement import engagement_headers
+        _eng_hdrs = engagement_headers()
+        _eid = req.engagement_id or _eng_hdrs.get("X-Engagement-Id")
+        if _eid:
+            remote_payload["engagement_id"] = _eid
         s = get_settings()
         async with httpx.AsyncClient(timeout=660) as c:
             resp = await c.post(
                 f"{s.tunnel_manager_url}/ssh/{node_id}/remote-scan",
                 json=remote_payload,
+                headers=_eng_hdrs,
             )
         if resp.status_code >= 400:
             raise HTTPException(resp.status_code, resp.text)

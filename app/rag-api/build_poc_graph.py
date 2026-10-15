@@ -1431,7 +1431,20 @@ def node_run_refine(state: BuildPocState) -> Dict[str, Any]:
         arjun_discovered=state.get("arjun_discovered"),
         focused_urls_from_body=state.get("focused_urls"),
         gather_facts=(_gather_manifest_text(state["gather_manifest"]) if state.get("gather_manifest") else None),
+        # Carry the escalation counters forward across a go-around. The second
+        # pass starts from a fresh `built["metrics"]`, so without this the
+        # stored result reports only the LAST pass — on CVE-2024-22120
+        # (2026-10-13) that hid the single most interesting event of the run, a
+        # payload-only command refused before dispatch and successfully
+        # re-asked, which happened in pass 1 and appeared nowhere in the
+        # metrics. Only the cumulative counters are carried; per-pass values
+        # like target_runs keep their own meaning.
         metrics={**(built.get("metrics") or {}),
+                 **{_k: int(((state.get("result") or {}).get("metrics") or {}).get(_k) or 0)
+                    for _k in ("refine_axis_required", "refine_axis_rejected")
+                    if ((state.get("result") or {}).get("metrics") or {}).get(_k)},
+                 "refine_passes": int(((state.get("result") or {}).get("metrics") or {})
+                                      .get("refine_passes") or 0) + 1,
                  "_session_cookie_header": ((state.get("session_info") or {}).get("cookie_header")
                                             or (state.get("auth") or {}).get("_auto_cookie") or "")},
         # Resolved object-ids from the login's post-access inventory /

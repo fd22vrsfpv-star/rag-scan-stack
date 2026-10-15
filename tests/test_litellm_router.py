@@ -639,3 +639,83 @@ def test_build_litellm_kwargs_is_shared(monkeypatch):
     # `messages` is intentionally NOT set — the caller plugs in its own
     # (single-prompt or multi-turn shape).
     assert "messages" not in kwargs
+
+
+# ── reasoning models reject a temperature override ─────────────────────────
+# A reasoning model with reasoning ACTIVE accepts only temperature=1 and the
+# default top_p. LiteLLM enforces that client-side and raises
+# UnsupportedParamsError BEFORE any HTTP call, so the whole LiteLLM attempt
+# fails and the call drops to the hand-rolled path — which then rediscovers the
+# same restriction reactively, one 400 at a time. Observed live 2026-10-13:
+#
+#   WARNING llm_query: LiteLLM path failed on backend=azure model=gpt-5-mini
+#   (litellm.UnsupportedParamsError: gpt-5-mini doesn't support temperature=0.1
+#   while reasoning is active. Only temperature=1 is supported unless
+#   reasoning_effort resolves to 'none') — falling back to hand-rolled dispatch
+#   INFO llm-query: retrying ... (swapping max_tokens -> max_completion_tokens)
+#   INFO llm-query: retrying ... (dropping unsupported temperature override)
+#
+# Three wasted round-trips for one answer.
+
+def test_reasoning_model_drops_temperature_when_reasoning_active():
+    lmodel, kwargs = lr._build_litellm_kwargs(
+        "azure", "gpt-5-mini", {"temperature": 0.1, "reasoning_effort": "medium"},
+        "https://foundry.services.ai.azure.com", "k", 1024, None)
+    assert kwargs["reasoning_effort"] == "medium"
+    assert "temperature" not in kwargs, (
+        "temperature survived with reasoning active — LiteLLM will refuse the "
+        "call client-side and the whole attempt falls back to hand-rolled")
+
+
+def test_reasoning_model_drops_top_p_when_reasoning_active():
+    _, kwargs = lr._build_litellm_kwargs(
+        "azure", "gpt-5-mini", {"top_p": 0.3, "reasoning_effort": "low"},
+        "https://foundry.services.ai.azure.com", "k", 1024, None)
+    assert "top_p" not in kwargs
+
+
+def test_temperature_of_one_is_kept_because_it_is_accepted():
+    """Only the DEFAULT is rejected-by-override; temperature=1 is exactly what
+    the provider allows, so dropping it would be gratuitous."""
+    _, kwargs = lr._build_litellm_kwargs(
+        "azure", "gpt-5-mini", {"temperature": 1, "reasoning_effort": "high"},
+        "https://foundry.services.ai.azure.com", "k", 1024, None)
+    assert kwargs["temperature"] == 1
+
+
+def test_reasoning_model_without_effort_keeps_temperature():
+    """Reasoning INACTIVE (no effort resolved) means the normal rules apply.
+    Dropping here would silently change every call to these deployments."""
+    _, kwargs = lr._build_litellm_kwargs(
+        "azure", "gpt-5-mini", {"temperature": 0.2},
+        "https://foundry.services.ai.azure.com", "k", 1024, None)
+    assert kwargs.get("temperature") == 0.2
+
+
+def test_effort_none_is_not_reasoning_active():
+    """`reasoning_effort: none` is the provider's own escape hatch — the error
+    text says temperature is fine 'unless reasoning_effort resolves to none'."""
+    _, kwargs = lr._build_litellm_kwargs(
+        "azure", "gpt-5-mini", {"temperature": 0.1, "reasoning_effort": "none"},
+        "https://foundry.services.ai.azure.com", "k", 1024, None)
+    assert kwargs.get("temperature") == 0.1
+
+
+def test_non_reasoning_model_is_untouched():
+    """A classic chat deployment accepts temperature normally. The drop must be
+    gated on the model, not applied globally — which is exactly why this is not
+    `litellm.drop_params = True`."""
+    _, kwargs = lr._build_litellm_kwargs(
+        "azure", "gpt-4o", {"temperature": 0.1, "top_p": 0.3},
+        "https://x.openai.azure.com", "k", 1024, None)
+    assert kwargs["temperature"] == 0.1 and kwargs["top_p"] == 0.3
+
+
+def test_drop_params_is_not_set_globally():
+    """`litellm.drop_params = True` would discard every unsupported param for
+    every provider, turning a genuinely bad request into a quietly different
+    one. The targeted drop above exists so this never has to be set."""
+    import pathlib as _p
+    src = _p.Path(lr.__file__).read_text(encoding="utf-8")
+    assert "drop_params" not in src.replace("# ", "").split("NOT `litellm.")[0], (
+        "drop_params is being set in code — prefer the targeted drop")

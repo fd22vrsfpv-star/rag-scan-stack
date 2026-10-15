@@ -156,6 +156,65 @@ class ScopeClassifier:
             except (ValueError, TypeError):
                 return False
 
+        elif rt == "asset_state":
+            # What we OBSERVED about the host, rather than what its name looks
+            # like: did it resolve, and is anything listening.
+            #
+            # `probed` is the load-bearing condition. "No open ports" is
+            # ambiguous on its own — a host with no asset row has never been
+            # looked at, and a host we scanned and found nothing on is a
+            # different animal. Filing the first as "no services" buries it
+            # before anyone has checked, so the default REQUIRES evidence that
+            # we looked, and a rule has to ask for the other behaviour on
+            # purpose.
+            #
+            # Conditions (all optional, ANDed):
+            #   unresolved:      true  -> ip is 0.0.0.0 / ::  / absent
+            #   max_open_ports:  N     -> at most N listening ports
+            #   probed:          true  -> an asset row exists (default true)
+            #   port_scanned:    true  -> the host HAS port rows, i.e. something
+            #                             actually looked at its ports
+            #
+            # port_scanned is the difference between "we scanned it and nothing
+            # was listening" and "nobody has looked". Measured here: 16 resolved
+            # assets have port rows with none open, and 1562 have no port rows
+            # at all. Filing the second group as "no services" would bury 1562
+            # hosts that might be serving anything, and they would never be
+            # scanned again to find out.
+            if cond.get("probed", True) and not context.get("has_asset"):
+                return False
+            if cond.get("port_scanned") and not context.get("port_scanned"):
+                return False
+            #   retired: true -> the host serves a decommissioned-service page
+            #
+            # Measured, not assumed. The obvious signal is the TLS certificate,
+            # and it does NOT work here: of 508 scope hosts on 443, the
+            # `*.examplecorp.com` wildcard is served by 32 RETIRED hosts and 15
+            # LIVE ones — www.examplecorp.com, forums, tableau, forms, livehelp
+            # among them. The issuer is identical on both (GeoTrust TLS RSA CA
+            # G1, 33 retired / 263 live) and one certificate SERIAL is shared
+            # between retired and live hosts, so they are literally the same
+            # cert. A cert-based rule would file the main website as retired.
+            #
+            # What does discriminate is the response: the retirement redirect,
+            # 33/33 with no false positives. `detect_retired_hosts` probes for
+            # it and records the verdict as the `retired` asset tag, which is
+            # the fact this condition reads.
+            if cond.get("retired") and not context.get("retired"):
+                return False
+            if cond.get("unresolved") and not context.get("unresolved"):
+                return False
+            mx = cond.get("max_open_ports")
+            if mx is not None:
+                try:
+                    if int(context.get("open_ports") or 0) > int(mx):
+                        return False
+                except (TypeError, ValueError):
+                    return False
+            # An all-empty condition set must not match everything.
+            return any(k in cond for k in ("unresolved", "max_open_ports",
+                                           "probed", "port_scanned"))
+
         elif rt == "composite":
             op = cond.get("op", "and").lower()
             sub_conditions = cond.get("conditions", [])
@@ -414,10 +473,73 @@ def classify_and_assign_engagement(cur, engagement_id: str,
     )
     hosts = [r["target"] if isinstance(r, dict) else r[0] for r in cur.fetchall()]
 
+    # Observed state per host, fetched ONCE for the whole batch. Without this
+    # every rule saw an empty context, so a rule could only ever match on the
+    # NAME — there was no way to express "this host resolved to nothing and has
+    # nothing listening". Two queries beat 909 round trips.
+    state: dict = {}
+    if hosts:
+        cur.execute(
+            # Ports follow the IP, not the hostname — masscan reports an IP, so
+            # its findings land on an IP-keyed asset row with a NULL hostname
+            # and the hostname's own row reads as dead. The sentinel IPs are
+            # excluded from the self-join or every unresolved host would
+            # inherit every other unresolved host's ports, since they all share
+            # 0.0.0.0.
+            """SELECT a.hostname,
+                      bool_or(host(a.ip) IN ('0.0.0.0', '::')) AS unresolved,
+                      count(p.id) FILTER (WHERE p.is_open)     AS open_ports,
+                      count(p.id)                              AS port_rows,
+                      bool_or('retired' = ANY(COALESCE(a.tags, ARRAY[]::text[])))
+                                                               AS retired
+                 FROM assets a
+                 LEFT JOIN assets a2
+                        ON a2.ip = a.ip
+                       AND host(a.ip) NOT IN ('0.0.0.0', '::')
+                 LEFT JOIN ports p ON p.asset_id = a2.id
+                WHERE a.hostname = ANY(%s)
+                GROUP BY a.hostname""",
+            (hosts,),
+        )
+        for r in cur.fetchall():
+            hn = r["hostname"] if isinstance(r, dict) else r[0]
+            unres = r["unresolved"] if isinstance(r, dict) else r[1]
+            opn = r["open_ports"] if isinstance(r, dict) else r[2]
+            prows = r["port_rows"] if isinstance(r, dict) else r[3]
+            ret = r["retired"] if isinstance(r, dict) else r[4]
+            state[hn] = {"has_asset": True, "unresolved": bool(unres),
+                         "open_ports": int(opn or 0),
+                         "port_scanned": int(prows or 0) > 0,
+                         "retired": bool(ret)}
+
+        # Port rows prove a scan only when the scan FOUND something. masscan
+        # reports open ports only, so a host that answered nothing produces no
+        # asset and no port row and is indistinguishable from one nobody ever
+        # scanned. scope_coverage records the scan itself, which is what makes
+        # an empty result usable evidence.
+        cur.execute(
+            """SELECT target FROM scope_coverage
+                WHERE engagement_id = %s::uuid AND status = 'completed'
+                  AND stage_name = 'discovery' AND target = ANY(%s)""",
+            (engagement_id, hosts),
+        )
+        for r in cur.fetchall():
+            tgt = r["target"] if isinstance(r, dict) else r[0]
+            # A completed scan IS the probe — see the same note in
+            # reclassify_engagement_scope. An asset row only exists when
+            # something was found, so it cannot stand in for "did anyone look".
+            st = state.setdefault(tgt, {"has_asset": True, "unresolved": False,
+                                        "open_ports": 0})
+            st["has_asset"] = True
+            st["port_scanned"] = True
+
     in_scope = unknown = 0
     per_scope: dict = {}
     for h in hosts:
-        sug = clf.classify_rules_only(h, {})
+        # A host with no asset row has never been probed — has_asset False, and
+        # the asset_state rule refuses it unless a rule opts in explicitly.
+        sug = clf.classify_rules_only(
+            h, state.get(h, {"has_asset": False, "unresolved": False, "open_ports": 0}))
         if sug and sug.confidence >= 0.9:
             scope, src = sug.scope, "auto-classified"
             in_scope += 1

@@ -243,8 +243,12 @@ def _emit_ip_event(event_type: str, node_id: str, data: dict = None):
             headers={"x-api-key": api_key},
             timeout=5, verify=False,
         )
-    except Exception:
-        pass
+    except Exception as e:  # fire-and-forget, but not invisible
+        # `requests` was missing from this image for the life of the service,
+        # so every emit raised ImportError into a bare `pass`. Nothing in any
+        # log said so. Fire-and-forget means "don't block the caller", not
+        # "never tell anyone".
+        log.warning("webhook emit %s failed: %s", event_type, e)
 
 
 def _emit_wireguard_event(event_type: str, node_id: str, data: dict = None):
@@ -260,8 +264,8 @@ def _emit_wireguard_event(event_type: str, node_id: str, data: dict = None):
             headers={"x-api-key": api_key},
             timeout=5, verify=False,
         )
-    except Exception:
-        pass  # Silent failure for fire-and-forget
+    except Exception as e:  # fire-and-forget, but not invisible — see above
+        log.warning("webhook emit %s failed: %s", event_type, e)
 
 
 def _create_tunnel(node_id: str, name: str, tunnel_method: str, metadata: dict,
@@ -1274,6 +1278,154 @@ app = FastAPI(title="Node Manager", version="1.0.0", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
+# Engagement attribution
+# ---------------------------------------------------------------------------
+# node_manager had NO engagement awareness at all: every audit row it wrote
+# carried "engagement_id": null and nothing it collected could be attributed.
+# The frontend's apiFetch already sends X-Engagement-Id on every call and the
+# BFF forwards it, so the header is there — nobody read it. This is the exact
+# middleware audit_writer's own docstring asks each runner to install.
+try:
+    from audit_writer import current_engagement_id as _current_engagement_id
+except ImportError:  # audit_writer not mounted — keep a local contextvar
+    import contextvars as _ctxvars
+    _current_engagement_id = _ctxvars.ContextVar("current_engagement_id", default=None)
+
+
+@app.middleware("http")
+async def _capture_engagement(request, call_next):
+    eid = request.headers.get("x-engagement-id")
+    token = _current_engagement_id.set(eid or None)
+    try:
+        return await call_next(request)
+    finally:
+        _current_engagement_id.reset(token)
+
+
+# Scan types that establish "this target was port-scanned". A clean result from
+# one of these is EVIDENCE OF ABSENCE — the host answered nothing — which is
+# what lets scope reclassification file it as no_services. Without a coverage
+# record, "scanned and nothing listening" is indistinguishable from "nobody ever
+# looked", and the classifier (correctly) refuses to move either.
+PORT_SCAN_TYPES = {"masscan", "nmap", "naabu", "rustscan"}
+
+
+def _record_scan_job(job_id, node_id, scan_type, targets, parameters,
+                     engagement_id, status, result_summary=None, error=None):
+    """Write/advance the `node_scan_jobs` row for a remote scan.
+
+    `node_scan_jobs` was declared, indexed, triggered — and never written:
+    `SELECT count(*) FROM node_scan_jobs` returned **0** while the same code
+    path was filling `scan_audit/audit.jsonl` and `scope_coverage`. A remote
+    scan's history was reconstructable only from a JSONL file on disk plus the
+    per-target coverage rows, neither of which records which node ran it, what
+    parameters it was given, or why it failed.
+
+    Keyed by `job_id` (unique index `uq_node_scan_jobs_job_id`), so dispatch
+    INSERTs `running` and the completion/failure paths UPDATE that same row.
+    Without the unique index a retried dispatch forks the history in two.
+
+    Fails soft and says so. This is bookkeeping: a scan that ran must not be
+    refused or lost because its job row could not be written, but a silent
+    failure here is exactly how the table got to zero rows in the first place.
+    """
+    if not job_id:
+        log.warning("scan job not recorded: no job_id (%s)", scan_type)
+        return False
+    try:
+        conn = _get_conn()
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO node_scan_jobs
+                   (node_id, scan_type, job_id, status, targets, parameters,
+                    engagement_id, result_summary, error, started_at, completed_at)
+               VALUES (%s::uuid, %s, %s, %s, %s::jsonb, %s::jsonb,
+                       %s::uuid, %s::jsonb, %s,
+                       now(),
+                       CASE WHEN %s IN ('completed', 'failed', 'cancelled')
+                            THEN now() ELSE NULL END)
+               ON CONFLICT (job_id) DO UPDATE
+                   SET status         = EXCLUDED.status,
+                       result_summary = COALESCE(EXCLUDED.result_summary,
+                                                 node_scan_jobs.result_summary),
+                       error          = COALESCE(EXCLUDED.error,
+                                                 node_scan_jobs.error),
+                       completed_at   = EXCLUDED.completed_at""",
+            (node_id, scan_type, job_id, status,
+             json.dumps(list(targets or [])[:200]),
+             json.dumps(parameters or {}),
+             engagement_id or None,
+             json.dumps(result_summary) if result_summary is not None else None,
+             (error or None) and str(error)[:4000],
+             status),
+        )
+        cur.close()
+        conn.close()
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("scan job write failed (%s %s, status=%s): %s",
+                    scan_type, str(job_id)[:8], status, e)
+        return False
+
+
+def _record_scan_coverage(engagement_id, targets, scan_type, job_id, status):
+    """Record that these targets were port-scanned, so an empty result is a fact.
+
+    masscan only reports OPEN ports, so the 224 of 268 IPs that answered nothing
+    left no trace anywhere in the database — no asset row, no port row. Every
+    one of them looked exactly like a host that had never been scanned.
+    """
+    if scan_type not in PORT_SCAN_TYPES or not targets:
+        return 0
+    if not engagement_id:
+        log.warning("scan coverage for %s not recorded: no engagement "
+                    "(X-Engagement-Id absent and none in the request body)",
+                    scan_type)
+        return 0
+    try:
+        conn = _get_conn()
+        conn.autocommit = True
+        cur = conn.cursor()
+        rows = 0
+        for tgt in targets:
+            tgt = (tgt or "").strip()
+            if not tgt:
+                continue
+            # Upsert: scope_coverage is unique on
+            # (engagement_id, target, stage, scan_type) — the conflict target
+            # repeats those four columns exactly, or every insert after the
+            # first scan of a host raises
+            #   duplicate key value violates unique constraint
+            #     "scope_coverage_engagement_id_target_stage_scan_type_key"
+            # A re-scan must refresh the record, not be refused by it.
+            cur.execute(
+                """INSERT INTO scope_coverage
+                       (engagement_id, target, stage, stage_name, scan_type,
+                        job_id, status, started_at, completed_at)
+                   VALUES (%s::uuid, %s, 2, 'discovery', %s, %s, %s, now(),
+                           CASE WHEN %s = 'running' THEN NULL ELSE now() END)
+                   ON CONFLICT (engagement_id, target, stage, scan_type)
+                   DO UPDATE SET job_id = EXCLUDED.job_id,
+                                 status = EXCLUDED.status,
+                                 started_at = EXCLUDED.started_at,
+                                 completed_at = EXCLUDED.completed_at,
+                                 stage_name = EXCLUDED.stage_name""",
+                (engagement_id, tgt, scan_type, job_id, status, status),
+            )
+            rows += 1
+        cur.close()
+        conn.close()
+        log.info("scan coverage: %d %s targets recorded as %s (job %s)",
+                 rows, scan_type, status, job_id[:8])
+        return rows
+    except Exception as e:  # noqa: BLE001
+        log.warning("scan coverage write failed (%s, %d targets): %s",
+                    scan_type, len(targets), e)
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 def _get_conn():
@@ -1436,6 +1588,9 @@ class RemoteScanRequest(BaseModel):
     rate: Optional[int] = None
     extra_args: Optional[list[str]] = None  # additional CLI flags
     timeout: int = 600
+    # Falls back to the X-Engagement-Id header when omitted (see
+    # _capture_engagement). Collected data must be attributable.
+    engagement_id: Optional[str] = None
 
 
 class ChiselConfigRequest(BaseModel):
@@ -2584,6 +2739,15 @@ REMOTE_SCAN_TEMPLATES = {
         "cmd": ["masscan", "-p", "{ports}", "--rate", "{rate}", "-oJ", "/tmp/scan_out.json"],
         "output": "/tmp/scan_out.json",
         "ingest": "masscan",
+        # masscan builds its own packets, so it needs CAP_NET_RAW. As a normal
+        # SSH user it exits non-zero with
+        #   [-] FAIL: permission denied
+        #   [hint] need to sudo or run as root or something
+        # which reads to the operator as a scan that found nothing. nmap is
+        # deliberately NOT marked: without root it silently falls back to a TCP
+        # connect scan and still works, so requiring sudo there would break
+        # nodes that scan fine today.
+        "needs_root": True,
     },
     "nmap": {
         "cmd": ["nmap", "-sV", "-oX", "/tmp/scan_out.xml", "-p", "{ports}"],
@@ -2771,24 +2935,56 @@ async def _remote_scan_bounded(node_id: str, req):
     # Resolve hostnames to IPs for masscan (it only accepts IPs/CIDRs)
     targets = list(req.targets)
     if req.scan_type == "masscan":
-        resolved = []
-        for t in targets:
-            # Skip if already an IP or CIDR
-            if t.replace(".", "").replace("/", "").replace(":", "").isdigit():
-                resolved.append(t)
-                continue
+        # CONCURRENT, off the event loop, and bounded.
+        #
+        # This was a serial `socket.getaddrinfo` per target inside the request
+        # handler. A 338-target scan meant 338 blocking lookups on the event
+        # loop, 283 of which were dead names that each cost a resolver timeout.
+        # node-manager stopped answering /health for minutes, the BFF's probe
+        # gave up, and the operator was told
+        #   "Node manager unreachable after 4 attempts"
+        # for a service that was working — while the real failure (masscan not
+        # installed on the node) was still ahead of it.
+        import asyncio as _aio
+        import socket as _socket
+        import time as _time
+
+        _literals = [t for t in targets
+                     if t.replace(".", "").replace("/", "").replace(":", "").isdigit()]
+        _names = [t for t in targets if t not in _literals]
+
+        def _resolve_one(name: str):
             try:
-                import socket
-                infos = socket.getaddrinfo(t, None, socket.AF_INET)
-                ips = list({info[4][0] for info in infos})
-                if ips:
-                    log.info("Resolved %s → %s for masscan", t, ips)
-                    resolved.extend(ips)
-                else:
-                    log.warning("Could not resolve %s, skipping", t)
-            except Exception as e:
-                log.warning("DNS resolution failed for %s: %s", t, e)
-        targets = resolved
+                infos = _socket.getaddrinfo(name, None, _socket.AF_INET)
+                return name, sorted({i[4][0] for i in infos}), None
+            except Exception as e:  # noqa: BLE001
+                return name, [], str(e)
+
+        _sem = _aio.Semaphore(32)   # kind to the resolver, still ~30x faster
+
+        async def _bounded(name: str):
+            async with _sem:
+                try:
+                    return await _aio.wait_for(
+                        _aio.get_running_loop().run_in_executor(None, _resolve_one, name),
+                        timeout=5)
+                except _aio.TimeoutError:
+                    return name, [], "timeout after 5s"
+
+        _t0 = _time.monotonic()
+        _results = await _aio.gather(*[_bounded(n) for n in _names])
+        resolved = list(_literals)
+        _failed = 0
+        for name, ips, err in _results:
+            if ips:
+                resolved.extend(ips)
+            else:
+                _failed += 1
+                log.debug("DNS resolution failed for %s: %s", name, err)
+        log.info("masscan DNS: %d/%d names resolved, %d failed, %.1fs",
+                 len(_names) - _failed, len(_names), _failed,
+                 _time.monotonic() - _t0)
+        targets = sorted(set(resolved))
         if not targets:
             raise HTTPException(400, "No valid IP targets after DNS resolution")
 
@@ -2823,11 +3019,22 @@ async def _remote_scan_bounded(node_id: str, req):
     job_id = str(uuid.uuid4())
     t0 = time.time()
 
+    # Request body wins over the header so a scheduled/automated caller can be
+    # explicit; the header covers every call the dashboard makes.
+    _eid = req.engagement_id or _current_engagement_id.get()
+
     write_audit("scan_started", req.scan_type, "node_manager", {
         "job_id": job_id, "execution_mode": "remote", "node_id": node_id,
         "targets": req.targets[:20], "targets_count": len(req.targets),
         "parameters": {"ports": req.ports, "rate": req.rate},
     })
+
+    # The durable half of the same record. write_audit appends to a JSONL file;
+    # this is the row an operator can query, join and purge with the engagement.
+    _record_scan_job(job_id, node_id, req.scan_type, req.targets,
+                     {"ports": req.ports, "rate": req.rate,
+                      "timeout": req.timeout, "extra_args": req.extra_args},
+                     _eid, "running")
 
     log.info("Remote scan %s on node %s: %s", req.scan_type, node_id, " ".join(cmd))
 
@@ -2859,10 +3066,20 @@ async def _remote_scan_bounded(node_id: str, req):
         # Parse and ingest WHOIS results locally
         ingest_result = {}
         if tmpl.get("_whois_ingest"):
-            try:
-                from osint_runner.osint_runner import _parse_whois_domain, _parse_whois_ip
-            except ImportError:
-                _parse_whois_domain = None
+            # One implementation, shared with osint_runner via the ./common
+            # mount. This branch used to import osint_runner's parsers inside
+            # `except ImportError:` — the module is not in this image, so the
+            # import always failed — and then not use them anyway: underneath
+            # was a re-typed, SHORTER copy of the same field maps (8 fields
+            # against 11 for a domain, with the domain and IP maps merged into
+            # one). A remote WHOIS therefore recorded org/registrar and
+            # silently dropped expiry, registrant, DNSSEC and status, while a
+            # local WHOIS of the same host recorded all of them.
+            #
+            # Hard import, no soft fallback: a WHOIS parsed by a different map
+            # than every other caller is worse than one that refuses, because
+            # the gap only shows up as missing fields nobody is looking for.
+            from common.whois_parse import parse_whois
             ingested = 0
             conn = _get_conn()
             conn.autocommit = True
@@ -2872,28 +3089,10 @@ async def _remote_scan_bounded(node_id: str, req):
                     continue
                 import re as _re
                 is_ip = bool(_re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', tgt))
-                # Simple field extraction
-                parsed = {"raw_length": len(raw), "target": tgt, "type": "ip" if is_ip else "domain"}
-                field_map = {
-                    "org": ["OrgName:", "org:", "Registrant Organization:"],
-                    "registrar": ["Registrar:", "registrar:"],
-                    "creation_date": ["Creation Date:", "created:"],
-                    "country": ["Country:", "country:", "Registrant Country:"],
-                    "net_range": ["NetRange:", "inetnum:"],
-                    "cidr": ["CIDR:", "route:"],
-                    "asn": ["OriginAS:", "origin:"],
-                    "name_servers": ["Name Server:", "nserver:"],
-                }
-                for key, patterns in field_map.items():
-                    values = []
-                    for pat in patterns:
-                        for line in raw.splitlines():
-                            if line.strip().lower().startswith(pat.lower()):
-                                val = line.split(":", 1)[1].strip()
-                                if val and val not in values:
-                                    values.append(val)
-                    if values:
-                        parsed[key] = values if key == "name_servers" else values[0]
+                parsed = parse_whois(raw, tgt, is_ip)
+                # `target` is what the recon_findings row is keyed by; the
+                # shared parser names the key `ip` or `domain`, so keep both.
+                parsed["target"] = tgt
                 finding_type = "whois_ip" if is_ip else "whois_record"
                 cur.execute(
                     "INSERT INTO recon_findings (source, finding_type, target, data, severity) "
@@ -2909,6 +3108,11 @@ async def _remote_scan_bounded(node_id: str, req):
             "job_id": job_id, "execution_mode": "remote", "node_id": node_id,
             "duration_s": duration_s, "targets": len(req.targets),
         })
+        _record_scan_job(job_id, node_id, req.scan_type, req.targets, None,
+                         _eid, "completed",
+                         result_summary={"duration_s": duration_s,
+                                         "targets_processed": len(all_results),
+                                         "ingest": ingest_result})
         return {
             "ok": True, "job_id": job_id, "scan_type": req.scan_type,
             "node_id": node_id, "execution_mode": "remote",
@@ -2926,6 +3130,7 @@ async def _remote_scan_bounded(node_id: str, req):
         tool_cmd=cmd,
         output_remote_path=tmpl["output"],
         timeout=req.timeout,
+        elevate=bool(tmpl.get("needs_root")),
     )
 
     duration_s = round(time.time() - t0, 2)
@@ -2938,6 +3143,15 @@ async def _remote_scan_bounded(node_id: str, req):
             "job_id": job_id, "execution_mode": "remote", "node_id": node_id,
             "error": error_detail[:500], "duration_s": duration_s,
         })
+        # Record the attempt as FAILED, never as coverage. A failed scan is not
+        # evidence the host has nothing listening — that conflation is how
+        # "unreachable" gets filed as "absent".
+        _record_scan_coverage(_eid, req.targets, req.scan_type, job_id, "failed")
+        _record_scan_job(job_id, node_id, req.scan_type, req.targets, None,
+                         _eid, "failed",
+                         result_summary={"duration_s": duration_s,
+                                         "exit_code": result.get("exit_code")},
+                         error=error_detail)
         raise HTTPException(500, {
             "error": error_detail[:500],
             "stdout": result.get("stdout", "")[-500:],
@@ -3033,9 +3247,20 @@ async def _remote_scan_bounded(node_id: str, req):
         "duration_s": duration_s,
     })
 
+    # The scan completed, so every target it was pointed at WAS looked at —
+    # including the ones that reported nothing, which is the whole point.
+    covered = _record_scan_coverage(_eid, req.targets, req.scan_type,
+                                    job_id, "completed")
+    _record_scan_job(job_id, node_id, req.scan_type, req.targets, None,
+                     _eid, "completed",
+                     result_summary={"duration_s": duration_s,
+                                     "coverage_recorded": covered,
+                                     "ingest": ingest_result})
+
     return {
         "ok": True,
         "job_id": job_id,
+        "coverage_recorded": covered,
         "scan_type": req.scan_type,
         "node_id": node_id,
         "execution_mode": "remote",

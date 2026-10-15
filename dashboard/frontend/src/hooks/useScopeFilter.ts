@@ -20,9 +20,28 @@ export function useScopeFilter(scopeName: string) {
     return scopeData.targets.map(t => (t.target || '').toLowerCase().trim()).filter(Boolean)
   }, [scopeName, scopeData])
 
+  // TRUNCATION: the endpoint caps how many targets it returns. If the list we
+  // hold is a PREFIX of the scope, every match below is answered against
+  // incomplete data and in-scope rows get hidden with no indication — the
+  // examplecorp scope has 909 targets, the first 500 by added_at excluded the
+  // apex `examplecorp.com`, and Content Intelligence showed "2 of 100
+  // extractions (98 hidden by scope filter)" when all 100 were in scope.
+  //
+  // Fail OPEN here, deliberately. This is a VIEW filter: the cost of a false
+  // negative is hidden evidence the operator already collected, while the cost
+  // of a false positive is one extra row on screen. Authorization is a
+  // different path entirely (etl/scope_gate.py) and that one fails closed.
+  const truncated = useMemo(() => {
+    const total = (scopeData as { total?: number } | undefined)?.total
+    const have = scopeData?.targets?.length ?? 0
+    return typeof total === 'number' && total > have
+  }, [scopeData])
+
   const matchesScope = useCallback((val: string): boolean => {
     // No scope selected → no filter, everything matches.
     if (!scopeName) return true
+    // Incomplete target list → cannot answer honestly; show the row.
+    if (truncated) return true
     // A scope IS selected but its target list hasn't arrived yet (React Query
     // is mid-fetch after the user picked a new scope from the dropdown).
     // Return false so the table briefly shows empty rather than flashing the
@@ -51,7 +70,7 @@ export function useScopeFilter(scopeName: string) {
       if (v.endsWith('.' + t)) return true
     }
     return false
-  }, [scopeName, targetsList])
+  }, [scopeName, targetsList, truncated])
 
   /**
    * True when ANY of the given identities is in scope.
@@ -77,5 +96,5 @@ export function useScopeFilter(scopeName: string) {
   // isFiltering reflects user intent (a scope is selected), not load state.
   // This keeps the count chip ("N in <scope>") accurate the instant the user
   // changes the dropdown, rather than blinking off during the targets refetch.
-  return { matchesScope, matchesAnyScope, isFiltering: !!scopeName }
+  return { matchesScope, matchesAnyScope, isFiltering: !!scopeName, truncated }
 }

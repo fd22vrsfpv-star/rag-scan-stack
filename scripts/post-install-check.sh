@@ -354,6 +354,28 @@ else
   warn "scan_recommendations.priority check skipped (no DB connection helper available)"
 fi
 
+# node_scan_jobs.engagement_id + the job_id unique index — a remote scan's
+# durable history. The table was declared, indexed and never written (count=0);
+# node_manager now INSERTs 'running' at dispatch and UPDATEs the same row by
+# job_id, which needs the unique index or a retry forks the history in two.
+HAS_NSJ_ENG=$(_run_sql "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='node_scan_jobs' AND column_name='engagement_id')")
+if [[ "$HAS_NSJ_ENG" == "t" ]]; then
+  pass "node_scan_jobs.engagement_id column present"
+elif [[ "$HAS_NSJ_ENG" == "f" ]]; then
+  fail "node_scan_jobs.engagement_id missing — run ./scripts/ensure_db_schema.sh"
+else
+  warn "node_scan_jobs.engagement_id check skipped (no DB connection helper available)"
+fi
+
+HAS_NSJ_UQ=$(_run_sql "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE tablename='node_scan_jobs' AND indexname='uq_node_scan_jobs_job_id')")
+if [[ "$HAS_NSJ_UQ" == "t" ]]; then
+  pass "uq_node_scan_jobs_job_id unique index present"
+elif [[ "$HAS_NSJ_UQ" == "f" ]]; then
+  fail "uq_node_scan_jobs_job_id missing — the ON CONFLICT (job_id) upsert in node_manager raises 'no unique or exclusion constraint matching the ON CONFLICT specification'. Run ./scripts/ensure_db_schema.sh"
+else
+  warn "uq_node_scan_jobs_job_id check skipped (no DB connection helper available)"
+fi
+
 # raw_artifacts.note / item_count — upload label + per-file item count (Scan Results)
 HAS_ARTIFACT_COLS=$(_run_sql "SELECT (count(*) = 2)::text FROM information_schema.columns WHERE table_name='raw_artifacts' AND column_name IN ('note','item_count')")
 if [[ "$HAS_ARTIFACT_COLS" == "true" ]]; then

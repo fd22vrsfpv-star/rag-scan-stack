@@ -29,10 +29,15 @@ Run standalone:
     sh -c "pip -q install pytest; python -m pytest tests/test_timing_assertion_mismatch.py -q"
 """
 import ast
+import os
 import pathlib
 import re
+import sys
 
 import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _ast_assert import call_kwarg, calls_with  # noqa: E402
 
 API = pathlib.Path(__file__).resolve().parents[1] / "app" / "rag-api" / "api.py"
 
@@ -322,4 +327,64 @@ def test_exception_runs_before_the_downgrade():
     assert exc < dow, (
         "the confirmed-timing exception must clear `reflection` BEFORE the "
         "downgrade, or it has no effect"
+    )
+
+
+# ---- F12: PoC commands must run under bash, not dash
+#
+# kali-listener executes with subprocess.run(shell=True), which on POSIX uses
+# /bin/sh — a symlink to dash in this image. The model naturally writes bash:
+# process substitution <(...), [[ ]], arrays. Those die before reaching the
+# target. 37 trace files carry a shell syntax error ("redirection unexpected"
+# x24, "end of file unexpected" x4, "word unexpected" x2), and the pre-dispatch
+# shlex check cannot catch them — shlex parses tokens, not shell grammar.
+# Measured on the runner: <(...) and [[ ]] and arrays all FAIL under /bin/sh
+# and all pass under bash. bash 5.3.3 is already installed.
+
+
+def _listener_src():
+    p = pathlib.Path(__file__).resolve().parents[1] / "kali_listener" / "listener_service.py"
+    if not p.exists():
+        pytest.skip(f"{p} not present")
+    return p.read_text(encoding="utf-8", errors="replace")
+
+
+def test_vector_run_executes_under_bash():
+    src = _listener_src()
+    assert "_EXEC_SHELL" in src, "the exec shell must be resolved"
+    assert calls_with(src, "shutil.which", args=["bash"]), (
+        "resolve bash at import; a hardcoded path breaks on an image that "
+        "installs it elsewhere"
+    )
+    assert calls_with(src, "subprocess.run", kwargs={"shell": True}), (
+        "the shell=True exec site is gone"
+    )
+    assert call_kwarg(src, "subprocess.run", "executable"), (
+        "shell=True without executable= uses /bin/sh (dash here), which "
+        "rejects the bash syntax the model writes"
+    )
+
+
+def test_runner_reports_its_own_runtime():
+    """The runner is the authority on its shell — same reasoning as
+    /tools/capabilities. Hardcoding the executor fixes the symptom; REPORTING
+    it is what lets the synthesiser write correct commands and lets the fact be
+    embedded into RAG instead of compiled into one branch."""
+    src = _listener_src()
+    assert '"/runtime/profile"' in src, "the runtime profile endpoint is gone"
+    for key in ("exec_shell", "sh_is_dash", "bash_available",
+                "binaries_present", "binaries_missing"):
+        assert f'"{key}"' in src, f"the profile must report {key}"
+
+
+def test_bash_absence_falls_back_rather_than_failing():
+    """shutil.which returns None when bash is absent; subprocess then behaves
+    exactly as before. A hard failure would be worse than dash."""
+    src = _listener_src()
+    i = src.find("_BASH = ")
+    assert i != -1
+    window = src[max(0, i - 400):i + 120]
+    assert "None" in window, (
+        "the comment must record that None means the previous /bin/sh "
+        "behaviour, not a crash"
     )
