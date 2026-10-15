@@ -732,14 +732,32 @@ of 2,313 items name software we actually run** (Apache, Atlassian Jira, Azure),
 all of which currently render as "no asset impact".
 **Where:** `news_runner/news_agent.py::_match_assets` (the `vulns v JOIN assets a`
 query); consumed by `app/rag-api/api.py:3503` and the News page.
-**Done when:** a second match path `news CVE/product -> detected_software ->
-asset` records hits with `match_reason: "software.product"` beside the existing
-`"vuln.cve"`, and a news item naming a product we run reports the affected
-hosts. Two things must be handled or it will be noise rather than signal:
+**Done when:** matching is TIERED, because the two kinds of hit carry very
+different confidence and must not look alike (operator, 2026-10-15):
+
+| tier | match | how it reads | action |
+|------|-------|--------------|--------|
+| **confirmed** | the news CVE is on a `vulns` row for this asset | strong highlight | this affects us, now |
+| **potential** | the news item names a product `detected_software` says we run, with no CVE hit | lower-weight highlight, "potential — review" | one click to raise a FOLLOW-UP |
+
+The existing `vuln.cve` path becomes the confirmed tier unchanged; the new
+`software.product` path is the potential tier. Both land in `asset_matches`
+with their `match_reason`, so the UI can style on it and the API consumer can
+filter. A potential match MUST be actionable without leaving the page — the
+operator decides it is worth chasing and it becomes a `follow_up_items` row
+carrying the item, the product and the affected hosts.
+
+This mirrors the confidence model already built for build-poc facts
+(`app/rag-api/fact_provenance.py`): a thing observed on THIS host outranks a
+thing true of the software in general, and the weaker claim is surfaced as a
+claim rather than hidden or promoted.
+
+Two things must be handled or the potential tier is noise rather than signal:
 `detected_software` carries header artefacts as product names (`HSTS`,
 `https`, `Country`, `IP`, `RedirectLocation`) which need an allow-list or
 CPE-style normalisation, and a version comparison is needed — `Apache 2.4.58`
-is not affected by every Apache CVE.
+is not affected by every Apache CVE. A potential match that cannot be
+version-qualified should say so rather than imply the host is vulnerable.
 **Enforced by:** not enforced. A guard would need a fixture news item whose
 product matches a seeded `detected_software` row and assert a non-empty
 `asset_matches`.
