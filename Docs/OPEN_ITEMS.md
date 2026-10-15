@@ -710,3 +710,59 @@ not distinguish "our exploit pipeline is weak" from "we are answering a harder
 question than the one being scored".
 **Enforced by:** not enforced
 
+### News asset-matching pivots through `vulns.cve`, which can never contain tomorrow's CVE
+**Found:** 2026-10-15
+**Evidence:** `asset_matches` is empty on **all 2,313** `news_items` — not one
+hit, ever. `_match_assets` is not broken and has run 38 times
+(`asset_matched_at IS NOT NULL`); it correctly finds nothing:
+
+    news_items with CVEs      353      distinct CVEs in news    456
+                                       distinct CVEs in vulns    14
+    OVERLAP (news n vulns)      0
+
+It pivots `news CVE -> vulns.cve -> asset`, so it can only match a CVE a
+scanner has ALREADY flagged on a host. The value of a news feed is the
+opposite case — a new CVE in software you run and have no finding for yet —
+and that case cannot match by construction.
+
+The inventory to match against already exists: `detected_software` has **328
+distinct products** (Apache on 281 hosts, Apache HTTP Server 252, Apache httpd
+189, jQuery 75, Microsoft ASP.NET 48). A crude title-substring test says **167
+of 2,313 items name software we actually run** (Apache, Atlassian Jira, Azure),
+all of which currently render as "no asset impact".
+**Where:** `news_runner/news_agent.py::_match_assets` (the `vulns v JOIN assets a`
+query); consumed by `app/rag-api/api.py:3503` and the News page.
+**Done when:** a second match path `news CVE/product -> detected_software ->
+asset` records hits with `match_reason: "software.product"` beside the existing
+`"vuln.cve"`, and a news item naming a product we run reports the affected
+hosts. Two things must be handled or it will be noise rather than signal:
+`detected_software` carries header artefacts as product names (`HSTS`,
+`https`, `Country`, `IP`, `RedirectLocation`) which need an allow-list or
+CPE-style normalisation, and a version comparison is needed — `Apache 2.4.58`
+is not affected by every Apache CVE.
+**Enforced by:** not enforced. A guard would need a fixture news item whose
+product matches a seeded `detected_software` row and assert a non-empty
+`asset_matches`.
+
+### News ingest reports only a boolean while it is running
+**Found:** 2026-10-15
+**Evidence:** operator: "the news intell shows running ingest, but I don't see
+anything that is happening". A run takes ~2 minutes and walks 17 sources
+(today: 10:00:53 -> 10:02:39, 280 articles, 89 new), and for that whole window
+the page can say nothing more specific than "running".
+
+The data to show it already exists and is already persisted **per source,
+inside the loop**: `news_agent.py:337` calls `_update_run` immediately after
+appending each source's `src_stats` to `per_source`, and
+`GET /news/runs/{run_id}` returns that column. The News page polls that
+endpoint and reads only `runQ.data?.status === 'running'` (News.tsx:225) —
+`per_source` is never rendered anywhere in the frontend.
+**Where:** `dashboard/frontend/src/pages/News.tsx:225` (`ingestRunning`);
+producer `news_runner/news_agent.py:335-337`; endpoint
+`app/rag-api/api.py:3546` `/news/runs/{run_id}`.
+**Done when:** while a run is in flight the page shows which sources have been
+checked and what each returned — the `per_source` entries already carry
+`name`, `new` and an error field — so a stalled or failing source is visible
+while it is happening rather than only in the final summary.
+**Enforced by:** not enforced.
+
