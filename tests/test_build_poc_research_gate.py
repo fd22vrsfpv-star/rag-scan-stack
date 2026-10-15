@@ -717,8 +717,34 @@ def test_refine_result_carries_stop_reason_and_give_up_triggers_deep_recon():
     body = _func_src("_run_refine_poc")
     assert '_stop_reason = "identical_resend"' in body and '_stop_reason = "dup_exit"' in body
     assert '"stop_reason": _stop_reason or ("success" if success else "max_iters")' in body
-    g = GRAPH.read_text()
-    assert 'res.get("stop_reason") in ("identical_resend", "dup_exit")' in g and "gave_up or int(" in g
+    # Pinned by MEANING, not by the exact tuple text. The literal
+    # `res.get("stop_reason") in ("identical_resend", "dup_exit")` was
+    # asserted as a substring, so PR #377 adding a THIRD give-up reason
+    # (cross_round_dup) broke a guard it did not weaken. What must hold is
+    # that both original reasons still count as giving up, and that `gave_up`
+    # still feeds the `early` decision that routes to deep_recon.
+    import ast as _ast
+    tree = _ast.parse(GRAPH.read_text())
+    route = next((n for n in _ast.walk(tree)
+                  if isinstance(n, _ast.FunctionDef) and n.name == "_route_after_refine"), None)
+    assert route is not None, "_route_after_refine is gone — nothing routes to deep_recon"
+    gave_up = next((n for n in _ast.walk(route)
+                    if isinstance(n, _ast.Assign)
+                    and any(isinstance(t, _ast.Name) and t.id == "gave_up" for t in n.targets)), None)
+    assert gave_up is not None, "_route_after_refine no longer computes gave_up"
+    reasons = {c.value for c in _ast.walk(gave_up.value)
+               if isinstance(c, _ast.Constant) and isinstance(c.value, str)}
+    missing = {"identical_resend", "dup_exit"} - reasons
+    assert not missing, (
+        f"these stop reasons no longer count as giving up: {sorted(missing)} — "
+        "the loop would run to max_iters instead of routing to deep_recon")
+    early = next((n for n in _ast.walk(route)
+                  if isinstance(n, _ast.Assign)
+                  and any(isinstance(t, _ast.Name) and t.id == "early" for t in n.targets)), None)
+    assert early is not None, "_route_after_refine no longer computes `early`"
+    assert any(isinstance(n, _ast.Name) and n.id == "gave_up" for n in _ast.walk(early.value)), (
+        "`early` no longer reads `gave_up`, so a loop that gave up early never "
+        "triggers the deep pass — the round-8 CVE-2024-3408 defect")
 
 
 def test_unsourced_credential_detector():

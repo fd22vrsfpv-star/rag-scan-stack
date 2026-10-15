@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+from _ast_assert import decorated_routes
+
 REPO = Path(__file__).resolve().parent.parent
 API = REPO / "app" / "rag-api" / "api.py"
 GRAPH = REPO / "app" / "rag-api" / "build_poc_graph.py"
@@ -259,21 +261,32 @@ def test_lessons_table_in_schema_script():
 
 
 def test_bff_proxies_exist():
-    """BFF must proxy /api/build-poc/lessons and /api/build-poc/lessons/{lesson_id}."""
+    """BFF must proxy /api/build-poc/lessons and /api/build-poc/lessons/{lesson_id}.
+
+    Read as DECLARED ROUTES, not as source substrings: the literal is satisfied
+    by the path appearing in a comment, and it pins the decorator object too.
+    `decorated_routes` reports the (verb, path) pairs a router actually
+    declares, which is the thing that has to be true.
+    """
     bff = (REPO / "dashboard" / "bff" / "routers" / "exploits.py").read_text()
-    assert '"/api/build-poc/lessons"' in bff, "GET proxy missing"
-    assert '"/api/build-poc/lessons/{lesson_id}"' in bff, "DELETE proxy missing"
+    routes = decorated_routes(bff)
+    assert ("get", "/api/build-poc/lessons") in routes, (
+        f"GET proxy missing; build-poc routes declared: "
+        f"{sorted(r for r in routes if 'build-poc' in r[1])}")
+    assert ("delete", "/api/build-poc/lessons/{lesson_id}") in routes, (
+        "DELETE proxy missing")
 
 
 def test_list_endpoint_exists():
     """rag-api must declare GET /build-poc/lessons."""
-    api_src = API.read_text()
-    assert '"/build-poc/lessons"' in api_src
-    assert "list_build_poc_lessons" in api_src or "def list_build_poc" in api_src
+    routes = decorated_routes(API.read_text())
+    assert ("get", "/build-poc/lessons") in routes, (
+        f"upstream GET missing; build-poc routes declared: "
+        f"{sorted(r for r in routes if 'build-poc' in r[1])}")
 
 
 def test_delete_endpoint_exists():
     """rag-api must declare DELETE /build-poc/lessons/{lesson_id}."""
-    api_src = API.read_text()
-    assert '"/build-poc/lessons/{lesson_id}"' in api_src
-    assert "deactivate_lesson" in api_src or "def deactivate" in api_src
+    routes = decorated_routes(API.read_text())
+    assert ("delete", "/build-poc/lessons/{lesson_id}") in routes, (
+        "upstream DELETE missing")

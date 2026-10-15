@@ -68,7 +68,16 @@ _READS_SOURCE = re.compile(r'read_text\(|_src\(|open\([^)]*\.py')
 # subprocess.run site fails test_vector_run_executes_under_bash, and replacing
 # `_privileges_required(details)` at its call site fails
 # test_gather_manifest_fills_cheap_gaps_before_judging.
-BASELINE = 386
+# 385 after merging PRs #377 and #378 (2026-10-14). Their test files arrived
+# with 8 source-substring assertions between them, pushing the total to 393;
+# all 8 were converted to structural checks (decorated_routes, arg_default,
+# call_kwarg, and ast for the seeding assignment, the prior-slice membership
+# test and the BuildPocState field), and the exact-tuple assertion in
+# test_build_poc_research_gate.py went with them — #377 legitimately added a
+# third give-up reason and broke a guard it had not weakened. Both files now
+# contribute 0. Converting at the moment a test lands is far cheaper than
+# retrofitting it later, which is the whole point of the ratchet.
+BASELINE = 385
 
 
 def _is_code_fragment(literal: str) -> bool:
