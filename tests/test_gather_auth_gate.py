@@ -214,3 +214,98 @@ def test_the_probe_status_is_captured_from_a_real_response():
                for a in assigns), (
         "ep_probe_status has no None initialiser: 'not observed' would then be "
         "indistinguishable from a real status")
+
+
+# -- 8. "pre-auth" contains "auth" ------------------------------------------
+
+def _needs_auth_logic():
+    """Exec just the needs_auth decision from _gather_manifest.
+
+    Extracted by source window rather than imported: _gather_manifest is a
+    ~700-line function that probes the network, and the decision under test is
+    a dozen lines of pure string logic inside it.
+    """
+    import re as _re
+    src = ast.get_source_segment(API.read_text(encoding="utf-8"),
+                                 _func("_gather_manifest")) or ""
+    i = src.index("_blob = f\"{pre_blob} {desc}\"")
+    j = src.index("needs_auth = bool(_auth_positive) and not _auth_negated")
+    body = src[i:j] + "needs_auth = bool(_auth_positive) and not _auth_negated\n"
+    body = "\n".join(line[4:] if line.startswith("    ") else line
+                     for line in body.split("\n"))
+
+    def run(pre_blob="", desc=""):
+        ns = {"_re": _re, "pre_blob": pre_blob.lower(), "desc": desc.lower()}
+        exec(compile(body, "<auth>", "exec"), ns)
+        return ns["needs_auth"], ns["_auth_negated"]
+    return run
+
+
+PRE_AUTH = [
+    "A pre-authentication arbitrary file access (LFI-like) in Atlassian products",
+    "allows unauthenticated attackers to perform path traversal",
+    "exploitable without authentication",
+    "no authentication is required to exploit this issue",
+    "the endpoint does not require authentication",
+    "anonymous access to the admin servlet",
+    "requires no credentials",
+]
+
+
+@pytest.mark.parametrize("text", PRE_AUTH)
+def test_a_pre_auth_advisory_does_not_demand_a_session(text):
+    """THE bug. 'auth' is a substring of 'pre-authentication'.
+
+    CVE-2026-21589 (2026-10-16) stopped `gather_incomplete:auth` on BOTH runs
+    with the research text reading 'a pre-authentication arbitrary file
+    access' — the gate demanded a session for a vulnerability whose defining
+    property is that it needs none.
+    """
+    needs, negated = _needs_auth_logic()(desc=text)
+    assert needs is False, (
+        f"{text!r} set needs_auth — the gate would demand a session for a "
+        "pre-auth vulnerability and refuse to synthesise anything")
+    assert negated, "the negation was not detected"
+
+
+@pytest.mark.parametrize("text", [
+    "requires an authenticated user with admin privileges",
+    "an authenticated attacker can escalate",
+    "the user must be logged in",
+    "requires login as a project administrator",
+])
+def test_a_genuine_auth_requirement_still_demands_one(text):
+    needs, _ = _needs_auth_logic()(desc=text)
+    assert needs is True, (
+        f"{text!r} no longer sets needs_auth — the fix for pre-auth has "
+        "disabled the requirement for advisories that really do need a session")
+
+
+def test_a_session_precondition_still_counts():
+    needs, _ = _needs_auth_logic()(pre_blob="valid session cookie required")
+    assert needs is True
+
+
+def test_silence_is_not_a_requirement():
+    assert _needs_auth_logic()(desc="a buffer overflow in the parser")[0] is False
+
+
+def test_the_negation_is_recorded_with_its_evidence():
+    """An operator must see WHY the gate stopped asking for auth."""
+    src = ast.get_source_segment(API.read_text(encoding="utf-8"),
+                                 _func("_gather_manifest")) or ""
+    fn = _func("_gather_manifest")
+    # Structural: an add("auth", "n/a", ...) whose SOURCE argument is the
+    # pre-auth marker, and whose reason interpolates the matched phrase.
+    calls = [c for c in ast.walk(fn)
+             if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+             and c.func.id == "add" and len(c.args) >= 4
+             and getattr(c.args[0], "value", None) == "auth"
+             and getattr(c.args[3], "value", None) == "analysis:pre-auth"]
+    assert calls, (
+        "no add(\"auth\", ..., \"analysis:pre-auth\") — a gate that silently "
+        "stops requiring auth is indistinguishable from one that forgot to")
+    reason = ast.unparse(calls[0].args[2])
+    assert "_auth_negated" in reason, (
+        "the recorded reason does not quote the phrase that triggered it, so "
+        "an operator cannot tell WHY auth stopped being required")

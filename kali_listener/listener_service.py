@@ -2968,6 +2968,19 @@ class VectorRunRequest(BaseModel):
     target: str = ""
     port: Optional[int] = None
     timeout: int = VECTOR_RUN_DEFAULT_TIMEOUT
+    #: SOCKS proxy the caller resolved (etl/attack_proxy.resolve). Applied as
+    #: ALL_PROXY/HTTP(S)_PROXY to the command's environment. None means the
+    #: caller decided no proxy applies -- which is NOT the same as the caller
+    #: never having asked, so `proxy_decided` says which it was.
+    proxy_url: Optional[str] = None
+    #: Label + source of that decision, echoed into the output so an operator
+    #: reading a stored PoC can see how it egressed.
+    proxy_label: Optional[str] = None
+    proxy_source: Optional[str] = None
+    #: True when the caller ran the proxy policy at all. A caller that did not
+    #: (an older rag-api, a hand-rolled curl) is reported as UNDECIDED rather
+    #: than silently treated as "direct was fine".
+    proxy_decided: bool = False
 
 
 @app.post("/vectors/run")
@@ -2991,6 +3004,36 @@ def vectors_run(request: VectorRunRequest):
         raise HTTPException(403, f"out of scope: {refusal}")
     to = max(5, min(int(request.timeout or VECTOR_RUN_DEFAULT_TIMEOUT),
                     VECTOR_RUN_MAX_TIMEOUT))
+    # ── Proxy ───────────────────────────────────────────────────────────────
+    # This endpoint had NO proxy handling of any kind (`grep -c proxy` was 0),
+    # because its docstring's assumption -- "reached only by the
+    # exploit-runner's source='command' branch" -- stopped being true when the
+    # Exploit Workbench started calling it directly. exploit-runner enforces a
+    # node SOCKS proxy on every execute path; the workbench's commands were
+    # egressing from THIS container's own address.
+    #
+    # The caller resolves the proxy (one shared policy, etl/attack_proxy) and
+    # passes the decision; here we only APPLY it and report what happened. No
+    # command rewriting: curl honours ALL_PROXY natively, so splicing --proxy
+    # into a shell string full of subshells and quoted literals buys nothing
+    # and can corrupt the command.
+    run_env = dict(os.environ)
+    if request.proxy_url:
+        try:
+            from etl.attack_proxy import proxy_env as _penv, note as _pnote, Decision as _PD
+            run_env.update(_penv(request.proxy_url))
+            proxy_line = _pnote(_PD(request.proxy_url, request.proxy_label,
+                                    request.proxy_source or "caller", "caller-resolved"), cmd)
+        except Exception as e:  # noqa: BLE001
+            # Could not apply it -> say so and REFUSE, rather than run direct
+            # under a line claiming it was proxied.
+            logger.warning("vector run: proxy application failed: %s", e)
+            raise HTTPException(500, f"proxy could not be applied: {type(e).__name__}: {e}")
+    elif request.proxy_decided:
+        proxy_line = "[proxy] DIRECT - the caller resolved no proxy for this target"
+    else:
+        proxy_line = ("[proxy] UNDECIDED - the caller ran no proxy policy; this "
+                      "command egressed from the listener's own address")
     try:
         # EXECUTE UNDER BASH, NOT dash. subprocess(shell=True) uses /bin/sh,
         # which here is a symlink to dash — so every bash-only construct the
@@ -3002,16 +3045,18 @@ def vectors_run(request: VectorRunRequest):
         # installed at /usr/bin/bash; _BASH is None when it is not, which falls
         # back to the previous /bin/sh behaviour rather than failing to run.
         proc = subprocess.run(cmd, shell=True, capture_output=True,
-                              text=True, timeout=to, executable=_EXEC_SHELL)
+                              text=True, timeout=to, executable=_EXEC_SHELL,
+                              env=run_env)
         out = (proc.stdout or "") + (proc.stderr or "")
-        return {"ok": True, "exit_code": proc.returncode, "output": out[:20000]}
+        return {"ok": True, "exit_code": proc.returncode,
+                "output": f"{proxy_line}\n{out[:20000]}", "proxy": proxy_line}
     except subprocess.TimeoutExpired as e:  # noqa: BLE001
         partial = (e.stdout or "") if isinstance(e.stdout, str) else ""
-        return {"ok": False, "exit_code": None,
-                "output": f"[timeout after {to}s]\n{partial[:4000]}"}
+        return {"ok": False, "exit_code": None, "proxy": proxy_line,
+                "output": f"{proxy_line}\n[timeout after {to}s]\n{partial[:4000]}"}
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "exit_code": None,
-                "output": f"[error] {type(e).__name__}: {e}"[:2000]}
+        return {"ok": False, "exit_code": None, "proxy": proxy_line,
+                "output": f"{proxy_line}\n[error] {type(e).__name__}: {e}"[:2000]}
 
 
 

@@ -114,7 +114,10 @@ def test_loop_runs_the_tool_check_in_the_prerun_block_and_skips_the_listener():
     i_tool = loop.index("_prerun_tool_check(ip, port, command")
     i_trace = loop.index('"prerun_tool_check"')
     i_short = loop.index("PRERUN_TOOL_MISSING")
-    i_post = loop.index('json={"command": command, "target": str(ip), "port": port, "timeout": _vt}')
+    # The dispatch used to be a literal json={...} dict; it is now built by
+    # `_vectors_run_payload` so the proxy decision cannot be omitted. Ordering
+    # is the point, not the spelling.
+    i_post = loop.index("_vectors_run_payload(command, ip, port, _vt")
     # same pre-run block, ordered: probe → oob → tools → (short-circuit | listener call)
     assert i_probe < i_oob < i_tool < i_trace < i_short < i_post
     assert "ec = 45" in loop and "skipped_runs_prerun_tool_missing" in loop
@@ -127,6 +130,50 @@ def test_loop_runs_the_tool_check_in_the_prerun_block_and_skips_the_listener():
 def test_runner_probe_is_cached_and_never_raises():
     src = _func_src("_runner_has_binaries")
     assert src and "_RUNNER_BIN_CACHE" in src and "_RUNNER_BIN_CACHE_TTL" in src
-    assert '"/vectors/run"' in src.replace("'", '"') or "/vectors/run" in src
     assert "command -v" in src and "except Exception" in src
     assert '"prerun_tool_check"' in _const_src("_KEY_TRACE_PHASES")
+
+
+def _dispatch_lineno():
+    """Line of the target dispatch inside `_run_refine_poc`, structurally.
+
+    2026-10-16: this was a character-window search for the literal string
+    "vectors/run" after the hook — widened 2000 -> 8000 once already, then
+    broken outright when the dispatch moved behind `_attack_proxy_for` /
+    `_vectors_run_payload` and ~70 lines of proxy policy landed between the
+    hook and the post. The ORDER is what matters, so compare line numbers and
+    stop caring how the dispatch is spelled.
+    """
+    import ast as _ast
+    from pathlib import Path as _P
+    api = _P(__file__).resolve().parents[1] / "app" / "rag-api" / "api.py"
+    tree = _ast.parse(api.read_text(encoding="utf-8"))
+    fn = next((n for n in _ast.walk(tree)
+               if isinstance(n, _ast.FunctionDef) and n.name == "_run_refine_poc"), None)
+    assert fn, "_run_refine_poc not found"
+    lines = []
+    for n in _ast.walk(fn):
+        if not isinstance(n, _ast.Call):
+            continue
+        if isinstance(n.func, _ast.Name) and n.func.id in (
+                "_listener_vectors_run", "_vectors_run_payload"):
+            lines.append(n.lineno)
+        elif n.args and "/vectors/run" in _ast.unparse(n.args[0]):
+            lines.append(n.lineno)
+    assert lines, "no /vectors/run dispatch found in _run_refine_poc"
+    return min(lines)
+
+
+def _hook_lineno(func_name):
+    """Line of the first call to `func_name` inside `_run_refine_poc`."""
+    import ast as _ast
+    from pathlib import Path as _P
+    api = _P(__file__).resolve().parents[1] / "app" / "rag-api" / "api.py"
+    tree = _ast.parse(api.read_text(encoding="utf-8"))
+    fn = next(n for n in _ast.walk(tree)
+              if isinstance(n, _ast.FunctionDef) and n.name == "_run_refine_poc")
+    lines = [n.lineno for n in _ast.walk(fn)
+             if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name)
+             and n.func.id == func_name]
+    assert lines, f"{func_name} is not called in _run_refine_poc"
+    return min(lines)

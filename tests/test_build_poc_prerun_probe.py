@@ -93,10 +93,9 @@ def test_prerun_probe_hooked_before_dispatch():
     # but still running the heavy exploit regardless. Window widened
     # 2000 → 8000 on 2026-10-07: the OOB check + shape-feedback + Python-lane
     # shadow blocks now sit between the hook and the dispatch.
-    post = src[hook_pos : hook_pos + 8000]
-    assert "vectors/run" in post, (
-        "the listener /vectors/run dispatch must appear within the same "
-        "block as the probe hook, not before it"
+    assert _hook_lineno("_prerun_payload_probe") < _dispatch_lineno(), (
+        "the listener /vectors/run dispatch happens BEFORE the probe hook — "
+        "we would probe and then run the heavy exploit regardless"
     )
 
 
@@ -156,3 +155,48 @@ def test_dedup_branch_still_runs_live_verify():
         "stored with a distinguishable source so the operator can audit "
         "which runs were saved by the fresh-verify"
     )
+
+
+def _dispatch_lineno():
+    """Line of the target dispatch inside `_run_refine_poc`, structurally.
+
+    2026-10-16: this was a character-window search for the literal string
+    "vectors/run" after the hook — widened 2000 -> 8000 once already, then
+    broken outright when the dispatch moved behind `_attack_proxy_for` /
+    `_vectors_run_payload` and ~70 lines of proxy policy landed between the
+    hook and the post. The ORDER is what matters, so compare line numbers and
+    stop caring how the dispatch is spelled.
+    """
+    import ast as _ast
+    from pathlib import Path as _P
+    api = _P(__file__).resolve().parents[1] / "app" / "rag-api" / "api.py"
+    tree = _ast.parse(api.read_text(encoding="utf-8"))
+    fn = next((n for n in _ast.walk(tree)
+               if isinstance(n, _ast.FunctionDef) and n.name == "_run_refine_poc"), None)
+    assert fn, "_run_refine_poc not found"
+    lines = []
+    for n in _ast.walk(fn):
+        if not isinstance(n, _ast.Call):
+            continue
+        if isinstance(n.func, _ast.Name) and n.func.id in (
+                "_listener_vectors_run", "_vectors_run_payload"):
+            lines.append(n.lineno)
+        elif n.args and "/vectors/run" in _ast.unparse(n.args[0]):
+            lines.append(n.lineno)
+    assert lines, "no /vectors/run dispatch found in _run_refine_poc"
+    return min(lines)
+
+
+def _hook_lineno(func_name):
+    """Line of the first call to `func_name` inside `_run_refine_poc`."""
+    import ast as _ast
+    from pathlib import Path as _P
+    api = _P(__file__).resolve().parents[1] / "app" / "rag-api" / "api.py"
+    tree = _ast.parse(api.read_text(encoding="utf-8"))
+    fn = next(n for n in _ast.walk(tree)
+              if isinstance(n, _ast.FunctionDef) and n.name == "_run_refine_poc")
+    lines = [n.lineno for n in _ast.walk(fn)
+             if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name)
+             and n.func.id == func_name]
+    assert lines, f"{func_name} is not called in _run_refine_poc"
+    return min(lines)

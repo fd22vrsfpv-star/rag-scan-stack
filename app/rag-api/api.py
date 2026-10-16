@@ -411,6 +411,141 @@ _build_poc_wall_deadline: contextvars.ContextVar = contextvars.ContextVar(
     "build_poc_wall_deadline", default=None,
 )
 
+
+# Operator's per-run proxy choice for build-poc attack traffic. A contextvar
+# for the same reason the deep-test knobs are: the choice is made at the
+# endpoint and read in the refine loop, ten-plus frames down, and threading it
+# through every signature between them would touch code that has nothing to do
+# with proxying.
+_build_poc_proxy_choice: contextvars.ContextVar = contextvars.ContextVar(
+    "build_poc_proxy_choice", default=None,
+)
+
+
+def _attack_proxy_for(ip, eid=None, run_id=None, operator_choice=None):
+    """Resolve + enforce the attack proxy for one dispatch to the listener.
+
+    Returns (decision, refusal) -- `refusal` is None when the dispatch may
+    proceed, else the operator-facing reason it must not. Traces either way.
+
+    EVERY call site that posts to kali-listener /vectors/run goes through this.
+    It is a function rather than an inline block because the first version was
+    inline in the refine loop, and `_known_good_probe` -- a second site posting
+    to the same endpoint -- was missed. Its nuclei probe egressed from the
+    listener's own address while the refine loop beside it was proxied, which
+    the live `[proxy] UNDECIDED` line caught on 2026-10-16.
+    """
+    try:
+        from etl.attack_proxy import (resolve as _r, enforce as _e,
+                                      require_proxy as _req,
+                                      allow_direct_on_own_network as _loc,
+                                      node_proxy as _np, ProxyRequired as _PR,
+                                      note as _note)
+    except Exception as e:  # noqa: BLE001
+        return None, (f"proxy policy unavailable ({type(e).__name__}: {e}) - "
+                      f"refusing to dispatch rather than attack direct")
+    choice = operator_choice if operator_choice is not None else (
+        _build_poc_proxy_choice.get() or {})
+    op_proxy = (choice or {}).get("proxy_url")
+    try:
+        if not op_proxy and (choice or {}).get("node"):
+            op_proxy, _lbl = _np(get_db, choice["node"])
+            if not op_proxy:
+                return None, (f"node {choice['node']!r} is not online or exposes no "
+                              f"SOCKS port - refusing to fall back to a different "
+                              f"node than the one you picked")
+        dec = _r(get_db, target=str(ip), engagement_id=eid, operator_proxy=op_proxy)
+        try:
+            _e(dec, _req(get_db), _loc(get_db))
+        except _PR as pe:
+            _poc_trace(run_id, "proxy_refused", response=str(pe),
+                       extra={"target": str(ip)})
+            return None, str(pe)
+    except Exception as e:  # noqa: BLE001
+        # Could not evaluate the policy. That is an unknown, never permission.
+        msg = (f"proxy policy could not be evaluated ({type(e).__name__}: {e}) - "
+               f"refusing to dispatch rather than attack direct by default")
+        _poc_trace(run_id, "proxy_refused", response=msg, extra={"target": str(ip)})
+        return None, msg
+    _poc_trace(run_id, "proxy_selected", response=_note(dec, ""),
+               extra={"proxy_url": dec.proxy_url, "source": dec.source,
+                      "label": dec.label})
+    return dec, None
+
+
+def _vectors_run_payload(command, ip, port, timeout, decision):
+    """The /vectors/run body, with the proxy decision attached.
+
+    One builder so a new dispatch site cannot omit the proxy fields and have
+    the listener report UNDECIDED.
+    """
+    return {"command": command, "target": str(ip), "port": int(port or 80),
+            "timeout": int(timeout),
+            "proxy_url": getattr(decision, "proxy_url", None),
+            "proxy_label": getattr(decision, "label", None),
+            "proxy_source": getattr(decision, "source", None),
+            "proxy_decided": True}
+
+
+class _RefusedResponse:
+    """A listener response that never happened, because policy refused it.
+
+    Shaped like the httpx response every caller already handles -- status, a
+    `.json()` body with `output`, `.text`, `.elapsed` -- so a refusal surfaces
+    through each caller's EXISTING error path instead of needing twelve
+    bespoke branches. Nothing was dispatched.
+    """
+    status_code = 403
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        self.text = f"[proxy] REFUSED\n{reason}"
+
+    def json(self):
+        return {"ok": False, "exit_code": None, "output": self.text,
+                "proxy": "[proxy] REFUSED", "refused": True}
+
+    @property
+    def elapsed(self):
+        import datetime as _dt
+        return _dt.timedelta(0)
+
+
+def _listener_vectors_run(listener, command, ip, port, timeout, *, eid=None,
+                          run_id=None, headers=None, http_timeout=None,
+                          api_key=None):
+    """THE way to run a command on the target through kali-listener.
+
+    Resolves and enforces the attack proxy, then posts. Returns the response,
+    or a `_RefusedResponse` when policy refused -- never dispatches in that
+    case.
+
+    Every /vectors/run dispatch goes through here. Twelve sites posted
+    directly and were unproxied until 2026-10-16; routing them through one
+    function is what makes "every attack is proxied" checkable rather than a
+    claim about twelve places someone has to remember.
+    """
+    import httpx as _hx
+    dec, refusal = _attack_proxy_for(ip, eid=eid, run_id=run_id)
+    if refusal:
+        return _RefusedResponse(refusal)
+    hdrs = dict(headers or {})
+    hdrs.setdefault("x-api-key", api_key or API_KEY)
+    return _hx.post(f"{str(listener).rstrip('/')}/vectors/run",
+                    json=_vectors_run_payload(command, ip, port, timeout, dec),
+                    headers=hdrs, verify=False,
+                    timeout=http_timeout if http_timeout is not None else int(timeout) + 60)
+
+
+class _SkipDispatch(Exception):
+    """Internal: the refine loop decided NOT to send this command.
+
+    Raised inside the dispatch `try` so the skip takes the same exit as a
+    transport failure, without the surrounding handler mistaking it for one.
+    Used by the proxy policy: a refused attack must not be dispatched, and
+    must not be counted as a target run it never made.
+    """
+
 # ── derivation SUB-budget ──────────────────────────────────────────────────
 #
 # The wall deadline above is the budget for the WHOLE build, and its own
@@ -16197,10 +16332,16 @@ def _known_good_probe(cve, ip, port, product="", eid=None, run_id=None,
         return out
 
     import httpx as _hx
+    # Same proxy policy as the refine loop. This probe sends real traffic to
+    # the target, so it egresses from the node like any other attack.
+    _kg_dec, _kg_refusal = _attack_proxy_for(ip, eid=eid, run_id=run_id)
+    if _kg_refusal:
+        out["skipped"] = f"proxy refused: {_kg_refusal}"
+        _poc_trace(run_id, "known_good_probe", iteration=0, response=out["skipped"])
+        return out
     try:
         r = _hx.post(f"{listener.rstrip('/')}/vectors/run",
-                     json={"command": cmd, "target": str(ip),
-                           "port": int(port or 80), "timeout": int(budget_sec)},
+                     json=_vectors_run_payload(cmd, ip, port, budget_sec, _kg_dec),
                      headers={"x-api-key": API_KEY}, verify=False,
                      timeout=int(budget_sec) + 30)
         body = (r.json().get("output") or "") if r.status_code < 400 else ""
@@ -16370,11 +16511,10 @@ def _deep_recon_for_gaps(cve, ip, port, product, eid, run_id, manifest: dict, *,
                 try:
                     _listener = os.environ.get("KALI_LISTENER_URL",
                                                "https://kali-listener:8019")
-                    _lr = _hx.post(f"{_listener.rstrip('/')}/vectors/run",
-                                   json={"command": _cmd, "target": str(ip),
-                                         "port": int(port or 80), "timeout": _tl},
-                                   headers={"x-api-key": API_KEY}, verify=False,
-                                   timeout=_tl + 30)
+                    _lr = _listener_vectors_run(_listener, _cmd, ip,
+                                                int(port or 80), _tl,
+                                                eid=eid, run_id=run_id,
+                                                http_timeout=_tl + 30)
                     _tout = (_lr.json().get("output") or "") if _lr.status_code < 400 else ""
                     _ok = _lr.status_code < 400
                 except Exception as _te:  # noqa: BLE001
@@ -17357,8 +17497,40 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
     except Exception:  # noqa: BLE001
         pass
     desc = (spec.get("description") or "").lower()
-    needs_auth = any(k in pre_blob for k in ("auth", "login", "session", "logged", "credential", "cookie")) or \
-                 any(k in desc for k in ("authenticated", "logged-in", "logged in", "requires login", "admin privileges", "with admin"))
+    # ── "pre-auth" contains "auth" ──────────────────────────────────────────
+    #
+    # needs_auth was a bare substring match, and "auth" is a substring of
+    # "pre-authentication" and of "unauthenticated" — the two phrases that mean
+    # EXACTLY THE OPPOSITE. So an advisory reading "a pre-authentication
+    # arbitrary file access" set needs_auth=True and the gate then demanded a
+    # session for a vulnerability whose defining property is that it needs
+    # none.
+    #
+    # Observed on CVE-2026-21589 (2026-10-16), both runs, on a host that 401s
+    # at the root with no login form: stop=gather_incomplete:auth with the
+    # research text saying "pre-authentication arbitrary file access" and
+    # "allows unauthenticated attackers to perform path traversal".
+    #
+    # A negation WINS. It is a stronger statement about the precondition than
+    # the bare presence of the word, and the cost of getting it wrong this way
+    # round is a run that never dispatches at all.
+    _blob = f"{pre_blob} {desc}"
+    _auth_negated = _re.search(
+        r"(?:pre[-\s]?auth(?:entication|enticated)?|un[-\s]?authenticated|"
+        r"without\s+(?:any\s+)?(?:authentication|auth\b|credentials|login)|"
+        r"no\s+authentication(?:\s+(?:is\s+)?required)?|"
+        r"does\s+not\s+require\s+(?:authentication|auth\b|credentials|login)|"
+        r"anonymous(?:ly)?(?:\s+(?:access|exploitable|exploit))?|"
+        r"requires?\s+no\s+(?:authentication|credentials|login))", _blob)
+    # The positive form must not fire on "unauthenticated" / "pre-authenticated"
+    # / "non-authenticated", which is how the bug got in.
+    _auth_positive = (
+        any(k in pre_blob for k in ("login", "session", "logged", "credential", "cookie"))
+        or _re.search(r"(?<!un)(?<!un-)(?<!pre-)(?<!pre )(?<!non-)(?<!non )authenticat(?:ed|ion)", pre_blob)
+        or any(k in desc for k in ("logged-in", "logged in", "requires login",
+                                   "admin privileges", "with admin"))
+        or _re.search(r"(?<!un)(?<!un-)(?<!pre-)(?<!pre )(?<!non-)(?<!non )authenticated", desc))
+    needs_auth = bool(_auth_positive) and not _auth_negated
     if vc == "auth-bypass":
         # The session is what the exploit PRODUCES. Demanding one first blocked
         # CVE-2024-3408 in round 5 ("missing: auth") by construction.
@@ -17421,6 +17593,11 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
             else:
                 add("auth", "missing",
                     "exploit needs authentication; no session cookie in hand", "analysis")
+    elif _auth_negated:
+        add("auth", "n/a",
+            f"the advisory describes this as exploitable WITHOUT authentication "
+            f"({_auth_negated.group(0).strip()!r}) — demanding a session would "
+            f"refuse the very thing under test", "analysis:pre-auth")
     else:
         add("auth", "n/a", "not required by advisory/preconditions", "analysis")
 
@@ -18819,9 +18996,8 @@ def _shadow_dispatch_decomposed(new: dict, cve, ip, port, eid, run_id, model=Non
     out["attempted"] = True
     t0 = _t.time()
     try:
-        lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
-                      json={"command": command, "target": str(ip), "port": port, "timeout": timeout},
-                      headers={"x-api-key": API_KEY}, verify=False, timeout=timeout + 60)
+        lr = _listener_vectors_run(listener, command, ip, port, timeout,
+                                   eid=eid, run_id=run_id)
         d = lr.json() if lr.status_code < 400 else {}
         output = d.get("output", "") or lr.text
         ec = d.get("exit_code") if isinstance(d, dict) else None
@@ -19669,9 +19845,7 @@ def _poc_reflection_detected(command, canary, ip, port, listener, vt):
     control = "CTRLz" + _s.token_hex(5)
     probe_cmd = command.replace(canary, control)
     try:
-        lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
-                      json={"command": probe_cmd, "target": str(ip), "port": port, "timeout": vt},
-                      headers={"x-api-key": API_KEY}, verify=False, timeout=vt + 60)
+        lr = _listener_vectors_run(listener, probe_cmd, ip, port, vt)
         d = lr.json() if lr.status_code < 400 else {}
         out = (d.get("output", "") if isinstance(d, dict) else "") or lr.text
     except Exception:  # noqa: BLE001
@@ -19916,9 +20090,7 @@ def _postex_run(command, ip, port):
     listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
     vt = int(os.environ.get("VECTOR_RUN_TIMEOUT", "600"))
     try:
-        lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
-                      json={"command": command, "target": str(ip), "port": port, "timeout": vt},
-                      headers={"x-api-key": API_KEY}, verify=False, timeout=vt + 60)
+        lr = _listener_vectors_run(listener, command, ip, port, vt)
         d = lr.json() if lr.status_code < 400 else {}
         return (d.get("output", "") if isinstance(d, dict) else "") or lr.text
     except Exception as e:  # noqa: BLE001
@@ -21440,11 +21612,8 @@ def _discover_live_paths(ip, port, timeout=25, max_paths=25):
         f"esac; done"
     )
     try:
-        r = _hx.post(f"{listener.rstrip('/')}/vectors/run",
-                     json={"command": cmd, "target": str(ip), "port": int(port),
-                           "timeout": max(10, timeout)},
-                     headers={"x-api-key": API_KEY}, verify=False,
-                     timeout=max(15, timeout) + 10)
+        r = _listener_vectors_run(listener, cmd, ip, int(port), max(10, timeout),
+                                  http_timeout=max(15, timeout) + 10)
         d = r.json() if r.status_code < 400 else {}
         out = d.get("output", "") if isinstance(d, dict) else ""
     except Exception as e:  # noqa: BLE001
@@ -22409,11 +22578,8 @@ def _timing_confirmation_rerun(command, assertion, ip, port, listener,
                 "reason": "no timing payload found in command to scale"}
     try:
         t0 = _t.time()
-        lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
-                      json={"command": scaled_cmd, "target": str(ip),
-                            "port": port, "timeout": vt},
-                      headers={"x-api-key": api_key}, verify=False,
-                      timeout=vt + 60)
+        lr = _listener_vectors_run(listener, scaled_cmd, ip, port, vt,
+                                   api_key=api_key)
         elapsed = round(_t.time() - t0, 2)
         _out_sample = (lr.json().get("output","")[:120]
                        if lr.status_code < 400 else "")[:120]
@@ -26664,9 +26830,9 @@ def _curl_run(ip, port, cmd, timeout=30, engagement_id=None):
     if engagement_id:
         headers["X-Engagement-Id"] = str(engagement_id)
     try:
-        r = _hx.post(f"{listener.rstrip('/')}/vectors/run",
-                     json={"command": cmd, "target": str(ip), "port": port, "timeout": timeout},
-                     headers=headers, verify=False, timeout=timeout + 30)
+        r = _listener_vectors_run(listener, cmd, ip, port, timeout,
+                                  eid=engagement_id, headers=headers,
+                                  http_timeout=timeout + 30)
         d = r.json() if r.status_code < 500 else {}
         return (d.get("output", "") if isinstance(d, dict) else "") or r.text
     except Exception as e:  # noqa: BLE001
@@ -28217,16 +28383,35 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                 metrics.setdefault("skipped_runs_prerun_404", 0)
                 metrics["skipped_runs_prerun_404"] += 1
             else:
+                # ── Select the proxy for this attack ────────────────────
+                # Shared with _known_good_probe via _attack_proxy_for, because
+                # this was inline first and the second dispatch site was
+                # missed -- its traffic went direct while this one was proxied.
+                _px, _px_err = _attack_proxy_for(ip, eid=eid, run_id=run_id)
+                if _px_err:
+                    output = f"[proxy] REFUSED\n{_px_err}"
+                    ec = 46          # 46 = refused by proxy policy (45 is tool-missing)
+                    metrics.setdefault("skipped_runs_proxy", 0)
+                    metrics["skipped_runs_proxy"] += 1
+                    lr = None
                 try:
+                    if _px_err:
+                        raise _SkipDispatch()
                     lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
-                                  json={"command": command, "target": str(ip), "port": port, "timeout": _vt},
+                                  json=_vectors_run_payload(command, ip, port, _vt, _px),
                                   headers={"x-api-key": API_KEY}, verify=False, timeout=_vt + 60)
                     d = lr.json() if lr.status_code < 400 else {}
                     output = d.get("output", "") or lr.text
                     ec = d.get("exit_code") if isinstance(d, dict) else None
+                except _SkipDispatch:
+                    pass            # already recorded above; nothing was sent
                 except Exception as e:  # noqa: BLE001
                     output = f"listener error: {e}"; ec = None
-                metrics["target_runs"] += 1
+                # A command the proxy policy refused never reached the target,
+                # so it is not a target run. Counting it would inflate the
+                # dispatch metrics with traffic that never left.
+                if not _px_err:
+                    metrics["target_runs"] += 1
                 # Shape improvement #1 (2026-10-06): when the probe got a
                 # non-2xx status and the server returned a diagnostic body
                 # (`{"detail":"Field required: body.url"}` is typical),
@@ -29634,6 +29819,14 @@ class BuildPocBody(BaseModel):
     # it false, so they run ONLY where a grant already exists (fail-closed).
     release: bool = False
     model: Optional[str] = None   # a local ollama model runs locally; else cloud/routed
+    # Proxy for THIS build's attack traffic. Highest precedence, above the
+    # engagement's selected node and above automatic resolution.
+    #   proxy_url: an explicit SOCKS url, e.g. "socks5h://node-manager:10120"
+    #   node:      a node NAME or id -- resolved to that node's SOCKS port, so
+    #              the operator picks a node rather than remembering a port.
+    # Both unset = the engagement's node, then automatic (see etl/attack_proxy).
+    proxy_url: Optional[str] = None
+    node: Optional[str] = None
     # Auth: many targets need a logged-in session. Supply creds (or bruteforce=true to
     # obtain them via default-credential checks) and the builder establishes a session and
     # bakes the cookie into the exploit.
@@ -34441,6 +34634,11 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     # Deep-test knobs — propagate into contextvars so derivation helpers
     # pick them up without passing extra params through 10+ layers.
     _build_poc_candidate_fanout.set(max(1, int(eff_fanout)))
+    # Operator's proxy pick for this run (explicit url, or a node by name/id).
+    _build_poc_proxy_choice.set(
+        {"proxy_url": (body.proxy_url or "").strip() or None,
+         "node": (body.node or "").strip() or None}
+        if (body.proxy_url or body.node) else None)
     _build_poc_deep_flags.set({
         "default_cred_sweep": eff_dcs,
         "wordlist_fuzz": eff_wlf,
@@ -34999,10 +35197,7 @@ def _run_tool_validation(ip, port, tool_entry, eid=None, timeout=150):
         return res
     _t0 = _t.time()
     try:
-        lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
-                      json={"command": test_cmd, "target": str(ip), "port": port,
-                            "timeout": timeout},
-                      headers={"x-api-key": API_KEY}, verify=False, timeout=timeout + 60)
+        lr = _listener_vectors_run(listener, test_cmd, ip, port, timeout, eid=eid)
         d = lr.json() if lr.status_code < 400 else {}
         out = (d.get("output", "") if isinstance(d, dict) else "") or lr.text
         res["ran"] = True
@@ -35777,10 +35972,10 @@ def run_exploit(exploit_id: str, authorized: bool = Depends(auth)):
     response_time_ms = None
     target_response_ms = None
     try:
-        lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
-                       json={"command": row["command"], "target": str(row.get("target_host") or ""),
-                              "port": row.get("target_port") or 80, "timeout": vt},
-                       headers={"x-api-key": API_KEY}, verify=False, timeout=vt + 60)
+        lr = _listener_vectors_run(listener, row["command"],
+                                   str(row.get("target_host") or ""),
+                                   row.get("target_port") or 80, vt,
+                                   eid=row.get("engagement_id"))
         try: response_time_ms = int(lr.elapsed.total_seconds() * 1000)
         except Exception: pass  # noqa: BLE001
         d = lr.json() if lr.status_code < 400 else {}
@@ -36971,10 +37166,10 @@ def run_exploit_version(exploit_id: str, version: int, authorized: bool = Depend
     response_time_ms = None
     target_response_ms = None
     try:
-        lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
-                       json={"command": v["command"], "target": str(parent.get("target_host") or ""),
-                              "port": parent.get("target_port") or 80, "timeout": vt},
-                       headers={"x-api-key": API_KEY}, verify=False, timeout=vt + 60)
+        lr = _listener_vectors_run(listener, v["command"],
+                                   str(parent.get("target_host") or ""),
+                                   parent.get("target_port") or 80, vt,
+                                   eid=parent.get("engagement_id"))
         try: response_time_ms = int(lr.elapsed.total_seconds() * 1000)
         except Exception: pass  # noqa: BLE001
         d = lr.json() if lr.status_code < 400 else {}
@@ -39390,9 +39585,8 @@ def _bakeoff_one(cve, ip, port, store_id, model, eid, guidance=""):
     if command:
         listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
         try:
-            lr = _hx.post(f"{listener.rstrip('/')}/vectors/run",
-                          json={"command": command, "target": str(ip), "port": port, "timeout": 60},
-                          headers={"x-api-key": API_KEY}, verify=False, timeout=120)
+            lr = _listener_vectors_run(listener, command, ip, port, 60,
+                                       eid=eid, http_timeout=120)
             d = lr.json() if lr.status_code < 400 else {}
             output = (d.get("output", "") if isinstance(d, dict) else "") or lr.text
         except Exception as e:  # noqa: BLE001
