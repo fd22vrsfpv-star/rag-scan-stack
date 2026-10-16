@@ -8,7 +8,7 @@ import { useAnalyzeExtractor, type ExtractorAnalyze } from '@/api/agents'
 import {
   FileText, Braces, Loader2, Search, X, Copy, Check, Download, Play,
   AlertTriangle, CheckCircle2, Clock, Zap, RefreshCw, ChevronRight, Sparkles,
-  Pencil, Plus, Bot, RotateCcw, Wand2, Lightbulb, ArrowRight, Upload,
+  Pencil, Plus, Bot, RotateCcw, Wand2, Lightbulb, ArrowRight, Upload, ExternalLink,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -208,9 +208,23 @@ export default function ScanResults() {
                             Without the CVE every build in a 10-CVE run renders
                             as an identical "cve_poc_builder" row. */}
                         {pocLabel(a) && (
-                          <div className="text-[11px] font-sans text-orange-300/90 mt-0.5">
-                            {pocLabel(a)}
-                          </div>
+                          pocWorkbenchHref(a) ? (
+                            <a
+                              href={pocWorkbenchHref(a) as string}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              onClick={e => e.stopPropagation()}
+                              title="Open this build in the Exploit Workbench pop-out — command, assertion and PoC detail. (Click the rest of the row for the raw run output.)"
+                              className="text-[11px] font-sans text-orange-300/90 mt-0.5 inline-flex items-center gap-1 underline decoration-dotted underline-offset-2 hover:text-orange-200"
+                            >
+                              {pocLabel(a)}
+                              <ExternalLink className="w-3 h-3 shrink-0" />
+                            </a>
+                          ) : (
+                            <div className="text-[11px] font-sans text-orange-300/90 mt-0.5">
+                              {pocLabel(a)}
+                            </div>
+                          )
                         )}
                       </td>
                       <td className="px-3 py-2 align-top">
@@ -291,6 +305,34 @@ export default function ScanResults() {
  *  "CVE-2024-22120 — FAILED — needs tweaking"). Falls back to the first line of
  *  the content ("CVE PoC Build: CVE-...") for rows written before the note was
  *  set. Returns null for every non-PoC tool so other rows are unchanged. */
+/** Deep link from a PoC-build artifact to the build it produced.
+ *
+ *  A `cve_poc_builder` row IS an exploit build — it has a CVE, a target and a
+ *  stored PoC behind it. The row opened the raw artifact and nothing pointed
+ *  at the build itself, so the one artifact that is directly actionable was
+ *  the one you had to go looking for.
+ *
+ *  Returns null when there is no CVE or no target to aim at, so the label
+ *  stays plain text rather than becoming a link to nowhere. */
+function pocWorkbenchHref(a: import('@/api/artifacts').Artifact): string | null {
+  if (a.tool !== 'cve_poc_builder') return null
+  const cve = (a.note?.match(/CVE-\d{4}-\d{4,7}/)?.[0]
+    || a.content?.match(/CVE-\d{4}-\d{4,7}/)?.[0] || '').toUpperCase()
+  // `target` may be "ip" or "ip:port"; the artifact's own port wins when set.
+  const rawTarget = (a.target || '').trim()
+  const ip = rawTarget.split(':')[0] || ''
+  const port = a.port || rawTarget.split(':')[1] || ''
+  if (!cve && !ip) return null
+  const q = new URLSearchParams({ tab: 'workbench' })
+  if (ip) q.set('ip', ip)
+  if (port) q.set('port', String(port))
+  if (cve) q.set('cve', cve)
+  // /exploits-popout mounts the SAME ExploitManager, so it reads the same
+  // params — chromeless, in its own tab, which is where an operator wants a
+  // build they are about to work on. Matches the existing Pop-out control.
+  return `/exploits-popout?${q.toString()}`
+}
+
 function pocLabel(a: import('@/api/artifacts').Artifact): string | null {
   if (a.tool !== 'cve_poc_builder') return null
   const fromNote = a.note?.match(/CVE-\d{4}-\d{4,7}.*/)?.[0]

@@ -218,20 +218,87 @@ def _github_exploit_search(product: str, version: str, cve_ids: Optional[list] =
 # Feed fetching
 # ---------------------------------------------------------------------------
 
-def _fetch_feed(url: str, parser: str) -> list:
-    """Pull articles from one source. Returns a list of normalized dicts:
-        {title, link, published, raw_excerpt}
-    All dicts share a stable shape so the downstream upserter is parser-agnostic."""
-    import feedparser  # local import — keeps the module importable even if pip step is pending
-    headers = {"User-Agent": USER_AGENT}
-    try:
-        resp = requests.get(url, headers=headers, timeout=20, verify=True)
+def _fetch_feed(url: str, parser: str) -> tuple:
+    """Pull articles from one source. Returns `(articles, error)`.
+
+    `articles` is a list of normalized dicts {title, link, published,
+    raw_excerpt}, all sharing a stable shape so the downstream upserter is
+    parser-agnostic. `error` is None on success, or a string saying exactly
+    what went wrong.
+
+    THE ERROR RETURN IS THE POINT. This used to raise on a bad status and then
+    swallow it:
+
         if resp.status_code >= 400:
             raise RuntimeError(f"http {resp.status_code}")
-        feed = feedparser.parse(resp.content)
-    except Exception:
-        # feedparser can also pull URLs directly; fall back to that path.
-        feed = feedparser.parse(url)
+        ...
+        except Exception:
+            feed = feedparser.parse(url)   # fails quietly, yields nothing
+
+    So a blocked or moved feed produced `articles: 0, error: None` — identical
+    in the run record to a feed that genuinely had nothing new. Measured
+    2026-10-15, four of seventeen sources were in that state and had been for
+    an unknown time:
+
+        GitHub Security Advisories  HTTP 406  (bot-blocked)
+        Microsoft MSRC              HTTP 301
+        Assetnote Research          HTTP 301
+        CSO Online                  HTTP 404  (serves an HTML error page)
+
+    The feed had been running at 13 of 17 and the panel could not say so.
+    CLAUDE.md: "`except: pass` around an HTTP call hides a 404 forever."
+
+    Redirects are followed explicitly, and the FINAL url is reported, so a feed
+    that moved is distinguishable from one that is blocked.
+    """
+    import feedparser  # local import — keeps the module importable even if pip step is pending
+    headers = {"User-Agent": USER_AGENT,
+               # Several feeds (GitHub's advisories.atom among them) reject a
+               # request that does not say it wants a feed.
+               "Accept": "application/atom+xml, application/rss+xml, "
+                         "application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5"}
+    error = None
+    feed = None
+    try:
+        resp = requests.get(url, headers=headers, timeout=20, verify=True,
+                            allow_redirects=True)
+        # `resp.url` is the url AFTER redirects, which is the useful one to
+        # report — but it only exists on a real requests.Response. Reaching
+        # for it unguarded turned any stub or non-requests response into
+        # "AttributeError: no attribute 'url'", reported as a fetch failure
+        # for a feed that had actually parsed fine.
+        final_url = getattr(resp, "url", None) or url
+        if resp.status_code >= 400:
+            error = "HTTP %s from %s" % (resp.status_code, final_url)
+        elif not (resp.content or b"").strip():
+            error = "HTTP %s but an empty body from %s" % (resp.status_code, final_url)
+        else:
+            feed = feedparser.parse(resp.content)
+            if getattr(feed, "bozo", 0) and not feed.entries:
+                error = "response did not parse as a feed (%s) from %s" % (
+                    type(getattr(feed, "bozo_exception", None)).__name__, final_url)
+            elif final_url != url:
+                # Not an error — but worth surfacing, because a silently
+                # redirected feed is how two of these drifted out of service.
+                log.info("[news] %s redirected to %s", url, final_url)
+    except Exception as e:  # noqa: BLE001
+        error = "%s: %s" % (type(e).__name__, str(e)[:200])
+
+    if feed is None:
+        # Last resort: let feedparser fetch it itself. Keep whatever error we
+        # already have -- if this path rescues the feed we clear it below, and
+        # if it does not, the ORIGINAL reason is what the operator needs.
+        try:
+            feed = feedparser.parse(url)
+            if feed.entries and error:
+                log.info("[news] %s recovered via feedparser after: %s", url, error)
+                error = None
+        except Exception as e:  # noqa: BLE001
+            if not error:
+                error = "%s: %s" % (type(e).__name__, str(e)[:200])
+            feed = None
+    if feed is None:
+        return [], error or "no feed could be fetched"
 
     articles = []
     for entry in feed.entries[:50]:
@@ -262,8 +329,7 @@ def _fetch_feed(url: str, parser: str) -> list:
             "published_at": _parse_published(entry, published),
             "raw_excerpt": excerpt,
         })
-    return articles
-
+    return articles, error
 
 def fetch_all_sources(run_id: Optional[str] = None,
                      enabled_only: bool = True,
@@ -295,7 +361,13 @@ def fetch_all_sources(run_id: Optional[str] = None,
             src_stats = {"id": str(src["id"]), "name": src["name"],
                          "articles": 0, "new": 0, "updated": 0, "error": None}
             try:
-                articles = _fetch_feed(src["url"], src["parser"])
+                articles, fetch_error = _fetch_feed(src["url"], src["parser"])
+                if fetch_error:
+                    # Recorded, not raised: one dead feed must not abort the
+                    # other sixteen. The operator needs the reason, per source,
+                    # in the run record.
+                    src_stats["error"] = fetch_error
+                    log.warning("[news] source %r: %s", src["name"], fetch_error)
                 src_stats["articles"] = len(articles)
                 stats["articles_seen"] += len(articles)
                 stats["sources_fetched"] += 1

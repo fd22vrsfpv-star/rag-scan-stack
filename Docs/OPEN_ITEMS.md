@@ -710,37 +710,34 @@ not distinguish "our exploit pipeline is weak" from "we are answering a harder
 question than the one being scored".
 **Enforced by:** not enforced
 
-### 4 of 17 news sources return nothing, and all 4 report no error
-**Found:** 2026-10-15
-**Evidence:** the latest completed ingest fetched 280 articles across 17
-sources. Four of them contributed **0 articles with `error: None`**, which is
-indistinguishable in the run record from a feed that genuinely had nothing new.
-Fetched directly from `news-runner`:
+### 2 news sources have no working feed and are disabled
+**Found:** 2026-10-15 (superseded the "4 sources return nothing" item, which is fixed)
+**Evidence:** the fetcher now records WHY a source returned nothing, which
+turned four silent zeros into four diagnosable errors. Two were recoverable and
+are fixed; two are not:
 
-    GitHub Security Advisories  https://github.com/advisories.atom   HTTP 406
-    Microsoft MSRC              https://msrc.microsoft.com/blog/feed HTTP 301
-    Assetnote Research          https://www.assetnote.io/feed.xml    HTTP 301
-    CSO Online                  https://www.csoonline.com/index.rss  HTTP 404
+    GitHub Security Advisories  HTTP 406 from https://github.com/advisories.atom
+    Assetnote Research          301 -> https://www.slcyber.io/assetnote (HTML, not a feed)
 
-One bot-block (406 — the Accept/User-Agent we send is rejected), two
-un-followed redirects, and one dead URL that serves 176KB of HTML error page.
-The feed has therefore been running at **13 of 17 sources**; the 2,324 items
-collected come from those 13.
-**Where:** `news_runner/news_agent.py` — the per-source fetch records
-`articles: 0, error: None` rather than checking the HTTP status. The `error`
-field exists and is carried all the way into `news_runs.per_source`; nothing
-populates it for a non-200.
-**Done when:** a non-2xx response is recorded in that source's `error` field
-instead of being flattened to an empty result, redirects are followed, and the
-two stale URLs are corrected. The 406 needs a browser-like `User-Agent` and
-`Accept: application/atom+xml` — GitHub serves the feed to a normal client.
-**Enforced by:** not enforced. A guard would assert that a source whose fetch
-returns non-2xx records a non-null `error`.
-*Why it matters:* this is the repo's recurring "unreachable is not absent", in
-the news fetcher. A blocked source and an idle source look identical, so four
-feeds have been silently contributing nothing and the operator's reasonable
-read of the panel — "nothing is happening" — was closer to the truth than the
-run record was.
+GitHub refuses this client with 406 even when sent a browser `User-Agent` and
+an `Accept: application/atom+xml` header — measured, both return 0 bytes.
+Assetnote was acquired by SL Cyber and the feed did not survive the move;
+`/feed/`, `/rss.xml` and `/assetnote-security-research/rss/` on slcyber.io all
+404.
+
+Both are now `enabled=false` so they stop contributing a zero to every run.
+Fixed in the same pass: Microsoft MSRC moved to
+`https://api.msrc.microsoft.com/update-guide/rss` (50 articles) and CSO Online
+to `https://www.csoonline.com/feed/` (20 articles). 15 of 17 sources enabled.
+**Where:** `news_sources` rows; fetcher `news_runner/news_agent.py::_fetch_feed`.
+**Done when:** GitHub advisories are ingested by some route that it does not
+refuse — its REST/GraphQL advisory API with a token is the obvious one, and is
+a different integration rather than a URL change — and Assetnote's research
+feed is found at its new home or the source is deleted rather than left
+disabled.
+**Enforced by:** not enforced. A guard would assert every ENABLED source
+produced either articles or a non-null error on its last run, which is now
+possible because the error is recorded.
 
 ### News asset-matching pivots through `vulns.cve`, which can never contain tomorrow's CVE
 **Found:** 2026-10-15

@@ -154,7 +154,10 @@ const assetColumns: ColumnDef<Asset, unknown>[] = [
       <span className="inline-flex items-center gap-1 flex-wrap">
         {n > 0 && (
           <Link
-            to={`/exploits?ip=${encodeURIComponent(row.original.ip)}`}
+            // tab=pending explicitly: ?ip= is read by PendingTab, and the
+            // Exploits page defaults to the Workbench, so a link without the
+            // tab landed somewhere that ignores the filter and looked inert.
+            to={`/exploits?tab=pending&ip=${encodeURIComponent(row.original.ip)}`}
             onClick={e => e.stopPropagation()}
             title={`${n} exploit(s) pending approval — open the Exploits queue to release them`}
             className="inline-flex items-center gap-1 text-xs font-semibold px-1.5 py-0.5 rounded border bg-amber-500/15 text-amber-400 border-amber-500/40 hover:bg-amber-500/25"
@@ -164,7 +167,7 @@ const assetColumns: ColumnDef<Asset, unknown>[] = [
         )}
         {spray > 0 && (
           <Link
-            to={`/exploits?ip=${encodeURIComponent(row.original.ip)}`}
+            to={`/exploits?tab=pending&ip=${encodeURIComponent(row.original.ip)}`}
             onClick={e => e.stopPropagation()}
             title={`${spray} open login service(s) and no valid credential yet — a small default-credential spray (<=3 tries/account) is the acceptable first step`}
             className="inline-flex items-center gap-1 text-xs font-semibold px-1.5 py-0.5 rounded border bg-sky-500/15 text-sky-400 border-sky-500/40 hover:bg-sky-500/25"
@@ -174,9 +177,13 @@ const assetColumns: ColumnDef<Asset, unknown>[] = [
         )}
         {poc > 0 && (
           <Link
-            to={`/exploits?tab=store&ip=${encodeURIComponent(row.original.ip)}`}
+            // `tab=store` was folded into the Workbench by the tab refactor, and
+            // the Workbench is already the default — so this navigated to the
+            // page you were effectively already on, with ?ip= read by nobody.
+            // The Workbench's PoC Store list now honours ?ip=.
+            to={`/exploits?tab=workbench&ip=${encodeURIComponent(row.original.ip)}`}
             onClick={e => e.stopPropagation()}
-            title={`${poc} built PoC(s), ${vpoc} verified — jump to Exploit Store`}
+            title={`${poc} built PoC(s), ${vpoc} verified — open the PoC Store filtered to this target`}
             className={cn('inline-flex items-center gap-1 text-xs font-semibold px-1.5 py-0.5 rounded border',
               vpoc > 0
                 ? 'bg-green-500/15 text-green-400 border-green-500/40 hover:bg-green-500/25'
@@ -423,7 +430,11 @@ function ExploitWorkbenchOperationsTab({ product, version, collectedCves, embedd
                 <span className="font-mono text-amber-400">{ex.cve}</span>
                 <span className="text-muted-foreground">on {ex.target}</span>
                 <div className="flex-1" />
-                <a href={`/exploits?open=${ex.id}`} target="_blank" rel="noopener"
+                {/* ?open= was read by nothing anywhere in the app — the link
+                    opened an unfiltered Exploits page. Target the host, which
+                    the PoC Store list now filters on. */}
+                <a href={`/exploits?tab=workbench&ip=${encodeURIComponent(ex.target || '')}`}
+                  target="_blank" rel="noopener"
                   className="text-[10px] px-2 py-0.5 rounded border border-border hover:bg-muted">
                   Open in /exploits
                 </a>
@@ -3024,7 +3035,7 @@ export default function AssetBrowser() {
                 )}
               </div>
               <Link
-                to={`/exploits?ip=${encodeURIComponent(selectedIp)}`}
+                to={`/exploits?tab=pending&ip=${encodeURIComponent(selectedIp)}`}
                 className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-amber-600 text-white text-xs font-medium hover:bg-amber-700 whitespace-nowrap"
               >
                 <Zap className="h-3 w-3" /> Review &amp; approve in Exploits

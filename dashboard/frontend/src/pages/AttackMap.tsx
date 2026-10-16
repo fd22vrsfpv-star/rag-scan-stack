@@ -67,7 +67,7 @@ function LinkedRecords({ vector }: { vector: AttackVector }) {
     { to: `/findings?ip=${q}`, icon: Bug, label: 'Findings', count: vector.finding_count, color: 'text-red-400' },
     { to: `/follow-ups?search=${q}`, icon: Flag, label: 'Follow-ups', color: 'text-amber-400' },
     { to: `/recommendations?ip=${q}`, icon: Lightbulb, label: 'Recommendations', color: 'text-cyan-400' },
-    { to: `/exploits?ip=${q}`, icon: Zap, label: 'Exploits', color: 'text-fuchsia-400' },
+    { to: `/exploits?tab=pending&ip=${q}`, icon: Zap, label: 'Exploits', color: 'text-fuchsia-400' },
   ]
   return (
     <div className="mb-3 rounded-lg border border-primary/40 bg-primary/5 p-2.5">

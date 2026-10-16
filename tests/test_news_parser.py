@@ -104,7 +104,8 @@ def test_fetch_feed_parses_local_rss(monkeypatch):
             with open(fixture, "rb") as f:
                 return f.read()
     monkeypatch.setattr(na.requests, "get", lambda *a, **kw: _R())
-    arts = na._fetch_feed("https://example.invalid/a", "rss")
+    arts, err = na._fetch_feed("https://example.invalid/a", "rss")
+    assert err is None, f"a local fixture feed should not error: {err}"
     assert len(arts) == 2
     titles = [a["title"] for a in arts]
     assert any("CVE-2099-12345" in t for t in titles)
@@ -214,7 +215,8 @@ def test_fetch_feed_extracts_published_at(monkeypatch):
                 return f.read()
 
     monkeypatch.setattr(na.requests, "get", lambda *a, **kw: _R())
-    arts = na._fetch_feed("https://example.invalid/a", "rss")
+    arts, err = na._fetch_feed("https://example.invalid/a", "rss")
+    assert err is None, f"a local fixture feed should not error: {err}"
     assert len(arts) == 2
     pubs = [a["published_at"] for a in arts]
     assert all(p is not None for p in pubs), f"pubDate not parsed: {pubs}"

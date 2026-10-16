@@ -47600,28 +47600,78 @@ class ScopeMoveTargets(BaseModel):
 
 @app.post("/engagements/{eid}/scopes/{scope_name}/move", tags=["Engagements"])
 def move_scope_targets(eid: str, scope_name: str, body: ScopeMoveTargets, _: bool = Depends(auth)):
-    """Move specific targets to a different scope/engagement."""
+    """Move specific targets to a different scope/engagement.
+
+    A move is DESTRUCTIVE — it deletes the row from the source scope — so it
+    must leave a record of what moved and from where. This endpoint did not:
+    it wrote `source='moved'` and nothing else, no `scope_decisions` row, no
+    audit entry. Its sibling `/scope/move` has always called
+    `_capture_scope_decisions`, so the same operation was accountable through
+    one route and anonymous through the other.
+
+    That asymmetry is invisible until the record is needed. Seven
+    `*.agents_net` hostnames — including our own `zap` and
+    `playwright-scanner` containers — were moved into `excluded` in a single
+    batch on 2026-10-14 20:35:37, and their previous scope is simply
+    unrecoverable: 0 decision rows, 0 audit entries. The outcome was right;
+    the provenance was gone. `/scope/move`'s own docstring records a worse
+    case, where a widened move took `examplecorp.com` and `legacycorp.net` — the two
+    apexes defining the engagement — out of scope from a dialog that said
+    "77 item(s) selected".
+
+    Two other defects fixed here:
+
+    * `target_type` was hardcoded to 'domain', so every IP moved through this
+      route was recorded as a domain. Derived now, the same way
+      `_capture_scope_decisions` does it.
+    * `except Exception: conn.rollback()` rolled back the WHOLE transaction
+      mid-loop and then kept going, so one bad target silently discarded every
+      move already made while `moved` still counted them — a success count
+      that could describe work that no longer existed. Failures are now
+      collected per target and reported.
+    """
     moved = 0
+    moved_targets: list = []
+    failed: list = []
     with get_db() as conn, conn.cursor() as cur:
         for target in body.targets:
+            t = (target or "").strip()
+            if not t:
+                continue
             try:
-                # Delete from source
                 cur.execute(
-                    "DELETE FROM scope_targets WHERE engagement_id = %s::uuid AND name = %s AND target = %s RETURNING id",
-                    (eid, scope_name, target)
-                )
+                    "DELETE FROM scope_targets WHERE engagement_id = %s::uuid "
+                    "AND name = %s AND target = %s RETURNING id",
+                    (eid, scope_name, t))
                 if cur.rowcount > 0:
-                    # Insert into destination
+                    ttype = "ip" if t.replace(".", "").isdigit() or ":" in t else "domain"
                     cur.execute("""
                         INSERT INTO scope_targets (engagement_id, name, target, target_type, source)
-                        VALUES (%s::uuid, %s, %s, 'domain', 'moved')
+                        VALUES (%s::uuid, %s, %s, %s, 'moved')
                         ON CONFLICT (engagement_id, name, target) DO NOTHING
-                    """, (body.to_engagement_id, body.to_scope_name, target))
+                    """, (body.to_engagement_id, body.to_scope_name, t, ttype))
                     moved += 1
-            except Exception:
-                conn.rollback()
+                    moved_targets.append(t)
+            except Exception as e:  # noqa: BLE001
+                # Per-target savepoint semantics: report the one that failed
+                # instead of discarding the whole batch silently.
+                failed.append({"target": t, "error": str(e)[:200]})
+        # Provenance BEFORE the commit, in the same transaction, so a recorded
+        # decision can never describe a move that did not land.
+        if moved_targets:
+            try:
+                _capture_scope_decisions(moved_targets, scope_name,
+                                         body.to_scope_name, cur)
+            except Exception as e:  # noqa: BLE001
+                # Never lose the move over the bookkeeping, but say so — a
+                # silent failure here is how the record went missing before.
+                logging.warning("scope move provenance not captured for %d "
+                                "target(s) %s -> %s: %s", len(moved_targets),
+                                scope_name, body.to_scope_name, e)
         conn.commit()
-    return {"ok": True, "moved": moved, "from": f"{eid}/{scope_name}", "to": f"{body.to_engagement_id}/{body.to_scope_name}"}
+    return {"ok": True, "moved": moved, "failed": failed,
+            "from": f"{eid}/{scope_name}",
+            "to": f"{body.to_engagement_id}/{body.to_scope_name}"}
 
 
 class ScopeMoveAll(BaseModel):

@@ -623,6 +623,9 @@ export default function FindingsExplorer() {
                               severity={item.severity}
                               target={item.findings[0]?.url || item.findings[0]?.hostname || item.findings[0]?.ip || ''}
                               findingId={item.findings[0]?.id}
+                              ip={item.findings[0]?.ip}
+                              port={item.findings[0]?.port}
+                              cve={item.findings[0]?.cve}
                               onCreateFollowUp={topCreateFollowUp}
                               onCreateRule={topCreateAdhocRule}
                             />
@@ -717,6 +720,9 @@ export default function FindingsExplorer() {
                           severity={f.severity}
                           target={f.url || f.hostname || f.ip || ''}
                           findingId={f.id}
+                          ip={f.ip}
+                          port={f.port}
+                          cve={f.cve}
                           onCreateFollowUp={topCreateFollowUp}
                           onCreateRule={topCreateAdhocRule}
                         />
@@ -1640,13 +1646,31 @@ function AutoEvidenceCard({ item }: { item: AutoEvidenceItem }) {
 
 // ─── Quick Actions (inline on finding rows) ─────────
 function FindingQuickActions({
-  title, source, severity, target, findingId,
+  title, source, severity, target, findingId, ip, port, cve,
   onCreateFollowUp, onCreateRule,
 }: {
   title: string; source: string; severity: string; target: string; findingId?: string
+  ip?: string; port?: number | string; cve?: string | string[]
   onCreateFollowUp: ReturnType<typeof useCreateFollowUp>
   onCreateRule: ReturnType<typeof useCreateAdhocRule>
 }) {
+  // A finding written by the PoC builder HAS a built exploit behind it — the
+  // confirmed command, the assertion, the whole build. The row showed the
+  // verdict ("CVE-2024-36675: verified exploit on 172.19.145.100:9090") and
+  // offered no way to reach any of it, so the one finding that is already
+  // actionable was the one you had to go hunting for.
+  //
+  // vulns.cve is a text[], so the API hands back an array here.
+  const firstCve = Array.isArray(cve) ? cve[0] : cve
+  const wbIp = ip || (target || '').split(':')[0] || ''
+  const wbPort = port || (target || '').split(':')[1] || ''
+  const hasPoc = source === 'poc_builder' && !!wbIp
+  // The chromeless pop-out, in its own tab: it mounts the same ExploitManager
+  // and reads the same params, and a build you are about to work on belongs in
+  // its own window rather than replacing the findings list you are triaging.
+  const wbHref = `/exploits-popout?tab=workbench&ip=${encodeURIComponent(wbIp)}`
+    + (wbPort ? `&port=${encodeURIComponent(String(wbPort))}` : '')
+    + (firstCve ? `&cve=${encodeURIComponent(String(firstCve))}` : '')
   const [done, setDone] = useState<'followup' | 'rule' | null>(null)
 
   const matchName = (title || '').replace(/[^\w\s-]/g, '').trim()
@@ -1700,6 +1724,18 @@ function FindingQuickActions({
 
   return (
     <div className="flex items-center gap-0.5">
+      {hasPoc && (
+        <a
+          href={wbHref}
+          target="_blank"
+          rel="noopener noreferrer"
+          onClick={e => e.stopPropagation()}
+          title={`Open the built PoC for ${firstCve || 'this finding'} in the Exploit Workbench pop-out — command, assertion and build detail`}
+          className="p-1 rounded border border-purple-500/40 bg-purple-500/10 text-purple-300 hover:bg-purple-500/20"
+        >
+          <Sparkles className="h-3 w-3" />
+        </a>
+      )}
       <button
         onClick={handleFollowUp}
         className="p-1 rounded text-muted-foreground hover:text-amber-400 hover:bg-amber-500/10"
