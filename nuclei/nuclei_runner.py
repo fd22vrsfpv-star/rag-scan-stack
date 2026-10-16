@@ -740,6 +740,75 @@ def _read_body(fpath: str, max_body: int = 12000) -> str:
         return exec_part[:max_body]
     return (info_part[-(max_body - len(exec_part)):] + exec_part)
 
+@app.get("/templates/by-tag/{tag}")
+def templates_by_tag(tag: str, limit: int = 6, severity: str = "critical,high"):
+    """CVE template ids carrying `tag`, newest first.
+
+    Operator ask, 2026-10-15: "also consider past cve's that are similar for
+    the same product, some of those might have similar faults." A product's
+    vulnerabilities cluster by component and by coding habit, so last year's
+    template for the same product frequently fires on this year's bug -- and
+    when it does it hands the synthesis step a WORKING request shape for the
+    right application instead of a guess.
+
+    Why this endpoint and not /templates/search: that one matches on FILENAME,
+    and a CVE template is named CVE-2024-22120.yaml, which contains no product
+    name. Measured 2026-10-15 it returns ZERO CVE templates for Zabbix,
+    WordPress, Apache and Jenkins alike. Templates carry the product as a TAG
+    ("edb,packetstorm,zabbix,unauth,...") and that is the only axis that finds
+    them.
+
+    Why it lives here rather than shelling `nuclei -tl` through the listener:
+    this is a query against a local corpus, not an action against a target.
+    Routed through the dispatcher it was refused -- correctly -- with
+    "out of scope: target 127.0.0.1 is not in the configured scope", because
+    a command needs a target and a corpus query has none.
+
+    `limit` is load-bearing. After filtering to critical/high CVE templates:
+    zabbix 5, jenkins 7, php 19, microsoft 20, apache 104, wordpress 600.
+    Running 600 templates at a host is a vulnerability scan, not the control
+    experiment the caller wants.
+    """
+    import os as _os
+    import re as _re
+    import yaml as _yaml
+    t = (tag or "").strip().lower()
+    if not _re.fullmatch(r"[a-z0-9][a-z0-9._-]{1,38}", t):
+        return {"ok": False, "tag": tag, "ids": [],
+                "reason": "tag must be a short alphanumeric product name"}
+    if not _os.path.isdir(TEMPLATES):
+        return {"ok": False, "tag": t, "ids": [],
+                "reason": f"templates directory not found: {TEMPLATES}"}
+    wanted_sev = {x.strip().lower() for x in (severity or "").split(",") if x.strip()}
+    found = []
+    for root, _dirs, files in _os.walk(TEMPLATES):
+        if "/cves/" not in root.replace("\\", "/") + "/":
+            continue
+        for fname in files:
+            if not fname.lower().endswith(".yaml"):
+                continue
+            tid = fname[:-5]
+            if not tid.upper().startswith("CVE-"):
+                continue
+            try:
+                with open(_os.path.join(root, fname), encoding="utf-8",
+                          errors="ignore") as fh:
+                    meta = _yaml.safe_load(fh.read(2048)) or {}
+            except Exception:  # noqa: BLE001
+                continue
+            info = meta.get("info") or {}
+            tags = str(info.get("tags") or "").lower()
+            if t not in [x.strip() for x in tags.split(",")]:
+                continue
+            if wanted_sev and str(info.get("severity") or "").lower() not in wanted_sev:
+                continue
+            found.append(tid.upper())
+    # Sorting the id sorts by year then number, so reverse is newest-first.
+    found = sorted(set(found), reverse=True)
+    return {"ok": True, "tag": t, "total": len(found),
+            "ids": found[:max(0, int(limit))]}
+
+
 @app.get("/templates/for-cve/{cve}")
 def template_for_cve(cve: str, include_body: bool = False, max_body: int = 12000):
     """Is there a nuclei template for this CVE, and what would running it mean?

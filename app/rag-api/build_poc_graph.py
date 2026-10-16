@@ -107,6 +107,23 @@ class BuildPocState(TypedDict, total=False):
     # in round 1.
     prior_cmd_signatures: List[str]
 
+    # Result of the known-good control run: the CVE's own nuclei template plus
+    # a bounded set of same-product CVE templates, executed BEFORE synthesis.
+    # {"ran": [...], "hit": [...], "evidence": str, "skipped": reason|None}.
+    # A hit is third-party evidence the target is vulnerable AND a working
+    # request shape; no hit on a verified template points at the target or the
+    # plumbing rather than at synthesis.
+    known_good: Dict[str, Any]
+
+    # Post-run review agent output. node_post_run_review returned this WITHOUT
+    # it being declared here, and LangGraph drops an undeclared key silently —
+    # no error, no warning, the key simply is not in the final state (verified
+    # 2026-10-15 against the installed langgraph). Nothing read it, so nothing
+    # broke; the review is persisted to build_poc_reviews and traced
+    # independently. Declaring it makes the field actually flow, so the next
+    # reader gets the review instead of None for a reason nobody could see.
+    review: Dict[str, Any]
+
     # Final verdict
     verified: bool
     reflection: bool
@@ -1101,6 +1118,42 @@ def node_research(state: BuildPocState) -> Dict[str, Any]:
                        extra={"nuclei_template": _tr})
     except Exception as e:  # noqa: BLE001
         logging.debug("nuclei template check skipped for %s: %s", state.get("cve"), e)
+
+    # ── RUN THE KNOWN-GOOD CHECK, don't just note that one exists ───────────
+    #
+    # The block above has asked "does projectdiscovery ship a check for this
+    # CVE" since it was written, logged the answer, and then synthesised from
+    # scratch regardless — its own comment said so: "Advisory only — never
+    # gates the build". On 2026-10-15 CVE-2024-3408 carried a template marked
+    # verified=True and the build ran nine commands, ended max_iters, and never
+    # executed it.
+    #
+    # Running it first is a CONTROL. Without one, a failed build cannot
+    # separate "the exploit is hard" from "the target is not vulnerable" from
+    # "our plumbing is broken". It also tries a bounded set of CVE templates
+    # for the SAME PRODUCT, because a product's faults cluster by component and
+    # coding habit — a 2022 Zabbix template firing on a 2024 Zabbix bug hands
+    # synthesis a working request shape for the right application instead of a
+    # guess.
+    #
+    # Advisory in the other direction: it never blocks the build, and every
+    # failure is swallowed. It is scope-gated like any other target traffic.
+    _known_good = None
+    if (os.environ.get("BUILD_POC_KNOWN_GOOD", "on") or "on").lower() != "off":
+        try:
+            from api import _known_good_probe
+            kg = _known_good_probe(
+                state["cve"], state["ip"], state["port"],
+                product=state.get("product") or "", eid=state.get("eid"),
+                run_id=state["run_id"])
+            # Carried on the RETURN, not by mutating `state`: a LangGraph node's
+            # changes propagate only through the dict it returns, so assigning
+            # to state here would have been silently discarded and synthesis
+            # would never have seen the result.
+            _known_good = kg
+        except Exception as e:  # noqa: BLE001
+            logging.debug("known-good probe skipped for %s: %s", state.get("cve"), e)
+
     # Agent-driven spec derivation. Skip if a hand-curated YAML spec already exists
     # or env BUILD_POC_AUTO_DERIVE=off.
     if (os.environ.get("BUILD_POC_AUTO_DERIVE", "on") or "on").lower() != "off":
@@ -1123,7 +1176,10 @@ def node_research(state: BuildPocState) -> Dict[str, Any]:
                                   "source": derived.get("source")})
         except Exception as e:  # noqa: BLE001
             logging.debug("spec derivation failed: %s", e)
-    return {"research_out": research_out}
+    _out = {"research_out": research_out}
+    if _known_good:
+        _out["known_good"] = _known_good
+    return _out
 
 
 # ── guidance assembly (parity-critical) ────────────────────────────────────────
@@ -1140,10 +1196,39 @@ def node_assemble_guidance(state: BuildPocState) -> Dict[str, Any]:
     recon_guidance = " ".join(state.get("segments") or [])
     hint_guidance = state.get("hint_guidance") or ""
     auth_guidance = state.get("auth_guidance") or ""
+
+    # KNOWN-GOOD EVIDENCE, first and in its own voice.
+    #
+    # A nuclei template that FIRED against this host is third-party proof the
+    # vulnerability is present and a working request shape for it. Leaving that
+    # in the trace while synthesis guesses is the same mistake the pipeline
+    # already made with `input_field = listingfields`: the fact was gathered,
+    # rendered somewhere nobody read, and ignored by all 26 dispatched
+    # commands. So it goes at the FRONT of the guidance, labelled as evidence
+    # rather than suggestion.
+    kg = state.get("known_good") or {}
+    kg_guidance = ""
+    if kg.get("hit"):
+        _own = [h for h in kg["hit"]
+                if str(h.get("template", "")).upper() == str(state.get("cve", "")).upper()]
+        _sib = [h for h in kg["hit"] if h not in _own]
+        kg_guidance = (
+            "KNOWN-GOOD EVIDENCE — a third-party check already FIRED on this "
+            "host.\n"
+            + ("  The CVE's OWN nuclei template matched: %s. The target IS "
+               "vulnerable; you are reproducing a known-working request, not "
+               "searching for one.\n" % ", ".join(h["template"] for h in _own)
+               if _own else "")
+            + ("  Template(s) for OTHER CVEs in the same product matched: %s. "
+               "The same product has this class of fault and these request "
+               "shapes reach it — adapt them rather than starting from the "
+               "advisory text.\n" % ", ".join(h["template"] for h in _sib)
+               if _sib else "")
+            + "  Matcher output:\n" + (kg.get("evidence") or "")[:1500] + "\n")
     if recon_guidance:
-        guidance = hint_guidance + (recon_guidance + " " + auth_guidance).strip()
+        guidance = kg_guidance + hint_guidance + (recon_guidance + " " + auth_guidance).strip()
     else:
-        guidance = hint_guidance + auth_guidance
+        guidance = kg_guidance + hint_guidance + auth_guidance
     # Research overrides — same as monolith: when research_out is present, rebuild
     # guidance from (auth_guidance + " " + " ".join(research_parts)).strip()
     research_out = state.get("research_out")
@@ -2191,6 +2276,76 @@ def build_graph():
     return g.compile()
 
 
+def summarize_state(final: Dict[str, Any], declared=None) -> Dict[str, Any]:
+    """A bounded, reviewable picture of what the graph KNEW when it finished.
+
+    The state is the pipeline's entire memory -- 69 fields carrying the recon,
+    the session, the manifest, the facts, the verdict -- and at the end of a
+    run it was discarded. The trace recorded what each node SAID; nothing
+    recorded what the pipeline ENDED UP KNOWING. So "why did synthesis not use
+    the session" or "did the manifest ever get a product" could only be
+    answered by replaying node output and inferring.
+
+    Bounded on purpose. Dumping the state verbatim would write tens of
+    kilobytes of recon segments into every run's trace and bury the signal it
+    is meant to surface, so each field is reduced to its SHAPE -- type, size,
+    and the value itself only when it is small enough to read.
+
+    Returns {"populated": n, "empty": n, "fields": {name: shape}, "missing":
+    [...], "verdict": {...}} -- never raises.
+    """
+    try:
+        declared = declared or list(getattr(BuildPocState, "__annotations__", {}) or {})
+    except Exception:  # noqa: BLE001
+        declared = []
+    fields, empty, missing = {}, 0, []
+    for name in sorted(declared):
+        if name not in (final or {}):
+            missing.append(name)
+            continue
+        v = (final or {}).get(name)
+        if v is None or v == "" or v == [] or v == {}:
+            empty += 1
+            fields[name] = "empty"
+            continue
+        if isinstance(v, (bool, int, float)):
+            fields[name] = v
+        elif isinstance(v, str):
+            fields[name] = v if len(v) <= 80 else "str(%d chars)" % len(v)
+        elif isinstance(v, (list, tuple)):
+            fields[name] = "list(%d)" % len(v)
+        elif isinstance(v, dict):
+            # The KEYS of a dict are the useful part at a glance -- they say
+            # which sub-facts exist -- and they are small.
+            ks = sorted(str(k) for k in v)[:12]
+            fields[name] = "dict(%d): %s" % (len(v), ks)
+        else:
+            fields[name] = type(v).__name__
+    # `result` is normally the refine loop's verdict dict, but a crashed or
+    # half-built run can leave anything there. Coerce rather than trust: the
+    # docstring promises this never raises, and `"a string".get(...)` is
+    # exactly how that promise gets broken.
+    res = (final or {}).get("result")
+    if not isinstance(res, dict):
+        res = {}
+    return {
+        "populated": len(fields) - empty,
+        "empty": empty,
+        "missing": missing,
+        "fields": fields,
+        # The verdict, pulled out so a reader does not have to hunt for it.
+        "verdict": {
+            "verified": res.get("verified", (final or {}).get("verified")),
+            "success": res.get("success", (final or {}).get("success")),
+            "stop_reason": res.get("stop_reason"),
+            "iterations": res.get("iterations", (final or {}).get("iters")),
+            "off_target": res.get("off_target"),
+            "drifted": res.get("drifted"),
+            "verification_method": res.get("verification_method"),
+        },
+    }
+
+
 def invoke_build_poc(state: BuildPocState) -> Dict[str, Any]:
     """Run the graph and return the same dict shape _build_poc_core returned to
     its endpoint caller: {command, assertion, canary, success, verified,
@@ -2211,6 +2366,21 @@ def invoke_build_poc(state: BuildPocState) -> Dict[str, Any]:
         except Exception:  # noqa: BLE001
             pass
         raise
+    # The graph's final state, summarised into the trace. See summarize_state:
+    # the state is the pipeline's whole memory and it used to be discarded at
+    # this point, so a reviewer could see what each node said but not what the
+    # run ended up knowing.
+    try:
+        from api import _poc_trace
+        _summary = summarize_state(final)
+        _poc_trace(state.get("run_id"), "graph_state_summary",
+                   response=("graph finished: %d fields populated, %d empty, "
+                             "%d never set | verdict=%s"
+                             % (_summary["populated"], _summary["empty"],
+                                len(_summary["missing"]), _summary["verdict"])),
+                   extra=_summary)
+    except Exception as _sse:  # noqa: BLE001
+        logging.debug("graph state summary failed: %s", _sse)
     result = final.get("result") or {}
     session_info = final.get("session_info")
     built = final.get("built") or {}

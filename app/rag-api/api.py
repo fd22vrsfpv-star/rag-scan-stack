@@ -15986,6 +15986,200 @@ def _gap_tool_command(spec: dict, ip, port, product: str = "") -> str | None:
     return cmd
 
 
+# How many sibling-CVE templates to try when the CVE's own template does not
+# exist or does not fire. Bounded hard: this is a control experiment, not a
+# vulnerability scan, and each template is a real request against the target.
+_KNOWN_GOOD_SIBLINGS = int(os.environ.get("BUILD_POC_SIBLING_TEMPLATES", "6") or "6")
+
+
+def _nuclei_product_tag(product: str) -> str:
+    """The nuclei TAG for a product name, or "" when there isn't a usable one.
+
+    Templates are tagged with the product ("edb,packetstorm,zabbix,unauth,..."),
+    which is the only axis that finds a product's CVE templates. The obvious
+    approach -- nuclei-runner's /templates/search?q=<product> -- cannot: it
+    matches on FILENAME, and a CVE template is named CVE-2024-22120.yaml, which
+    contains no product name. Measured 2026-10-15: that search returns 0 CVE
+    templates for Zabbix, WordPress, Apache and Jenkins alike, while
+    `nuclei -tags zabbix` returns 6 CVE templates including this CVE's own.
+    """
+    prod = str(product or "").strip().lower()
+    if not prod or prod in ("unknown", "none", "n/a"):
+        return ""
+    # "Apache httpd" -> "apache"; "Microsoft ASP.NET" -> "asp.net" is not a
+    # tag, so take the first word that is long enough to be a product name.
+    _NOT_A_PRODUCT = {"http", "https", "server", "linux", "unix", "windows",
+                      "web", "the", "and", "inc", "ltd", "com", "org"}
+    for word in prod.replace("-", " ").split():
+        w = "".join(ch for ch in word if ch.isalnum() or ch == ".")
+        if len(w) >= 3 and w not in _NOT_A_PRODUCT:
+            return w
+    return ""
+
+
+def _nuclei_ids_for_tag(tag: str, limit: int) -> list:
+    """Newest `limit` CVE template ids carrying `tag`. [] on any failure.
+
+    Asks nuclei-runner, which owns the corpus. This is a QUERY, not an action:
+    it sends nothing to any target and needs no scope decision. The first
+    version shelled `nuclei -tl` through the listener and was refused --
+    correctly -- with "out of scope: target 127.0.0.1 is not in the configured
+    scope", because the dispatcher requires a target and a corpus query has
+    none.
+    """
+    t = str(tag or "").strip()
+    if not t:
+        return []
+    try:
+        import requests as _rq
+        _nu = os.environ.get("NUCLEI_URL", "https://nuclei-runner:8011")
+        r = _rq.get(f"{_nu}/templates/by-tag/{t}",
+                    params={"limit": int(limit)}, timeout=20, verify=False)
+        return [str(x).upper() for x in ((r.json() or {}).get("ids") or [])]
+    except Exception as e:  # noqa: BLE001
+        logging.debug("sibling template lookup failed for tag %r: %s", t, e)
+        return []
+
+
+def _known_good_probe(cve, ip, port, product="", eid=None, run_id=None,
+                      budget_sec=180) -> dict:
+    """Run the CVE's OWN nuclei template, then siblings, BEFORE synthesising.
+
+    Why this runs first
+    -------------------
+    The pipeline already asked whether projectdiscovery ships a check for the
+    CVE and wrote the answer into the trace -- and then synthesised from
+    scratch anyway. The code said so itself: "Advisory only -- never gates the
+    build". On 2026-10-15 CVE-2024-3408 carried a template marked
+    `verified=True`, and the build ran nine commands, ended `max_iters` and
+    never executed it.
+
+    A known-good payload is not just a shortcut. It is a CONTROL. Without one,
+    a failed build cannot distinguish:
+
+        * the exploit is genuinely hard,
+        * the target is not actually vulnerable,
+        * our plumbing is broken (wrong port, no session, a WAF, CSRF handling).
+
+    A verified template that ALSO fails points at the target or the plumbing. A
+    template that PASSES while our PoC fails isolates the failure to synthesis
+    exactly. Either outcome is worth more than another from-scratch attempt.
+
+    Returns {"ran": [...], "hit": [...], "evidence": str, "skipped": reason|None}.
+    Never raises, never gates: a probe that could not run leaves the build
+    exactly as it was.
+    """
+    out = {"ran": [], "hit": [], "evidence": "", "skipped": None}
+    ids = []
+    try:
+        import requests as _rq
+        _nu = os.environ.get("NUCLEI_URL", "https://nuclei-runner:8011")
+        _tr = _rq.get(f"{_nu}/templates/for-cve/{cve}", timeout=10, verify=False).json()
+        if _tr.get("found") and _tr.get("template_id"):
+            ids.append(str(_tr["template_id"]))
+    except Exception as e:  # noqa: BLE001
+        logging.debug("known-good: template lookup failed for %s: %s", cve, e)
+    tag = _nuclei_product_tag(product)
+    if not ids and not tag:
+        out["skipped"] = ("no template for this CVE and no usable product tag "
+                          "(product=%r) — nothing known-good to try" % (product,))
+        return out
+
+    # AUTHORISATION. Same gate as every other target-bound command; a template
+    # id is not permission to send traffic.
+    scheme = "https" if int(port or 80) in (443, 8443) else "http"
+    url = "%s://%s:%s" % (scheme, ip, port or 80)
+    # The CVE's own template by id when it exists; otherwise (or additionally)
+    # every CVE template tagged with this product. `-severity` keeps it to
+    # faults rather than detection panels, and the sibling run is capped so a
+    # product like WordPress (1,157 tagged templates) cannot turn a control
+    # experiment into an estate-wide scan.
+    listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    sibs = []
+    if tag:
+        sibs = [i for i in _nuclei_ids_for_tag(tag, _KNOWN_GOOD_SIBLINGS)
+                if i.upper() != str(cve).upper() and i not in ids]
+    run_ids = ids + sibs
+    if not run_ids:
+        out["skipped"] = ("no template for this CVE and no sibling CVE templates "
+                          "tagged %r" % tag)
+        return out
+    cmd = ("nuclei -id %s -u %s -silent -nc -jsonl -timeout 10 -rate-limit 20"
+           % (",".join(run_ids), url))
+    try:
+        from etl.scope_gate import check_dispatch, load_dispatch_scope
+        with get_db() as _c, _c.cursor() as _cur:
+            _rows, _src = load_dispatch_scope(_cur, eid)
+        _refusal = (check_dispatch(str(ip), _rows, cmd) if _rows
+                    else f"scope unreadable or empty ({_src})")
+    except Exception as _se:  # noqa: BLE001
+        _refusal = f"scope gate unavailable ({type(_se).__name__})"
+    if _refusal:
+        out["skipped"] = f"refused by the scope gate: {_refusal}"
+        _poc_trace(run_id, "known_good_probe", iteration=0,
+                   response=out["skipped"], extra={"ids": ids, "target": str(ip)})
+        return out
+
+    import httpx as _hx
+    try:
+        r = _hx.post(f"{listener.rstrip('/')}/vectors/run",
+                     json={"command": cmd, "target": str(ip),
+                           "port": int(port or 80), "timeout": int(budget_sec)},
+                     headers={"x-api-key": API_KEY}, verify=False,
+                     timeout=int(budget_sec) + 30)
+        body = (r.json().get("output") or "") if r.status_code < 400 else ""
+    except Exception as e:  # noqa: BLE001
+        out["skipped"] = f"dispatch failed: {type(e).__name__}: {e}"
+        _poc_trace(run_id, "known_good_probe", iteration=0, response=out["skipped"])
+        return out
+
+    out["ran"] = run_ids
+    for line in (body or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:  # noqa: BLE001
+            continue
+        tid = str(rec.get("template-id") or rec.get("templateID") or "")
+        if tid:
+            out["hit"].append({"template": tid,
+                               "matched": rec.get("matched-at") or rec.get("host"),
+                               "severity": (rec.get("info") or {}).get("severity")})
+    out["evidence"] = (body or "")[:3000]
+
+    # Record the verdict as a FACT with its provenance. A template hit is a
+    # third-party observation about THIS host, which outranks anything we
+    # inferred from an advisory.
+    for h in out["hit"]:
+        try:
+            _record_confirmation(
+                f"{ip}:{port or 80}", "template_evidence", h["template"], "confirmed",
+                evidence=f"nuclei template {h['template']} matched at {h.get('matched')}",
+                method="nuclei_template", claim_value=h["template"],
+                cve=(cve if h["template"].upper() == str(cve).upper() else None),
+                product=product, engagement_id=eid, run_id=run_id,
+                source="probe_confirmed", probe_id="known_good_probe",
+                source_ref=f"nuclei -id {h['template']}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    _own = [h for h in out["hit"] if h["template"].upper() == str(cve).upper()]
+    _poc_trace(run_id, "known_good_probe", iteration=0,
+               response=(body or "")[:1200],
+               extra={"ids_run": run_ids, "hits": out["hit"],
+                      "own_cve_hit": bool(_own),
+                      "product_tag": tag, "siblings": sibs,
+                      "reason": ("the CVE's own template FIRED — the target is "
+                                 "vulnerable and this is a working payload shape"
+                                 if _own else
+                                 "no template fired; a verified check that also "
+                                 "fails points at the target or the plumbing, "
+                                 "not at synthesis")})
+    return out
+
+
 def _deep_recon_for_gaps(cve, ip, port, product, eid, run_id, manifest: dict, *, auth=None,
                          session_info=None, cred_hints=None, admin_paths=None, recon_text="",
                          id_pool=None, budget_sec=None) -> dict:
@@ -35212,6 +35406,16 @@ _KEY_TRACE_PHASES = {
     # noise: if a verified template existed and the build still failed, that is
     # the first thing the reviewer needs to see.
     "nuclei_template_available",
+    # What the graph ENDED UP KNOWING. The trace records what each node said;
+    # this records the final state -- which fields were populated, which were
+    # empty, which were never set -- so "did the manifest ever get a product"
+    # is answerable without replaying node output and inferring.
+    "graph_state_summary",
+    # The known-good control run: the CVE's own nuclei template plus a bounded
+    # set of same-product CVE templates, executed BEFORE synthesis. When a
+    # verified template fired and the build still failed, that is the first
+    # thing a reviewer needs to see.
+    "known_good_probe",
     "enforced_resolved_ids", "enforced_request_contract",
     "challenge_building_blocks", "readiness_gate",
     "recon:access_enumeration", "poc_captured_credentials",
