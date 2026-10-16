@@ -234,6 +234,68 @@ gap between two rows. (The stage-level bound is done — see the update above.)
 **Enforced by:** `tests/test_derive_budget.py` covers the bound; the per-call
 tracing is not enforced.
 
+### A probe-confirmed advisory endpoint loses to a generic one, and refine follows the loser
+**Found:** 2026-10-16 (CVE-2026-21589 against a Jira host, run `..._1792171874`)
+**Evidence:** two gates in the same run disagreed about the endpoint, and the
+one that was WRONG is the one synthesis and refine used.
+
+`readiness_gate` had probed and confirmed the advisory's own traversal path:
+
+    Already satisfied:
+      - target reachable (HTTP 401)
+      - endpoint /download/resources/<ns>/<path>/..::..::..::..::..::WEB-INF::web.xml
+        exists (HTTP 200)
+
+`gather_check`, moments later, resolved something else entirely:
+
+    [gathered] endpoint = /bamboo/browse  (via candidate_probe:HEAD HTTP 302
+                                           (advisory/derived path))
+
+The traversal path answers **200 unauthenticated** while the site root answers
+401 — it is the pre-auth bypass the CVE describes, confirmed by probe.
+`/bamboo/browse` merely redirects.
+
+Synthesis's FIRST command used the correct path. The refine loop then drifted
+onto `/bamboo/browse` and spent its remaining iterations scraping `atl_token`
+and POSTing `/rest/gadget/1.0/login` — a CSRF/login dance against a path that
+was never the vulnerability. Final verdict: `stop=identical_resend`,
+`drifted=True`, `verification_method=regex_missed`, 3 iterations, nothing
+verified.
+**Where:** endpoint resolution in `_gather_manifest` (the `candidate_probe`
+ranking), and the readiness-gate preconditions that already hold the better
+answer.
+**Done when:** an endpoint that a gate has CONFIRMED by probe at a 2xx, and
+that came from the advisory, outranks a generic candidate that only
+redirects — and the refine loop's axis rule treats moving off that endpoint as
+a change of endpoint axis rather than a free payload edit. A test asserts that
+given both candidates, the probe-confirmed advisory path wins.
+**Enforced by:** not enforced.
+*Why it matters:* every other gate on this run worked — the proxy, the
+derivation budget, the pre-auth fix that got it to READY for the first time.
+The run still failed because it attacked the wrong URL, and the right one was
+sitting in its own trace four lines earlier.
+
+### A readiness-gate precondition still demands auth for a pre-auth CVE
+**Found:** 2026-10-16 (same run)
+**Evidence:** after the `needs_auth` negation fix landed in `_gather_manifest`
+(which correctly stopped blocking — `gather_check` reached READY), the
+`readiness_gate` text still read:
+
+    EXPLOIT READINESS CHALLENGE — the following preconditions are NOT satisfied:
+      - exploit requires authentication but NO session cookie was established
+
+two lines above its own evidence that the target endpoint answers HTTP 200
+unauthenticated. The readiness gate has a SEPARATE auth precondition that did
+not get the same treatment.
+**Where:** the readiness-gate precondition builder (not `_gather_manifest`
+item 7, which is fixed).
+**Done when:** the readiness gate applies the same negation rule — an advisory
+describing a pre-authentication or unauthenticated flaw does not generate an
+"requires authentication" precondition. It is advisory-only today (it does not
+block), so this is wrong guidance into the prompt rather than a halt.
+**Enforced by:** not enforced. `tests/test_gather_auth_gate.py` covers the
+gather side only.
+
 ### Scope classification rules are GLOBAL — two engagements collide
 **Found:** 2026-10-16
 **Evidence:** `knowledge/scope_rules/` holds 13 builtin rules and 2 custom
