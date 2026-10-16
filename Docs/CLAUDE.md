@@ -372,6 +372,37 @@ large change. Add the test in the same commit as the rule.
   whose output triggered more calls. The loop fed itself until dispatches timed
   out and were recorded as failures for scans that had actually started.
 
+### Never write a customer's identity into the repo
+- **No customer or engagement-target names anywhere in the repository.** Not in
+  code, comments, docstrings, commit messages, test fixtures, CLI help strings,
+  skill files, `Docs/`, or SQL comments. This repo is PUBLIC.
+- That includes anything that identifies them as effectively as a name:
+  **hostnames** (`keys3.<customer>.com`), apex domains, internal host lists,
+  and findings tied to them ("32 of their hosts are retired", "this estate's
+  wildcard is served by..."). A hostname plus a liveness finding is recon
+  detail about someone else's estate, not a code comment.
+- **Write the behaviour, not the customer.** A comment exists to explain the
+  code; the real name adds nothing a placeholder does not:
+  - bad:  `# *.sky.<customer>.com is served by 32 retired hosts and 15 live`
+  - good: `# a wildcard cert can front a mix of retired and live hosts, so the
+            cert alone cannot decide retirement — see the redirect instead`
+  Where a concrete example genuinely helps, use `example-corp.com`,
+  `legacy-corp.net`, `host-a.example.com` — never a real target.
+- **Real engagement data lives in the DATABASE**, which is where scope,
+  findings and hosts belong and where the purge can reach them. A name copied
+  into a comment is outside every control the platform has: no engagement
+  attribution, no purge, no scope gate.
+- *How this was found:* on 2026-10-16 a customer's name appeared in **237
+  lines of code and 32 commit messages** on a public repo, including specific
+  hostnames and which of their hosts were dead. Removing it needed a full
+  `git filter-repo` history rewrite and a force-push — and the old commits
+  stayed readable by direct SHA afterwards, because a rewrite makes objects
+  unreachable rather than deleting them. The cheapest moment to not write a
+  customer's name is before writing it.
+- *Enforced by:* not enforced yet. A guard would scan tracked files and commit
+  messages for a configured deny-list of engagement apex domains, which means
+  the deny-list itself must live outside the repo.
+
 ### Tests
 - Every endpoint MUST have a test that **executes** it. `ast.parse` passing,
   imports succeeding, and containers reporting healthy are NOT verification.

@@ -99,14 +99,31 @@ def test_crafter_prompt_is_narrow():
 
 
 def test_crafter_class_guidance_covers_major_classes():
-    src = API.read_text()
-    assert "_CRAFT_CLASS_GUIDANCE" in src, "class guidance dict missing"
-    guidance_block = src[src.find("_CRAFT_CLASS_GUIDANCE ="):][:4000]
-    # Each major class gets at least one line of guidance.
+    # Parse the dict rather than slicing 4000 characters after its name:
+    # the window silently dropped `upload` the moment the `lfi` entry grew
+    # (2026-10-16), reporting "class guidance must cover upload" about a dict
+    # that covers it perfectly well. A fixed-size window over source is a
+    # guard that fails when the code IMPROVES.
+    import ast as _ast
+    tree = _ast.parse(API.read_text())
+    guidance = next(
+        (_ast.literal_eval(n.value) for n in _ast.walk(tree)
+         if isinstance(n, _ast.Assign)
+         and any(getattr(t, "id", "") == "_CRAFT_CLASS_GUIDANCE" for t in n.targets)),
+        None)
+    assert guidance is not None, "class guidance dict missing"
+    # Each major class gets guidance, reached under any spelling a classifier
+    # may emit (the alias map is what makes `path-traversal` resolve to `lfi`).
+    aliases = next(
+        (_ast.literal_eval(n.value) for n in _ast.walk(tree)
+         if isinstance(n, _ast.Assign)
+         and any(getattr(t, "id", "") == "_CRAFT_CLASS_ALIASES" for t in n.targets)),
+        {})
     for cls in ("ssrf", "sqli", "ssti", "lfi", "cmdi", "upload",
-                "auth-bypass", "xxe"):
-        assert f'"{cls}"' in guidance_block, (
-            f"class guidance must cover {cls}"
+                "auth-bypass", "xxe", "path-traversal"):
+        key = aliases.get(cls, cls)
+        assert key in guidance and guidance[key].strip(), (
+            f"class guidance must cover {cls} (resolved to {key!r})"
         )
 
 

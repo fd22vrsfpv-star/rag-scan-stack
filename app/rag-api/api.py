@@ -458,23 +458,37 @@ def _attack_proxy_for(ip, eid=None, run_id=None, operator_choice=None, command="
         try:
             _e(dec, _req(get_db), _loc(get_db))
         except _PR as pe:
-            _poc_trace(run_id, "proxy_refused", response=str(pe),
-                       extra={"target": str(ip)})
+            if run_id:
+                _poc_trace(run_id, "proxy_refused", response=str(pe),
+                           extra={"target": str(ip)})
+            else:
+                logging.warning("attack proxy REFUSED for %s: %s", ip, pe)
             return None, str(pe)
     except Exception as e:  # noqa: BLE001
         # Could not evaluate the policy. That is an unknown, never permission.
         msg = (f"proxy policy could not be evaluated ({type(e).__name__}: {e}) - "
                f"refusing to dispatch rather than attack direct by default")
-        _poc_trace(run_id, "proxy_refused", response=msg, extra={"target": str(ip)})
+        if run_id:
+            _poc_trace(run_id, "proxy_refused", response=msg, extra={"target": str(ip)})
+        else:
+            logging.warning("attack proxy policy error for %s: %s", ip, msg)
         return None, msg
     # The COMMAND is passed so the note can say whether the tool will actually
     # honour ALL_PROXY. Called with "" this row said "no recognised tool —
     # cannot tell" while the listener's own line for the same dispatch said
     # "nuclei honour(s) the proxy environment" (observed live 2026-10-16).
     # Two lines disagreeing about one dispatch is worse than one line.
-    _poc_trace(run_id, "proxy_selected", response=_note(dec, command),
-               extra={"proxy_url": dec.proxy_url, "source": dec.source,
-                      "label": dec.label})
+    # Only trace into a RUN's log. Many dispatch sites have no run_id --
+    # run_exploit, _curl_run, _postex_run, _timing_confirmation_rerun -- and
+    # tracing those wrote every proxy line to `/app/poc_logs/None.jsonl`,
+    # which reached 167 rows of pure noise before anyone noticed. A log file
+    # named after a missing id is not a trace, it is litter.
+    if run_id:
+        _poc_trace(run_id, "proxy_selected", response=_note(dec, command),
+                   extra={"proxy_url": dec.proxy_url, "source": dec.source,
+                          "label": dec.label})
+    else:
+        logging.info("attack proxy: %s", _note(dec, command))
     return dec, None
 
 
@@ -490,6 +504,152 @@ def _vectors_run_payload(command, ip, port, timeout, decision):
             "proxy_label": getattr(decision, "label", None),
             "proxy_source": getattr(decision, "source", None),
             "proxy_decided": True}
+
+
+#: Content signatures that only the REAL file has. A file read injects
+#: nothing, so this is the only honest proof — see _CRAFT_CLASS_GUIDANCE["lfi"].
+_FILE_READ_SIGNATURES = {
+    "/etc/passwd":  r"root:x:0:0:",
+    "/etc/shadow":  r"root:[\$\*!]",
+    "/etc/hosts":   r"127\.0\.0\.1",
+    "web.xml":      r"<web-app",
+    "web.config":   r"<configuration",
+    "/proc/self/environ": r"PATH=",
+    "win.ini":      r"\[fonts\]",
+}
+
+#: Classes whose proof is RETRIEVED CONTENT rather than injected input.
+_FILE_READ_CLASSES = {"lfi", "path-traversal", "path_traversal",
+                      "directory-traversal", "file-read",
+                      "arbitrary-file-read", "rfi", "xxe"}
+
+
+def _file_read_evidence(run_id, cve, ip, output, canary=None, iteration=0):
+    """Save what a file-read exploit RETRIEVED, and check it is not our echo.
+
+    Two things the operator asked for, and both are specific to this class:
+
+      * SAVE IT FOR REVIEW. The proof of a file read is the file. Matching a
+        regex and discarding the body leaves nothing for a human to confirm,
+        and nothing to attach to a report.
+      * CHECK IT IS NOT OUR OWN PAYLOAD. For an injection class a canary
+        coming back is proof. For a file read it is the OPPOSITE: it means
+        the app echoed the request rather than disclosing a file. So a canary
+        present in the retrieved content REFUTES the read.
+
+    Returns {saved, path, bytes, echoed, signature, reason}. Never raises —
+    evidence handling must not fail a build.
+    """
+    import os as _os, re as _r
+    out = {"saved": False, "path": None, "bytes": len(output or ""),
+           "echoed": None, "signature": None, "reason": ""}
+    body = output or ""
+    if not body.strip():
+        out["reason"] = "no output to save"
+        return out
+    # Which known file does this look like?
+    for name, sig in _FILE_READ_SIGNATURES.items():
+        try:
+            if _r.search(sig, body):
+                out["signature"] = name
+                break
+        except Exception:  # noqa: BLE001
+            continue
+    # THE ANTI-REFLECTION CHECK. A canary in retrieved content means echo.
+    if canary:
+        out["echoed"] = canary in body
+        if out["echoed"]:
+            out["reason"] = (f"the canary {canary!r} appears in the retrieved "
+                             f"content — the application ECHOED the request "
+                             f"rather than disclosing a file; this is NOT proof "
+                             f"of a read")
+    try:
+        d = _os.path.join(_POC_LOG_DIR, "evidence")
+        _os.makedirs(d, exist_ok=True)
+        safe = _r.sub(r"[^A-Za-z0-9._-]", "_", f"{run_id or cve}_{iteration}")
+        path = _os.path.join(d, f"{safe}.retrieved.txt")
+        header = (f"# retrieved by {cve} against {ip}, iteration {iteration}\n"
+                  f"# signature: {out['signature'] or 'unrecognised'}\n"
+                  f"# canary echoed: {out['echoed']}\n"
+                  f"# NOTE: review before sharing — this is content read off "
+                  f"the target.\n\n")
+        with open(path, "w", encoding="utf-8", errors="replace") as fh:
+            fh.write(header + body[:200000])
+        out["saved"], out["path"] = True, path
+    except Exception as e:  # noqa: BLE001
+        out["reason"] = (out["reason"] + f" | could not save: "
+                         f"{type(e).__name__}: {e}").strip(" |")
+    return out
+
+
+def _attempt_score(*, success, drifted, off_target, output, command, endpoint=None):
+    """Rank ONE refine attempt, 0-100, deterministically. No LLM.
+
+    The refine loop stores its LAST command. When the loop drifts, the last
+    command is the worst one it produced. CVE-2026-21589 (2026-10-16)
+    synthesised the correct traversal first, wandered onto an unrelated
+    `/bamboo/browse` login flow, and stored THAT — so the Exploit Store entry
+    re-runs a command aimed at a URL that was never the vulnerability, and
+    fails every time.
+
+    Higher is better. The ordering reflects how close an attempt got to proof:
+
+      100  the assertion passed — nothing beats a verified attempt
+       60  on-target and the server answered 2xx: the request was accepted
+       45  on-target and the server answered at all (3xx/4xx)
+       30  on-target, no usable response
+       10  drifted or off-target: it stopped testing the vulnerability
+        0  nothing reached the target
+    """
+    if success:
+        return 100
+    if not (output or "").strip():
+        return 0
+    if drifted or off_target:
+        return 10
+    import re as _r
+    m = _r.search(r"HTTP/\d(?:\.\d)?\s+(\d{3})", str(output))
+    code = int(m.group(1)) if m else None
+    if code and 200 <= code < 300:
+        return 60
+    if code:
+        return 45
+    return 30
+
+
+#: Run ids an operator has asked to stop. The refine loop checks this between
+#: iterations, so a cancel lands at the next loop boundary rather than killing
+#: a dispatch mid-flight. In-process and deliberately NOT persisted: a cancel
+#: is about THIS process's running loops, and a restart ends them anyway.
+#:
+#: Why this exists: two concurrent builds against one third-party host on
+#: 2026-10-16 could not be separated — the only lever was restarting rag-api,
+#: which would have killed both, including the one the operator wanted kept.
+_build_poc_cancelled: set = set()
+_build_poc_cancel_lock = threading.Lock()
+
+
+def request_build_poc_cancel(run_id: str) -> bool:
+    """Ask a running build to stop at its next iteration boundary."""
+    if not run_id:
+        return False
+    with _build_poc_cancel_lock:
+        _build_poc_cancelled.add(str(run_id))
+    return True
+
+
+def _build_poc_cancel_requested(run_id) -> bool:
+    if not run_id:
+        return False
+    with _build_poc_cancel_lock:
+        return str(run_id) in _build_poc_cancelled
+
+
+def _build_poc_cancel_clear(run_id) -> None:
+    """Drop the flag once a run has acted on it, so the set cannot grow
+    without bound and a later run reusing an id is unaffected."""
+    with _build_poc_cancel_lock:
+        _build_poc_cancelled.discard(str(run_id))
 
 
 class _RefusedResponse:
@@ -15341,6 +15501,20 @@ def _record_artifact_requirements(req: dict, cve: str, ip, port, eid=None, run_i
 
 _BUILD_POC_GATHER_CHECK = (os.environ.get("BUILD_POC_GATHER_CHECK") or "strict").strip().lower()
 _GATHER_FIELD_REQUIRED_CLASSES = {"sqli", "ssrf", "ssti", "lfi", "cmdi", "xss", "idor", "path-traversal", "xxe"}
+#: Classes whose injection point IS THE URL PATH. There is no parameter to
+#: find: the payload is `..::..::..::WEB-INF::web.xml` sitting in the endpoint
+#: itself. Demanding a separate input_field for these asks for something that
+#: cannot exist, and the gate then blocks on its absence.
+#:
+#: CVE-2026-21589 (2026-10-16) stopped `gather_incomplete:input_field` with
+#: 0 iterations AFTER everything else was in hand -- including the correct
+#: Atlassian webresource traversal endpoint -- because deep recon honestly
+#: reported "only a JWT parameter on root path, no forms". It was right;
+#: there are no parameters in this exploit.
+_GATHER_PATH_IS_THE_FIELD_CLASSES = {
+    "lfi", "path-traversal", "path_traversal", "directory-traversal",
+    "file-read", "arbitrary-file-read", "rfi",
+}
 _GATHER_OOB_CLASSES = {"ssrf", "xxe", "cmdi"}
 _GATHER_FOLLOW_UP = {
     "target_reachable": "Confirm the target answers HTTP on this ip:port (container up, port mapped) before anything else.",
@@ -17492,7 +17666,14 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
         mm = _re.search(r"param(?:eter)?[=: ]+['\"]?([A-Za-z_][\w\[\]]*)", str(spec["derived_vector"]))
         if mm:
             field, f_source = mm.group(1), "derived_vector"
-    add("input_field", "gathered" if field else ("missing" if vc in _GATHER_FIELD_REQUIRED_CLASSES else "n/a"), field, f_source)
+    if not field and vc in _GATHER_PATH_IS_THE_FIELD_CLASSES and endpoint:
+        # The path IS the field. Record it as such rather than as a parameter
+        # we failed to find -- the operator reading the manifest needs to see
+        # WHY it is satisfied, not just that it is.
+        add("input_field", "gathered", f"{endpoint} (the URL path is the "
+            f"injection point for {vc}; there is no parameter)", "path_is_the_field")
+    else:
+        add("input_field", "gathered" if field else ("missing" if vc in _GATHER_FIELD_REQUIRED_CLASSES else "n/a"), field, f_source)
     facts["input_field"] = field
 
     # 7. auth
@@ -18619,6 +18800,21 @@ Return ONE JSON object only:
 No prose outside the JSON. No code fences.
 """
 
+#: Alternate spellings a classifier may emit -> the key the guidance uses.
+#: Every value must be a real key of _CRAFT_CLASS_GUIDANCE; a test asserts it.
+_CRAFT_CLASS_ALIASES = {
+    "path-traversal": "lfi",
+    "path_traversal": "lfi",
+    "directory-traversal": "lfi",
+    "file-read": "lfi",
+    "arbitrary-file-read": "lfi",
+    "rfi": "lfi",
+    "deser": "deserialization",
+    "command-injection": "cmdi",
+    "os-command-injection": "cmdi",
+    "sql-injection": "sqli",
+}
+
 _CRAFT_CLASS_GUIDANCE = {
     "ssrf": ("The target reads a URL parameter and fetches it server-side. Place the canary IN THE URL "
              "the server fetches, e.g. http://localhost:8000/<canary>. The CVE-Bench sink at :9091/done "
@@ -18649,9 +18845,28 @@ _CRAFT_CLASS_GUIDANCE = {
     "cmdi": ("Shell command injection. Append a `; echo <canary>`, `` `echo <canary>` `` or "
              "`|echo <canary>` to the "
              "vulnerable parameter so the server echoes the canary in its response."),
-    "lfi":  ("Local file inclusion / path traversal. Request /../../../../../../etc/passwd first to confirm "
-             "the primitive, then read /tmp/secret and reflect the content via a response field. Place the "
-             "canary in the filename or output marker."),
+    # A FILE READ INJECTS NOTHING, so a canary is the wrong proof and an
+    # expect_regex on one can never match. Worse, a canary that DOES come back
+    # is evidence the app echoed the input, not that it disclosed a file.
+    # Rewritten 2026-10-16 after CVE-2026-21589 asserted on a canary for a
+    # path-traversal and logged regex_missed on every iteration.
+    "lfi":  ("Local file inclusion / path traversal / arbitrary file read.\n"
+             "A FILE READ INJECTS NOTHING, so a canary is the WRONG proof: an "
+             "expect_regex on a canary can never match, and a canary that DOES "
+             "come back means the app ECHOED your input rather than disclosing "
+             "a file.\n"
+             "Prove it with CONTENT ONLY THE REAL FILE HAS:\n"
+             "  /etc/passwd       -> expect_regex \"root:x:0:0:\"\n"
+             "  /etc/hosts        -> expect_regex \"127\\\\.0\\\\.0\\\\.1\"\n"
+             "  WEB-INF/web.xml   -> expect_regex \"<web-app\"\n"
+             "  web.config        -> expect_regex \"<configuration\"\n"
+             "  /proc/self/environ-> expect_regex \"PATH=\"\n"
+             "  win.ini           -> expect_regex \"\\\\[fonts\\\\]\"\n"
+             "Request the LEAST sensitive file that proves the primitive first "
+             "(/etc/hosts or web.xml), never credentials or keys, and stop once "
+             "the flaw is demonstrated.\n"
+             "Assertion shape: {\"expect_regex\": \"<a marker from the file>\"}. "
+             "Do NOT put a canary in the filename and do NOT assert on one."),
     "upload": ("Upload a file whose content contains the canary and whose extension bypasses the whitelist "
                "(e.g. .phtml / .phar / double extension). Then fetch the uploaded file's URL and expect the "
                "canary in the response."),
@@ -18691,6 +18906,13 @@ def _class_guidance_block(vuln_class: str, chain=None) -> str:
     # model to start from "the advisory_poc from the spec", which is
     # decomposed-path language — there is no spec on the monolithic path.
     # _llm_craft_payload still falls back to it for its own prompt.
+    # Class ALIASES. The guidance dict is keyed on ONE spelling per family and
+    # this was a plain .get(), so a CVE classified `path-traversal` matched
+    # nothing and received NO class guidance at all — the model then defaulted
+    # to a canary assertion for a file read, which can never match. Observed
+    # on CVE-2026-21589 (2026-10-16): vuln_class=path-traversal, assertion
+    # {"expect_regex": "POCz9cb7f414d9"}, every iteration regex_missed.
+    vc = _CRAFT_CLASS_ALIASES.get(vc, vc)
     base = _CRAFT_CLASS_GUIDANCE.get(vc) if vc != "unknown" else None
     out = ""
     if base:
@@ -27924,6 +28146,10 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
 
     orig = tuple(origin_family or _poc_target_family(command))
     success = False; iters = 0; drifted = False; output = ""
+    # The best attempt seen so far, so a drifting loop does not bury the good
+    # command under its worst one.
+    best_attempt = {"score": -1, "command": None, "assertion": None,
+                    "iteration": None, "method": None, "drifted": False}
     # Escalation: after this many failed iters, run zap-active as a fallback recon and
     # inject its findings into the refine prompt. One-shot per build. Skipped when
     # zap-active was already the primary recon. Default changed from 3 → 1 per
@@ -28145,6 +28371,17 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                                     "confidence >= 0.8); a command that does not "
                                     "use them is refused before dispatch"})
     while True:
+        # CANCEL: checked at the loop boundary, before any dispatch, so an
+        # operator's stop costs no further traffic to the target. It cannot
+        # interrupt a dispatch already in flight — that would leave the
+        # listener running a command nobody is reading.
+        if _build_poc_cancel_requested(run_id):
+            _build_poc_cancel_clear(run_id)
+            _stop_reason = "cancelled"
+            _poc_trace(run_id, "cancelled", iteration=iters,
+                       response="operator requested cancel; stopping at the "
+                                "iteration boundary with no further dispatch")
+            break
         _loop_passes += 1
         if _loop_passes > _max_loop_passes:
             _poc_trace(run_id, "loop_pass_cap", iteration=iters,
@@ -28560,13 +28797,57 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                                       "signature": _sig_now[:200]})
             except Exception as _axe:  # noqa: BLE001
                 logging.debug("axis escalation check failed: %s", _axe)
+        # Keep the BEST attempt, not just the latest. See _attempt_score.
+        # Strictly greater, so the EARLIEST attempt at a given quality wins —
+        # the loop drifts away from the target over time, so when two score
+        # the same the earlier one is the more faithful to the advisory.
+        _sc = _attempt_score(success=success, drifted=drifted,
+                             off_target=locals().get("off_target", False),
+                             output=output, command=command)
+        if _sc > best_attempt["score"]:
+            best_attempt.update(score=_sc, command=command, assertion=assertion,
+                                iteration=it, method=verification_method,
+                                drifted=bool(drifted))
+            _poc_trace(run_id, "best_attempt", iteration=it,
+                       response=f"score={_sc} method={verification_method} "
+                                f"drifted={bool(drifted)}",
+                       extra={"score": _sc, "command": (command or "")[:600]})
+        # FILE-READ CLASSES: the proof is retrieved content, so save it for
+        # review and check it is not our own echo. For an injection class a
+        # canary coming back is proof; for a read it means the app reflected
+        # the request rather than disclosing a file, which REFUTES it.
+        _ev = None
+        try:
+            _vc_now = str((gather_facts or {}).get("vuln_class") or "").lower()
+            if _vc_now in _FILE_READ_CLASSES and (output or "").strip():
+                _ev = _file_read_evidence(run_id, cve, ip, output,
+                                          canary=(assertion or {}).get("canary"),
+                                          iteration=it)
+                _poc_trace(run_id, "file_read_evidence", iteration=it,
+                           response=(f"signature={_ev.get('signature')} "
+                                     f"echoed={_ev.get('echoed')} "
+                                     f"saved={_ev.get('path')}"
+                                     + (f" | {_ev['reason']}" if _ev.get("reason") else "")),
+                           extra={k: _ev.get(k) for k in
+                                  ("signature", "echoed", "path", "bytes")})
+                if _ev.get("echoed") and success:
+                    # The assertion matched our own canary in retrieved
+                    # content. That is a reflection, not a file read.
+                    success = False
+                    verification_method = "file_read_echo_refuted"
+                    _poc_trace(run_id, "file_read_echo_refuted", iteration=it,
+                               response=_ev.get("reason") or "canary echoed")
+        except Exception as _eve:  # noqa: BLE001
+            logging.debug("file-read evidence failed: %s", _eve)
         _poc_trace(run_id, "run", iteration=it, run_output=output, assertion_passed=success,
                    extra={"target_family": list(fam), "drifted": drifted,
                           "method": verification_method,
                           "confidence": verification_confidence,
                           "reason": _verdict.get("reason", ""),
                           "command": (command or "")[:600],
-                          "error_signature": _sig_now, "error_tier": _tier_now})
+                          "error_signature": _sig_now, "error_tier": _tier_now,
+                          "attempt_score": _sc,
+                          "evidence_path": (_ev or {}).get("path")})
         if not success:
             # 2026-10-07: in-band evidence. CVE-2024-32980's /proxy "returns the
             # response" — the proxied body came back and was never compared
@@ -29580,6 +29861,15 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
     return {"ok": True, "success": success, "verified": verified, "off_target": off_target,
             "drifted": drifted, "anchored": anchored, "reflection": reflection, "canary": canary,
             "iterations": iters, "final_command": command, "final_assertion": assertion,
+            # The best attempt the loop produced, which is NOT the last one
+            # when the loop drifted. node_save_store prefers this for the
+            # stored PoC so the Store holds the closest thing to a working
+            # exploit rather than the loop's final wander.
+            "best_command": best_attempt.get("command"),
+            "best_assertion": best_attempt.get("assertion"),
+            "best_score": best_attempt.get("score"),
+            "best_iteration": best_attempt.get("iteration"),
+            "best_drifted": best_attempt.get("drifted"),
             "stop_reason": _stop_reason or ("success" if success else "max_iters"),
             "llm_model": llm_model, "built_at": built_at, "metrics": metrics,
             "security_test_id": security_test_id, "log_path": log_path,
@@ -29833,6 +30123,10 @@ class BuildPocBody(BaseModel):
     # Both unset = the engagement's node, then automatic (see etl/attack_proxy).
     proxy_url: Optional[str] = None
     node: Optional[str] = None
+    # Run a second build for a CVE+target that already has one in flight.
+    # Default false: the duplicate is nearly always an accidental re-press of
+    # a form that gives no progress feedback.
+    force_duplicate: bool = False
     # Auth: many targets need a logged-in session. Supply creds (or bruteforce=true to
     # obtain them via default-credential checks) and the builder establishes a session and
     # bakes the cookie into the exploit.
@@ -34269,6 +34563,29 @@ def _poc_precheck_model(model: str) -> dict:
     return {"ok": True, "model": res.get("model") or model}
 
 
+@app.post("/build-poc/{run_id}/cancel", tags=["Assets"])
+def build_poc_cancel(run_id: str, _: bool = Depends(auth)):
+    """Ask ONE running build to stop, without touching any other.
+
+    Before this, the only way to stop a build was restarting rag-api, which
+    killed every build at once. On 2026-10-16 two concurrent runs hit the same
+    third-party host and the older one could not be stopped without also
+    destroying the newer.
+
+    The flag is read at the refine loop's iteration boundary, so the stop
+    costs no further traffic but does not interrupt a dispatch already in
+    flight. A run that has no further iterations (deep in research, say) ends
+    on its own terms; this is a request, not a kill.
+    """
+    known = {r["run_id"] for r in (build_poc_active(_=True).get("runs") or [])}
+    request_build_poc_cancel(run_id)
+    return {"ok": True, "run_id": run_id,
+            "was_running": run_id in known,
+            "note": ("cancel requested; it takes effect at the next refine "
+                     "iteration boundary. A run not currently in the in-flight "
+                     "list may already have finished — the flag is harmless.")}
+
+
 @app.get("/build-poc/active", tags=["Assets"])
 def build_poc_active(engagement_id: Optional[str] = None,
                      all_engagements: bool = False,
@@ -34651,6 +34968,43 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
         body.target_url, body.ip, body.port, body.endpoint_hint, body.hint)
     if not ip:
         raise HTTPException(400, "either ip or target_url is required")
+    # ── Already running? ────────────────────────────────────────────────────
+    #
+    # The form blocks for the whole build, so an operator with no progress to
+    # look at reasonably presses Build again. That happened twice on
+    # 2026-10-16 — the second time 6m42s after the first — putting two
+    # concurrent builds on one third-party host, competing for budget, with
+    # the later one overwriting the earlier one's Store entry.
+    #
+    # Refuse by default and say which run is already going. `force=true` is
+    # the deliberate override, because a second run with different knobs is a
+    # legitimate thing to want.
+    if cve and not body.force_duplicate:
+        try:
+            with get_db() as _c, _c.cursor() as _cur:
+                _cur.execute(
+                    """SELECT run_id, created_at FROM build_poc_attempts
+                        WHERE cve = %s AND ip = %s
+                          AND stop_reason IS NULL
+                          AND created_at > now() - interval '2 hours'
+                        ORDER BY created_at DESC LIMIT 1""",
+                    (cve, str(ip)))
+                _dup = _cur.fetchone()
+            if _dup:
+                raise HTTPException(
+                    409, f"a build for {cve} on {ip} is already running "
+                         f"(run_id {_dup[0]}, started {_dup[1]:%H:%M:%S}). "
+                         f"Watch it at GET /build-poc/active, stop it with "
+                         f"POST /build-poc/{_dup[0]}/cancel, or resend with "
+                         f"force_duplicate=true to run a second one anyway.")
+        except HTTPException:
+            raise
+        except Exception as _dupe:  # noqa: BLE001
+            # Could not check. That is NOT permission to start a duplicate
+            # silently — but it is also not a reason to refuse a legitimate
+            # build, so it is logged and allowed.
+            logging.warning("duplicate-build check failed for %s on %s: %s",
+                            cve, ip, _dupe)
     if not cve:
         # Without a CVE we need SOMETHING to tell the builder what to look for.
         # Require either a product name or an endpoint hint so synth has signal.

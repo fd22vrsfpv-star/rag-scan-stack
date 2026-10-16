@@ -1722,6 +1722,35 @@ def node_failure_analysis(state: BuildPocState) -> Dict[str, Any]:
         return {}
 
 
+def _preferred_command(result: Dict[str, Any]):
+    """The command worth storing: the verified one, else the best-scoring.
+
+    Returns the FINAL command whenever the run verified (what passed is the
+    proof) or whenever the loop never scored a better attempt. Otherwise the
+    best attempt, which for a drifted run is an earlier iteration.
+    """
+    final = result.get("final_command")
+    if result.get("verified"):
+        return final
+    best = result.get("best_command")
+    if not best or best == final:
+        return final
+    # Only prefer the best when it genuinely outranks where the loop ended.
+    from api import _attempt_score
+    final_score = _attempt_score(success=False, drifted=bool(result.get("drifted")),
+                                 off_target=bool(result.get("off_target")),
+                                 output=result.get("output") or "x", command=final)
+    return best if (result.get("best_score") or -1) > final_score else final
+
+
+def _preferred_assertion(result: Dict[str, Any]):
+    """The assertion belonging to whichever command _preferred_command picked."""
+    if _preferred_command(result) == result.get("best_command") \
+            and result.get("best_command"):
+        return result.get("best_assertion") or result.get("final_assertion")
+    return result.get("final_assertion")
+
+
 def node_save_store(state: BuildPocState) -> Dict[str, Any]:
     """Save the built PoC + emit webhook. Store verified/unverified — the
     unverified rows stay for operator inspection (same as monolith).
@@ -1780,8 +1809,19 @@ def node_save_store(state: BuildPocState) -> Dict[str, Any]:
                 cve=state["cve"], kind="web",
                 target_host=state["ip"], target_port=state["port"],
                 product=state.get("product"), version=state.get("version"),
-                command=result.get("final_command"),
-                assertion=result.get("final_assertion"),
+                # Store the BEST attempt, not the last. When the refine loop
+                # drifts, its final command is the worst it produced:
+                # CVE-2026-21589 synthesised the correct traversal first,
+                # wandered onto an unrelated /bamboo/browse login flow, and
+                # stored THAT — so pressing Run in the Store re-ran a command
+                # aimed at a URL that was never the vulnerability.
+                #
+                # A verified run always stores its final command: the thing
+                # that passed IS the proof. Only an unverified run falls back
+                # to the best-scoring attempt, and only when it actually
+                # scored better than the last one.
+                command=_preferred_command(result),
+                assertion=_preferred_assertion(result),
                 rationale=built.get("rationale", ""),
                 verified=bool(result.get("verified")), source="cve_poc_builder",
                 security_test_id=result.get("security_test_id"),
@@ -1790,6 +1830,13 @@ def node_save_store(state: BuildPocState) -> Dict[str, Any]:
                 eid=state.get("eid"),
                 metadata={"off_target": result.get("off_target"),
                           "drifted": result.get("drifted"),
+                          # WHICH attempt this row holds, so an operator
+                          # reading a failed PoC can tell whether it is the
+                          # loop's last wander or its best shot.
+                          "stored_attempt": ("final" if _preferred_command(result)
+                                             == result.get("final_command") else "best"),
+                          "best_score": result.get("best_score"),
+                          "best_iteration": result.get("best_iteration"),
                           "reflection": result.get("reflection"),
                           "iterations": result.get("iterations"),
                           "metrics": metrics,

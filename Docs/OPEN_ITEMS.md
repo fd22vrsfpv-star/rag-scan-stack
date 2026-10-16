@@ -296,6 +296,95 @@ block), so this is wrong guidance into the prompt rather than a halt.
 **Enforced by:** not enforced. `tests/test_gather_auth_gate.py` covers the
 gather side only.
 
+### The vuln-class taxonomy is eight hard-coded sets in api.py
+**Found:** 2026-10-16
+**Evidence:** eight term lists in `app/rag-api/api.py` all describe one thing —
+what a vulnerability class needs and how to prove it:
+
+    _FILE_READ_SIGNATURES              proof markers per file
+    _FILE_READ_CLASSES                 retrieve rather than inject
+    _GATHER_FIELD_REQUIRED_CLASSES     need a parameter
+    _GATHER_PATH_IS_THE_FIELD_CLASSES  inject via the path
+    _GATHER_OOB_CLASSES                need an out-of-band sink
+    _GATHER_FOLLOW_UP                  what to do when an item is missing
+    _CRAFT_CLASS_ALIASES               alternate spellings
+    _CRAFT_CLASS_GUIDANCE              how to craft and how to prove
+
+Every CVE-2026-21589 failure on 2026-10-16 was one of these being incomplete
+for `path-traversal`: absent from `_CRAFT_CLASS_ALIASES` (no class guidance at
+all, so a canary assertion for a file read), then absent from
+`_GATHER_PATH_IS_THE_FIELD_CLASSES` (a parameter demanded for a payload that
+lives in the path). Each fix needed a code edit, an image rebuild and a
+redeploy, while `knowledge/` is **bind-mounted into 8 services** and would have
+taken effect live.
+**Where:** `app/rag-api/api.py` (the eight sets), `knowledge/` (where they
+belong).
+**Done when:** one `knowledge/vuln_classes.yaml` is the single source of truth,
+with TWO readers, because CLAUDE.md requires both and they are not the same
+mechanism:
+  * the GATES read it **deterministically** (exact lookup). "Is path-traversal
+    a file-read class?" must not be a similarity score — CLAUDE.md:
+    "Retrieve, then gate — never retrieve to authorize."
+  * a loader **embeds it into `rag_documents`** so the planner and synthesiser
+    can recall class guidance by similarity, which CLAUDE.md requires of any
+    knowledge file defining actions and `tests/test_knowledge_rag_coverage.py`
+    enforces.
+The current sets stay as a compiled fallback so a missing or malformed YAML
+cannot break a gate, and a test asserts the YAML covers every class the code
+knows about.
+**Enforced by:** not enforced. `tests/test_knowledge_rag_coverage.py` would
+cover the loader half once the file exists.
+*Why it matters:* a class taxonomy that can only be changed by editing Python
+means every new vulnerability class costs a deploy, and the operator who knows
+the class cannot add it.
+
+### Gates make SEMANTIC decisions with substring matches, and it keeps costing runs
+**Found:** 2026-10-16 (three separate failures in one day, one root cause)
+**Evidence:** a string test standing in for a judgement, in four gates:
+
+| Decision | Mechanism | What it cost |
+|---|---|---|
+| does this exploit need auth? | substring `("auth","login","session",…)` over advisory prose | `"pre-authentication"` CONTAINS `"auth"` — CVE-2026-21589 stopped `gather_incomplete:auth` on two runs with **0 iterations**, for a flaw whose defining property is needing no auth |
+| which class guidance applies? | `_CRAFT_CLASS_GUIDANCE.get(vuln_class)` | `path-traversal` was not a key, so the run got **no class guidance at all** and defaulted to a canary assertion |
+| did the exploit work? | `expect_regex` on the response | a file read injects nothing, so the canary assertion was **unsatisfiable** — `regex_missed` on every iteration |
+| will this tool honour the proxy? | tool name against a set | anything unlisted reports "cannot tell" |
+
+A fifth is already recorded in project memory: the TLS cert cannot identify a
+retired host, because retired and live share CN, issuer and serial.
+
+Each was individually fixed (negation detection, an alias map, class-aware
+proof). The CLASS was not: the next gate that reads prose with a substring
+will fail the same way, and the failure mode is silent — a gate that matched
+nothing looks identical to a gate that found nothing.
+
+**Where:** `_gather_manifest` item 7 (`needs_auth`), `_class_guidance_block`,
+`_poc_assertion_verdict*`, `etl/attack_proxy.env_mechanism`, the readiness-gate
+preconditions.
+**NOT the fix:** handing these decisions to the LLM. CLAUDE.md's own rule is
+"retrieve to decide, gate deterministically to act" — advisory text is
+semi-adversarial input, and a model deciding whether auth is required means a
+prompt-injected advisory decides it. Determinism is also what made every one
+of these diagnosable: the offending substring could be pointed at.
+**Done when:** gates branch on OBSERVATION rather than prose. The pattern that
+worked on 2026-10-16 is already in the code —
+`[gathered] target_reachable = HTTP 401 (via probe)` and
+`endpoint … (HTTP 200)` are facts, not inferences, and the auth fix keys on
+the endpoint's observed status rather than reading the advisory better.
+Concretely: the model EXTRACTS candidates from prose (it is good at that),
+they are stored as claims in `confirmed_facts` with provenance, and a claim at
+`advisory_derived` (0.6) never gates anything on its own — only
+`probe_confirmed` (0.9) does. **That machinery already exists and is already
+calibrated; the gates simply do not consult it.** A gate that must read prose
+records WHICH phrase it matched, so a wrong match is visible rather than
+silent.
+**Enforced by:** not enforced. A guard would assert that no gate's block/allow
+decision is reached solely from a substring test over `description`,
+`preconditions` or advisory text without a corresponding `confirmed_facts`
+lookup.
+*Why it matters:* this is the single highest-yield fix available. Every
+individual bug above was cheap once seen, and each one cost an entire build —
+two of them cost runs against a live third-party target that produced nothing.
+
 ### Scope classification rules are GLOBAL — two engagements collide
 **Found:** 2026-10-16
 **Evidence:** `knowledge/scope_rules/` holds 13 builtin rules and 2 custom
