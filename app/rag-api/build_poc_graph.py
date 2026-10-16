@@ -18,8 +18,10 @@ calls `invoke_build_poc(state)`; when off, the existing monolith runs unchanged.
 
 from __future__ import annotations
 
+import functools
 import logging
 import operator
+import re
 import os
 import time
 from typing import Annotated, Any, Dict, List, Optional, TypedDict
@@ -63,6 +65,9 @@ class BuildPocState(TypedDict, total=False):
     deep_recon_done: bool             # one deeper-recon pass per run (gaps / early stop)
     deep_recon: Dict[str, Any]        # what the pass ran and found
     gather_manifest: Dict[str, Any]   # the manifest (items/missing/follow_ups/facts) for the result
+    reuse_recon: Optional[str]        # per-run auto|always|never recon reuse; None = default
+    fact_challenge_mode: Optional[str]  # per-run auto|review|off; None = container default
+    fact_challenge: Dict[str, Any]    # the challenger's verdict on the fact SET (findings/applied/ran) — an UNDECLARED key here is silently dropped
     cred_hints: List[str]
     admin_paths_mined: List[str]
     detected_frameworks: List[str]
@@ -142,7 +147,9 @@ def initial_state(cve: str, ip: str, port: int, product=None, version=None, eid=
                   max_iters: int = 3, research: bool = True, model=None, auth=None,
                   recon_first: bool = False, recon_source: str = "basic",
                   hint: Optional[str] = None,
-                  focused_urls: Optional[List[str]] = None) -> BuildPocState:
+                  focused_urls: Optional[List[str]] = None,
+                  fact_challenge: Optional[str] = None,
+                  reuse_recon: Optional[str] = None) -> BuildPocState:
     """Build the initial state dict handed to the graph. Mirrors the argument shape
     of _build_poc_core so the wrapper is trivial."""
     # Supplied credentials are the FIRST cred_hint so node_auto_login logs in
@@ -161,6 +168,14 @@ def initial_state(cve: str, ip: str, port: int, product=None, version=None, eid=
         "segments": [], "recon_metrics": {}, "intel_list": [],
         "zap_paths": [], "arjun_discovered": [], "focused_urls": list(focused_urls or []),
         "cred_hints": _supplied, "admin_paths_mined": [],
+        # None => the container default. Threaded per-run so an operator can
+        # demand a sign-off, or skip the challenge entirely, for ONE build
+        # without an env edit and a restart.
+        "fact_challenge_mode": fact_challenge,
+        # None => the container default (`auto`). Per-run so a target known
+        # not to have changed can skip recon entirely, and a target that just
+        # changed can be forced to re-scan.
+        "reuse_recon": reuse_recon,
         "detected_frameworks": [], "waf_family": None, "waf_characterization": {},
         "auth": auth or {}, "auth_guidance": "", "session_info": None,
         "hint_guidance": "", "hint_parts": [], "research_out": None,
@@ -193,6 +208,124 @@ def _want(sources: str, kind: str) -> bool:
 # emit the same _poc_trace phase the monolith emitted, and return the pieces to
 # fold into state via the TypedDict reducers.
 
+def _recon_cached(tool, variant=None):
+    """Serve a recon node from `recon_cache` when a FRESH result exists.
+
+    A decorator rather than a rewrite of each node: the node keeps its name
+    (so the routing guards still find `def node_zap_recon`), its body is
+    untouched, and the caching policy lives in exactly one place.
+
+    `tool` may be a callable taking the state, for a node whose answer has
+    two different shelf lives — a ZAP ACTIVE scan goes stale faster than a
+    passive spider, and a single TTL for both would either re-run the cheap
+    one needlessly or over-trust the expensive one.
+
+    `variant` is a callable taking the state and returning the inputs that
+    change this tool's answer — the ZAP path list arjun fans across, whether a
+    session is held. Leave a real input out and an UNAUTHENTICATED crawl would
+    be served in answer to a request for an authenticated one, which is a
+    wrong answer rather than a slow one.
+
+    Only the metrics THIS node added are stored, computed as the delta against
+    the state's metrics on entry — storing the merged dict would cache every
+    earlier tool's numbers and replay them on a later run.
+
+    A result with no segments and no side outputs is NOT stored: the nodes
+    swallow their own tool errors, so "nothing at all" is more likely a
+    failure than a finding, and caching it would pin that failure for hours.
+    """
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(state: BuildPocState) -> Dict[str, Any]:
+            from api import (_recon_cache_lookup, _recon_cache_store, _poc_trace)
+            try:
+                from etl.recon_cache import cache_key, note, REUSE
+            except Exception:  # noqa: BLE001
+                return fn(state)        # no cache module: behave as before
+            try:
+                tname = tool(state) if callable(tool) else tool
+            except Exception:  # noqa: BLE001
+                tname = "recon"
+            var = None
+            try:
+                var = variant(state) if callable(variant) else variant
+            except Exception as e:  # noqa: BLE001
+                logging.debug("recon cache variant for %s failed: %s", tname, e)
+            key = cache_key(tname, state.get("ip"), state.get("port"), var)
+            mode = state.get("reuse_recon")
+            action, reason, payload, age = _recon_cache_lookup(key, tname, mode)
+            before = set((state.get("recon_metrics") or {}).keys())
+
+            if action == REUSE and isinstance(payload, dict):
+                out = {k: v for k, v in payload.items() if k != "recon_metrics"}
+                cached_metrics = {k: {**(v if isinstance(v, dict) else {}),
+                                      "reused": True, "age_seconds": age,
+                                      "signal": note(action, tname, reason)}
+                                  for k, v in (payload.get("recon_metrics") or {}).items()}
+                out["recon_metrics"] = {**(state.get("recon_metrics") or {}), **cached_metrics}
+                _poc_trace(state.get("run_id"), f"recon:{tname}:cache",
+                           response=note(action, tname, reason),
+                           extra={"tool": tname, "age_seconds": age, "action": action,
+                                  "reason": reason})
+                return out
+
+            # MISS, REFRESH or UNAVAILABLE all run the tool. They are traced
+            # separately because only UNAVAILABLE means the cache is broken.
+            if action != REUSE:
+                _poc_trace(state.get("run_id"), f"recon:{tname}:cache",
+                           response=note(action, tname, reason),
+                           extra={"tool": tname, "action": action, "reason": reason,
+                                  "age_seconds": age})
+            out = fn(state)
+            try:
+                if _worth_caching(out):
+                    delta = {k: v for k, v in (out.get("recon_metrics") or {}).items()
+                             if k not in before}
+                    _recon_cache_store(key, tname, state.get("ip"), state.get("port"),
+                                       {**{k: v for k, v in out.items() if k != "recon_metrics"},
+                                        "recon_metrics": delta},
+                                       engagement_id=state.get("eid"), variant=var,
+                                       run_id=state.get("run_id"))
+            except Exception as e:  # noqa: BLE001
+                logging.debug("recon cache store for %s failed: %s", tname, e)
+            return out
+        return wrapper
+    return deco
+
+
+def _worth_caching(out: Dict[str, Any]) -> bool:
+    """Did the node actually produce something?
+
+    The recon nodes catch their own tool failures and return empty, so an
+    all-empty result is as likely to be a broken tool as a clean target.
+    Caching it would pin that failure for the whole TTL.
+    """
+    if not isinstance(out, dict):
+        return False
+    if out.get("segments"):
+        return True
+    return any(out.get(k) for k in ("zap_paths", "arjun_discovered", "openapi",
+                                    "detected_frameworks", "admin_paths_mined",
+                                    "focused_urls", "cred_hints"))
+
+
+def _auth_fingerprint(state: BuildPocState):
+    """Whether this run holds a session, for the cache variant.
+
+    An authenticated crawl and an anonymous one return different answers from
+    the same tool against the same URL. Sharing a cache entry between them is
+    the one failure mode worse than re-running: a wrong answer, served fast.
+    The USER is part of it, not just the fact of a session — two accounts see
+    different things. The credential itself never enters the key.
+    """
+    si = state.get("session_info") or {}
+    auth = state.get("auth") or {}
+    user = si.get("user") or si.get("username") or auth.get("username")
+    return {"authenticated": bool(si.get("cookie_header") or si.get("cookie")),
+            "user": str(user) if user else None}
+
+
+@_recon_cached('port_sweep', variant=None)
 def node_port_sweep(state: BuildPocState) -> Dict[str, Any]:
     from api import _scout_open_ports, _poc_trace
     import re as _re_ps
@@ -249,6 +382,7 @@ def node_port_sweep(state: BuildPocState) -> Dict[str, Any]:
             **upd}
 
 
+@_recon_cached('waf_detect', variant=None)
 def node_waf_detect(state: BuildPocState) -> Dict[str, Any]:
     from api import _scout_waf, _poc_trace
     import re as _re
@@ -651,6 +785,7 @@ def node_auto_login(state: BuildPocState) -> Dict[str, Any]:
             "recon_metrics": {**state.get("recon_metrics", {}), **metrics}}
 
 
+@_recon_cached('framework_deep_enum', variant=lambda st: {'auth': _auth_fingerprint(st)})
 def node_framework_deep_enum(state: BuildPocState) -> Dict[str, Any]:
     from api import _deep_enum_framework, _poc_trace
     frameworks = state.get("detected_frameworks") or []
@@ -674,6 +809,9 @@ def node_framework_deep_enum(state: BuildPocState) -> Dict[str, Any]:
             "recon_metrics": {**state.get("recon_metrics", {}), **metrics}}
 
 
+@_recon_cached(lambda st: 'zap_active' if _want(st.get('recon_source', 'basic'), 'active') else 'zap',
+               variant=lambda st: {'active': _want(st.get('recon_source', 'basic'), 'active'),
+                                   'auth': _auth_fingerprint(st)})
 def node_zap_recon(state: BuildPocState) -> Dict[str, Any]:
     from api import _zap_recon, _extract_zap_paths, _poc_trace
     _t0 = time.time()
@@ -716,6 +854,7 @@ def node_discovered_knowledge_recon(state: BuildPocState) -> Dict[str, Any]:
             "recon_metrics": {**state.get("recon_metrics", {}), **metrics}}
 
 
+@_recon_cached('openapi', variant=lambda st: {'auth': _auth_fingerprint(st)})
 def node_openapi_recon(state: BuildPocState) -> Dict[str, Any]:
     """Probe common OpenAPI/Swagger paths and parse the first spec we find.
     When present, this is the REAL attack surface for API-first apps the
@@ -746,6 +885,7 @@ def node_openapi_recon(state: BuildPocState) -> Dict[str, Any]:
             "recon_metrics": {**state.get("recon_metrics", {}), **metrics}}
 
 
+@_recon_cached('playwright', variant=lambda st: {'auth': _auth_fingerprint(st), 'urls': sorted(st.get('focused_urls') or [])[:20]})
 def node_playwright_recon(state: BuildPocState) -> Dict[str, Any]:
     """Headless-browser crawl when ZAP spider only turned up static assets
     (classic SPA problem). Logs in (when auth supplied), navigates, captures
@@ -781,6 +921,7 @@ def node_playwright_recon(state: BuildPocState) -> Dict[str, Any]:
             "recon_metrics": {**state.get("recon_metrics", {}), **metrics}}
 
 
+@_recon_cached('arjun', variant=lambda st: {'zap_paths': sorted(st.get('zap_paths') or [])[:40], 'auth': _auth_fingerprint(st)})
 def node_arjun_recon(state: BuildPocState) -> Dict[str, Any]:
     from api import _scout_arjun, _scout_arjun_paths, _poc_trace
     _t0 = time.time()
@@ -1363,6 +1504,36 @@ def node_gather_check(state: BuildPocState) -> Dict[str, Any]:
         _probe_results = {}
         _poc_trace(state["run_id"], "preflight_facts",
                    response=f"(skipped: {type(_pfe).__name__}: {_pfe})")
+    # CHALLENGE the fact SET. The probes above test one claim each; this is
+    # the only step that reads them together and can notice that the endpoint
+    # is a template, the route belongs to another product, or the parameter
+    # came from a different vulnerability class. Each contradiction carries its
+    # own declared action (clear / downgrade / relax_auth / warn) — one of them
+    # UNBLOCKS a build, so "high severity" cannot be a single behaviour.
+    try:
+        from api import _challenge_derived_facts
+        _auth_item = next((i for i in (man.get("items") or [])
+                           if i.get("item") == "auth"), None)
+        _reach = next((i for i in (man.get("items") or [])
+                       if i.get("item") == "target_reachable"), None)
+        _obs = []
+        _m = re.search(r"HTTP (\d{3})", str((_reach or {}).get("value") or ""))
+        if _m and not (state.get("session_info") or {}).get("cookie_header"):
+            # The root answered this status with NO session attached, so it is
+            # evidence about whether authentication is actually required.
+            _obs.append({"item": "target_reachable", "status": int(_m.group(1)),
+                         "value": (_reach or {}).get("value")})
+        _challenge = _challenge_derived_facts(
+            man, state["cve"], state["ip"], state["port"],
+            eid=state.get("eid"), run_id=state["run_id"],
+            product=state.get("product"), probe_results=_probe_results,
+            auth_required=bool(_auth_item and _auth_item.get("status") == "missing"),
+            auth_observations=_obs, mode=state.get("fact_challenge_mode"))
+    except Exception as _ce:  # noqa: BLE001
+        _challenge = {"ran": False, "error": f"{type(_ce).__name__}: {_ce}"}
+        man["challenge"] = _challenge
+        _poc_trace(state["run_id"], "fact_challenge",
+                   response=f"(skipped: {type(_ce).__name__}: {_ce})")
     # Pass 2 (after deep_recon) must not prepend a second manifest onto pass 1's
     # output: compose from the pre-gather guidance captured on pass 1.
     base = state.get("guidance_base") if state.get("guidance_base") else (state.get("guidance") or "")
@@ -1373,8 +1544,20 @@ def node_gather_check(state: BuildPocState) -> Dict[str, Any]:
                                              "gather_check": {"ready": man.get("ready"),
                                                               "missing": man.get("missing"),
                                                               "signal": man.get("summary")}}}
+    upd["fact_challenge"] = _challenge
     if mode == "strict" and not man.get("ready"):
         upd["gather_blocked"] = True
+    elif (_challenge.get("findings")
+          and str(_challenge.get("mode")) == "review"):
+        # review mode: the operator signs off on a contested fact set before
+        # traffic is spent on it. `auto` (the default) applied the actions and
+        # carried on, which is what makes this opt-in rather than a new stall.
+        upd["gather_blocked"] = True
+        man["missing"] = (man.get("missing") or []) + ["intel_review"]
+        man["follow_ups"] = (man.get("follow_ups") or []) + [
+            "Review the challenged facts on the run's Intel tab, then re-run. "
+            "Set BUILD_POC_FACT_CHALLENGE=auto to apply the actions and continue "
+            "without a sign-off."]
     return upd
 
 

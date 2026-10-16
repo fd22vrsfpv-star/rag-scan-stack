@@ -308,7 +308,11 @@ def _load_gather():
     src = API.read_text(); tree = _ast.parse(src); ns = {"os": os}
     for node in tree.body:
         if isinstance(node, _ast.Assign) and getattr(node.targets[0], "id", "") in (
-                "_GATHER_FIELD_REQUIRED_CLASSES", "_GATHER_OOB_CLASSES", "_GATHER_FOLLOW_UP", "_BUILD_POC_GATHER_CHECK"):
+                # _gather_decide's follow-up text became class-aware on
+                # 2026-10-16 (a path-based class has no parameter to find), so
+                # the path class set is a real dependency of this isolated exec.
+                "_GATHER_FIELD_REQUIRED_CLASSES", "_GATHER_OOB_CLASSES", "_GATHER_FOLLOW_UP",
+                "_GATHER_PATH_IS_THE_FIELD_CLASSES", "_BUILD_POC_GATHER_CHECK"):
             exec(_ast.get_source_segment(src, node), ns)
     node = next(x for x in _ast.walk(tree) if isinstance(x, _ast.FunctionDef) and x.name == "_gather_decide")
     exec(_ast.get_source_segment(src, node), ns)

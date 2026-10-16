@@ -1591,6 +1591,36 @@ CREATE INDEX IF NOT EXISTS ix_exploit_versions_parent ON public.exploit_store_ve
 -- IP for every target). Holds the gather manifest, the run's own recon, the
 -- trace summary and the end-of-attempt failure analysis that review.md and
 -- the UI attempt summary render. Mirrored by api._ensure_build_poc_attempts_table().
+-- ─── recon_cache ────────────────────────────────────────────────────────────
+-- A previous recon result, so a rebuild of the same CVE against the same host
+-- does not pay for a full ZAP spider / Playwright crawl / arjun fan-out again.
+-- Reuse is bounded by a per-tool TTL in etl/recon_cache.py, and a reused
+-- result carries its AGE into the gather manifest, where the
+-- `fact_is_stale` contradiction rule downgrades anything past its window.
+--
+-- `payload` is the recon NODE's whole return dict (segments + zap_paths +
+-- arjun_discovered + metrics), not just text: a node that returned only its
+-- text would lose the side outputs the later nodes read.
+--
+-- engagement_id: collected target data, so it is engagement-attributable and
+-- a data purge can claim it (CLAUDE.md "Engagement attribution is mandatory").
+CREATE TABLE IF NOT EXISTS public.recon_cache (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    cache_key text NOT NULL UNIQUE,
+    tool text NOT NULL,
+    ip text NOT NULL,
+    port integer NOT NULL DEFAULT 0,
+    engagement_id uuid,
+    variant jsonb,
+    payload jsonb NOT NULL,
+    run_id text,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_recon_cache_target
+    ON public.recon_cache(ip, port, tool, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_recon_cache_engagement
+    ON public.recon_cache(engagement_id);
+
 CREATE TABLE IF NOT EXISTS public.build_poc_attempts (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     engagement_id uuid,

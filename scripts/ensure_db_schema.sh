@@ -337,6 +337,7 @@ CRITICAL_TABLES=(
     "exploit_store"
     "exploit_store_versions"
     "build_poc_attempts"
+    "recon_cache"
     "build_poc_error_memory"
     "build_poc_lessons"
     "learned_postex_overlays"

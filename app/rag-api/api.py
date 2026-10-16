@@ -18149,6 +18149,46 @@ def _gather_manifest_text(man: dict) -> str:
     for i in man.get("items") or []:
         if i["status"] == "missing":
             lines.append(f"  [MISSING] {i['item']}: {i.get('value') or ''}")
+
+    # Facts the provenance scale scores below the floor are ASSUMPTIONS, and
+    # saying so is the whole point of computing a confidence. Before this, a
+    # 0.45 advisory-only endpoint reached this prompt looking exactly like a
+    # 0.9 probed one, because every reader filtered on `status` and nothing
+    # read the number.
+    assumed = []
+    for i in man.get("items") or []:
+        if i["status"] not in ("gathered", "unverified") or not i.get("value"):
+            continue
+        c = _fact_confidence(i.get("source"), i["status"])
+        if c and c < _FACT_CONFIDENCE_FLOOR:
+            assumed.append(f"  [assumption {c:.2f}] {i['item']} = {i.get('value')}  "
+                           f"(via {i.get('source')}) — NOT observed on this target")
+    if assumed:
+        lines.append("")
+        lines.append(f"ASSUMPTIONS (below the {_FACT_CONFIDENCE_FLOOR:.2f} confidence floor — "
+                     f"state these in the rationale, do not present them as known):")
+        lines.extend(assumed)
+
+    # What the challenger made of the fact SET. Rendered even when it found
+    # nothing, and loudly when it could not run: "no contradictions" and "the
+    # check never happened" must never read the same.
+    ch = man.get("challenge") or {}
+    if ch:
+        lines.append("")
+        if not ch.get("ran"):
+            lines.append("FACT CHALLENGE DID NOT RUN (%s) — absence of findings "
+                         "proves nothing here" % (ch.get("error") or "unknown reason"))
+        elif ch.get("findings"):
+            lines.append("FACT CHALLENGE — the fact set contradicts itself:")
+            for f in ch["findings"]:
+                lines.append(f"  [{str(f.get('severity')).upper()}/{f.get('action')}] "
+                             f"{f.get('rule_id')}: {f.get('message')}")
+                if f.get("remedy"):
+                    lines.append(f"      do instead: {f['remedy']}")
+        else:
+            lines.append(f"FACT CHALLENGE: {ch.get('rules_evaluated', 0)} rules, "
+                         f"no contradictions")
+
     facts = man.get("facts") or {}
     mined = facts.get("mined") or {}
     if any(mined.get(k) for k in ("paths", "fields", "methods", "headers")):
@@ -18397,6 +18437,252 @@ _PROVENANCE_FOR_MANIFEST_SOURCE = {
     "llm_fallback": "model_inferred",
     "harness": "harness_declared",
 }
+
+
+# ── The challenger: does the derived fact SET make sense? ───────────────────
+#
+# `_preflight_prove_facts` tests each claim against the target, one at a time,
+# with a negative control. That makes an individual fact honest. It cannot make
+# the SET coherent — every probe can be individually right while the facts
+# together describe a target that does not exist. One real ledger held four
+# facts at confidence 0.9, every one wrong, and no single probe was in a
+# position to notice: a templated endpoint, another product's route, a
+# command-injection parameter on a traversal, and an auth precondition the
+# target itself contradicted.
+#
+# Rules are authored as DATA in knowledge/fact_contradictions.yaml (and
+# embedded into rag_documents so the planner can recall the reasoning); the
+# decision is made deterministically in etl/fact_contradictions.py. RAG
+# explains, the deterministic pass decides — CLAUDE.md's "retrieve, then gate".
+#
+# Modes (BUILD_POC_FACT_CHALLENGE):
+#   auto   — DEFAULT. Apply each rule's declared action and carry on. The
+#            operator reads what happened afterwards instead of being asked
+#            mid-build.
+#   review — apply, then HALT so the operator signs off before traffic is
+#            spent on a contested fact set.
+#   off    — record and render, change nothing. For comparing against a
+#            previous run's behaviour.
+_FACT_CHALLENGE_MODE = (os.environ.get("BUILD_POC_FACT_CHALLENGE", "auto") or "auto").strip().lower()
+if _FACT_CHALLENGE_MODE not in ("auto", "review", "off"):
+    _FACT_CHALLENGE_MODE = "auto"
+
+# Below this, a fact is rendered to synth as an ASSUMPTION rather than a fact.
+# The number was computed and then ignored: every reader filtered on `status`,
+# so a 0.45 advisory-only endpoint reached the prompt looking exactly like a
+# 0.9 probed one. A floor is what turns the number into a control.
+try:
+    _FACT_CONFIDENCE_FLOOR = float(os.environ.get("BUILD_POC_FACT_FLOOR", "0.6"))
+except (TypeError, ValueError):
+    _FACT_CONFIDENCE_FLOOR = 0.6
+
+
+def _fact_confidence(source: str, status: str) -> float:
+    """Confidence for a manifest item, via the provenance scale. Fail-soft."""
+    try:
+        from fact_provenance import confidence_for
+        return float(confidence_for(
+            _PROVENANCE_FOR_MANIFEST_SOURCE.get(str(source or ""), "model_inferred"),
+            "confirmed" if str(status) == "gathered" else "unverified"))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+# ── Recon reuse ─────────────────────────────────────────────────────────────
+#
+# Every recon node ran its tool unconditionally, so rebuilding the same CVE
+# against the same host paid for a full ZAP spider, Playwright crawl and arjun
+# fan-out again for answers already in the database. Prior results were read
+# (scan evidence, prior_live_recon, discovered knowledge) but only ever as
+# EXTRA CONTEXT, never as a substitute for running the tool.
+#
+# What makes reuse safe is the challenger above: a reused result carries its
+# AGE, and the `fact_is_stale` rule downgrades a fact past its TTL. The worst
+# reuse can do is hand synthesis a fact marked old.
+#
+# Both helpers fail soft and keep the four outcomes distinct — a cache that
+# could not be READ is not a cache MISS, because only one of those means the
+# cache is broken.
+
+
+def _recon_cache_lookup(key: str, tool: str, mode=None):
+    """(action, reason, payload, age_seconds). Never raises."""
+    try:
+        from etl import recon_cache as _rc
+    except Exception as e:  # noqa: BLE001
+        return "unavailable", "recon_cache module unavailable (%s)" % type(e).__name__, None, None
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            return _rc.lookup(cur, key, tool, mode or _rc.AUTO)
+    except Exception as e:  # noqa: BLE001
+        return "unavailable", "cache unreachable (%s)" % type(e).__name__, None, None
+
+
+def _recon_cache_store(key: str, tool: str, ip, port, payload: dict, *,
+                       engagement_id=None, variant=None, run_id=None) -> bool:
+    """Store one recon result. Never raises; False when it did not store."""
+    try:
+        from etl import recon_cache as _rc
+        with get_db() as conn, conn.cursor() as cur:
+            ok = _rc.store(cur, key, tool, ip, port, payload,
+                           engagement_id=engagement_id, variant=variant, run_id=run_id)
+            conn.commit()
+            return ok
+    except Exception as e:  # noqa: BLE001
+        logging.warning("recon cache store failed for %s: %s", tool, e)
+        return False
+
+
+def _challenge_intel(man: dict, probe_results: dict = None, *, product=None,
+                     auth_required=None, auth_observations=None) -> dict:
+    """Flatten the manifest into the `intel` shape the evaluator reads."""
+    items = (man or {}).get("items") or []
+    facts, sources, gathered = {}, {}, []
+    for i in items:
+        name, val = str(i.get("item")), i.get("value")
+        if val not in (None, ""):
+            facts[name] = val
+            sources[name] = str(i.get("source") or "")
+        if i.get("status") == "gathered":
+            gathered.append(name)
+    lr = ((man or {}).get("facts") or {}).get("live_recon") or {}
+    observed = []
+    for key in ("crawl_urls", "zap_paths", "href_endpoints"):
+        observed.extend(lr.get(key) or [])
+    observed.extend(list((lr.get("arjun_params") or {}).keys()))
+    return {
+        "facts": facts,
+        "fact_sources": sources,
+        "gathered_items": gathered,
+        "product": product or ((man or {}).get("facts") or {}).get("product"),
+        "vuln_class": (man or {}).get("vuln_class"),
+        "observed_paths": observed,
+        "probe_results": {k: {"status": getattr(v, "status", None) or (v or {}).get("status"),
+                              "evidence": getattr(v, "evidence", None) or (v or {}).get("evidence")}
+                          for k, v in (probe_results or {}).items()},
+        "auth_required": auth_required,
+        "auth_observations": auth_observations or [],
+    }
+
+
+def _challenge_derived_facts(man: dict, cve, ip, port, eid=None, run_id=None,
+                             product=None, probe_results=None,
+                             auth_required=None, auth_observations=None,
+                             mode=None) -> dict:
+    """Read the whole fact set, apply each contradiction's declared action.
+
+    Mutates `man` in place (items, facts, missing/ready via a re-decide) and
+    attaches the result as `man["challenge"]`. Never raises: a challenger that
+    blew up must not fail a build — but it MUST NOT look like a clean bill of
+    health either, so `ran` carries that distinction all the way to the UI.
+    """
+    # A per-run override beats the env default, so an operator can skip the
+    # review (or demand one) for a single build without an env edit or a
+    # restart. An unrecognised value falls back rather than disabling a safety
+    # check by typo.
+    mode = (str(mode or "").strip().lower() or _FACT_CHALLENGE_MODE)
+    if mode not in ("auto", "review", "off"):
+        mode = _FACT_CHALLENGE_MODE
+    out = {"ran": False, "findings": [], "applied": [], "mode": mode,
+           "error": None}
+    if mode == "off":
+        out["error"] = "disabled for this run (fact_challenge=off)"
+        man["challenge"] = out
+        return out
+    try:
+        from etl.fact_contradictions import evaluate as _fc_eval, summarize as _fc_sum
+    except Exception as e:  # noqa: BLE001
+        out["error"] = "challenger unavailable: %s" % type(e).__name__
+        man["challenge"] = out
+        logging.warning("fact challenge unavailable: %s", e)
+        return out
+
+    intel = _challenge_intel(man, probe_results, product=product,
+                             auth_required=auth_required,
+                             auth_observations=auth_observations)
+    try:
+        res = _fc_eval(intel)
+    except Exception as e:  # noqa: BLE001
+        out["error"] = "challenger raised %s" % type(e).__name__
+        man["challenge"] = out
+        return out
+
+    out.update(ran=bool(res.get("ran")), findings=res.get("findings") or [],
+               unimplemented=res.get("unimplemented") or [],
+               rules_evaluated=res.get("rules_evaluated", 0),
+               high=res.get("high", 0), medium=res.get("medium", 0),
+               summary=_fc_sum(res))
+
+    by_item = {str(i.get("item")): i for i in (man.get("items") or [])}
+    for f in out["findings"]:
+        item, action = str(f.get("item") or ""), str(f.get("action") or "warn")
+        it = by_item.get(item)
+        if action == "relax_auth":
+            # The one finding that UNBLOCKS. The target answered without a
+            # session, so an `auth` item recorded as missing is wrong.
+            a = by_item.get("auth")
+            if a is not None and a.get("status") == "missing":
+                a["status"] = "n/a"
+                a["value"] = "pre-authentication: %s" % f.get("message")
+                a["source"] = "challenge:relax_auth"
+                out["applied"].append({"item": "auth", "action": action,
+                                       "rule_id": f.get("rule_id")})
+            continue
+        if it is None or action == "warn":
+            continue
+        if action == "clear":
+            it["status"] = "missing"
+            it["value"] = f.get("remedy") or f.get("message")
+            it["source"] = "challenge:%s" % f.get("rule_id")
+        elif action == "downgrade":
+            if it.get("status") == "gathered":
+                it["status"] = "unverified"
+                it["source"] = "%s (challenged: %s)" % (it.get("source") or "?",
+                                                        f.get("rule_id"))
+        else:
+            continue
+        out["applied"].append({"item": item, "action": action,
+                               "rule_id": f.get("rule_id"),
+                               "severity": f.get("severity")})
+
+    if out["applied"]:
+        # The gate decided before the challenge ran, so its verdict is stale
+        # the moment a fact is cleared or downgraded. Re-decide rather than
+        # letting a cleared endpoint read as ready.
+        try:
+            man.update(_gather_decide(man.get("items") or [], man.get("vuln_class") or "",
+                                      man.get("privileges_required") or ""))
+        except Exception as e:  # noqa: BLE001
+            logging.warning("fact challenge re-decide failed: %s", e)
+        for name in ("endpoint", "input_field", "method"):
+            itm = by_item.get(name)
+            if itm is not None and itm.get("status") == "missing":
+                (man.setdefault("facts", {})).pop(name, None)
+
+    man["challenge"] = out
+    try:
+        _poc_trace(run_id, "fact_challenge", iteration=0,
+                   response=out.get("summary") or "",
+                   extra={"findings": out["findings"], "applied": out["applied"],
+                          "ran": out["ran"], "mode": mode,
+                          "reason": "the derived fact SET was read together; "
+                                    "each contradiction's declared action was applied"})
+    except Exception as e:  # noqa: BLE001
+        logging.debug("fact challenge trace failed: %s", e)
+
+    if out["findings"]:
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("build_poc_facts_challenged", "build-poc", {
+                "engagement_id": eid, "cve": cve, "target": "%s:%s" % (ip, port),
+                "run_id": run_id, "mode": mode,
+                "findings": len(out["findings"]), "high": out.get("high", 0),
+                "medium": out.get("medium", 0), "applied": len(out["applied"]),
+                "rule_ids": sorted({f.get("rule_id") for f in out["findings"]}),
+            })
+        except Exception as e:  # noqa: BLE001
+            logging.debug("fact challenge webhook failed: %s", e)
+    return out
 
 
 def _record_gather_manifest(man: dict, cve: str, ip, port, eid=None, run_id=None) -> dict:
@@ -30226,6 +30512,23 @@ class BuildPocBody(BaseModel):
     # when the budget is spent.
     wall_timeout_sec: Optional[int] = None
 
+    # Derived-intelligence challenge for THIS build (see
+    # knowledge/fact_contradictions.yaml). None = the container default
+    # (BUILD_POC_FACT_CHALLENGE, itself `auto`).
+    #   auto   — apply each contradiction's declared action and carry on
+    #   review — apply, then halt for an operator sign-off on the Intel tab
+    #   off    — record and render, change nothing
+    # `auto` is the default on purpose: the operator asked for the review to be
+    # skippable and automatic, so a sign-off is something you opt IN to.
+    fact_challenge: Optional[str] = None
+
+    # Reuse a previous recon result for this target instead of re-running the
+    # tool. None = the container default (`auto`).
+    #   auto   — reuse while fresh, re-run past the tool's TTL
+    #   always — reuse at any age (the target has not changed since)
+    #   never  — always run the tool; the pre-cache behaviour
+    reuse_recon: Optional[str] = None
+
 
 class FetchPreconditionsBody(BaseModel):
     ip: str
@@ -32214,7 +32517,7 @@ def _zap_focused_active_scan(ip, port, urls, max_total_wait=300, per_url_wait=90
 
 def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=True, model=None,
                     auth=None, recon_first=False, recon_source="basic", hint=None,
-                    focused_urls=None):
+                    focused_urls=None, fact_challenge=None, reuse_recon=None):
     """Dispatch the full build-poc pipeline via the LangGraph in build_poc_graph.
 
     All ten recon phases (port_sweep -> waf_detect -> waf_characterize -> basic_recon ->
@@ -32242,7 +32545,8 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
         cve, ip, port, product=product, version=version, eid=eid,
         max_iters=max_iters, research=research, model=model, auth=auth,
         recon_first=recon_first, recon_source=recon_source, hint=hint,
-        focused_urls=focused_urls or [],
+        focused_urls=focused_urls or [], fact_challenge=fact_challenge,
+        reuse_recon=reuse_recon,
     )
     return _bpg.invoke_build_poc(_state)
 
@@ -34625,6 +34929,160 @@ def build_poc_cancel(run_id: str, _: bool = Depends(auth)):
                      "list may already have finished — the flag is harmless.")}
 
 
+@app.get("/build-poc/{run_id}/intel", tags=["Assets"])
+def build_poc_intel(run_id: str, engagement_id: Optional[str] = None,
+                    all_engagements: bool = False, _: bool = Depends(auth)):
+    """The derived-intelligence review for one build: every fact, where it came
+    from, what proved it, and what the challenger made of the set.
+
+    The operator ask this answers is "how do I sanity-check what we derived
+    from recon, and see that nothing is missing". Until now that was spread
+    across three places that never met: the manifest (prose, in a prompt), the
+    `confirmed_facts` ledger (status, no manifest context) and the run trace (a
+    JSONL file inside the container). A fact could read `confirmed 0.9` in the
+    ledger while being a template nothing could ever have matched.
+
+    Three columns matter and each is a distinct question:
+      source      — where the value came from (probe / advisory / the model)
+      proof       — what a test case observed, INCLUDING "the control matched",
+                    which means the probe tested nothing
+      challenged  — what reading the facts TOGETHER showed
+
+    Engagement-filtered like every other listing; `?all_engagements=true` is
+    the explicit cross-engagement override.
+    """
+    import json as _j
+    eid = _resolve_engagement_id(engagement_id)
+    row, trace_rows = None, []
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            where, params = ["run_id = %s"], [str(run_id)]
+            if eid and not all_engagements:
+                where.append("(engagement_id = %s OR engagement_id IS NULL)")
+                params.append(str(eid))
+            cur.execute("""SELECT run_id, cve, ip, port, engagement_id, stage_reached,
+                                  stop_reason, gather_manifest, poc_log_path, created_at
+                             FROM build_poc_attempts
+                            WHERE """ + " AND ".join(where) + " LIMIT 1", params)
+            row = cur.fetchone()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(503, f"could not read the run: {type(e).__name__}: {e}")
+    if not row:
+        raise HTTPException(404, f"no build-poc run {run_id} in this engagement")
+
+    man = row.get("gather_manifest")
+    if isinstance(man, str):
+        try:
+            man = _j.loads(man)
+        except Exception:  # noqa: BLE001
+            man = None
+    man = man if isinstance(man, dict) else {}
+
+    # The challenge may only exist in the trace (the attempt row is written at
+    # the end, and a run that is still going has not written one).
+    challenge = man.get("challenge") or {}
+    probe_evidence = {}
+    try:
+        path = row.get("poc_log_path") or _poc_run_file(run_id)
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = _j.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                ph = d.get("phase")
+                if ph == "fact_challenge":
+                    ex = d.get("extra") or {}
+                    if ex.get("findings") is not None or ex.get("ran") is not None:
+                        challenge = {**challenge, **ex}
+                elif ph == "gather_check" and isinstance(d.get("extra"), dict):
+                    m2 = (d["extra"] or {}).get("gather_manifest")
+                    if isinstance(m2, dict):
+                        man = m2 if not man else {**man, **m2}
+                elif ph == "preflight_facts":
+                    trace_rows.append(d.get("extra") or {})
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # noqa: BLE001
+        logging.debug("intel: trace read failed: %s", e)
+
+    target = f"{row.get('ip')}:{row.get('port')}"
+    ledger = {}
+    try:
+        _ensure_confirmed_facts_table()
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""SELECT claim_key, claim_value, status, evidence, method,
+                                  confidence, source, updated_at
+                             FROM confirmed_facts
+                            WHERE target = %s AND (cve = %s OR cve IS NULL)
+                            ORDER BY updated_at DESC""", [target, row.get("cve")])
+            for r in cur.fetchall() or []:
+                ledger.setdefault(str(r.get("claim_key")), dict(r))
+    except Exception as e:  # noqa: BLE001
+        logging.debug("intel: ledger read failed: %s", e)
+
+    challenged_by = {}
+    for f in (challenge.get("findings") or []):
+        challenged_by.setdefault(str(f.get("item")), []).append(f)
+
+    facts = []
+    for i in (man.get("items") or []):
+        name = str(i.get("item"))
+        led = ledger.get(name) or {}
+        conf = led.get("confidence")
+        if conf is None:
+            conf = _fact_confidence(i.get("source"), i.get("status"))
+        try:
+            conf = round(float(conf), 3)
+        except (TypeError, ValueError):
+            conf = None
+        ev = str(led.get("evidence") or "")
+        facts.append({
+            "item": name,
+            "value": i.get("value"),
+            "status": i.get("status"),
+            "source": i.get("source"),
+            "confidence": conf,
+            # Three distinct proof outcomes, never collapsed: proven, the probe
+            # could not decide, and the probe's own control matched (it tested
+            # nothing). The last one used to be indistinguishable from the first.
+            "proof": ("proven" if led.get("status") == "confirmed"
+                      else "disproven" if led.get("status") == "refuted"
+                      else "untested (control matched)" if "control matched" in ev
+                      else "inconclusive" if "inconclusive" in ev
+                      else "not probed" if not ev else "unverified"),
+            "proof_evidence": ev[:400] or None,
+            "probe_method": led.get("method"),
+            "below_floor": bool(conf is not None and conf < _FACT_CONFIDENCE_FLOOR),
+            "challenged": challenged_by.get(name) or [],
+        })
+
+    return {
+        "run_id": row.get("run_id"), "cve": row.get("cve"), "target": target,
+        "engagement_id": row.get("engagement_id"),
+        "stage_reached": row.get("stage_reached"), "stop_reason": row.get("stop_reason"),
+        "created_at": row.get("created_at").isoformat() if row.get("created_at") else None,
+        "all_engagements": bool(all_engagements),
+        "ready": man.get("ready"), "missing": man.get("missing") or [],
+        "vuln_class": man.get("vuln_class"),
+        "confidence_floor": _FACT_CONFIDENCE_FLOOR,
+        "challenge_mode": challenge.get("mode") or _FACT_CHALLENGE_MODE,
+        # The three-outcome rule applied to the reviewer itself: a challenge
+        # that did not run must never render as "nothing wrong".
+        "challenge_ran": bool(challenge.get("ran")),
+        "challenge_error": challenge.get("error"),
+        "challenge_summary": challenge.get("summary"),
+        "findings": challenge.get("findings") or [],
+        "applied": challenge.get("applied") or [],
+        "unimplemented_rules": challenge.get("unimplemented") or [],
+        "facts": facts,
+        "preflight": trace_rows[-1] if trace_rows else None,
+    }
+
+
 @app.get("/build-poc/active", tags=["Assets"])
 def build_poc_active(engagement_id: Optional[str] = None,
                      all_engagements: bool = False,
@@ -35128,7 +35586,9 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     core = _build_poc_core(cve, ip, port, body.product, body.version, eid,
                            eff_max_iters, model=body.model, auth=auth, recon_first=body.recon_first,
                            recon_source=body.recon_source or "basic", hint=hint,
-                           focused_urls=body.focused_urls or [])
+                           focused_urls=body.focused_urls or [],
+                           fact_challenge=body.fact_challenge,
+                           reuse_recon=body.reuse_recon)
     return {"ok": True, "cve": cve,
             "test_mode": preset or "custom",
             "effective_knobs": {

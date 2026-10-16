@@ -163,10 +163,23 @@ def test_a_404_endpoint_is_refuted():
 
 
 def test_a_protected_endpoint_is_confirmed_not_refuted():
-    """401/403 proves the path exists. A 403 on the right path beats 200 on the wrong one."""
+    """401/403 proves the path exists. A 403 on the right path beats 200 on the wrong one.
+
+    Updated 2026-10-16 when negative controls landed. The property this guards
+    is unchanged — a protected path must never be REFUTED — but "confirmed"
+    now requires that the control answered differently. A stub that returns
+    401 for every URL is a target that 401s everything, and a 401 there says
+    nothing about this path.
+    """
     for code in (401, 403, 500):
-        r = run_probes(lambda m, u, **k: _R(code, ""), "http://t:9090", FACTS)
+        # Control (nonsense leaf) 404s, claim does not -> confirmed.
+        r = run_probes(lambda m, u, **k: _R(404, "") if "/z" in u else _R(code, "body"),
+                       "http://t:9090", FACTS)
         assert r["endpoint_exists"].status == CONFIRMED, code
+        # Everything answers the same -> not confirmed, and still not refuted.
+        r = run_probes(lambda m, u, **k: _R(code, ""), "http://t:9090", FACTS)
+        assert r["endpoint_exists"].status != REFUTED, code
+        assert "control matched" in r["endpoint_exists"].evidence, code
 
 
 def test_a_probe_that_could_not_run_is_not_a_refutation():

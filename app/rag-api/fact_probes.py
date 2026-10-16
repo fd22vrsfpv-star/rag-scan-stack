@@ -35,6 +35,8 @@ own and can be tested with a stub. It is called as
 """
 from __future__ import annotations
 
+import hashlib
+import re
 from typing import Callable, Optional
 
 CONFIRMED = "confirmed"
@@ -83,6 +85,87 @@ def _inconclusive(probe_id, why) -> ProbeResult:
                        "probe", probe_id)
 
 
+def _indistinguishable(probe_id, why) -> ProbeResult:
+    """The probe RAN, the claim "passed", and so did a NEGATIVE CONTROL.
+
+    A third flavour of UNVERIFIED, and the one this module was missing. The
+    old `probe_endpoint_exists` confirmed on anything that was not a 404 — so
+    on an app that soft-404s, redirects, or serves a generic page for unknown
+    routes, EVERY claimed endpoint confirmed, including a path that still had
+    a literal `{placeholder}` in it. The check could not fail, which made it
+    no check at all.
+
+    A control is the same request with a value we KNOW is wrong. If the target
+    answers the control the same way it answered the claim, the claim was
+    never tested: what we observed is the target's default behaviour, not
+    evidence about our fact. That is "I looked, and the instrument reads the
+    same with nothing in it" — not a refutation (the fact may well be true),
+    and emphatically not a confirmation.
+    """
+    return ProbeResult(UNVERIFIED, "probe ran, control matched: %s" % why,
+                       "probe", probe_id)
+
+
+# A value that still carries a template placeholder is not a value. Advisories
+# publish routes as `/s/{key}/_/download/resources/{module}:{name}` and the
+# extractor forwards them verbatim; probing one asks the target about a path
+# containing a literal brace. A templated route confirmed at 0.9 on a real
+# run, which is how a template became a "verified endpoint".
+_PLACEHOLDER = re.compile(r"\{[^}]*\}|<[^>]+>|\.\.\.|%7B|%3C", re.I)
+
+
+def has_placeholder(value) -> bool:
+    """Does this value still contain an unsubstituted template placeholder?"""
+    return bool(_PLACEHOLDER.search(str(value or "")))
+
+
+def control_token(seed: str, n: int = 10) -> str:
+    """A deterministic nonsense token derived from `seed`.
+
+    Deterministic so a probe is reproducible and a re-run of the same build
+    sends the same control request — a random control makes two runs
+    incomparable. Hex only, so it is a legal path segment and a legal
+    parameter name under every encoding, and led by a letter because some
+    frameworks reject a parameter whose name starts with a digit.
+    """
+    h = hashlib.sha256(("fact-probe-control:" + str(seed or "")).encode()).hexdigest()
+    return "z" + h[:max(1, n - 1)]
+
+
+def _split_query(path: str):
+    p = str(path or "")
+    return (p.split("?", 1)[0], ("?" + p.split("?", 1)[1]) if "?" in p else "")
+
+
+def control_path(path: str, nonce: str) -> str:
+    """The claimed route with its LAST segment replaced by nonsense.
+
+    Keeps the route prefix and the query so the control exercises the same
+    handler, mount point and middleware as the claim. If the app answers this
+    the same way, "the endpoint exists" described the app, not the endpoint.
+    """
+    bare, query = _split_query(path)
+    parts = [seg for seg in bare.split("/") if seg != ""]
+    if not parts:
+        return "/" + nonce + query
+    parts[-1] = nonce
+    return "/" + "/".join(parts) + query
+
+
+def _body(r) -> str:
+    return getattr(r, "text", "") or ""
+
+
+def _same_size(a: str, b: str) -> bool:
+    """Response sizes close enough to be the same page.
+
+    Tolerant by 2% or 32 bytes, whichever is larger: a CSRF nonce or a
+    timestamp changes a page's length without changing the page.
+    """
+    la, lb = len(a or ""), len(b or "")
+    return abs(la - lb) <= max(32, int(0.02 * max(la, lb)))
+
+
 def probe_target_reachable(http: Callable, base: str) -> ProbeResult:
     """Does the target answer HTTP at all?
 
@@ -102,16 +185,31 @@ def probe_target_reachable(http: Callable, base: str) -> ProbeResult:
 
 
 def probe_endpoint_exists(http: Callable, base: str, path: str) -> ProbeResult:
-    """Is the claimed endpoint actually served?
+    """Is the claimed endpoint actually served — as opposed to this app
+    answering everything?
 
-    404/410 refutes. Anything else — including 401/403, which prove the path
-    exists and is protected — confirms. A 403 on the right path is a far better
-    starting point than a 200 on the wrong one.
+    404/410 refutes. Anything else USED to confirm, including 401/403, on the
+    reasoning that a 403 on the right path beats a 200 on the wrong one. That
+    reasoning is sound and the test built on it was not: an app that soft-404s
+    or redirects unknown routes answers a nonsense path exactly the same way,
+    so the probe confirmed every claim it was ever given.
+
+    So the non-404 answer is now compared against a CONTROL — the same route
+    with its last segment replaced by nonsense. Same status AND same-size body
+    means the response describes the app, not the endpoint.
     """
     pid = "endpoint_exists"
     if not path:
         return _unverified(pid, "no endpoint claimed")
-    url = base.rstrip("/") + "/" + str(path).lstrip("/")
+    if has_placeholder(path):
+        # Probing `/s/{key}/...` asks the target about a literal brace. The
+        # answer is meaningless whichever way it comes back, so do not spend
+        # a request on it and do not let it reach the ledger as a fact.
+        return _unverified(
+            pid, "endpoint %r still contains a template placeholder — "
+                 "substitute it before it can be probed" % str(path)[:120])
+    root = base.rstrip("/")
+    url = root + "/" + str(path).lstrip("/")
     try:
         r = http("GET", url, timeout=8)
     except Exception as e:  # noqa: BLE001
@@ -119,13 +217,35 @@ def probe_endpoint_exists(http: Callable, base: str, path: str) -> ProbeResult:
     if r.status_code in (404, 410):
         return ProbeResult(REFUTED, "HTTP %s at %s — path not served"
                            % (r.status_code, url), "probe", pid)
-    return ProbeResult(CONFIRMED, "HTTP %s at %s" % (r.status_code, url),
+
+    ctrl_url = root + control_path(path, control_token(path))
+    try:
+        c = http("GET", ctrl_url, timeout=8)
+    except Exception as e:  # noqa: BLE001
+        # The control could not run. That is not a reason to withhold what we
+        # DID observe, but the fact is worth less and the ledger must say so,
+        # so a reader can tell a controlled confirmation from a bare one.
+        return ProbeResult(CONFIRMED,
+                           "HTTP %s at %s (control unavailable: %s)"
+                           % (r.status_code, url, type(e).__name__),
+                           "probe", pid, value=path)
+    if c.status_code == r.status_code and _same_size(_body(r), _body(c)):
+        return _indistinguishable(
+            pid, "a nonsense path (%s) answered HTTP %s with a same-size body "
+                 "— this app answers unknown routes, so HTTP %s at %s is not "
+                 "evidence the endpoint exists"
+                 % (ctrl_url, c.status_code, r.status_code, url))
+    return ProbeResult(CONFIRMED,
+                       "HTTP %s at %s; control %s answered HTTP %s (%d vs %d bytes)"
+                       % (r.status_code, url, ctrl_url, c.status_code,
+                          len(_body(r)), len(_body(c))),
                        "probe", pid, value=path)
 
 
 def probe_input_field(http: Callable, base: str, path: str, field: str,
                       marker: Optional[str] = None) -> ProbeResult:
-    """Does the endpoint ACCEPT the claimed parameter?
+    """Does the endpoint ACCEPT the claimed parameter — and does it treat that
+    parameter differently from any other?
 
     This is the fact that matters most and the one that was purely a guess.
     The test is deliberately weak on purpose: we are proving the parameter is
@@ -133,40 +253,78 @@ def probe_input_field(http: Callable, base: str, path: str, field: str,
     exploit's job; proving the parameter exists is a precondition for even
     trying, and getting it wrong wastes the whole build.
 
-    Confirmed when the parameter is reflected, or when supplying it changes the
-    response from the same request without it. Unverified — never refuted —
-    when neither happens: plenty of real injection points are blind, and
-    refuting `listingfields` because it does not echo would be worse than
-    saying nothing.
+    Three signals confirm: the value is reflected, supplying it changes the
+    status, or it changes the response size. Each is now re-run with a NONSENSE
+    parameter name. An app that reflects any query value, or that 404s on any
+    unknown parameter, produces all three signals for a name it has never heard
+    of — which is how `command` was confirmed at 0.9 on a path-traversal CVE
+    because it "changed the status (200 -> 404)".
+
+    Unverified — never refuted — when no signal appears: plenty of real
+    injection points are blind, and refuting a parameter because it does not
+    echo would be worse than saying nothing.
     """
     pid = "input_field"
     if not field:
         return _unverified(pid, "no input field claimed")
+    if has_placeholder(field):
+        return _unverified(
+            pid, "input field %r still contains a template placeholder"
+                 % str(field)[:80])
     url = base.rstrip("/") + "/" + str(path or "").lstrip("/")
     token = marker or "pf0prb"
     sep = "&" if "?" in url else "?"
+    ctrl_field = control_token("%s|%s" % (path, field))
     try:
         with_param = http("GET", "%s%s%s=%s" % (url, sep, field, token), timeout=8)
         without = http("GET", url, timeout=8)
+        control = http("GET", "%s%s%s=%s" % (url, sep, ctrl_field, token), timeout=8)
     except Exception as e:  # noqa: BLE001
         return _unverified(pid, "%s probing %s" % (type(e).__name__, field))
-    body = getattr(with_param, "text", "") or ""
+
+    body = _body(with_param)
+    base_body = _body(without)
+    ctrl_body = _body(control)
+
     if token in body:
+        if token in ctrl_body:
+            return _indistinguishable(
+                pid, "the token came back for a parameter this app has never "
+                     "heard of (%r), so reflection does not show %r is read"
+                     % (ctrl_field, field))
         return ProbeResult(CONFIRMED,
-                           "parameter %r reflected in the response (HTTP %s)"
-                           % (field, with_param.status_code),
+                           "parameter %r reflected in the response (HTTP %s); "
+                           "nonsense parameter %r was not"
+                           % (field, with_param.status_code, ctrl_field),
                            "probe", pid, value=field)
-    base_body = getattr(without, "text", "") or ""
+
     if with_param.status_code != without.status_code:
+        if control.status_code == with_param.status_code:
+            return _indistinguishable(
+                pid, "a nonsense parameter (%r) moved the status the same way "
+                     "(%s -> %s), so the change is not about %r"
+                     % (ctrl_field, without.status_code,
+                        control.status_code, field))
         return ProbeResult(CONFIRMED,
-                           "parameter %r changed the status (%s -> %s)"
-                           % (field, without.status_code, with_param.status_code),
+                           "parameter %r changed the status (%s -> %s); "
+                           "nonsense parameter %r left it at %s"
+                           % (field, without.status_code, with_param.status_code,
+                              ctrl_field, control.status_code),
                            "probe", pid, value=field)
-    if base_body and body and len(body) != len(base_body):
+
+    if base_body and body and not _same_size(body, base_body):
+        if ctrl_body and not _same_size(ctrl_body, base_body):
+            return _indistinguishable(
+                pid, "a nonsense parameter (%r) changed the response size too "
+                     "(%d vs %d bytes), so the change is not about %r"
+                     % (ctrl_field, len(ctrl_body), len(base_body), field))
         return ProbeResult(CONFIRMED,
-                           "parameter %r changed the response size (%d -> %d bytes)"
-                           % (field, len(base_body), len(body)),
+                           "parameter %r changed the response size (%d -> %d "
+                           "bytes); nonsense parameter %r did not (%d bytes)"
+                           % (field, len(base_body), len(body), ctrl_field,
+                              len(ctrl_body)),
                            "probe", pid, value=field)
+
     return _inconclusive(
         pid, "parameter %r neither reflected nor changed the response — this is "
              "NOT a refutation, a blind injection point looks exactly like this"
@@ -174,7 +332,14 @@ def probe_input_field(http: Callable, base: str, path: str, field: str,
 
 
 def probe_method_allowed(http: Callable, base: str, path: str, method: str) -> ProbeResult:
-    """Is the HTTP verb accepted on that path? 405 refutes."""
+    """Is the HTTP verb accepted on that path? 405 refutes.
+
+    Controlled with a verb that cannot be routed anywhere. A server that does
+    not enforce methods answers an invented verb exactly as it answers the
+    claimed one, and "OPTIONS accepted" then says nothing — which is how an
+    OPTIONS result on a route belonging to a DIFFERENT product reached the
+    ledger as confirmed.
+    """
     pid = "method_allowed"
     if not method:
         return _unverified(pid, "no method claimed")
@@ -187,8 +352,23 @@ def probe_method_allowed(http: Callable, base: str, path: str, method: str) -> P
     if r.status_code == 405:
         return ProbeResult(REFUTED, "HTTP 405 — %s not allowed on %s" % (verb, url),
                            "probe", pid)
-    return ProbeResult(CONFIRMED, "%s accepted on %s (HTTP %s)"
-                       % (verb, url, r.status_code), "probe", pid, value=verb)
+    ctrl_verb = control_token(path or "/", 8).upper()
+    try:
+        c = http(ctrl_verb, url, timeout=8)
+    except Exception as e:  # noqa: BLE001
+        return ProbeResult(CONFIRMED,
+                           "%s accepted on %s (HTTP %s; control unavailable: %s)"
+                           % (verb, url, r.status_code, type(e).__name__),
+                           "probe", pid, value=verb)
+    if c.status_code == r.status_code and _same_size(_body(r), _body(c)):
+        return _indistinguishable(
+            pid, "an invented verb (%s) was answered HTTP %s too — this server "
+                 "does not enforce methods, so %s on %s is not evidence"
+                 % (ctrl_verb, c.status_code, verb, url))
+    return ProbeResult(CONFIRMED,
+                       "%s accepted on %s (HTTP %s); invented verb %s got HTTP %s"
+                       % (verb, url, r.status_code, ctrl_verb, c.status_code),
+                       "probe", pid, value=verb)
 
 
 # claim_type -> (callable, required manifest keys). The runner skips a probe

@@ -317,8 +317,21 @@ all, so a canary assertion for a file read), then absent from
 lives in the path). Each fix needed a code edit, an image rebuild and a
 redeploy, while `knowledge/` is **bind-mounted into 8 services** and would have
 taken effect live.
-**Where:** `app/rag-api/api.py` (the eight sets), `knowledge/` (where they
-belong).
+2026-10-16, second count: it is **eleven** vocabularies in `api.py`, not eight
+— add `_FILE_READ_CLASSES` (:522), `_WEB_VULN_CLASSES` (:6507),
+`_CWE_TO_VULN_CLASS` (:14988), `_SCAN_EVIDENCE_CWE_FOR_CLASS` (:16938),
+`_BLIND_CLASSES` (:21629) and `_CLASSIFIER_TO_FAILURE_KEY` (:26043). Twelve
+`knowledge/*.yaml` files also name classes. `_FILE_READ_CLASSES` alone lists
+`lfi`, `path-traversal` AND `path_traversal` — three spellings of one thing,
+in one set, because nothing normalises.
+
+And the same change that added the fact challenger added a **twelfth** copy:
+`knowledge/fact_contradictions.yaml` carries its own `path_is_the_field_classes`
+and `class_field_hints`. That was the cheap way to ship the rule and it is
+exactly how this item keeps growing — every new feature that reasons about a
+vuln class writes its own list because there is nothing to import.
+**Where:** `app/rag-api/api.py` (eleven sets), `knowledge/fact_contradictions.yaml`
+(two more), `knowledge/` (where they all belong).
 **Done when:** one `knowledge/vuln_classes.yaml` is the single source of truth,
 with TWO readers, because CLAUDE.md requires both and they are not the same
 mechanism:

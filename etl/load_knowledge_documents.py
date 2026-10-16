@@ -806,6 +806,29 @@ def _render_cve_exploit_specs(data: Dict[str, Any]) -> List[Doc]:
     return docs
 
 
+def _render_fact_contradictions(data: Dict[str, Any]) -> List[Doc]:
+    """One document per contradiction rule.
+
+    Embedded so the planner can RECALL why a derived fact was challenged —
+    `etl/fact_contradictions.py` makes the decision deterministically, this
+    makes the reasoning retrievable. The `why` text is the valuable part: each
+    rule exists because a real build recorded a wrong fact at high confidence.
+    """
+    docs: List[Doc] = []
+    for r in (data.get("rules") or []):
+        if not isinstance(r, dict):
+            continue
+        rid = r.get("id") or "?"
+        title = f"Fact contradiction ({r.get('severity','medium')}): {rid}"
+        body = (f"Check `{r.get('check','?')}` flags derived intelligence when: "
+                f"{_s(r.get('message'))}. "
+                f"Why this rule exists: {_s(r.get('why'))}")
+        if r.get("remedy"):
+            body += f" What to do instead: {_s(r.get('remedy'))}"
+        docs.append((title, " ".join(body.split())))
+    return docs
+
+
 RENDERERS = {
     "app_request_contracts": _render_app_request_contracts,
     "exploitation_tools": _render_exploitation_tools,
@@ -839,6 +862,7 @@ RENDERERS = {
     "web_profiles": _render_web_profiles,
     "credential_spray_policy": _render_credential_spray_policy,
     "web_auth_templates": _render_web_auth_templates,
+    "fact_contradictions": _render_fact_contradictions,
 }
 
 
