@@ -2351,6 +2351,30 @@ def invoke_build_poc(state: BuildPocState) -> Dict[str, Any]:
     its endpoint caller: {command, assertion, canary, success, verified,
     off_target, reflection, iterations, exploit_store_id, ...}."""
     graph = build_graph()
+    # ── Announce the run BEFORE doing any of it ─────────────────────────────
+    #
+    # `build_poc_endpoint` is a synchronous def: it blocks for the whole build
+    # (10-25 min observed) and the UI awaits that single response, so until
+    # now the FIRST evidence a run existed was the attempt row written at the
+    # END. An operator who pressed Build PoC had nothing to look at and no way
+    # to tell "running" from "never started" — which is exactly how two
+    # concurrent runs of CVE-2026-21589 went unnoticed on 2026-10-16.
+    #
+    # The row is upserted on run_id, so the end-of-run record updates this one
+    # rather than racing it. Fail-soft: a status row is not worth failing a
+    # build over.
+    try:
+        from api import _record_build_poc_attempt, _poc_run_file
+        _record_build_poc_attempt(
+            run_id=state.get("run_id"), cve=state.get("cve"), ip=state.get("ip"),
+            port=state.get("port"), eid=state.get("eid"),
+            stage_reached="running",
+            poc_log_path=_poc_run_file(state.get("run_id")))
+    except Exception as e:  # noqa: BLE001
+        import logging as _lg
+        _lg.getLogger(__name__).warning(
+            "build-poc: could not record the start of %s: %s",
+            state.get("run_id"), e)
     try:
         final = graph.invoke(state)
     except Exception as e:  # noqa: BLE001

@@ -234,6 +234,41 @@ gap between two rows. (The stage-level bound is done — see the update above.)
 **Enforced by:** `tests/test_derive_budget.py` covers the bound; the per-call
 tracing is not enforced.
 
+### Scope classification rules are GLOBAL — two engagements collide
+**Found:** 2026-10-16
+**Evidence:** `knowledge/scope_rules/` holds 13 builtin rules and 2 custom
+examples. **No rule carries an `engagement_id`**, and `rule_engine.py` contains
+no engagement awareness (`grep -n engagement app/rag-api/rule_engine.py` returns
+one unrelated comment). `custom.yaml`'s own header says *"Replace the examples
+below with your engagement's actual scope rules"* — singular, because the file
+cannot express more than one customer:
+
+    - id: example_primary
+      rule_type: domain_pattern
+      scope_name: customer_general
+      conditions: { pattern: "*.example.com" }
+
+A second engagement's `domain_pattern` / `whois_org` rules would be evaluated
+against the first engagement's hosts, and there is nowhere to say which
+customer a pattern belongs to.
+
+The matching LOGIC is fine and not the problem — `check_customer_hosted_cert`
+compares registrable domains between a host and its TLS cert and names no
+customer, so it generalises correctly. The gap is ownership, not matching.
+**Where:** `knowledge/scope_rules/{builtin,custom}.yaml`,
+`app/rag-api/rule_engine.py`.
+**Done when:** a scope rule carries a nullable `engagement_id` (NULL = global,
+the same convention the `not_in_scope` deny-list already uses), the loader
+keys rules per engagement, and the engine evaluates only the active
+engagement's rules plus the global ones. A test asserts that a rule belonging
+to engagement A does not classify a host belonging to engagement B.
+**Enforced by:** not enforced. A guard would assert `rule_engine` filters on
+the active engagement, and that a per-engagement rule cannot match another
+engagement's host.
+*Why it matters:* this is the attribution invariant the project already
+enforces for collected data, applied to the config that decides what gets
+scanned. It is defensible only while exactly one customer exists.
+
 ### test_post_enumeration: the netexec parser fails to import in the sidecar
 **Found:** 2026-10-07 (running the suite in the `python:3.12-slim` sidecar with `PYTHONPATH=.`)
 **Evidence:** `tests/test_post_enumeration.py::test_the_registry_handles_netexec_and_its_aliases`

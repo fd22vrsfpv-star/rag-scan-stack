@@ -422,7 +422,7 @@ _build_poc_proxy_choice: contextvars.ContextVar = contextvars.ContextVar(
 )
 
 
-def _attack_proxy_for(ip, eid=None, run_id=None, operator_choice=None):
+def _attack_proxy_for(ip, eid=None, run_id=None, operator_choice=None, command=""):
     """Resolve + enforce the attack proxy for one dispatch to the listener.
 
     Returns (decision, refusal) -- `refusal` is None when the dispatch may
@@ -467,7 +467,12 @@ def _attack_proxy_for(ip, eid=None, run_id=None, operator_choice=None):
                f"refusing to dispatch rather than attack direct by default")
         _poc_trace(run_id, "proxy_refused", response=msg, extra={"target": str(ip)})
         return None, msg
-    _poc_trace(run_id, "proxy_selected", response=_note(dec, ""),
+    # The COMMAND is passed so the note can say whether the tool will actually
+    # honour ALL_PROXY. Called with "" this row said "no recognised tool —
+    # cannot tell" while the listener's own line for the same dispatch said
+    # "nuclei honour(s) the proxy environment" (observed live 2026-10-16).
+    # Two lines disagreeing about one dispatch is worse than one line.
+    _poc_trace(run_id, "proxy_selected", response=_note(dec, command),
                extra={"proxy_url": dec.proxy_url, "source": dec.source,
                       "label": dec.label})
     return dec, None
@@ -526,7 +531,7 @@ def _listener_vectors_run(listener, command, ip, port, timeout, *, eid=None,
     claim about twelve places someone has to remember.
     """
     import httpx as _hx
-    dec, refusal = _attack_proxy_for(ip, eid=eid, run_id=run_id)
+    dec, refusal = _attack_proxy_for(ip, eid=eid, run_id=run_id, command=command)
     if refusal:
         return _RefusedResponse(refusal)
     hdrs = dict(headers or {})
@@ -16334,7 +16339,7 @@ def _known_good_probe(cve, ip, port, product="", eid=None, run_id=None,
     import httpx as _hx
     # Same proxy policy as the refine loop. This probe sends real traffic to
     # the target, so it egresses from the node like any other attack.
-    _kg_dec, _kg_refusal = _attack_proxy_for(ip, eid=eid, run_id=run_id)
+    _kg_dec, _kg_refusal = _attack_proxy_for(ip, eid=eid, run_id=run_id, command=cmd)
     if _kg_refusal:
         out["skipped"] = f"proxy refused: {_kg_refusal}"
         _poc_trace(run_id, "known_good_probe", iteration=0, response=out["skipped"])
@@ -28387,7 +28392,8 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                 # Shared with _known_good_probe via _attack_proxy_for, because
                 # this was inline first and the second dispatch site was
                 # missed -- its traffic went direct while this one was proxied.
-                _px, _px_err = _attack_proxy_for(ip, eid=eid, run_id=run_id)
+                _px, _px_err = _attack_proxy_for(ip, eid=eid, run_id=run_id,
+                                                 command=command)
                 if _px_err:
                     output = f"[proxy] REFUSED\n{_px_err}"
                     ec = 46          # 46 = refused by proxy policy (45 is tool-missing)
@@ -34261,6 +34267,83 @@ def _poc_precheck_model(model: str) -> dict:
         return {"ok": False, "error": str(res.get("error") or "unknown LLM error"),
                 "model": res.get("model") or model}
     return {"ok": True, "model": res.get("model") or model}
+
+
+@app.get("/build-poc/active", tags=["Assets"])
+def build_poc_active(engagement_id: Optional[str] = None,
+                     all_engagements: bool = False,
+                     _: bool = Depends(auth)):
+    """Build-PoC runs that are IN FLIGHT, with the phase each is on.
+
+    `build_poc_endpoint` is a synchronous def that blocks for the whole build,
+    so its HTTP response arrives 10-25 minutes after submit. Until this
+    endpoint existed there was nothing to poll: the attempt row was written at
+    the END, the Scan Monitor's `bpc-` row could not be opened, and the live
+    trace was a file inside the container. An operator who pressed Build PoC
+    had no way to distinguish "running" from "never started" — which is how
+    two concurrent runs of the same CVE went unnoticed on 2026-10-16.
+
+    A run is in flight when its row has no `stop_reason`. The current phase is
+    the last line of its trace, which is also how `last_seen` is derived: a
+    run whose trace has not moved is still reported, with the age, rather than
+    being hidden or guessed about.
+    """
+    import json as _j
+    out = []
+    # Engagement-filtered like every other listing (CLAUDE.md: "Engagement +
+    # scope filters apply on READS"). Without this an operator working in one
+    # engagement would see another's in-flight runs under their own header --
+    # the exact defect /exploit-store had. NULL-engagement rows stay visible
+    # by the standard convention; ?all_engagements=true is the explicit
+    # cross-engagement override.
+    eid = _resolve_engagement_id(engagement_id)
+    where, params = ["stop_reason IS NULL",
+                     "created_at > now() - interval '6 hours'"], []
+    if eid and not all_engagements:
+        where.append("(engagement_id = %s OR engagement_id IS NULL)")
+        params.append(str(eid))
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""SELECT run_id, cve, ip, port, engagement_id, stage_reached,
+                                  poc_log_path, created_at
+                             FROM build_poc_attempts
+                            WHERE """ + " AND ".join(where) +
+                        " ORDER BY created_at DESC LIMIT 25", params)
+            rows = cur.fetchall() or []
+    except Exception as e:  # noqa: BLE001
+        # "Could not ask" is not "nothing is running" — say which it is.
+        raise HTTPException(503, f"could not read in-flight runs: {type(e).__name__}: {e}")
+    for r in rows:
+        phase, last_ts, n = None, None, 0
+        path = r.get("poc_log_path") or _poc_run_file(r.get("run_id"))
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    n += 1
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        d = _j.loads(line)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    phase, last_ts = d.get("phase") or phase, d.get("ts") or last_ts
+        except FileNotFoundError:
+            phase = None            # registered, trace not written yet
+        except Exception:  # noqa: BLE001
+            phase = None
+        out.append({"run_id": r.get("run_id"), "cve": r.get("cve"),
+                    "target": f"{r.get('ip')}:{r.get('port')}",
+                    "engagement_id": str(r.get("engagement_id") or "") or None,
+                    "phase": phase, "trace_rows": n,
+                    "last_trace_at": last_ts,
+                    "started_at": r.get("created_at").isoformat() if r.get("created_at") else None,
+                    "trace": path})
+    return {"ok": True, "running": len(out), "runs": out,
+            # The UI must be able to label which mode it is showing, so
+            # "all engagements" is never mistaken for "this engagement".
+            "engagement_id": str(eid) if eid else None,
+            "all_engagements": bool(all_engagements)}
 
 
 @app.get("/build-poc/attempts", tags=["Assets"])

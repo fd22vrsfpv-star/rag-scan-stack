@@ -4042,6 +4042,24 @@ DO $$ BEGIN
     ALTER TABLE engagements ADD COLUMN IF NOT EXISTS modified_by text;
     ALTER TABLE engagements ADD COLUMN IF NOT EXISTS modified_at timestamptz DEFAULT now();
     ALTER TABLE engagements ADD COLUMN IF NOT EXISTS node_id text DEFAULT 'local';
+    -- May an AGENT start attack traffic at this engagement's in-scope hosts
+    -- without a human pressing the button?
+    --
+    -- FAIL-CLOSED (default false) and deliberately SEPARATE from scope.
+    -- `scope_targets` answers "is this host in the engagement?"; it does NOT
+    -- answer "may an agent dispatch at it unprompted". Those are different
+    -- questions and conflating them is how an agent ends up initiating
+    -- traffic at a customer host nobody asked it to touch.
+    --
+    -- This column RECORDS the operator's decision. It grants nothing by
+    -- itself: the deterministic scope gate still runs on every dispatch, and
+    -- the NEVER_DISPATCHABLE_SCOPES (typosquats, new_for_review,
+    -- customer_scope, excluded) and the global not_in_scope deny-list are
+    -- unaffected. On redteam3 those cover 652 of its rows, which is why a
+    -- domain-level trust statement would be far wider than the gate.
+    ALTER TABLE engagements ADD COLUMN IF NOT EXISTS agent_dispatch_trusted boolean DEFAULT false;
+    ALTER TABLE engagements ADD COLUMN IF NOT EXISTS agent_dispatch_trusted_by text;
+    ALTER TABLE engagements ADD COLUMN IF NOT EXISTS agent_dispatch_trusted_at timestamptz;
 END $$;
 
 -- ── Sync trigger function ────────────────────────────────────────────
