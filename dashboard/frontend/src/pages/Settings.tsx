@@ -3601,6 +3601,7 @@ const SCAN_TIMEOUT_FIELDS: { key: string; label: string; help: string }[] = [
   { key: 'scan_timeout_build_poc_wall',       label: 'Build-PoC wall clock',      help: 'Whole build (recon → synth → refine). 0 = unlimited (default)' },
   { key: 'scan_timeout_build_poc_run',        label: 'Build-PoC command run',     help: 'Per-command listener run inside the refine loop. 0 = env default (600)' },
   { key: 'scan_timeout_build_poc_deep_recon', label: 'Build-PoC deep recon',      help: 'Deep-recon budget per build when gather is NOT READY. 0 = env default (480)' },
+  { key: 'scan_timeout_build_poc_derive',     label: 'Build-PoC spec derivation', help: 'Sub-budget for CVE spec derivation, so it cannot starve the refine loop. Also capped at 40% of the wall clock when one is set. 0 = uncapped, unset = 900' },
 ]
 
 // Build-PoC LIMITS are counts, not seconds — separate endpoint, separate

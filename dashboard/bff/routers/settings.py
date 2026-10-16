@@ -1787,6 +1787,11 @@ SCAN_TIMEOUT_KEYS = [
     "scan_timeout_build_poc_wall",        # whole build wall clock; 0 = unlimited
     "scan_timeout_build_poc_run",         # per-command listener run; 0 = env VECTOR_RUN_TIMEOUT (600)
     "scan_timeout_build_poc_deep_recon",  # deep-recon budget per build; 0 = env BUILD_POC_DEEP_RECON_BUDGET_SEC (480)
+    # 2026-10-16: spec derivation's SUB-budget. The wall above is the whole
+    # build, and derivation draws on it first, so a slow derivation starved the
+    # refine loop -- 2820s of a 3135s run on CVE-2024-36675 (1 refine run) and
+    # 3874s of 4198s on CVE-2024-32964 (0 runs). 0 = uncapped; unset = 900.
+    "scan_timeout_build_poc_derive",      # spec-derivation sub-budget; 0 = uncapped
 ]
 
 
@@ -1819,6 +1824,7 @@ def _scan_timeout_defaults() -> Dict[str, int]:
         "scan_timeout_build_poc_wall": 0,          # 0 = unlimited (operator decision 2026-10-09)
         "scan_timeout_build_poc_run": 600,
         "scan_timeout_build_poc_deep_recon": 480,
+        "scan_timeout_build_poc_derive": 900,       # _DERIVE_BUDGET_DEFAULT_SEC in rag-api
     }
 
 

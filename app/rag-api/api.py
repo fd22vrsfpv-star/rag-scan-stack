@@ -411,6 +411,82 @@ _build_poc_wall_deadline: contextvars.ContextVar = contextvars.ContextVar(
     "build_poc_wall_deadline", default=None,
 )
 
+# ── derivation SUB-budget ──────────────────────────────────────────────────
+#
+# The wall deadline above is the budget for the WHOLE build, and its own
+# comment says it was sized so "refine legitimately take longer". But spec
+# derivation draws on that pool FIRST and refine gets whatever is left, so a
+# slow derivation silently starves the loop that actually lands the exploit.
+#
+# Measured on the 2026-10-16 focused-10 (every one of the 10 runs had
+# cve_spec_derivation as its single largest phase):
+#
+#   CVE-2024-36675   total=3135s  derivation=2820s (90%)  ->  1 refine run
+#   CVE-2024-32964   total=4198s  derivation=3874s (92%)  ->  0 refine runs
+#
+# Both reproduced in the previous round at 4079s and 3899s. And the wall
+# deadline never fired for any of them: the runner sends no `wall_timeout_sec`
+# and `scan_timeout_build_poc_wall` is unset (0 = unlimited), so the guard in
+# `_derive_cve_spec` is `if deadline is not None` against a None — 15 passes
+# of LLM-extract + live-verify, uncapped.
+#
+# So derivation gets a budget of its OWN, which holds even when the wall is
+# unlimited. That is the point: the common case today has no wall at all.
+# Why 900s: on that same round, EVERY derivation that actually verified
+# finished well inside it -- CVE-2024-3552 in 216s (source=intel, a clean
+# SLEEP ladder 1.0s/5.4s/10.4s) and CVE-2024-5314 in 301s (intel+discovery,
+# canary in the response). The two that starved their runs took 2820s and
+# 3874s. The cap separates the wins from the grinding without touching a win.
+#
+# The budget is checked BETWEEN passes, not inside one, so it can overshoot by
+# at most one pass (~250-500s observed). That is deliberate: threading a
+# deadline through every LLM call and live verify inside a pass buys little
+# when a pass is already short relative to the cap. Do not read the overshoot
+# as a bug; tighten it only if pass duration grows.
+_DERIVE_BUDGET_DEFAULT_SEC = 900          # 15 min
+_DERIVE_BUDGET_FRAC_DEFAULT = 0.4         # ... or 40% of the wall, whichever is less
+
+
+def _derive_budget_seconds(now: float | None = None) -> float | None:
+    """Seconds spec derivation may spend, or None for uncapped.
+
+    Resolution order, first hit wins:
+      1. env `BUILD_POC_DERIVE_MAX_SEC`
+      2. Settings -> Scan timeouts `scan_timeout_build_poc_derive`
+      3. `_DERIVE_BUDGET_DEFAULT_SEC`
+    0 means uncapped, the same meaning the key carries for the wall timeout.
+
+    When a wall deadline IS armed, the cap is additionally clamped to
+    `BUILD_POC_DERIVE_BUDGET_FRAC` of the time still remaining, so derivation
+    can never take the whole of a short budget. The clamp is a MINIMUM of the
+    two, never a maximum: a generous wall does not license a long derivation.
+    """
+    cap = None
+    raw = os.environ.get("BUILD_POC_DERIVE_MAX_SEC")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            cap = int(str(raw).strip())
+        except ValueError:
+            cap = None
+    if cap is None:
+        cap = _build_poc_timeout_setting("scan_timeout_build_poc_derive",
+                                         _DERIVE_BUDGET_DEFAULT_SEC)
+    if cap is not None and cap <= 0:
+        cap = None          # explicit opt-out
+
+    wall = _build_poc_wall_deadline.get()
+    if wall is not None:
+        try:
+            frac = float(os.environ.get("BUILD_POC_DERIVE_BUDGET_FRAC")
+                         or _DERIVE_BUDGET_FRAC_DEFAULT)
+        except ValueError:
+            frac = _DERIVE_BUDGET_FRAC_DEFAULT
+        frac = min(max(frac, 0.05), 0.95)
+        remaining = wall - (now if now is not None else time.monotonic())
+        share = max(0.0, remaining * frac)
+        cap = share if cap is None else min(cap, share)
+    return cap
+
 
 @app.middleware("http")
 async def _capture_engagement_header(request, call_next):
@@ -26543,7 +26619,41 @@ def _derive_cve_spec(cve, product, version, ip, port, model=None, auth=None,
     max_passes = max(1, int(max_passes))
     last_result = None
     deadline = _build_poc_wall_deadline.get()
+    # Derivation's OWN budget, so it cannot starve refine. See
+    # `_derive_budget_seconds` for how it resolves and why it exists — the
+    # short version is that the wall budget is usually unlimited, which made
+    # the guard below a no-op and let 15 passes eat 90% of two runs.
+    _started = time.monotonic()
+    _derive_budget = _derive_budget_seconds(now=_started)
+    _derive_deadline = None if _derive_budget is None else _started + _derive_budget
     for pass_n in range(1, max_passes + 1):
+        # Derivation sub-budget. Checked BEFORE the wall, because it is the
+        # tighter of the two by construction, and before each pass starts so
+        # we never spend an iteration we don't have.
+        #
+        # A cut-short derivation must NOT look like one that found nothing —
+        # that is this repo's recurring "unreachable is not absent". The
+        # `source` says it was cut short, how many passes ran, and what the
+        # cap was, so the operator can raise the cap rather than conclude the
+        # CVE is underivable.
+        if _derive_deadline is not None and time.monotonic() >= _derive_deadline:
+            _spent = time.monotonic() - _started
+            _why = (f"derivation budget of {_derive_budget:.0f}s exhausted after "
+                    f"{pass_n - 1} of {max_passes} pass(es) ({_spent:.0f}s spent); "
+                    f"the remaining build time is left for refine. Raise it with "
+                    f"BUILD_POC_DERIVE_MAX_SEC or Settings -> Scan timeouts "
+                    f"(scan_timeout_build_poc_derive); 0 = uncapped")
+            logging.warning("build-poc %s: %s", cve, _why)
+            if last_result:
+                last_result["source"] = "derive_budget_exhausted"
+                last_result["evidence"] = _why
+                last_result["derive_budget_sec"] = _derive_budget
+                last_result["derive_passes_run"] = pass_n - 1
+                return last_result
+            return {"verified": False, "source": "derive_budget_exhausted_no_result",
+                    "spec": None, "evidence": _why,
+                    "derive_budget_sec": _derive_budget,
+                    "derive_passes_run": pass_n - 1}
         # Per-site wall-clock budget. "quick" preset = 1800s, "deep" =
         # 7200s, custom = whatever the operator supplied. Checked BEFORE
         # each pass starts so we never spend an iteration we don't have.
