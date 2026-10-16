@@ -1,0 +1,386 @@
+# THE vulnerability-class table. One row per class; every other class list in
+# the codebase is a PROJECTION of this file.
+#
+# Why this exists
+# ---------------
+# The same concept was spelled differently in eleven places. `_FILE_READ_CLASSES`
+# alone listed `lfi`, `path-traversal` AND `path_traversal` — three names for one
+# idea, in one set, because nothing normalised. Worse, each gate inlined its own
+# partial alias list: 6 non-canonical spellings in one set, 6 in another, 5, 2,
+# 0, 0. In a single run `path-traversal` therefore passed one gate and failed
+# another. That is not eleven vocabularies; it is one vocabulary with eleven
+# private, divergent spell-checkers.
+#
+# Two producers emit a class name — the deterministic classifier
+# (`_vuln_class_from_cve`, 10 canonical names) and the LLM fallback (free text).
+# `canonical()` in etl/vuln_classes.py is called ONCE at each producer's exit, so
+# nothing downstream ever sees a non-canonical name and no consumer needs an
+# alias list of its own.
+#
+# Properties are ORTHOGONAL, which is the thing a flat set cannot express and
+# why the old sets drifted:
+#   * XXE *is* a file read but does NOT inject through the path (it is a body).
+#   * LFI *is* a file read and injects through a PARAMETER (`?page=../../etc/passwd`).
+#   * Only a path traversal puts the payload in the URL path.
+# Collapsing `path-traversal` into `lfi` (which `_CRAFT_CLASS_ALIASES` did, to
+# give traversal some craft guidance) destroyed exactly the distinction the
+# gather gate needs — and because `lfi` then sat in the path-is-the-field set,
+# the gate stopped demanding a parameter for ANY file read. They share guidance;
+# they are not the same class.
+#
+# Reference ids are carried so a finding can be reported in the vocabulary the
+# reader already uses:
+#   cwes   — CWE id + the official CWE name
+#   owasp  — OWASP Top 10 **2021** category
+#   wstg   — OWASP Web Security Testing Guide test ids (see knowledge/wstg_map.yaml)
+#   mitre  — ATT&CK technique ids, which MUST exist in knowledge/mitre/attack_map.yaml
+#
+# Read deterministically by etl/vuln_classes.py (gates: an exact lookup, never a
+# similarity score) and embedded into rag_documents by
+# etl/load_knowledge_documents.py (planner: recall by similarity). CLAUDE.md
+# requires both and they are not the same mechanism.
+
+version: 1
+owasp_top10_version: "2021"
+
+# injects_via vocabulary — where the payload goes. `path` means the URL path IS
+# the injection point and there is no parameter to find.
+injection_points: [path, parameter, body, header, cookie, multipart, none]
+
+# A CWE that legitimately appears under more than one class needs its PRIMARY
+# declared, or `class_for_cwe()` is decided by whichever class the file lists
+# first — a lookup whose answer changes when someone reorders the file.
+#
+#   CWE-77 / CWE-78  the specific mechanism beats the generic outcome
+#   CWE-94           generic code injection. Kept on `cmdi`, which is where
+#                    the previous map put it: changing it would change which
+#                    craft guidance every CWE-94 CVE receives, and this
+#                    migration only diverges where the divergence IS the fix
+#                    (CWE-22/23/36 and CWE-639). ssti keeps its own CWE-1336.
+#   CWE-502          deserialization is the mechanism, rce the consequence
+#   CWE-98           PHP include; local inclusion is the common case, and rfi
+#                    still lists it because the same weakness enables both
+cwe_primary_class:
+  CWE-77: cmdi
+  CWE-78: cmdi
+  CWE-94: cmdi
+  CWE-502: deserialization
+  CWE-98: lfi
+
+# proof vocabulary — what counts as evidence the class actually fired.
+proof_kinds: [echo, oob, timing, file_content, status_change, side_effect]
+
+classes:
+
+  - name: sqli
+    title: SQL Injection
+    aliases: [sql-injection, blind-sqli, sqli-blind, union-sqli]
+    injects_via: [parameter, body, header, cookie]
+    file_read: false
+    needs_oob_sink: false
+    blind_capable: true
+    proof: [echo, timing, oob]
+    owasp: "A03:2021 – Injection"
+    wstg: [WSTG-INPV-05]
+    mitre: [T1190]
+    cwes:
+      - { id: CWE-89, name: "Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')" }
+
+  - name: xss
+    title: Cross-Site Scripting
+    aliases: [cross-site-scripting, xss-reflected, xss-stored, reflected-xss, stored-xss]
+    injects_via: [parameter, body, header]
+    file_read: false
+    needs_oob_sink: false
+    blind_capable: true
+    proof: [echo, oob]
+    owasp: "A03:2021 – Injection"
+    wstg: [WSTG-INPV-01, WSTG-INPV-02]
+    mitre: [T1059]
+    cwes:
+      - { id: CWE-79, name: "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')" }
+      - { id: CWE-80, name: "Improper Neutralization of Script-Related HTML Tags in a Web Page (Basic XSS)" }
+
+  - name: cmdi
+    title: OS Command Injection
+    aliases: [command-injection, os-command-injection, shell-injection, argument-injection]
+    injects_via: [parameter, body, header]
+    file_read: false
+    needs_oob_sink: true
+    blind_capable: true
+    proof: [echo, oob, timing]
+    owasp: "A03:2021 – Injection"
+    wstg: [WSTG-INPV-12]
+    mitre: [T1190, T1059]
+    cwes:
+      - { id: CWE-77, name: "Improper Neutralization of Special Elements used in a Command ('Command Injection')" }
+      - { id: CWE-78, name: "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')" }
+      - { id: CWE-88, name: "Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')" }
+
+  - name: ssti
+    title: Server-Side Template Injection
+    aliases: [template-injection, server-side-template-injection, jinja2-injection, velocity-injection]
+    injects_via: [parameter, body]
+    file_read: false
+    needs_oob_sink: false
+    blind_capable: true
+    proof: [echo, oob, timing]
+    owasp: "A03:2021 – Injection"
+    wstg: [WSTG-INPV-18]
+    mitre: [T1190, T1059]
+    cwes:
+      - { id: CWE-1336, name: "Improper Neutralization of Special Elements Used in a Template Engine" }
+      - { id: CWE-94, name: "Improper Control of Generation of Code ('Code Injection')" }
+
+  - name: ssrf
+    title: Server-Side Request Forgery
+    aliases: [server-side-request-forgery, ssrf-blind, outbound-request]
+    injects_via: [parameter, body]
+    file_read: false
+    needs_oob_sink: true
+    blind_capable: true
+    proof: [oob, echo]
+    owasp: "A10:2021 – Server-Side Request Forgery (SSRF)"
+    wstg: [WSTG-INPV-19]
+    mitre: [T1190]
+    cwes:
+      - { id: CWE-918, name: "Server-Side Request Forgery (SSRF)" }
+
+  - name: xxe
+    title: XML External Entity
+    aliases: [xml-external-entity, xml-external-entities, xxe-oob]
+    # A body injection. It CAN read files, which is why it belongs in a
+    # file-read projection — and it is NOT a path injection, which is why a
+    # single flat "file read" set could never serve both questions.
+    injects_via: [body]
+    file_read: true
+    needs_oob_sink: true
+    blind_capable: true
+    proof: [echo, oob, file_content]
+    owasp: "A05:2021 – Security Misconfiguration"
+    wstg: [WSTG-INPV-07]
+    mitre: [T1190]
+    cwes:
+      - { id: CWE-611, name: "Improper Restriction of XML External Entity Reference" }
+
+  - name: path-traversal
+    title: Path Traversal
+    # Its OWN class, not an alias of lfi. The payload is the URL path, so there
+    # is no parameter to find and parameter discovery cannot help.
+    aliases: [directory-traversal, dir-traversal]
+    injects_via: [path]
+    file_read: true
+    needs_oob_sink: false
+    blind_capable: false
+    proof: [file_content]
+    owasp: "A01:2021 – Broken Access Control"
+    wstg: [WSTG-ATHZ-01]
+    mitre: [T1190]
+    cwes:
+      - { id: CWE-22, name: "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')" }
+      - { id: CWE-23, name: "Relative Path Traversal" }
+      - { id: CWE-36, name: "Absolute Path Traversal" }
+
+  - name: lfi
+    title: Local File Inclusion
+    # Injects through a PARAMETER (`?page=../../etc/passwd`). Listing lfi as a
+    # path-injection class is what stopped the gather gate demanding a
+    # parameter for every file read.
+    aliases: [local-file-inclusion, file-read, arbitrary-file-read, file-disclosure, arbitrary-file-disclosure]
+    injects_via: [parameter]
+    file_read: true
+    needs_oob_sink: false
+    blind_capable: false
+    proof: [file_content, echo]
+    owasp: "A03:2021 – Injection"
+    wstg: [WSTG-INPV-11]
+    mitre: [T1190]
+    cwes:
+      - { id: CWE-98, name: "Improper Control of Filename for Include/Require Statement in PHP Program ('PHP Remote File Inclusion')" }
+      - { id: CWE-73, name: "External Control of File Name or Path" }
+
+  - name: rfi
+    title: Remote File Inclusion
+    # Also a parameter, and it makes the server FETCH — so it needs an
+    # out-of-band sink the way SSRF does. Aliasing it to lfi lost that.
+    aliases: [remote-file-inclusion]
+    injects_via: [parameter]
+    file_read: true
+    needs_oob_sink: true
+    blind_capable: true
+    proof: [oob, echo]
+    owasp: "A03:2021 – Injection"
+    wstg: [WSTG-INPV-11]
+    mitre: [T1190]
+    cwes:
+      - { id: CWE-98, name: "Improper Control of Filename for Include/Require Statement in PHP Program ('PHP Remote File Inclusion')" }
+
+  - name: deserialization
+    title: Insecure Deserialization
+    aliases: [deser, insecure-deserialization, unsafe-deserialization, object-injection]
+    injects_via: [body, parameter, cookie]
+    file_read: false
+    needs_oob_sink: true
+    blind_capable: true
+    proof: [oob, timing, side_effect]
+    owasp: "A08:2021 – Software and Data Integrity Failures"
+    wstg: [WSTG-INPV-11]
+    mitre: [T1190, T1059]
+    cwes:
+      - { id: CWE-502, name: "Deserialization of Untrusted Data" }
+
+  - name: upload
+    title: Unrestricted File Upload
+    aliases: [file-upload, arbitrary-file-upload, unrestricted-upload, webshell-upload]
+    injects_via: [multipart]
+    file_read: false
+    needs_oob_sink: false
+    blind_capable: false
+    proof: [echo, side_effect]
+    owasp: "A04:2021 – Insecure Design"
+    wstg: [WSTG-BUSL-09]
+    mitre: [T1505.003]
+    cwes:
+      - { id: CWE-434, name: "Unrestricted Upload of File with Dangerous Type" }
+
+  - name: auth-bypass
+    title: Authentication / Authorization Bypass
+    aliases: [authentication-bypass, authorization-bypass, missing-auth,
+              improper-authentication, improper-authorization, privilege-escalation]
+    injects_via: [path, header, cookie, parameter]
+    file_read: false
+    needs_oob_sink: false
+    blind_capable: false
+    proof: [status_change, echo]
+    owasp: "A07:2021 – Identification and Authentication Failures"
+    wstg: [WSTG-ATHN-02, WSTG-ATHZ-02]
+    mitre: [T1190, T1078]
+    cwes:
+      - { id: CWE-287, name: "Improper Authentication" }
+      - { id: CWE-306, name: "Missing Authentication for Critical Function" }
+      - { id: CWE-285, name: "Improper Authorization" }
+      - { id: CWE-862, name: "Missing Authorization" }
+      - { id: CWE-863, name: "Incorrect Authorization" }
+      - { id: CWE-269, name: "Improper Privilege Management" }
+      - { id: CWE-798, name: "Use of Hard-coded Credentials" }
+
+  - name: idor
+    title: Insecure Direct Object Reference
+    aliases: [insecure-direct-object-reference, bola, broken-object-level-authorization]
+    injects_via: [parameter, path]
+    file_read: false
+    needs_oob_sink: false
+    blind_capable: false
+    proof: [echo, status_change]
+    owasp: "A01:2021 – Broken Access Control"
+    wstg: [WSTG-ATHZ-04]
+    mitre: [T1190]
+    cwes:
+      - { id: CWE-639, name: "Authorization Bypass Through User-Controlled Key" }
+      - { id: CWE-284, name: "Improper Access Control" }
+
+  - name: csrf
+    title: Cross-Site Request Forgery
+    aliases: [cross-site-request-forgery, xsrf]
+    injects_via: [body, parameter]
+    file_read: false
+    needs_oob_sink: false
+    blind_capable: false
+    proof: [side_effect, status_change]
+    owasp: "A01:2021 – Broken Access Control"
+    wstg: [WSTG-SESS-05]
+    mitre: [T1190]
+    cwes:
+      - { id: CWE-352, name: "Cross-Site Request Forgery (CSRF)" }
+
+  - name: ldap-injection
+    title: LDAP Injection
+    aliases: [ldapi]
+    injects_via: [parameter, body]
+    file_read: false
+    needs_oob_sink: false
+    blind_capable: true
+    proof: [echo, status_change]
+    owasp: "A03:2021 – Injection"
+    wstg: [WSTG-INPV-06]
+    mitre: [T1190]
+    cwes:
+      - { id: CWE-90, name: "Improper Neutralization of Special Elements used in an LDAP Query ('LDAP Injection')" }
+
+  - name: nosql-injection
+    title: NoSQL Injection
+    aliases: [nosqli, mongo-injection]
+    injects_via: [parameter, body]
+    file_read: false
+    needs_oob_sink: false
+    blind_capable: true
+    proof: [echo, timing, status_change]
+    owasp: "A03:2021 – Injection"
+    wstg: [WSTG-INPV-05]
+    mitre: [T1190]
+    cwes:
+      - { id: CWE-943, name: "Improper Neutralization of Special Elements in Data Query Logic" }
+
+  - name: prototype-pollution
+    title: Prototype Pollution
+    aliases: [proto-pollution]
+    injects_via: [body, parameter]
+    file_read: false
+    needs_oob_sink: false
+    blind_capable: true
+    proof: [echo, side_effect]
+    owasp: "A03:2021 – Injection"
+    wstg: [WSTG-CLNT-13]
+    mitre: [T1190]
+    cwes:
+      - { id: CWE-1321, name: "Improperly Controlled Modification of Object Prototype Attributes ('Prototype Pollution')" }
+
+  - name: open-redirect
+    title: Open Redirect
+    aliases: [unvalidated-redirect, url-redirection]
+    injects_via: [parameter]
+    file_read: false
+    needs_oob_sink: false
+    blind_capable: false
+    proof: [status_change, echo]
+    owasp: "A01:2021 – Broken Access Control"
+    wstg: [WSTG-CLNT-04]
+    mitre: [T1190]
+    cwes:
+      - { id: CWE-601, name: "URL Redirection to Untrusted Site ('Open Redirect')" }
+
+  - name: rce
+    title: Remote Code Execution
+    # A generic outcome rather than a mechanism — kept because
+    # _SCAN_EVIDENCE_CWE_FOR_CLASS already keys on it and findings arrive
+    # labelled this way. Prefer the specific mechanism (cmdi / ssti /
+    # deserialization) when the advisory names one.
+    aliases: [remote-code-execution, code-execution, code-injection, arbitrary-code-execution]
+    injects_via: [parameter, body]
+    file_read: false
+    needs_oob_sink: true
+    blind_capable: true
+    proof: [oob, echo, timing]
+    owasp: "A03:2021 – Injection"
+    wstg: [WSTG-INPV-12]
+    mitre: [T1190, T1059]
+    cwes:
+      - { id: CWE-94, name: "Improper Control of Generation of Code ('Code Injection')" }
+      - { id: CWE-77, name: "Improper Neutralization of Special Elements used in a Command ('Command Injection')" }
+      - { id: CWE-78, name: "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')" }
+      - { id: CWE-502, name: "Deserialization of Untrusted Data" }
+
+  - name: unknown
+    title: Unclassified
+    # The honest answer, and a real class: the classifier returns it rather than
+    # guessing, and the gates must have a defined behaviour for it.
+    aliases: []
+    injects_via: []
+    file_read: false
+    needs_oob_sink: false
+    blind_capable: false
+    proof: []
+    owasp: null
+    wstg: []
+    mitre: []
+    cwes: []

@@ -829,6 +829,51 @@ def _render_fact_contradictions(data: Dict[str, Any]) -> List[Doc]:
     return docs
 
 
+def _render_vuln_classes(data: Dict[str, Any]) -> List[Doc]:
+    """One document per vulnerability class.
+
+    Embedded so the planner and the synthesiser can RECALL a class by
+    similarity — "the advisory says arbitrary file read, what is that and how
+    is it proven" — while `etl/vuln_classes.py` answers the GATES by exact
+    lookup. CLAUDE.md requires both and they are not the same mechanism.
+
+    The reference ids (CWE + its official name, OWASP Top 10, WSTG, ATT&CK) go
+    in the body so a retrieved document can be reported in whichever
+    vocabulary the reader already uses.
+    """
+    docs: List[Doc] = []
+    for c in (data.get("classes") or []):
+        if not isinstance(c, dict) or not c.get("name"):
+            continue
+        name = c["name"]
+        title = f"Vulnerability class: {c.get('title') or name} ({name})"
+        pts = _s(c.get("injects_via")) or "no injection point"
+        body = [f"Also written as: {_s(c.get('aliases')) or '(no aliases)'}.",
+                f"Injects via {pts}."]
+        if c.get("injects_via") == ["path"]:
+            body.append("The URL PATH is the injection point — there is no "
+                        "parameter to find, and parameter discovery cannot help.")
+        if c.get("file_read"):
+            body.append("Can read files from the target.")
+        if c.get("needs_oob_sink"):
+            body.append("Needs an out-of-band sink to prove.")
+        if c.get("blind_capable"):
+            body.append("Can be blind — absence of output is not absence of the bug.")
+        if c.get("proof"):
+            body.append(f"Proven by: {_s(c.get('proof'))}.")
+        if c.get("owasp"):
+            body.append(f"OWASP Top 10: {_s(c.get('owasp'))}.")
+        if c.get("wstg"):
+            body.append(f"OWASP WSTG tests: {_s(c.get('wstg'))}.")
+        if c.get("mitre"):
+            body.append(f"MITRE ATT&CK: {_s(c.get('mitre'))}.")
+        for cw in (c.get("cwes") or []):
+            if isinstance(cw, dict) and cw.get("id"):
+                body.append(f"{cw['id']}: {_s(cw.get('name'))}.")
+        docs.append((title, " ".join(" ".join(body).split())))
+    return docs
+
+
 RENDERERS = {
     "app_request_contracts": _render_app_request_contracts,
     "exploitation_tools": _render_exploitation_tools,
@@ -863,6 +908,7 @@ RENDERERS = {
     "credential_spray_policy": _render_credential_spray_policy,
     "web_auth_templates": _render_web_auth_templates,
     "fact_contradictions": _render_fact_contradictions,
+    "vuln_classes": _render_vuln_classes,
 }
 
 

@@ -35010,19 +35010,30 @@ def build_poc_intel(run_id: str, engagement_id: Optional[str] = None,
         logging.debug("intel: trace read failed: %s", e)
 
     target = f"{row.get('ip')}:{row.get('port')}"
-    ledger = {}
+    ledger, ledger_error = {}, None
     try:
         _ensure_confirmed_facts_table()
         with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Column names are `provenance` and `last_checked_at` — NOT
+            # `source`/`updated_at`. The first cut of this query used the
+            # latter, raised UndefinedColumn, and the `except` below turned
+            # that into every fact rendering as "not probed". Found by running
+            # the endpoint, not by a static check: the SQL guard verifies
+            # qualified references and INSERT lists, and an unqualified SELECT
+            # list is its blind spot.
             cur.execute("""SELECT claim_key, claim_value, status, evidence, method,
-                                  confidence, source, updated_at
+                                  confidence, provenance, last_checked_at
                              FROM confirmed_facts
                             WHERE target = %s AND (cve = %s OR cve IS NULL)
-                            ORDER BY updated_at DESC""", [target, row.get("cve")])
+                            ORDER BY last_checked_at DESC NULLS LAST""",
+                        [target, row.get("cve")])
             for r in cur.fetchall() or []:
                 ledger.setdefault(str(r.get("claim_key")), dict(r))
     except Exception as e:  # noqa: BLE001
-        logging.debug("intel: ledger read failed: %s", e)
+        # A ledger we could not read is not a ledger with nothing in it. Say
+        # which, rather than letting every fact render as "not probed".
+        ledger_error = f"{type(e).__name__}: {e}"
+        logging.warning("intel: ledger read failed: %s", e)
 
     challenged_by = {}
     for f in (challenge.get("findings") or []):
@@ -35049,13 +35060,15 @@ def build_poc_intel(run_id: str, engagement_id: Optional[str] = None,
             # Three distinct proof outcomes, never collapsed: proven, the probe
             # could not decide, and the probe's own control matched (it tested
             # nothing). The last one used to be indistinguishable from the first.
-            "proof": ("proven" if led.get("status") == "confirmed"
+            "proof": ("unreadable" if ledger_error
+                      else "proven" if led.get("status") == "confirmed"
                       else "disproven" if led.get("status") == "refuted"
                       else "untested (control matched)" if "control matched" in ev
                       else "inconclusive" if "inconclusive" in ev
                       else "not probed" if not ev else "unverified"),
             "proof_evidence": ev[:400] or None,
             "probe_method": led.get("method"),
+            "provenance": led.get("provenance"),
             "below_floor": bool(conf is not None and conf < _FACT_CONFIDENCE_FLOOR),
             "challenged": challenged_by.get(name) or [],
         })
@@ -35075,6 +35088,7 @@ def build_poc_intel(run_id: str, engagement_id: Optional[str] = None,
         "challenge_ran": bool(challenge.get("ran")),
         "challenge_error": challenge.get("error"),
         "challenge_summary": challenge.get("summary"),
+        "ledger_error": ledger_error,
         "findings": challenge.get("findings") or [],
         "applied": challenge.get("applied") or [],
         "unimplemented_rules": challenge.get("unimplemented") or [],
