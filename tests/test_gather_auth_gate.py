@@ -65,8 +65,10 @@ def _decide():
     """_gather_decide is documented PURE, so it runs standalone."""
     src = API.read_text(encoding="utf-8")
     ns = {}
+    # _gather_decide's follow-up text is now class-aware, so the path-based
+    # class set is a real dependency of this isolated exec.
     needed = ["_GATHER_FIELD_REQUIRED_CLASSES", "_GATHER_OOB_CLASSES",
-              "_GATHER_FOLLOW_UP"]
+              "_GATHER_FOLLOW_UP", "_GATHER_PATH_IS_THE_FIELD_CLASSES"]
     body = []
     for n in ast.walk(ast.parse(src)):
         if isinstance(n, ast.Assign) and any(

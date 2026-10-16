@@ -15522,6 +15522,12 @@ _GATHER_FOLLOW_UP = {
     "endpoint": "Find the vulnerable route: local source, the JSON self-documentation at /, forms/links from recon, the advisory PoC, then probe each candidate (not-404).",
     "method": "Confirm the HTTP method the route accepts (OPTIONS Allow header, or a HEAD/GET/POST probe that is not 405).",
     "input_field": "Find the parameter / JSON key / multipart field the sink reads: local source request.* accessors, the advisory PoC, discovered params, or the fix diff.",
+    # Class-specific override. The generic text sends deep-recon hunting for a
+    # PARAMETER, which a path-based class does not have — CVE-2026-21589 ran
+    # arjun_params and auth_crawl against a traversal and found nothing,
+    # because the payload lives in the URL path. Keyed by class so the
+    # follow-up matches the vulnerability rather than the average case.
+    "input_field@path": "There is NO parameter for a path-traversal / file-read: the payload IS the URL path. Confirm the vulnerable ROUTE instead (the advisory's download/resource endpoint), then craft the traversal into that path. Do not run parameter discovery.",
     "auth": "Obtain a VALID session (login via the Auth Profile) — the exploit needs authentication and no live session is in hand.",
     "oob_sink": "Bring up / configure the OOB listener and confirm it is reachable from here; a blind class cannot be verified without it.",
     "artifact": "Supply the external artifact (see artifact_requirements) — a request body alone cannot reach this sink.",
@@ -16912,7 +16918,14 @@ def _gather_decide(items: list, vuln_class: str, privileges_required: str = "") 
               or (name == "auth" and st == "unverified" and not _preauth))
         if not ok:
             missing.append(name)
-    follow_ups = [_GATHER_FOLLOW_UP.get(m, f"Gather `{m}`.") for m in missing]
+    # A class-specific follow-up wins over the generic one: "find the
+    # parameter" is actively misleading for a class whose injection point is
+    # the path, and it is what deep-recon acts on.
+    def _follow_up(m):
+        if m == "input_field" and vc in _GATHER_PATH_IS_THE_FIELD_CLASSES:
+            return _GATHER_FOLLOW_UP["input_field@path"]
+        return _GATHER_FOLLOW_UP.get(m, f"Gather `{m}`.")
+    follow_ups = [_follow_up(m) for m in missing]
     gathered = [n for n in sorted(required) if n not in missing]
     return {"ready": not missing, "required": sorted(required), "missing": missing,
             "gathered": gathered, "follow_ups": follow_ups,
@@ -17924,6 +17937,32 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
             # computation, so update the local `vc` too.
             if name == "vuln_class":
                 vc = keep
+                # ORDERING. The class-dependent items were decided while the
+                # class was still unknown, so `input_field` was recorded
+                # "n/a". Learning the class here makes it REQUIRED, and the
+                # stale n/a then reads as missing — while the manifest text,
+                # which prints only gathered/missing, omits it entirely. That
+                # is how CVE-2026-21589 reported "missing: input_field" for an
+                # item absent from its own manifest (2026-10-16).
+                #
+                # Re-apply the path-is-the-field rule now that the class is
+                # known: for a traversal the endpoint IS the injection point,
+                # so there is no parameter to find.
+                if vc in _GATHER_PATH_IS_THE_FIELD_CLASSES:
+                    _ep = facts.get("endpoint") or next(
+                        (i.get("value") for i in items
+                         if i["item"] == "endpoint" and i["status"] == "gathered"), None)
+                    for it in items:
+                        if it["item"] != "input_field" or it["status"] == "gathered":
+                            continue
+                        if not _ep:
+                            break   # nothing to stand in for the parameter
+                        it["status"] = "gathered"
+                        it["value"] = (f"{_ep} (the URL path is the injection "
+                                       f"point for {vc}; there is no parameter)")
+                        it["source"] = "path_is_the_field:after_class"
+                        facts["input_field"] = it["value"]
+                        break
         # Re-run the decision over the (possibly) upgraded items. Trace the
         # outcome unconditionally — an empty proposal used to leave no
         # record at all, which hid 31 silent failures (2026-10-09).

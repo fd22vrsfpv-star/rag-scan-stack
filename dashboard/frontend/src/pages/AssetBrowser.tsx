@@ -2832,8 +2832,8 @@ export default function AssetBrowser() {
                                                     window.open(`/exploits-popout?${qs.toString()}`, '_blank', 'noopener,noreferrer')
                                                   }}
                                                   className="px-1.5 py-0.5 rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 text-[10px] whitespace-nowrap"
-                                                  title={`Open ${sel} in the Exploit Workbench with the Build-PoC form pre-filled`}
-                                                >🔨 Build PoC</button>
+                                                  title={`Open the Exploit Workbench with the Build-PoC form pre-filled for ${sel}. It does NOT start a build — review the form and press Build there.`}
+                                                >🔨 Open form</button>
                                                 {resolveMsg[rk] && <span className="text-[10px] text-muted-foreground">{resolveMsg[rk]}</span>}
                                                 {pocMsg[rk] && <span className="text-[10px] text-muted-foreground">{pocMsg[rk]}</span>}
                                               </>

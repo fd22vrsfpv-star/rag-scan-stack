@@ -262,3 +262,83 @@ def test_a_path_class_with_no_endpoint_still_blocks():
     assert "endpoint" in cond, (
         "the path-is-the-field rule does not require an endpoint, so a run "
         "with neither a parameter nor a path would report the field gathered")
+
+
+# -- 6. the class can arrive AFTER the items were decided -------------------
+
+def test_the_path_rule_is_reapplied_when_the_class_arrives_late():
+    """Class-dependent items are decided before the class is always known.
+
+    CVE-2026-21589 (2026-10-16, run ..._1792183000): the manifest was built
+    while vuln_class was unknown, so `input_field` was recorded "n/a". The LLM
+    fallback then set vuln_class=path-traversal, which makes input_field
+    REQUIRED, and the stale n/a read as missing. The manifest text prints only
+    gathered/missing items, so the gate reported "missing: input_field" for an
+    item that did not appear in its own manifest.
+    """
+    # Structural: find the `if name == "vuln_class"` branch and check the
+    # rule is re-applied INSIDE it. A fixed-size window missed the marker by
+    # 146 characters once the explanatory comment grew — the same brittleness
+    # this suite keeps catching.
+    fn = _func("_gather_manifest")
+    branch = None
+    for node in ast.walk(fn):
+        # ast.unparse normalises string quotes to SINGLE, so matching on
+        # '"vuln_class"' finds nothing even when the branch is right there.
+        if isinstance(node, ast.If) and "vuln_class" in ast.unparse(node.test):
+            body = ast.unparse(node.body)
+            if "vc = keep" in body:
+                branch = body
+                break
+    assert branch, "no `if name == \"vuln_class\"` branch that updates vc"
+    assert "_GATHER_PATH_IS_THE_FIELD_CLASSES" in branch, (
+        "the path-is-the-field rule is not re-applied after the class is "
+        "learned, so a late vuln_class leaves input_field stuck at n/a and "
+        "the gate blocks on an item absent from its own manifest")
+    assert "path_is_the_field:after_class" in branch, (
+        "the late upgrade does not record a distinct source, so it is "
+        "indistinguishable from the one applied at build time")
+
+
+def _late_upgrade_loop():
+    """The `for it in items:` loop that performs the late upgrade.
+
+    Located structurally: a fixed-size window over the source missed this
+    marker by 146 characters once the explanatory comment above it grew.
+    """
+    for node in ast.walk(_func("_gather_manifest")):
+        if not isinstance(node, ast.For):
+            continue
+        if any(isinstance(c, ast.Constant)
+               and c.value == "path_is_the_field:after_class"
+               for c in ast.walk(node)):
+            return node
+    return None
+
+
+def test_the_late_upgrade_needs_an_endpoint():
+    """With no endpoint there is nothing to stand in for the parameter."""
+    loop = _late_upgrade_loop()
+    assert loop is not None, "no late-upgrade loop found"
+    # Some branch inside the loop must bail out when the endpoint is absent.
+    bail = [n for n in ast.walk(loop)
+            if isinstance(n, ast.If)
+            and any(isinstance(x, ast.Name) and x.id == "_ep"
+                    for x in ast.walk(n.test))
+            and any(isinstance(b, (ast.Break, ast.Continue)) for b in n.body)]
+    assert bail, (
+        "the late upgrade does not require an endpoint, so a run with "
+        "neither a parameter nor a path would report the field gathered")
+
+
+def test_the_late_upgrade_does_not_overwrite_a_real_parameter():
+    loop = _late_upgrade_loop()
+    assert loop is not None, "no late-upgrade loop found"
+    skip = [n for n in ast.walk(loop)
+            if isinstance(n, ast.If)
+            and any(isinstance(c, ast.Constant) and c.value == "gathered"
+                    for c in ast.walk(n.test))
+            and any(isinstance(b, (ast.Continue, ast.Break)) for b in n.body)]
+    assert skip, (
+        "the late upgrade does not skip an already-gathered input_field — it "
+        "would overwrite a real parameter the miner found")

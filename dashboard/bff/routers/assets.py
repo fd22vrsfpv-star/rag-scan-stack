@@ -451,7 +451,25 @@ async def build_poc(request: Request):
                             headers={"x-api-key": s.api_key, **engagement_headers()})
         if resp.status_code >= 400:
             from fastapi import HTTPException
-            raise HTTPException(resp.status_code, resp.text)
+            # Unwrap rag-api's own {"detail": "..."} instead of nesting it.
+            # Passing resp.text straight through produced a doubly-encoded
+            # message the operator had to read past two layers of escaping:
+            #   {"detail":"{\"detail\":\"a build for CVE-... is already
+            #   running (run_id ...)\"}"}
+            _detail = resp.text
+            try:
+                _j = resp.json()
+                if isinstance(_j, dict) and "detail" in _j:
+                    _detail = _j["detail"]
+                    # rag-api occasionally nests one more level.
+                    if isinstance(_detail, str) and _detail.lstrip().startswith("{"):
+                        import json as _json
+                        _inner = _json.loads(_detail)
+                        if isinstance(_inner, dict) and "detail" in _inner:
+                            _detail = _inner["detail"]
+            except Exception:  # noqa: BLE001
+                pass            # not JSON — the raw body is the best we have
+            raise HTTPException(resp.status_code, _detail)
         return safe_json(resp)
 
 

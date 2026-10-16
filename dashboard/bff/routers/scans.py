@@ -2304,6 +2304,41 @@ async def get_scan(job_id: str):
                     _status = ("running" if (not _stop and _stage == "running")
                                else "failed" if _stop in ("crash", "error")
                                else "unknown" if not _stop else "completed")
+                    # The detail page renders `progress.stage` and a JSON view
+                    # of `progress`, so a response without it shows a status
+                    # pill and "No results available yet" — true but useless
+                    # while a 20-minute build is underway. Fill it from the
+                    # run's own trace, which is the only live record there is.
+                    _prog = {"stage": _row.get("stage_reached") or "?"}
+                    try:
+                        async with httpx.AsyncClient(timeout=15) as _c2:
+                            _ar = await _c2.get(
+                                f"{s.rag_api_url}/build-poc/active",
+                                headers={"x-api-key": s.api_key, **engagement_headers()})
+                        if _ar.status_code < 400:
+                            _live = next((x for x in (_ar.json().get("runs") or [])
+                                          if x.get("run_id") == _rid), None)
+                            if _live:
+                                _prog.update(
+                                    stage=_live.get("phase") or _prog["stage"],
+                                    phase=_live.get("phase"),
+                                    trace_rows=_live.get("trace_rows"),
+                                    last_trace_at=_live.get("last_trace_at"),
+                                    trace=_live.get("trace"))
+                    except Exception as _pe:  # noqa: BLE001
+                        # Progress is a nicety; never fail the detail over it,
+                        # but say the live phase is unknown rather than imply
+                        # the stored stage is current.
+                        _prog["live_phase"] = f"unavailable ({type(_pe).__name__})"
+                    for _k in ("missing", "gather_manifest", "failure_analysis",
+                               "llm_model", "poc_log_path", "verified"):
+                        if _row.get(_k) not in (None, "", [], {}):
+                            _prog[_k] = _row[_k]
+                    _summary = (f"{_row.get('cve')} on {_row.get('ip')} — "
+                                + (f"stopped: {_stop}" if _stop
+                                   else f"running, phase {_prog.get('phase') or _prog['stage']}"
+                                        + (f", {_prog.get('trace_rows')} trace rows"
+                                           if _prog.get("trace_rows") else "")))
                     return {
                         "job_id": job_id,
                         "type": f"build-poc ({_row.get('cve') or '?'})",
@@ -2314,8 +2349,8 @@ async def get_scan(job_id: str):
                         "created_at": _row.get("created_at"),
                         "completed_at": _row.get("updated_at") if _stop else None,
                         "service_url": "rag-api (build-poc)",
-                        "summary": (_row.get("stop_reason")
-                                    or f"stage {_row.get('stage_reached') or '?'}"),
+                        "summary": _summary,
+                        "progress": _prog,
                         "last_data": _row,
                     }
             except Exception as _e:  # noqa: BLE001
