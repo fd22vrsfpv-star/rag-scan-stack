@@ -16560,7 +16560,7 @@ def _gather_decide(items: list, vuln_class: str, privileges_required: str = "") 
         required.add("oob_sink")
     by = {i["item"]: i for i in items}
     for name in ("auth", "artifact", "endpoint_id"):
-        if by.get(name, {}).get("status") in ("missing", "gathered"):
+        if by.get(name, {}).get("status") in ("missing", "gathered", "unverified"):
             required.add(name)
     # PRE-AUTH. When CVSS says privileges are REQUIRED, a payload cannot land
     # without a session — so auth is required even if nothing has reported it
@@ -16574,10 +16574,23 @@ def _gather_decide(items: list, vuln_class: str, privileges_required: str = "") 
         # The exploit IS the bypass — demanding a working login first would
         # refuse the very thing under test, whatever CVSS says about it.
         required.discard("auth")
+    # `auth: unverified` means the advisory IMPLIED authentication but the
+    # target contradicted it — the endpoint answered unauthenticated and no
+    # login surface exists (see the item-7 comment). That is a reason to try,
+    # not a reason to refuse: the exploit's own assertion is a far better
+    # judge than a keyword in advisory prose, and a refusal costs the whole
+    # run (CVE-2024-32964: 0 commands synthesised with a complete SSRF spec).
+    #
+    # It does NOT override CVSS. Under PR:L/H the vendor has STATED that
+    # privileges are required, which beats an inference drawn from a probe —
+    # so the pre-auth rule below still blocks, and `unverified` buys nothing.
+    _preauth = str(privileges_required or "").upper() in ("L", "H")
     missing = []
     for name in sorted(required):
         st = by.get(name, {}).get("status", "missing")
-        ok = st == "gathered" or (name == "evidence" and st == "unverified")
+        ok = (st == "gathered"
+              or (name == "evidence" and st == "unverified")
+              or (name == "auth" and st == "unverified" and not _preauth))
         if not ok:
             missing.append(name)
     follow_ups = [_GATHER_FOLLOW_UP.get(m, f"Gather `{m}`.") for m in missing]
@@ -17007,6 +17020,12 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
 
     # 4. endpoint (+ param) — plan_verify verdicts first, then local source, then candidate probes
     endpoint = field = ep_source = None
+    # The status the RESOLVED endpoint returned to an UNAUTHENTICATED
+    # probe, or None if it was never probed (resolved from source /
+    # advisory instead). Item 7 below needs the difference: an advisory
+    # keyword is a CLAIM that auth is needed, this is the target's own
+    # answer. None means 'not observed' and is never read as 'open'.
+    ep_probe_status = None
     cands = []
     for m in _re.finditer(r"(PRIMARY|ALT\d):\s+class=(\S+)\s+endpoint=(\S+)\s+param=(\S+)", plan_text or ""):
         cands.append({"label": m.group(1), "endpoint": m.group(3), "param": m.group(4)})
@@ -17158,6 +17177,7 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
                             else:
                                 _note = ""
                             endpoint, ep_source = ep, f"candidate_probe:{_m} HTTP {rp.status_code}{_note}"
+                            ep_probe_status = rp.status_code
                             break
                     except Exception:  # noqa: BLE001
                         continue
@@ -17169,6 +17189,7 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
         try:
             if r0.status_code < 400:
                 endpoint, ep_source = "/", f"root_probe:HTTP {r0.status_code} (header vector {mined['headers'][0]})"
+                ep_probe_status = r0.status_code
         except NameError:
             pass
     add("endpoint", "gathered" if endpoint else "missing", endpoint, ep_source)
@@ -17350,7 +17371,56 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
                 valid, why = False, f"probe error {type(e).__name__}"
             add("auth", "gathered" if valid else "missing", why, "session_probe")
         else:
-            add("auth", "missing", "exploit needs authentication; no session cookie in hand", "analysis")
+            # THREE outcomes, not two. `needs_auth` above is a KEYWORD MATCH
+            # over advisory text — a CLAIM that auth is needed. Blocking on it
+            # with no cookie conflated "auth could not be OBTAINED" with "auth
+            # is REQUIRED", which is this repo's recurring "unreachable is not
+            # absent", here in the gather gate.
+            #
+            # CVE-2024-32964 (2026-10-16) stopped `gather_incomplete:auth`
+            # with 0 runs while holding a COMPLETE SSRF spec — ssrf, POST
+            # /settings/agent, body, oob_sink probed HTTP 200 — and the
+            # challenge's own goal 8 was exactly that SSRF. The credentials
+            # were correct (the challenge ships username/password); there was
+            # simply no login form to post them to, so `auth_establish` said
+            # `ok=False note=no login form found`. The gate proved only that it
+            # could not log in.
+            #
+            # So ask the target instead of the advisory:
+            #   401/403 observed      -> missing. Auth is required, observed.
+            #   no login surface AND
+            #   the endpoint answered -> unverified. Proceed unauthenticated
+            #                            and let the exploit's own assertion
+            #                            decide. NOT "gathered": a 200 can be
+            #                            a login page, so this is an attempt,
+            #                            not a finding.
+            #   anything else         -> missing, as before.
+            #
+            # `unverified` still blocks under CVSS PR:L/H — see _gather_decide,
+            # where privileges_required is believed over this inference.
+            _pw = ("password", "passwd", "pwd", "pass")
+            _login_seen = any(
+                any(str(fn).lower() in _pw or "password" in str(fn).lower()
+                    for fn in (fm.get("fields") or []))
+                for fm in (live.get("form_fields") or []))
+            if ep_probe_status in (401, 403):
+                add("auth", "missing",
+                    f"exploit needs authentication; {endpoint} answered HTTP "
+                    f"{ep_probe_status} unauthenticated and no session is in hand",
+                    "endpoint_probe")
+            elif _login_seen:
+                add("auth", "missing",
+                    "exploit needs authentication; a login form was found but no "
+                    "session cookie is in hand", "analysis+login_form")
+            elif ep_probe_status is not None and ep_probe_status < 400:
+                add("auth", "unverified",
+                    f"advisory text implies authentication, but {endpoint} answered "
+                    f"HTTP {ep_probe_status} unauthenticated and no login surface was "
+                    f"found on this target — attempting unauthenticated rather than "
+                    f"blocking on a keyword", "analysis_unconfirmed")
+            else:
+                add("auth", "missing",
+                    "exploit needs authentication; no session cookie in hand", "analysis")
     else:
         add("auth", "n/a", "not required by advisory/preconditions", "analysis")
 

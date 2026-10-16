@@ -3,6 +3,8 @@ uvicorn
 psycopg2-binary
 requests
 pydantic
-httpx
+# [http2] so the `browser` fetch strategy can actually negotiate HTTP/2.
+# Without the h2 extra it silently fell back to HTTP/1.1 on every call.
+httpx[http2]
 feedparser>=6.0
 beautifulsoup4>=4.12

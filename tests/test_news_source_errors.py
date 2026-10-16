@@ -54,6 +54,24 @@ def _func(name):
     pytest.fail(f"{name} is not defined in news_agent.py")
 
 
+def _fetch_path_src() -> str:
+    """The whole fetch path, not one function body.
+
+    2026-10-16: `_fetch_feed` became a LADDER driver and the HTTP details
+    moved into `_strategy_*`. Four assertions here read `_fetch_feed`'s body
+    and would have failed because the code IMPROVED — the exact trap
+    `tests/test_guard_style.py` ratchets against. They now read the whole
+    fetch path, so they keep testing the behaviour rather than its address.
+    """
+    src = _src()
+    tree = ast.parse(src)
+    want = [n for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef)
+            and (n.name == "_fetch_feed" or n.name.startswith("_strategy_"))]
+    assert want, "neither _fetch_feed nor any _strategy_* function exists"
+    return "\n".join(ast.get_source_segment(src, n) or "" for n in want)
+
+
 def test_a_failed_fetch_returns_a_reason():
     """The fetcher must hand back WHY, not just an empty list."""
     fn = _func("_fetch_feed")
@@ -66,22 +84,38 @@ def test_a_failed_fetch_returns_a_reason():
 
 
 def test_the_status_code_is_checked_and_kept():
-    src = ast.get_source_segment(_src(), _func("_fetch_feed")) or ""
+    src = _fetch_path_src()
     assert "status_code" in src, "the HTTP status is not checked"
-    assert "error =" in src, (
+    assert "failed: HTTP" in src, (
         "the status is checked but the reason is not retained — that is the "
         "original bug, where a RuntimeError was raised and then swallowed")
 
 
 def test_the_fallback_does_not_erase_the_reason():
-    """The feedparser fallback must not turn a diagnosed failure into silence."""
-    src = ast.get_source_segment(_src(), _func("_fetch_feed")) or ""
-    i = src.find("feedparser.parse(url)")
-    assert i > 0, "the fallback path is gone"
-    tail = src[i:]
-    assert "error" in tail, (
-        "the fallback discards the original error, so a feed it fails to "
-        "rescue reports nothing about why the primary fetch failed")
+    """A later strategy must not turn an earlier diagnosed failure into silence.
+
+    Structural: the driver accumulates every attempt's note and returns the
+    JOIN of them, so a feed no strategy rescued still reports what each one
+    said. Previously this checked that the single feedparser fallback kept
+    `error`; the ladder generalises it.
+    """
+    fn = _func("_fetch_feed")
+    appends = [n for n in ast.walk(fn)
+               if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+               and n.func.attr == "append"
+               and isinstance(n.func.value, ast.Name)
+               and n.func.value.id == "attempts"]
+    assert len(appends) >= 2, (
+        f"only {len(appends)} attempt(s) are recorded — a strategy that fails "
+        "silently leaves the operator with no reason for the dead feed")
+    joined = [n for n in ast.walk(fn)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+              and n.func.attr == "join"
+              and any(isinstance(a, ast.Name) and a.id == "attempts"
+                      for a in n.args)]
+    assert joined, (
+        "the accumulated attempts are never returned, so the ladder diagnoses "
+        "each failure and then throws the diagnosis away")
 
 
 def test_the_caller_records_the_error():
@@ -137,14 +171,14 @@ def test_one_dead_feed_does_not_abort_the_run():
 
 def test_an_accept_header_is_sent():
     """Several feeds refuse a request that does not say it wants a feed."""
-    src = ast.get_source_segment(_src(), _func("_fetch_feed")) or ""
+    src = _fetch_path_src()
     assert "Accept" in src, (
         "no Accept header is sent; GitHub's advisories.atom is among the "
         "feeds that reject a request without one")
 
 
 def test_redirects_are_followed_explicitly():
-    src = ast.get_source_segment(_src(), _func("_fetch_feed")) or ""
+    src = _fetch_path_src()
     assert "allow_redirects" in src, (
         "redirects are not handled explicitly — two sources moved and the "
         "run record could not distinguish 'moved' from 'empty'")

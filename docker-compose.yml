@@ -812,6 +812,19 @@ services:
       # /api/generate takes the same payload and returns the same
       # {"response": ...}, so nothing else changes.
       NEWS_LLM_URL: ${NEWS_LLM_URL:-}
+      # Fetch fallback ladder, cheapest first. A feed that stops working
+      # rarely stops being published -- it moves, or starts refusing the
+      # client we send -- so one fetch strategy means one way to fail.
+      #   direct      plain GET with feed Accept headers
+      #   feedparser  feedparser fetches it itself
+      #   discover    read the site and follow its <link rel=alternate> feed
+      #   browser     full Chrome header set + HTTP/2 (the 403/406 class)
+      #   agent       the LLM reads the page and lists the articles
+      # Only a feed that fails EVERY cheaper strategy reaches `agent`, so
+      # its cost is one model call per genuinely-dead source per run --
+      # 15 of 17 sources are served by `direct` alone. Drop `agent` to
+      # spend nothing; order here is ignored, the ladder is canonical.
+      NEWS_FETCH_STRATEGIES: ${NEWS_FETCH_STRATEGIES:-direct,feedparser,discover,browser,agent}
       # LLM goes through llm_query, which resolves the backend the operator
       # actually configured (Settings -> LLM Tuning, app_settings.llm.*).
       # Talking straight to ${OLLAMA_URL} silently failed every call here:

@@ -218,118 +218,442 @@ def _github_exploit_search(product: str, version: str, cve_ids: Optional[list] =
 # Feed fetching
 # ---------------------------------------------------------------------------
 
+# ── fetch fallback ladder ──────────────────────────────────────────────────
+#
+# A feed that stops working rarely stops being PUBLISHED — it moves, or starts
+# refusing the client we send. Measured 2026-10-15, four of seventeen sources
+# were dead and two stayed dead after the URLs were corrected:
+#
+#     GitHub Security Advisories  HTTP 406 even with a browser UA + Accept
+#     Assetnote Research          301 -> slcyber.io (acquired; feed relocated)
+#
+# One fetch strategy means one way to fail. So each source is tried down a
+# LADDER, cheapest first, and the first strategy that yields articles wins.
+#
+# Every strategy returns THREE outcomes, never two:
+#     (articles, "ok: ...")            it worked
+#     (None,     "failed: ...")        it ran and the source said no
+#     (None,     "unavailable: ...")   it could not run here at all
+# The third is the one that matters: a strategy skipped for a missing
+# dependency must never be recorded as a source with no news. That is this
+# repo's recurring "unreachable is not absent".
+#
+# `agent` is OFF by default because it spends an LLM call per attempt. Turn it
+# on per deployment with NEWS_FETCH_STRATEGIES.
+_STRATEGY_ORDER = ("direct", "feedparser", "discover", "browser", "agent")
+_STRATEGY_DEFAULT = "direct,feedparser,discover,browser"
+
+# A real Chrome header set. The GitHub 406 is an Accept/UA rejection rather
+# than a JS gate, so presenting as a browser is the cheap thing to try before
+# reaching for an actual browser engine.
+_BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+_BROWSER_HEADERS = {
+    "User-Agent": _BROWSER_UA,
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,image/apng,*/*;q=0.8"),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+
+def _enabled_strategies() -> list:
+    """Operator-chosen ladder, in the canonical order. Unknown names are
+    dropped with a warning rather than silently ignored — a typo'd strategy
+    that quietly does nothing is how a configured fallback never runs."""
+    raw = os.environ.get("NEWS_FETCH_STRATEGIES") or _STRATEGY_DEFAULT
+    want = [x.strip().lower() for x in str(raw).split(",") if x.strip()]
+    bad = [w for w in want if w not in _STRATEGY_ORDER]
+    if bad:
+        log.warning("[news] ignoring unknown fetch strateg%s %s; known: %s",
+                    "y" if len(bad) == 1 else "ies", bad, list(_STRATEGY_ORDER))
+    return [name for name in _STRATEGY_ORDER if name in want]
+
+
+def _entries_from_feed(feed) -> list:
+    """feedparser feed -> the normalized article shape the upserter expects."""
+    articles = []
+    for entry in (getattr(feed, "entries", None) or [])[:50]:
+        title = (entry.get("title") or "").strip()
+        link = (entry.get("link") or "").strip()
+        if not title or not link:
+            continue
+        excerpt = entry.get("summary") or ""
+        if not excerpt and entry.get("content"):
+            try:
+                excerpt = entry["content"][0].get("value", "")
+            except Exception:  # noqa: BLE001
+                excerpt = ""
+        excerpt = re.sub(r"<[^>]+>", " ", excerpt)
+        excerpt = re.sub(r"\s+", " ", excerpt).strip()[:2000]
+        published = ""
+        for k in ("published", "updated", "created"):
+            if entry.get(k):
+                published = entry[k]
+                break
+        articles.append({"title": title, "link": link, "published": published,
+                         "published_at": _parse_published(entry, published),
+                         "raw_excerpt": excerpt})
+    return articles
+
+
+def _parse_or_none(content, where: str):
+    """feedparser.parse that reports WHY it produced nothing."""
+    import feedparser
+    feed = feedparser.parse(content)
+    entries = _entries_from_feed(feed)
+    if entries:
+        return entries, "ok: %d article(s) via %s" % (len(entries), where)
+    if getattr(feed, "bozo", 0):
+        return None, "failed: %s did not parse as a feed (%s)" % (
+            where, type(getattr(feed, "bozo_exception", None)).__name__)
+    return None, "failed: %s parsed but carried no usable entries" % where
+
+
+def _strategy_direct(url: str) -> tuple:
+    """The original path: requests + feed-flavoured Accept."""
+    headers = {"User-Agent": USER_AGENT,
+               "Accept": ("application/atom+xml, application/rss+xml, "
+                          "application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5")}
+    try:
+        resp = requests.get(url, headers=headers, timeout=20, verify=True,
+                            allow_redirects=True)
+    except Exception as e:  # noqa: BLE001
+        return None, "failed: %s: %s" % (type(e).__name__, str(e)[:160])
+    final_url = getattr(resp, "url", None) or url
+    if resp.status_code >= 400:
+        return None, "failed: HTTP %s from %s" % (resp.status_code, final_url)
+    if not (getattr(resp, "content", None) or b"").strip():
+        return None, "failed: HTTP %s but an empty body from %s" % (
+            resp.status_code, final_url)
+    if final_url != url:
+        log.info("[news] %s redirected to %s", url, final_url)
+    return _parse_or_none(resp.content, "direct fetch of %s" % final_url)
+
+
+def _strategy_feedparser(url: str) -> tuple:
+    """Let feedparser fetch it itself — it negotiates a few things we do not."""
+    try:
+        import feedparser
+    except Exception as e:  # noqa: BLE001
+        return None, "unavailable: feedparser not importable (%s)" % type(e).__name__
+    try:
+        return _parse_or_none(url, "feedparser's own fetch")
+    except Exception as e:  # noqa: BLE001
+        return None, "failed: %s: %s" % (type(e).__name__, str(e)[:160])
+
+
+def _discover_feed_urls(html: str, base_url: str) -> list:
+    """<link rel="alternate" type="application/rss+xml" href="..."> targets.
+
+    Order is preserved so the page's own first choice is tried first.
+    """
+    from urllib.parse import urljoin
+    out, seen = [], set()
+    for m in re.finditer(r"<link\b[^>]*>", html or "", re.I):
+        tag = m.group(0)
+        if not re.search(r'rel\s*=\s*["\']?[^"\'>]*alternate', tag, re.I):
+            continue
+        if not re.search(r'type\s*=\s*["\']?application/(rss|atom)\+xml', tag, re.I):
+            continue
+        href = re.search(r'href\s*=\s*["\']([^"\']+)["\']', tag, re.I)
+        if not href:
+            continue
+        full = urljoin(base_url, href.group(1).strip())
+        if full not in seen:
+            seen.add(full)
+            out.append(full)
+    return out
+
+
+def _strategy_discover(url: str) -> tuple:
+    """Ask the SITE where its feed is now.
+
+    A feed that 404s or redirects to HTML has usually moved, and the site
+    still advertises the new location in its <head>. This is the strategy
+    that recovers a relocated feed without anyone editing a URL by hand.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+    parts = urlsplit(url)
+    if not parts.scheme or not parts.netloc:
+        return None, "unavailable: %s is not an absolute url" % url
+    roots, seen = [], set()
+    for cand in (url, urlunsplit((parts.scheme, parts.netloc, "/", "", ""))):
+        if cand not in seen:
+            seen.add(cand)
+            roots.append(cand)
+    tried = []
+    for root in roots:
+        try:
+            resp = requests.get(root, headers=_BROWSER_HEADERS, timeout=20,
+                                verify=True, allow_redirects=True)
+        except Exception as e:  # noqa: BLE001
+            tried.append("%s: %s" % (root, type(e).__name__))
+            continue
+        if resp.status_code >= 400:
+            tried.append("%s: HTTP %s" % (root, resp.status_code))
+            continue
+        found = _discover_feed_urls(resp.text or "",
+                                    getattr(resp, "url", None) or root)
+        for feed_url in found[:3]:
+            if feed_url.rstrip("/") == url.rstrip("/"):
+                continue        # the url we already know is broken
+            try:
+                fr = requests.get(feed_url, headers=_BROWSER_HEADERS,
+                                  timeout=20, verify=True, allow_redirects=True)
+            except Exception as e:  # noqa: BLE001
+                tried.append("%s: %s" % (feed_url, type(e).__name__))
+                continue
+            if fr.status_code >= 400:
+                tried.append("%s: HTTP %s" % (feed_url, fr.status_code))
+                continue
+            arts, note = _parse_or_none(fr.content, "discovered feed %s" % feed_url)
+            if arts:
+                log.info("[news] %s: discovered a live feed at %s", url, feed_url)
+                return arts, note
+            tried.append("%s: %s" % (feed_url, note))
+        if not found:
+            tried.append("%s: no <link rel=alternate> feed advertised" % root)
+    return None, "failed: autodiscovery found no working feed (%s)" % "; ".join(tried[:4])
+
+
+def _strategy_browser(url: str) -> tuple:
+    """Fetch as a BROWSER would: full Chrome header set, HTTP/2, a cookie jar.
+
+    This is aimed at the 406/403 class, which rejects the CLIENT rather than
+    the request — GitHub's advisories.atom refuses a plain feed reader and is
+    the reason this strategy exists. It is NOT a JavaScript renderer: a feed
+    that only exists after client-side scripting needs the `agent` strategy
+    below, or a real browser engine, and this says so rather than pretending.
+
+    Deliberately NOT routed through `playwright-scanner`: its /preview is
+    scope-gated with no override (correctly — it is a tool for sending traffic
+    at engagement targets), so a news site would be refused, and it returns a
+    screenshot rather than the document body. Weakening that gate to read a
+    news feed would be an absurd trade.
+    """
+    try:
+        import httpx  # http/2 capable; the h2 package may or may not be present
+    except Exception as e:  # noqa: BLE001
+        return None, "unavailable: httpx not importable (%s)" % type(e).__name__
+    for use_http2 in (True, False):
+        try:
+            with httpx.Client(http2=use_http2, timeout=25, verify=True,
+                              follow_redirects=True,
+                              headers=_BROWSER_HEADERS) as cli:
+                resp = cli.get(url)
+        except Exception as e:  # noqa: BLE001
+            if use_http2 and "h2" in str(e).lower():
+                continue        # the h2 extra is absent; retry over HTTP/1.1
+            return None, "failed: %s: %s" % (type(e).__name__, str(e)[:160])
+        proto = "HTTP/2" if use_http2 else "HTTP/1.1"
+        if resp.status_code >= 400:
+            return None, "failed: HTTP %s from %s as a browser (%s)" % (
+                resp.status_code, resp.url, proto)
+        return _parse_or_none(resp.content,
+                              "browser-profile fetch of %s (%s)" % (resp.url, proto))
+    return None, "unavailable: no usable HTTP transport"
+
+
+_AGENT_PROMPT = """You are picking out the news articles listed on a security
+site's index page. Below is every link the page offers, with its anchor text.
+
+Return ONLY JSON: {"articles":[{"title":"...","link":"...","published":"..."}]}
+
+Rules:
+- `link` MUST be copied verbatim from the LINKS list. Never invent or edit one.
+- `title` is the article's own headline. Prefer the anchor text; clean it up
+  only to remove obvious boilerplate.
+- `published` is a date if the anchor text carries one, otherwise "".
+- Pick only ARTICLES. Skip navigation, tag and category pages, pagination,
+  authors, adverts, social links, "contact", "careers", "pricing".
+- Newest first if the order is discernible. At most 25.
+- If the page lists no articles, return {"articles":[]}.
+
+PAGE: %s
+PAGE TITLE: %s
+
+LINKS:
+%s
+"""
+
+
+def _page_link_index(html: str, base_url: str) -> list:
+    """[(absolute_url, anchor_text)] for every link the page offers.
+
+    Handing the model the LINK INDEX rather than the raw document is both
+    cheaper and more accurate. slcyber.io's resources page is 754,501 bytes of
+    mostly inline script and data; truncating it at 60k (as the first version
+    did) cut off every article link on the page, and the model correctly
+    reported finding none. The same page yields 87 links, 14 of them articles.
+    """
+    from urllib.parse import urljoin, urldefrag
+    out, seen = [], set()
+    for m in re.finditer(r'<a\b[^>]*href\s*=\s*["\']([^"\'#][^"\']*)["\'][^>]*>(.*?)</a>',
+                         html or "", re.I | re.S):
+        href, inner = m.group(1).strip(), m.group(2)
+        if href.lower().startswith(("javascript:", "mailto:", "tel:", "data:")):
+            continue
+        try:
+            full = urldefrag(urljoin(base_url, href))[0]
+        except Exception:  # noqa: BLE001
+            continue
+        if not full.startswith(("http://", "https://")):
+            continue
+        text = re.sub(r"<[^>]+>", " ", inner)
+        text = re.sub(r"\s+", " ", text).strip()[:220]
+        if full in seen:
+            continue
+        seen.add(full)
+        out.append((full, text))
+    return out
+
+
+def _strategy_agent(url: str) -> tuple:
+    """Last resort: have the model read the page and list the articles.
+
+    For a source that publishes no machine-readable feed at all. It is the
+    most expensive strategy and the least trustworthy, so it is off unless
+    NEWS_FETCH_STRATEGIES asks for it, and every link it returns must be one
+    the page actually contained — a fabricated link is worse than no article,
+    so links not present in the fetched HTML are DROPPED here rather than
+    trusted to the prompt's instruction not to invent them.
+    """
+    try:
+        resp = requests.get(url, headers=_BROWSER_HEADERS, timeout=25,
+                            verify=True, allow_redirects=True)
+    except Exception as e:  # noqa: BLE001
+        return None, "failed: %s: %s" % (type(e).__name__, str(e)[:160])
+    if resp.status_code >= 400:
+        return None, "failed: HTTP %s from %s" % (resp.status_code, resp.url)
+    html = resp.text or ""
+    if not html.strip():
+        return None, "failed: empty body from %s" % resp.url
+    from urllib.parse import urldefrag
+    index = _page_link_index(html, str(resp.url))
+    if not index:
+        return None, ("failed: %s offers no links at all — it is most likely "
+                      "rendered client-side, which this strategy cannot read"
+                      % resp.url)
+    # The set of links the PAGE ITSELF offers, resolved to absolute. Comparing
+    # the model's output against the raw HTML instead looks equivalent and is
+    # not: a page that writes href="/resources/foo" yields an absolutized
+    # model link that never appears literally in the source, so every real
+    # article was dropped as fabricated. Verified on slcyber.io 2026-10-16 —
+    # 3 of 3 correct links rejected by the strict form.
+    page_links = {u for u, _ in index}
+    title_m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+    page_title = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ",
+                        title_m.group(1) if title_m else "")).strip()[:200]
+    listing = "\n".join("%s | %s" % (u, t) for u, t in index[:400])
+    out = _call_llm(_AGENT_PROMPT % (url, page_title, listing[:60000]))
+    if out is _RATE_LIMITED:
+        return None, "unavailable: the LLM is rate-limited (429); not a verdict on the source"
+    if not out:
+        return None, "unavailable: the LLM returned nothing (see the [news] LLM warning above)"
+    raw = out.get("articles") if isinstance(out, dict) else None
+    if not isinstance(raw, list):
+        return None, "failed: the model returned no `articles` list"
+    articles, dropped = [], 0
+    for a in raw[:25]:
+        if not isinstance(a, dict):
+            continue
+        title = str(a.get("title") or "").strip()
+        link = str(a.get("link") or "").strip()
+        if not title or not link.startswith(("http://", "https://")):
+            continue
+        # Anti-fabrication: the link must be one the PAGE offered. A model
+        # that invents a plausible-looking article url is worse than a source
+        # with no news, because the invention is indistinguishable downstream.
+        if urldefrag(link)[0] not in page_links:
+            dropped += 1
+            continue
+        published = str(a.get("published") or "").strip()
+        articles.append({"title": title[:500], "link": link,
+                         "published": published,
+                         "published_at": _parse_published({}, published),
+                         "raw_excerpt": ""})
+    if not articles:
+        if dropped:
+            return None, ("failed: the model listed %d article(s), none of whose "
+                          "links were among the %d the page offers"
+                          % (len(raw), len(page_links)))
+        return None, "failed: the model found no articles on the page"
+    note = "ok: %d article(s) via the LLM reading %s" % (len(articles), resp.url)
+    if dropped:
+        note += " (%d dropped: link not present in the page)" % dropped
+    return articles, note
+
+
+_STRATEGY_FUNCS = {
+    "direct": _strategy_direct,
+    "feedparser": _strategy_feedparser,
+    "discover": _strategy_discover,
+    "browser": _strategy_browser,
+    "agent": _strategy_agent,
+}
+
+
 def _fetch_feed(url: str, parser: str) -> tuple:
     """Pull articles from one source. Returns `(articles, error)`.
 
     `articles` is a list of normalized dicts {title, link, published,
     raw_excerpt}, all sharing a stable shape so the downstream upserter is
     parser-agnostic. `error` is None on success, or a string saying exactly
-    what went wrong.
+    what went wrong — at EVERY strategy that was tried.
 
     THE ERROR RETURN IS THE POINT. This used to raise on a bad status and then
-    swallow it:
-
-        if resp.status_code >= 400:
-            raise RuntimeError(f"http {resp.status_code}")
-        ...
-        except Exception:
-            feed = feedparser.parse(url)   # fails quietly, yields nothing
-
-    So a blocked or moved feed produced `articles: 0, error: None` — identical
-    in the run record to a feed that genuinely had nothing new. Measured
-    2026-10-15, four of seventeen sources were in that state and had been for
-    an unknown time:
+    swallow it, so a blocked or moved feed produced `articles: 0, error: None`
+    — identical in the run record to a feed that genuinely had nothing new.
+    Measured 2026-10-15, four of seventeen sources were in that state:
 
         GitHub Security Advisories  HTTP 406  (bot-blocked)
         Microsoft MSRC              HTTP 301
         Assetnote Research          HTTP 301
         CSO Online                  HTTP 404  (serves an HTML error page)
 
-    The feed had been running at 13 of 17 and the panel could not say so.
-    CLAUDE.md: "`except: pass` around an HTTP call hides a 404 forever."
+    Correcting the URLs recovered MSRC and CSO. The other two stayed dead,
+    which is why there is now a LADDER rather than one fetch: a source that
+    refuses our client, or has moved its feed, is a different problem from a
+    source with no news, and each needs a different attempt. See
+    `_STRATEGY_ORDER` above for the strategies and `NEWS_FETCH_STRATEGIES`
+    for choosing them.
 
-    Redirects are followed explicitly, and the FINAL url is reported, so a feed
-    that moved is distinguishable from one that is blocked.
+    The first strategy that yields articles wins and the error is None. If
+    none do, the error names every strategy and what each said, so the
+    operator can tell "blocked" from "moved" from "we could not even try".
     """
-    import feedparser  # local import — keeps the module importable even if pip step is pending
-    headers = {"User-Agent": USER_AGENT,
-               # Several feeds (GitHub's advisories.atom among them) reject a
-               # request that does not say it wants a feed.
-               "Accept": "application/atom+xml, application/rss+xml, "
-                         "application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5"}
-    error = None
-    feed = None
-    try:
-        resp = requests.get(url, headers=headers, timeout=20, verify=True,
-                            allow_redirects=True)
-        # `resp.url` is the url AFTER redirects, which is the useful one to
-        # report — but it only exists on a real requests.Response. Reaching
-        # for it unguarded turned any stub or non-requests response into
-        # "AttributeError: no attribute 'url'", reported as a fetch failure
-        # for a feed that had actually parsed fine.
-        final_url = getattr(resp, "url", None) or url
-        if resp.status_code >= 400:
-            error = "HTTP %s from %s" % (resp.status_code, final_url)
-        elif not (resp.content or b"").strip():
-            error = "HTTP %s but an empty body from %s" % (resp.status_code, final_url)
-        else:
-            feed = feedparser.parse(resp.content)
-            if getattr(feed, "bozo", 0) and not feed.entries:
-                error = "response did not parse as a feed (%s) from %s" % (
-                    type(getattr(feed, "bozo_exception", None)).__name__, final_url)
-            elif final_url != url:
-                # Not an error — but worth surfacing, because a silently
-                # redirected feed is how two of these drifted out of service.
-                log.info("[news] %s redirected to %s", url, final_url)
-    except Exception as e:  # noqa: BLE001
-        error = "%s: %s" % (type(e).__name__, str(e)[:200])
-
-    if feed is None:
-        # Last resort: let feedparser fetch it itself. Keep whatever error we
-        # already have -- if this path rescues the feed we clear it below, and
-        # if it does not, the ORIGINAL reason is what the operator needs.
-        try:
-            feed = feedparser.parse(url)
-            if feed.entries and error:
-                log.info("[news] %s recovered via feedparser after: %s", url, error)
-                error = None
-        except Exception as e:  # noqa: BLE001
-            if not error:
-                error = "%s: %s" % (type(e).__name__, str(e)[:200])
-            feed = None
-    if feed is None:
-        return [], error or "no feed could be fetched"
-
-    articles = []
-    for entry in feed.entries[:50]:
-        title = (entry.get("title") or "").strip()
-        link = (entry.get("link") or "").strip()
-        if not title or not link:
+    attempts, order = [], _enabled_strategies()
+    if not order:
+        return [], ("no fetch strategy enabled: NEWS_FETCH_STRATEGIES=%r "
+                    "selected none of %s" % (os.environ.get("NEWS_FETCH_STRATEGIES"),
+                                             list(_STRATEGY_ORDER)))
+    for name in order:
+        fn = _STRATEGY_FUNCS.get(name)
+        if fn is None:                      # unreachable; belt and braces
+            attempts.append("%s=unavailable: not implemented" % name)
             continue
-        # Try summary, then content
-        excerpt = entry.get("summary") or ""
-        if not excerpt and entry.get("content"):
-            try:
-                excerpt = entry["content"][0].get("value", "")
-            except Exception:
-                excerpt = ""
-        # Strip basic HTML tags from excerpt for cleaner CVE extraction & display
-        excerpt = re.sub(r"<[^>]+>", " ", excerpt)
-        excerpt = re.sub(r"\s+", " ", excerpt).strip()[:2000]
+        try:
+            articles, note = fn(url)
+        except Exception as e:  # noqa: BLE001
+            # A strategy that CRASHED is a bug in us, not a verdict on the
+            # source. Say so and keep going down the ladder.
+            attempts.append("%s=unavailable: raised %s: %s"
+                            % (name, type(e).__name__, str(e)[:120]))
+            log.warning("[news] fetch strategy %s raised on %s: %s", name, url, e)
+            continue
+        attempts.append("%s=%s" % (name, note))
+        if articles:
+            if len(attempts) > 1:
+                log.info("[news] %s recovered via `%s` after %s", url, name,
+                         "; ".join(attempts[:-1]))
+            return articles, None
+    return [], "; ".join(attempts)
 
-        published = ""
-        for k in ("published", "updated", "created"):
-            if entry.get(k):
-                published = entry[k]
-                break
-        articles.append({
-            "title": title,
-            "link": link,
-            "published": published,
-            "published_at": _parse_published(entry, published),
-            "raw_excerpt": excerpt,
-        })
-    return articles, error
 
 def fetch_all_sources(run_id: Optional[str] = None,
                      enabled_only: bool = True,
