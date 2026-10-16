@@ -207,46 +207,54 @@ class TestMigrationCoverage:
             assert vc.canonical(target) != "unknown", target
 
     def test_the_cwe_map_agrees(self):
-        """Two tables mapping CWE -> class must not disagree, or the same CVE
-        classifies differently depending on which one a path consults."""
+        """The old map was single-valued; the new one is one-to-many. Agreement
+        now means the old answer is still AMONG the candidates — anything else
+        is a class a path used to reach and no longer can."""
         old = _api_const("_CWE_TO_VULN_CLASS")
         if old is None:
             pytest.skip("_CWE_TO_VULN_CLASS already removed")
         # Divergences we MEAN, each with the reason. Anything else is drift.
         intended = {
-            # The merge that broke the gather gate: a traversal injects
-            # through the path, an LFI through a parameter.
-            "CWE-22": ("lfi", "path-traversal"),
-            "CWE-23": ("lfi", "path-traversal"),
-            "CWE-36": ("lfi", "path-traversal"),
-            # "Authorization Bypass Through User-Controlled Key" IS the
-            # definition of an IDOR; the old map called it auth-bypass.
-            "CWE-639": ("auth-bypass", "idor"),
+            # The merge that broke the gather gate: a traversal injects through
+            # the path, an LFI through a parameter.
+            "CWE-22": "lfi", "CWE-23": "lfi", "CWE-36": "lfi",
+            # "Authorization Bypass Through User-Controlled Key" IS an IDOR;
+            # the old map called it auth-bypass.
+            "CWE-639": "auth-bypass",
         }
-        disagree = {}
+        lost = {}
         for cwe, cls in old.items():
-            mine = vc.class_for_cwe(cwe)
-            was = vc.canonical(cls)
-            if mine == "unknown":
-                disagree[cwe] = ("absent", cls)
-            elif mine != was and intended.get(cwe) != (was, mine):
-                disagree[cwe] = (mine, cls)
-        assert not disagree, "CWE map disagreement: %s" % disagree
+            cands = vc.classes_for_cwe(cwe)
+            if not cands:
+                lost[cwe] = ("absent", cls)
+            elif vc.canonical(cls) not in cands and intended.get(cwe) != vc.canonical(cls):
+                lost[cwe] = (cands, cls)
+        assert not lost, "CWE mappings the table lost: %s" % lost
 
-    def test_an_ambiguous_cwe_has_a_declared_primary(self):
-        """A CWE under several classes must not be resolved by file order."""
-        import collections
-        owners = collections.defaultdict(list)
-        for c in CLASSES:
-            for cw in (c.get("cwes") or []):
-                owners[str(cw["id"])].append(c["name"])
-        declared = {str(k).upper() for k in (RAW.get("cwe_primary_class") or {})}
-        ambiguous = {k for k, v in owners.items() if len(v) > 1}
-        assert ambiguous <= declared, (
-            "CWEs claimed by several classes with no declared primary: %s"
-            % sorted(ambiguous - declared))
-        for cid, cls in (RAW.get("cwe_primary_class") or {}).items():
-            assert vc.class_for_cwe(cid) == cls, cid
+
+    def test_a_cwe_may_point_at_several_classes(self):
+        """A CWE is a narrowing SIGNAL, not an answer. CWE-78 is OS command
+        injection AND remote code execution — the second is the consequence of
+        the first. An earlier draft forced one "primary" per CWE, which made
+        the lookup lie about the other."""
+        assert vc.classes_for_cwe("CWE-78") == ["cmdi", "rce"]
+        assert vc.classes_for_cwe("CWE-98") == ["lfi", "rfi"]
+        assert vc.classes_for_cwe("CWE-9999") == []
+
+    def test_the_candidate_list_is_sorted_not_file_ordered(self):
+        """A lookup whose answer changes when someone reorders the YAML is not
+        a lookup."""
+        for cwe in ("CWE-78", "CWE-98", "CWE-502"):
+            got = vc.classes_for_cwe(cwe)
+            assert got == sorted(got), cwe
+
+    def test_a_cwe_alone_answers_only_when_it_is_unambiguous(self):
+        """`unknown` for an ambiguous CWE is the truthful answer; returning the
+        alphabetically-first class would be fabricated certainty."""
+        assert vc.class_for_cwe("CWE-22") == "path-traversal"
+        assert vc.class_for_cwe("CWE-918") == "ssrf"
+        assert vc.class_for_cwe("CWE-78") == "unknown"
+        assert vc.class_for_cwe("CWE-98") == "unknown"
 
 
 # ── the semantic bug ───────────────────────────────────────────────────────
@@ -341,12 +349,11 @@ class TestReferences:
         assert r["owasp"] and r["cwes"] and r["wstg"] and r["mitre"]
         assert any(x["id"] == "CWE-22" for x in r["cwes"])
 
-    def test_a_cwe_resolves_to_exactly_one_class(self):
-        """CWE-98 appears under both lfi and rfi by design; the lookup must be
-        deterministic rather than order-dependent noise."""
-        assert vc.class_for_cwe("CWE-98") in ("lfi", "rfi")
-        assert vc.class_for_cwe("CWE-98") == vc.class_for_cwe("cwe-98")
-        assert vc.class_for_cwe("CWE-9999") == "unknown"
+    def test_a_shared_cwe_keeps_both_owners(self):
+        """CWE-98 enables local AND remote inclusion. Both must stay reachable
+        from it, and the lookup must be case-insensitive."""
+        assert set(vc.classes_for_cwe("CWE-98")) == {"lfi", "rfi"}
+        assert vc.classes_for_cwe("cwe-98") == vc.classes_for_cwe("CWE-98")
 
 
 # ── fail-soft ──────────────────────────────────────────────────────────────
@@ -387,3 +394,75 @@ def test_the_renderer_is_registered_and_emits_a_document_per_class():
     assert len(docs) == len(CLASSES)
     joined = " ".join(b for _, b in docs)
     assert "CWE-22" in joined and "OWASP" in joined
+
+
+# ── the combination: name is primary, CWE narrows ──────────────────────────
+
+@pytest.mark.unit
+class TestResolve:
+    def test_a_named_class_beats_the_cwe(self):
+        """An advisory that says "local file inclusion" has told us the class.
+        CWE-22 points at path-traversal; the name still wins."""
+        r = vc.resolve("local file inclusion via the page parameter",
+                       ["CWE-98", "CWE-22"])
+        assert r["class"] == "lfi"
+        assert r["basis"] == "name"
+        assert r["ambiguous"] is False
+
+    def test_a_cwe_answers_when_the_text_names_nothing(self):
+        r = vc.resolve("the endpoint is vulnerable", ["CWE-918"])
+        assert r["class"] == "ssrf" and r["basis"] == "cwe"
+
+    def test_an_ambiguous_cwe_with_no_name_reports_the_ambiguity(self):
+        """Not a guess. The caller can ask for more evidence instead of acting
+        on the alphabetically-first candidate."""
+        r = vc.resolve("the endpoint is vulnerable", ["CWE-78"])
+        assert r["class"] == "unknown"
+        assert r["ambiguous"] is True
+        assert r["candidates"] == ["cmdi", "rce"]
+
+    def test_the_text_breaks_a_cwe_tie(self):
+        r = vc.resolve("OS command injection in the ping handler", ["CWE-78"])
+        assert r["class"] == "cmdi"
+        assert r["ambiguous"] is False
+
+    def test_the_same_cwe_resolves_differently_by_name(self):
+        """CWE-98 enables both; only the text says which."""
+        assert vc.resolve("arbitrary file read", ["CWE-98"])["class"] == "lfi"
+        assert vc.resolve("remote file inclusion lets the server fetch",
+                          ["CWE-98"])["class"] == "rfi"
+
+    def test_nothing_to_go_on_is_unknown_and_says_so(self):
+        r = vc.resolve("", [])
+        assert r["class"] == "unknown" and r["basis"] == "none"
+        assert r["ambiguous"] is False
+        r2 = vc.resolve("nothing useful here", [])
+        assert r2["class"] == "unknown" and r2["basis"] == "none"
+
+    def test_a_short_class_name_does_not_match_mid_word(self):
+        """`rce` is a substring of "resou(rce)key". A substring scan over the
+        separator-squashed text classified a real path traversal as remote
+        code execution; matching is boundary-anchored now."""
+        r = vc.resolve("the resource key is validated", [])
+        assert r["class"] == "unknown", r
+        r2 = vc.resolve("script.execute allows path traversal via the resource key",
+                        ["CWE-22"])
+        assert r2["class"] == "path-traversal"
+        assert r2["candidates"] == ["path-traversal"], (
+            "`rce` leaked in from the word 'resource': %s" % r2["candidates"])
+
+    def test_separators_in_the_text_do_not_matter(self):
+        for spelling in ("arbitrary file read", "arbitrary-file-read",
+                         "arbitrary_file_read", "Arbitrary File Read"):
+            assert vc.resolve(spelling, [])["class"] == "lfi", spelling
+
+    def test_the_longest_alias_wins(self):
+        """`remote file inclusion` contains `file` tokens a shorter alias could
+        claim; the longer, more specific spelling must win."""
+        assert vc.resolve("remote file inclusion", [])["class"] == "rfi"
+
+    def test_resolve_never_raises_on_odd_input(self):
+        for t, c in ((None, None), (42, ["CWE-78"]), ("x", ["not-a-cwe"]),
+                     ("x", [None])):
+            r = vc.resolve(t, c)
+            assert r["class"] in vc.names() or r["class"] == "unknown"

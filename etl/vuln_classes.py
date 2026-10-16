@@ -87,30 +87,52 @@ def load(path: Optional[str] = None, force: bool = False) -> Dict[str, Any]:
                 except Exception:  # noqa: BLE001
                     continue
         by_name, by_alias, by_cwe = {}, {}, {}
+        raw_alias: List[tuple] = []     # (original spelling, class) for prose matching
         for c in (data.get("classes") or []):
             if not isinstance(c, dict) or not c.get("name"):
                 continue
             name = str(c["name"]).strip().lower()
             by_name[name] = c
             by_alias[_squash(name)] = name
+            raw_alias.append((name, name))
             for a in (c.get("aliases") or []):
                 by_alias.setdefault(_squash(a), name)
+                raw_alias.append((str(a), name))
             for cw in (c.get("cwes") or []):
                 cid = str((cw or {}).get("id") or "").strip().upper()
                 if cid:
-                    by_cwe.setdefault(cid, name)
-        # A CWE that appears under several classes gets its PRIMARY from the
-        # table, never from whichever class the file happened to list first —
-        # a lookup whose answer changes when someone reorders the file is not
-        # a lookup.
-        for cid, cls in (data.get("cwe_primary_class") or {}).items():
-            cid = str(cid).strip().upper()
-            target = str(cls).strip().lower()
-            if cid and target in by_name:
-                by_cwe[cid] = target
+                    # ONE CWE -> MANY classes, by design. CWE-78 is both `cmdi`
+                    # and `rce`; CWE-98 is both `lfi` and `rfi`. Picking one
+                    # would make the lookup lie about the other.
+                    by_cwe.setdefault(cid, [])
+                    if name not in by_cwe[cid]:
+                        by_cwe[cid].append(name)
+        for cid in by_cwe:
+            by_cwe[cid].sort()      # deterministic, never file order
+        # Boundary-aware patterns for matching a class name in PROSE. Squashing
+        # separators is right for `canonical("Path Traversal")` and wrong for
+        # scanning text: `rce` is a substring of "resou(rce)key", so a
+        # substring scan classified a path traversal as remote code execution.
+        # Each alias becomes `\btoken[-_ ]?token\b`, longest first so
+        # `remote file inclusion` is not swallowed by a shorter alias inside it.
+        alias_res = []
+        for spelling, cls in raw_alias:
+            toks = [t for t in re.split(r"[^a-z0-9]+", str(spelling).lower()) if t]
+            if not toks:
+                continue
+            # Separators are flexible so one entry covers `arbitrary-file-read`,
+            # `arbitrary file read` and `arbitrary_file_read` — but the ends are
+            # anchored on word boundaries, because `rce` is a substring of
+            # "resou(rce)key" and a plain substring scan classified a path
+            # traversal as remote code execution.
+            alias_res.append((len(spelling),
+                              re.compile(r"\b" + r"[-_ ]?".join(map(re.escape, toks)) + r"\b",
+                                         re.I),
+                              cls))
+        alias_res.sort(key=lambda x: -x[0])
         built = {"raw": data, "source": src, "by_name": by_name,
                  "by_alias": by_alias, "by_cwe": by_cwe,
-                 "loaded": bool(by_name)}
+                 "alias_res": alias_res, "loaded": bool(by_name)}
         if not path:
             _cache = built
         return built
@@ -216,9 +238,80 @@ def proof_kinds(name) -> List[str]:
 # ── reference vocabularies ──────────────────────────────────────────────────
 
 
+def classes_for_cwe(cwe) -> List[str]:
+    """EVERY class a CWE points at, sorted. A CWE is a narrowing signal, not an
+    answer: CWE-78 is `cmdi` and `rce`, CWE-98 is `lfi` and `rfi`."""
+    return list(load()["by_cwe"].get(str(cwe or "").strip().upper(), []))
+
+
 def class_for_cwe(cwe) -> str:
-    """Canonical class for a CWE id. Unmapped -> `unknown`."""
-    return load()["by_cwe"].get(str(cwe or "").strip().upper(), UNKNOWN)
+    """The class a CWE identifies ON ITS OWN — which is only meaningful when
+    it points at exactly one.
+
+    Returns `unknown` when the CWE is unmapped AND when it is ambiguous,
+    because "I cannot tell from this alone" is the truthful answer and
+    returning the alphabetically-first class would be a fabricated certainty.
+    Callers with more to go on should use `resolve()`.
+    """
+    hits = classes_for_cwe(cwe)
+    return hits[0] if len(hits) == 1 else UNKNOWN
+
+
+def resolve(text=None, cwes=None) -> dict:
+    """Decide a class from the COMBINATION of a name and a CWE set.
+
+    The class NAME is primary: an advisory that says "path traversal" has told
+    us the class, and no CWE should overrule it. The CWEs narrow when the text
+    does not name a class, and where they disagree the ambiguity is reported
+    rather than resolved by file order.
+
+    Returns {class, candidates, basis, ambiguous}:
+        basis = "name"      a class name or alias appeared in the text
+                "cwe"       the CWEs pointed at exactly one class
+                "cwe+name"  several CWE candidates, the text picked one
+                "none"      nothing to go on -> class is `unknown`
+    `ambiguous` is True when several candidates survived; `class` is then
+    `unknown` and `candidates` carries them, so a caller can ask for more
+    evidence instead of acting on a guess.
+    """
+    t = str(text or "")
+    tbl = load()
+
+    # 1. An explicit name or alias in the text wins outright. Matched on word
+    #    boundaries, longest alias first.
+    named = [(n, cls) for n, rx, cls in tbl.get("alias_res", []) if rx.search(t)]
+    if named:
+        top = named[0][0]
+        tied = {c for n, c in named if n == top}
+        if len(tied) == 1:
+            return {"class": named[0][1],
+                    "candidates": sorted({c for _, c in named}),
+                    "basis": "name", "ambiguous": False}
+
+    # 2. The CWEs give a candidate set.
+    cands: List[str] = []
+    for cw in (cwes or []):
+        for c in classes_for_cwe(cw):
+            if c not in cands:
+                cands.append(c)
+    cands.sort()
+    if len(cands) == 1:
+        return {"class": cands[0], "candidates": cands, "basis": "cwe",
+                "ambiguous": False}
+
+    # 3. Several CWE candidates — let the text break the tie, but only if it
+    #    actually mentions one of them.
+    if len(cands) > 1:
+        mentioned = [cls for _, rx, cls in tbl.get("alias_res", [])
+                     if cls in cands and rx.search(t)]
+        if len(set(mentioned)) == 1:
+            return {"class": mentioned[0], "candidates": cands,
+                    "basis": "cwe+name", "ambiguous": False}
+        return {"class": UNKNOWN, "candidates": cands, "basis": "cwe",
+                "ambiguous": True}
+
+    return {"class": UNKNOWN, "candidates": [], "basis": "none",
+            "ambiguous": False}
 
 
 def cwes_for(name) -> List[dict]:

@@ -47,25 +47,24 @@ owasp_top10_version: "2021"
 # the injection point and there is no parameter to find.
 injection_points: [path, parameter, body, header, cookie, multipart, none]
 
-# A CWE that legitimately appears under more than one class needs its PRIMARY
-# declared, or `class_for_cwe()` is decided by whichever class the file lists
-# first — a lookup whose answer changes when someone reorders the file.
+# A CWE maps to MANY classes, on purpose, and never decides one on its own.
 #
-#   CWE-77 / CWE-78  the specific mechanism beats the generic outcome
-#   CWE-94           generic code injection. Kept on `cmdi`, which is where
-#                    the previous map put it: changing it would change which
-#                    craft guidance every CWE-94 CVE receives, and this
-#                    migration only diverges where the divergence IS the fix
-#                    (CWE-22/23/36 and CWE-639). ssti keeps its own CWE-1336.
-#   CWE-502          deserialization is the mechanism, rce the consequence
-#   CWE-98           PHP include; local inclusion is the common case, and rfi
-#                    still lists it because the same weakness enables both
-cwe_primary_class:
-  CWE-77: cmdi
-  CWE-78: cmdi
-  CWE-94: cmdi
-  CWE-502: deserialization
-  CWE-98: lfi
+# CWE-78 is OS command injection — it belongs to `cmdi` and to `rce`, because
+# the second is the consequence of the first. CWE-98 belongs to `lfi` and to
+# `rfi`, because the same weakness enables both. Forcing a single "primary"
+# per CWE would make the lookup lie about one of them, and the earlier draft
+# of this file did exactly that.
+#
+# The CLASS NAME is the primary key. A CWE is a narrowing SIGNAL. Resolution is
+# the COMBINATION — `resolve(text, cwes)` in etl/vuln_classes.py:
+#
+#   1. a class name or alias appearing in the text wins outright;
+#   2. otherwise the CWEs give a candidate set;
+#   3. one candidate -> that class; several -> the ambiguity is REPORTED, not
+#      silently resolved by whichever class the file happens to list first.
+#
+# A lookup whose answer changes when someone reorders this file is not a
+# lookup, and a lookup that invents certainty it does not have is worse.
 
 # proof vocabulary — what counts as evidence the class actually fired.
 proof_kinds: [echo, oob, timing, file_content, status_change, side_effect]
@@ -116,6 +115,10 @@ classes:
       - { id: CWE-77, name: "Improper Neutralization of Special Elements used in a Command ('Command Injection')" }
       - { id: CWE-78, name: "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')" }
       - { id: CWE-88, name: "Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')" }
+      # Generic code injection also lands here: the previous single-valued map
+      # sent CWE-94 to cmdi, and under one-to-many it keeps that owner instead
+      # of losing it. It is ALSO ssti and rce — the text decides which.
+      - { id: CWE-94, name: "Improper Control of Generation of Code ('Code Injection')" }
 
   - name: ssti
     title: Server-Side Template Injection
