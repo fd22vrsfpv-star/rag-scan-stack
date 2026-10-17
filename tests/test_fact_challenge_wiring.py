@@ -80,7 +80,7 @@ def _load_challenger():
             "research": "advisory_derived", "llm_fallback": "model_inferred"},
         "_FACT_CHALLENGE_MODE": "auto",
     }
-    for name in ("_challenge_intel", "_challenge_derived_facts"):
+    for name in ("_probe_result_shape", "_challenge_intel", "_challenge_derived_facts"):
         fn = _func(API_TREE, name)
         assert fn is not None, "%s missing from api.py" % name
         exec(compile(ast.Module([fn], []), "<api>", "exec"), ns)
@@ -157,9 +157,16 @@ class TestApply:
         assert man["items"][0]["status"] == "gathered"
         assert res["applied"] == [] or all(a["action"] != "warn" for a in res["applied"])
 
-    def test_an_uncontrolled_probe_downgrades_its_fact(self):
-        """Ties A to B: a probe whose negative control matched tested nothing,
-        so the fact it 'confirmed' is not evidence."""
+    def test_an_uncontrolled_probe_warns_rather_than_blocking(self):
+        """A matched control means "I could not establish this", NOT "this is
+        false" — and the gate reads an unverified REQUIRED item as missing.
+
+        Observed live: on an app that soft-404s the control matches every
+        time, so `downgrade` made the item permanently missing and the build
+        stopped at gather with 0 iterations, where the previous run had
+        reached refine with 6. Blocking forever on an unprovable-here fact
+        makes the class unbuildable against that whole family of targets.
+        """
         man = _man([_item("endpoint", "gathered", "/download/x", "probe")])
         res = CH["_challenge_derived_facts"](
             man, "CVE-X", "10.0.0.1", 443,
@@ -168,7 +175,10 @@ class TestApply:
                 "evidence": "probe ran, control matched: a nonsense path "
                             "answered HTTP 200 with a same-size body"}})
         assert "fact_survived_no_control" in {f["rule_id"] for f in res["findings"]}
-        assert man["items"][0]["status"] == "unverified"
+        # Recorded, and the item still usable — the confidence floor renders
+        # it as an ASSUMPTION in the prompt, which is the honest treatment.
+        assert man["items"][0]["status"] == "gathered"
+        assert man["ready"] is not False
 
     def test_a_clean_fact_set_changes_nothing(self):
         man = _man([_item("endpoint", "gathered", "/plugins/servlet/fetch", "probe"),
@@ -188,6 +198,38 @@ class TestApply:
         assert len(CH["_traces"]) > before, (
             "a challenge that found nothing still has to leave a record — "
             "otherwise 'it found nothing' and 'it never ran' look identical")
+
+    def test_a_bare_status_string_is_accepted(self):
+        """THE SHAPE PRODUCTION ACTUALLY USES. `_preflight_prove_facts` returns
+        {claim: status string}; the normaliser handled ProbeResult objects and
+        dicts and raised AttributeError on a string. The gather node's
+        `except` swallowed it, so the challenger reported "(skipped:
+        AttributeError: 'str' object has no attribute 'get')" and never ran on
+        a real build — while every test here passed.
+        """
+        man = _man([_item("endpoint", "gathered", "/a/{b}", "llm_fallback")])
+        probes = {"endpoint_exists": "unverified", "target_reachable": "confirmed"}
+        res = CH["_challenge_derived_facts"](
+            man, "CVE-X", "10.0.0.1", 443, probe_results=probes)
+        assert res["ran"] is True, "the challenger did not run: %s" % res.get("error")
+        assert any(f["rule_id"] == "placeholder_unsubstituted"
+                   for f in res["findings"])
+        # Not merely "it did not crash": the STATUS must survive. Dropping the
+        # string branch degrades it to None silently, which is a dead rule
+        # rather than a loud failure.
+        intel = CH["_challenge_intel"](man, probes)
+        assert intel["probe_results"]["target_reachable"]["status"] == "confirmed"
+        assert intel["probe_results"]["endpoint_exists"]["status"] == "unverified"
+
+    def test_every_shape_normalises_to_status_and_evidence(self):
+        class PR:
+            status = "unverified"
+            evidence = "probe ran, control matched: nonsense answered the same"
+        shape = CH["_probe_result_shape"]
+        assert shape("confirmed") == {"status": "confirmed", "evidence": ""}
+        assert shape({"status": "refuted", "evidence": "x"})["status"] == "refuted"
+        assert "control matched" in shape(PR())["evidence"]
+        assert shape(None)["status"] is None
 
     def test_probe_result_objects_are_accepted_as_well_as_dicts(self):
         """`run_probes` returns ProbeResult objects, not dicts. Reading only

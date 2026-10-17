@@ -81,6 +81,13 @@ class TestKnowledgeFile:
         for rid in ("placeholder_unsubstituted", "path_class_with_a_query_parameter"):
             assert _rule(rid)["action"] == fc.CLEAR, rid
 
+    def test_an_unprovable_fact_is_not_treated_as_a_false_one(self):
+        """"The control matched" means the probe could not establish the fact.
+        Acting on it as if the fact were WRONG blocks every build against an
+        app that answers everything identically."""
+        assert _rule("fact_survived_no_control")["action"] == fc.WARN
+        assert _rule("route_belongs_to_another_product")["action"] == fc.DOWNGRADE
+
     def test_every_action_is_exercised_by_some_rule(self):
         used = {r.get("action") for r in RULES}
         assert used == set(fc.ACTIONS), (

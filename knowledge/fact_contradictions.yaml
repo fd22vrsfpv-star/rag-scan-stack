@@ -163,12 +163,28 @@ rules:
       exploit but not for the route, record that distinction explicitly.
 
   - id: fact_survived_no_control
-    action: downgrade
+    # `warn`, NOT `downgrade`. A matched control means "I could not establish
+    # this", which is NOT "this is false" -- and `downgrade` sets the item
+    # unverified, which the gate reads as MISSING and blocks the build.
+    #
+    # Observed live 2026-10-16 on a path-traversal against an Atlassian host:
+    # the app soft-404s, so the control matches EVERY time, so the item was
+    # permanently missing and the run stopped at gather with 0 iterations.
+    # The previous run, without the challenger, reached refine and spent 6.
+    # Blocking forever on an app that answers everything identically makes the
+    # class unbuildable there, which is a worse answer than proceeding with
+    # the fact declared unproven.
+    #
+    # The confidence floor already renders an unproven fact as an ASSUMPTION
+    # in the synth prompt, which is the honest treatment. `downgrade` stays
+    # right for a fact that is WRONG (another product's route), not one that
+    # is merely unestablished.
+    action: warn
     check: control_matched
     severity: high
     message: >-
       {item} was marked gathered, but its probe reported the target answers a
-      nonsense value identically
+      nonsense value identically -- treat it as an ASSUMPTION, not a fact
     why: >-
       A probe whose negative control matched did not test anything. Treating its
       result as a gathered fact reintroduces exactly the blindness the controls

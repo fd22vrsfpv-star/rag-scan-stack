@@ -470,13 +470,19 @@ def enforce_facts(command: str, required: dict) -> Optional[str]:
     if not missing:
         return None
     bits = ", ".join("%s=%r" % (k, v) for k, v in missing)
+    # NO CONCRETE EXAMPLES IN A REFUSAL MESSAGE. This text used to carry a
+    # real parameter name from a DIFFERENT CVE as the anecdote justifying the
+    # rule. The model read it as a parameter to use and put it in the
+    # dispatched command; the next run then read that command back as
+    # "discovered knowledge" for the host. A war story in a prompt became a
+    # payload. The lesson is kept, the borrowed identifier is not.
     return (
         "the command does not use proven fact(s): %s. These were established by "
         "probe or declared by the harness itself, so a command that does not "
-        "reference them is not exercising the vulnerability we identified — on "
-        "CVE-2024-4443 the parameter `listingfields` was proven and then absent "
-        "from all 26 dispatched commands, every one of which failed. Rebuild "
-        "the command around the proven fact(s)." % bits)
+        "reference them is not exercising the vulnerability we identified — in "
+        "a previous build a proven parameter was absent from all 26 dispatched "
+        "commands, every one of which failed. Rebuild the command around the "
+        "proven fact(s)." % bits)
 
 
 # Values that cannot discriminate. `endpoint_exists = '/'` was armed on a real

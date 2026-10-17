@@ -18607,10 +18607,16 @@ def _preflight_prove_facts(man: dict, cve, ip, port, eid=None, run_id=None,
                 source_ref="gather_manifest:%s (via %s)" % (item, sources.get(item, "?")))
         except Exception as e:  # noqa: BLE001
             logging.debug("preflight record failed (%s): %s", claim, e)
-        out[claim] = res.status
+        # Status AND evidence. The challenger's `fact_survived_no_control`
+        # rule keys on the evidence text ("probe ran, control matched"), so a
+        # status-only payload could never fire it however well it was wired.
+        out[claim] = {"status": res.status, "evidence": res.evidence,
+                      "method": res.method, "probe_id": res.probe_id}
     if out:
         _poc_trace(run_id, "preflight_facts", iteration=0,
-                   extra={"results": out, "target": target,
+                   extra={"results": {k: v.get("status") for k, v in out.items()},
+                          "evidence": {k: str(v.get("evidence"))[:200] for k, v in out.items()},
+                          "target": target,
                           "reason": "each gathered fact was probed before synthesis; "
                                     "confirmed ones are now enforceable, refuted ones "
                                     "will not be retried"})
@@ -18724,6 +18730,21 @@ def _recon_cache_store(key: str, tool: str, ip, port, payload: dict, *,
         return False
 
 
+def _probe_result_shape(v) -> dict:
+    """{status, evidence} from whatever shape a caller has.
+
+    A ProbeResult, a dict, or a bare status string — the last is what
+    `_preflight_prove_facts` actually returns, and assuming the first two is
+    how the challenger never ran outside the tests.
+    """
+    if isinstance(v, str):
+        return {"status": v, "evidence": ""}
+    if isinstance(v, dict):
+        return {"status": v.get("status"), "evidence": v.get("evidence") or ""}
+    return {"status": getattr(v, "status", None),
+            "evidence": getattr(v, "evidence", "") or ""}
+
+
 def _challenge_intel(man: dict, probe_results: dict = None, *, product=None,
                      auth_required=None, auth_observations=None) -> dict:
     """Flatten the manifest into the `intel` shape the evaluator reads."""
@@ -18748,8 +18769,12 @@ def _challenge_intel(man: dict, probe_results: dict = None, *, product=None,
         "product": product or ((man or {}).get("facts") or {}).get("product"),
         "vuln_class": (man or {}).get("vuln_class"),
         "observed_paths": observed,
-        "probe_results": {k: {"status": getattr(v, "status", None) or (v or {}).get("status"),
-                              "evidence": getattr(v, "evidence", None) or (v or {}).get("evidence")}
+        # THREE shapes reach here and production used the one not handled:
+        # `_preflight_prove_facts` returns {claim: status STRING}, the prober
+        # itself returns ProbeResult objects, and a test may pass dicts. The
+        # string branch raised AttributeError, the gather node's `except`
+        # swallowed it, and the challenger silently never ran on a real build.
+        "probe_results": {k: _probe_result_shape(v)
                           for k, v in (probe_results or {}).items()},
         "auth_required": auth_required,
         "auth_observations": auth_observations or [],
@@ -31101,7 +31126,9 @@ _FRAMEWORK_FINGERPRINTS = [
     ("Joomla!",              "Joomla",      ["/administrator/manifests/files/joomla.xml"]),
     ("Drupal",               "Drupal",      ["/CHANGELOG.txt", "/core/CHANGELOG.txt", "/user/login"]),
     ("LyLme Spage",          "LyLme Spage", ["/apply/", "/pwd/", "/include/", "/data/config.php"]),
-    ("Spage",                "LyLme Spage", ["/apply/", "/pwd/"]),
+    # ("Spage", ...) REMOVED 2026-10-17: a 5-character generic needle that
+    # matched inside unrelated camelCase identifiers. The full "LyLme Spage"
+    # entry above covers the real product.
     ("phpMyAdmin",           "phpMyAdmin",  ["/phpmyadmin/README", "/phpmyadmin/ChangeLog"]),
     ("Directus",             "Directus",    ["/server/info", "/users/me"]),
     ("MediaWiki",            "MediaWiki",   ["/api.php?action=query&meta=siteinfo&format=json"]),
@@ -31155,7 +31182,18 @@ def _mine_response(url, resp, tag="mine"):
         intel["body_len"] = len(body)
         # Framework match
         for needle, name, _probes in _FRAMEWORK_FINGERPRINTS:
-            if needle.lower() in body.lower():
+            # WORD BOUNDARIES. A bare substring scan matched the needle
+            # "Spage" inside `resultsPage` / `fieldsPage` in bundled JS, so a
+            # Jira host was fingerprinted as "LyLme Spage" and that product
+            # name led the whole run's reasoning, including its failure
+            # analysis. Third instance of this bug class in one day: `rce`
+            # inside "resou(rce)key" and `BLIND` inside "blindly".
+            # Alphanumeric lookarounds, NOT \b: several needles start or end
+            # with punctuation ("/administrator/"), and \b there demands a
+            # word character on the outside, which killed the Joomla match.
+            # Caught by tests/test_prompt_contamination.py before deploy.
+            if _re.search(r"(?<![A-Za-z0-9])" + _re.escape(needle)
+                          + r"(?![A-Za-z0-9])", body, _re.I):
                 intel["framework"] = name
                 intel["framework_needle"] = needle
                 break

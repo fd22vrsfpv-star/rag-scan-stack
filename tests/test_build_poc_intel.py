@@ -139,6 +139,18 @@ class TestLedgerQuery:
         assert "source" not in selected and "updated_at" not in selected
 
 
+@pytest.mark.unit
+def test_the_preflight_passes_evidence_not_only_a_status():
+    """The challenger's `fact_survived_no_control` rule keys on the evidence
+    text ("probe ran, control matched"). A status-only payload can never fire
+    it, however well the call is wired."""
+    fn = _func("_preflight_prove_facts")
+    assert fn is not None
+    src = ast.unparse(fn)
+    assert "res.evidence" in src, (
+        "only the status is returned, so the control-matched rule is dead")
+
+
 # ── three outcomes, everywhere ─────────────────────────────────────────────
 
 @pytest.mark.unit
