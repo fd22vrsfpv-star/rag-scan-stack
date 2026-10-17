@@ -38,6 +38,7 @@ pytest.importorskip("yaml")
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
+from etl import payload_variants as pv  # noqa: E402
 from etl import vuln_classes as vc  # noqa: E402
 
 API = REPO / "app" / "rag-api" / "api.py"
@@ -61,7 +62,13 @@ def _const(name):
 
 
 def _block():
-    ns = {"chr": chr, "_vc_proof_kinds": vc.proof_kinds, "_vc_canonical": vc.canonical}
+    # The block now appends the TARGET-shaped payloads and proof regexes, so
+    # the real variant table is bound too — the prompt and the test must not
+    # disagree about what a windows box is offered.
+    ns = {"chr": chr, "_vc_proof_kinds": vc.proof_kinds, "_vc_canonical": vc.canonical,
+          "_pv_selection": pv.variants_for, "_pv_payloads": pv.payloads_for,
+          "_pv_proof": pv.proof_for, "_pv_caveats": pv.proof_caveats_for,
+          "_pv_preferred_proof": pv.preferred_proof}
     inst = next(n for n in TREE.body if isinstance(n, ast.Assign)
                 and any(getattr(t, "id", "") == "_PROOF_KIND_INSTRUCTION" for t in n.targets))
     fn = _node("_proof_expectation_block")
@@ -93,11 +100,11 @@ class TestBlock:
 
     def test_a_class_that_cannot_echo_is_told_so_explicitly(self):
         out = BLOCK("path-traversal", CANARY)
-        assert "not a valid proof" in out.lower()
+        assert "canary regex cannot prove this class" in out.lower()
 
     def test_an_echo_class_is_not_told_the_canary_is_invalid(self):
         out = BLOCK("sqli", CANARY)
-        assert "not a valid proof" not in out.lower()
+        assert "canary regex cannot prove this class" not in out.lower()
 
     def test_jndi_gets_out_of_band_only(self):
         """Its proof kinds are ['oob'] and nothing else — the response is a

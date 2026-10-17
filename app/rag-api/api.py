@@ -508,7 +508,7 @@ def _vectors_run_payload(command, ip, port, timeout, decision):
 
 #: Content signatures that only the REAL file has. A file read injects
 #: nothing, so this is the only honest proof — see _CRAFT_CLASS_GUIDANCE["lfi"].
-_FILE_READ_SIGNATURES = {
+_FILE_READ_SIGNATURES_FALLBACK = {
     "/etc/passwd":  r"root:x:0:0:",
     "/etc/shadow":  r"root:[\$\*!]",
     "/etc/hosts":   r"127\.0\.0\.1",
@@ -602,6 +602,101 @@ def _vc_needs_oob_sink(name) -> bool:
     return bool(m and m.needs_oob_sink(name))
 
 
+# ── Target shape: which payload, and which proof regex ──────────────────────
+#
+# `assets.os` has existed for a long time and is populated on 0 of 2,295 rows;
+# nothing in the build-PoC pipeline referenced an OS. So the craft guidance
+# HEDGED — listing `/etc/passwd` and `win.ini` together and letting the model
+# pick. A wrong pick costs an iteration the loop then reads as "the endpoint is
+# wrong" rather than "the OS is wrong".
+#
+# Fail-soft and, when it fails, AMBIGUOUS rather than wrong: an undetermined OS
+# returns every variant, never a default of linux.
+_PV_WARNED = set()
+
+
+def _pv():
+    """The payload-variant table, or None. Logs each distinct failure once."""
+    try:
+        from etl import payload_variants as _m
+        if not _m.loaded() and "unloaded" not in _PV_WARNED:
+            _PV_WARNED.add("unloaded")
+            logging.error("payload variant table did not load — payloads and "
+                          "proof regexes are unselected; check "
+                          "knowledge/payload_variants.yaml")
+        return _m
+    except Exception as e:  # noqa: BLE001
+        if "import" not in _PV_WARNED:
+            _PV_WARNED.add("import")
+            logging.error("etl.payload_variants unavailable (%s)", type(e).__name__)
+        return None
+
+
+def _pv_detect(headers=None, body=None, paths=None) -> dict:
+    m = _pv()
+    if not m:
+        return {"os": None, "runtime": None, "evidence": [],
+                "os_provenance": None, "runtime_provenance": None}
+    try:
+        return m.detect(headers=headers, body=body, paths=paths)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("target shape detection failed: %s", e)
+        return {"os": None, "runtime": None, "evidence": [],
+                "os_provenance": None, "runtime_provenance": None}
+
+
+def _pv_payloads(vuln_class, os=None, runtime=None) -> list:
+    m = _pv()
+    return m.payloads_for(vuln_class, os=os, runtime=runtime) if m else []
+
+
+def _pv_proof(vuln_class, os=None, runtime=None) -> dict:
+    m = _pv()
+    return m.proof_for(vuln_class, os=os, runtime=runtime) if m else {}
+
+
+def _pv_preferred_proof(vuln_class, os=None, runtime=None) -> list:
+    """Proof targets that are ALWAYS readable. Steering the model to one of
+    these is what stops an unreadable file being read as a failed exploit."""
+    m = _pv()
+    try:
+        return m.preferred_proof(vuln_class, os=os, runtime=runtime) if m else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _pv_caveats(vuln_class, os=None, runtime=None) -> dict:
+    """Proof targets whose EMPTY result proves nothing — a permission, not a
+    refutation."""
+    m = _pv()
+    try:
+        return m.proof_caveats_for(vuln_class, os=os, runtime=runtime) if m else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _pv_selection(vuln_class, os=None, runtime=None) -> dict:
+    m = _pv()
+    if not m:
+        return {"entries": [], "ambiguous": True, "ambiguous_axes": ["os"],
+                "reason": "variant table unavailable"}
+    return m.variants_for(vuln_class, os=os, runtime=runtime)
+
+
+def _file_read_signatures() -> dict:
+    """Proof signatures, from the variant table with the literal as fallback.
+
+    Same table `_FILE_READ_SIGNATURES_FALLBACK` always was — the OS is now
+    recoverable from it instead of flattened away.
+    """
+    m = _pv()
+    try:
+        sig = m.file_read_signatures() if m else {}
+    except Exception:  # noqa: BLE001
+        sig = {}
+    return sig or _FILE_READ_SIGNATURES_FALLBACK
+
+
 def _vc_proof_kinds(name) -> list:
     """How this class can be PROVEN (echo / oob / timing / file_content / ...)."""
     m = _vc()
@@ -637,7 +732,7 @@ def _file_read_evidence(run_id, cve, ip, output, canary=None, iteration=0):
         out["reason"] = "no output to save"
         return out
     # Which known file does this look like?
-    for name, sig in _FILE_READ_SIGNATURES.items():
+    for name, sig in _file_read_signatures().items():
         try:
             if _r.search(sig, body):
                 out["signature"] = name
@@ -17390,6 +17485,17 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
         with _hx.Client(verify=False, timeout=timeout, follow_redirects=False) as cli:
             r0 = cli.get(base + "/", headers=hdrs)
         add("target_reachable", "gathered", f"HTTP {r0.status_code}", "probe")
+        # TARGET SHAPE, from the answer we already have — no extra request.
+        # Recorded as a FACT, not a manifest item, so the gate's required set
+        # is untouched: an undetermined OS must never be able to block a build,
+        # it only means every payload form is offered.
+        try:
+            facts["target_shape"] = _pv_detect(
+                headers=dict(r0.headers), body=(r0.text or "")[:4000],
+                paths=[str(u) for u in ((live.get("crawl_urls") or [])
+                                        + (live.get("zap_paths") or []))[:60]])
+        except Exception as _se:  # noqa: BLE001
+            logging.debug("target shape detection failed: %s", _se)
     except Exception as e:  # noqa: BLE001
         add("target_reachable", "missing", f"{type(e).__name__}", "probe")
 
@@ -18269,6 +18375,18 @@ def _gather_manifest_text(man: dict) -> str:
             f"{k}={mined[k]}" for k in ("paths", "methods", "fields", "headers") if mined.get(k)))
     if facts.get("banner"):
         lines.append(f"  server banner: {facts['banner'][:200]}")
+    _shape = facts.get("target_shape") or {}
+    if _shape.get("os") or _shape.get("runtime"):
+        _why = ", ".join(str(e.get("rule")) for e in (_shape.get("evidence") or []))
+        lines.append(f"  target shape: os={_shape.get('os') or 'UNKNOWN'} "
+                     f"runtime={_shape.get('runtime') or 'UNKNOWN'}"
+                     + (f"  (via {_why})" if _why else ""))
+    elif _shape:
+        # Say it plainly: nothing established the OS. Silence here reads as
+        # linux to every downstream reader, which is how a Windows target gets
+        # attacked with /etc/passwd for a whole build.
+        lines.append("  target shape: os=UNKNOWN runtime=UNKNOWN — no banner, "
+                     "header or path established it; every payload form applies")
 
     # What THIS run's recon found (forms / crawl / arjun / verb sweep) — the
     # same facts the endpoint/method/field chains above consulted.
@@ -19233,8 +19351,9 @@ _PROOF_KIND_INSTRUCTION = {
         "canary is the WRONG proof: CANARY can never appear, and if it DOES the",
         "app echoed your input instead of disclosing a file - that is a",
         "REFUTATION, not a near miss. Assert on content only the real file has.",
-        '  assertion: {"expect_regex": "root:x:0:0:"}  (per-OS signatures are in',
-        "  the class guidance above)",
+        "  assertion: use the proof regex selected for this target below -",
+        "  the signature is OS-specific and a right payload judged by the",
+        "  wrong regex still fails.",
     ],
     "oob": [
         "OUT-OF-BAND - the proof arrives at a SINK, not in the response. The",
@@ -19265,7 +19384,24 @@ _PROOF_KIND_INSTRUCTION = {
 }
 
 
-def _proof_expectation_block(vuln_class, canary) -> str:
+def _target_shape_from_guidance(text):
+    """(os, runtime) parsed from the manifest line the gather check rendered.
+
+    The manifest already determined this from the probe it had to make anyway;
+    re-detecting here would cost a second request for an answer we hold. A
+    missing line yields (None, None), which means UNKNOWN and never linux.
+    """
+    import re as _re
+    t = str(text or "")
+    m = _re.search(r"target shape:\s*os=(\S+)\s+runtime=(\S+)", t)
+    if not m:
+        return None, None
+    o, r = m.group(1), m.group(2)
+    return (None if o.upper().startswith("UNKNOWN") else o,
+            None if r.upper().startswith("UNKNOWN") else r)
+
+
+def _proof_expectation_block(vuln_class, canary, os=None, runtime=None) -> str:
     """What this class can realistically prove, and how to assert it.
 
     Returns "" for an unknown class so the caller keeps whatever generic
@@ -19281,8 +19417,36 @@ def _proof_expectation_block(vuln_class, canary) -> str:
         for line in _PROOF_KIND_INSTRUCTION.get(k) or []:
             out.append("  " + line.replace("CANARY", str(canary or "")))
     if "echo" not in kinds:
-        out.append("  A canary regex is NOT a valid proof for this class: the")
-        out.append("  exploit injects nothing that could come back.")
+        out.append("  A canary regex cannot prove this class: assert on the")
+        out.append("  proof described above, not on a marker you supplied.")
+    # The payload and the proof regex are TARGET-shaped. Appending them here is
+    # what stops the guidance hedging: an IIS box is no longer offered
+    # /etc/passwd, and the expect_regex is chosen for the target rather than
+    # guessed. An undetermined OS yields every form, labelled as such.
+    sel = _pv_selection(vuln_class, os=os, runtime=runtime)
+    pays = _pv_payloads(vuln_class, os=os, runtime=runtime)
+    proof = _pv_proof(vuln_class, os=os, runtime=runtime)
+    if pays or proof:
+        shape = "os=%s runtime=%s" % (os or "UNKNOWN", runtime or "UNKNOWN")
+        out.append("  TARGET SHAPE (%s):" % shape)
+        if sel.get("ambiguous"):
+            _ax = sel.get("ambiguous_axes") or ["os"]
+            out.append("    %s %s not established, so EVERY form is listed."
+                       % (" and ".join(_ax), "are" if len(_ax) > 1 else "is"))
+            out.append("    Try them in order and keep the one that answers; do")
+            out.append("    NOT assume linux because nothing said otherwise.")
+        for pp in pays[:8]:
+            out.append("    payload: " + str(pp))
+        pref = _pv_preferred_proof(vuln_class, os=os, runtime=runtime)
+        if pref:
+            out.append("    USE one of these as the proof target - they are")
+            out.append("    always readable: " + ", ".join(pref[:5]))
+        for k, v in list(proof.items())[:8]:
+            out.append("    proof:   %s -> expect_regex %s" % (k, v))
+        for k, v in list(_pv_caveats(vuln_class, os=os, runtime=runtime).items())[:6]:
+            out.append("    NOT a refutation if %s comes back empty - that is a"
+                       % k)
+            out.append("    PERMISSION, not a failed exploit: %s" % v)
     return chr(10).join(out) + chr(10)
 
 
@@ -21934,7 +22098,9 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
     # file read, an out-of-band class or an IDOR that is an instruction the
     # exploit cannot follow. Built from the class table; falls back to the old
     # canary paragraph only when the class is genuinely unknown.
-    _proof_block = _proof_expectation_block(_listener_vc, canary)
+    _shape_os, _shape_rt = _target_shape_from_guidance(guidance_extra)
+    _proof_block = _proof_expectation_block(_listener_vc, canary,
+                                            os=_shape_os, runtime=_shape_rt)
     if not _proof_block:
         _proof_block = (
             f"Make the PoC CAUSE the exact marker '{canary}' to appear as a DIRECT "

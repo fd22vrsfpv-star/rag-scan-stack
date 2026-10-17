@@ -874,6 +874,46 @@ def _render_vuln_classes(data: Dict[str, Any]) -> List[Doc]:
     return docs
 
 
+def _render_payload_variants(data: Dict[str, Any]) -> List[Doc]:
+    """One document per (class, target-shape) variant, plus the detection rules.
+
+    Embedded so the planner can RECALL "what do I send at an IIS box for a path
+    traversal" by similarity; `etl/payload_variants.py` answers the CRAFTER by
+    exact lookup. Both are needed and they are not the same mechanism.
+    """
+    docs: List[Doc] = []
+    for cls, entries in (data.get("variants") or {}).items():
+        for e in (entries or []):
+            if not isinstance(e, dict):
+                continue
+            shape = " ".join(x for x in (
+                ("os " + _s(e.get("os"))) if e.get("os") else "",
+                ("runtime " + _s(e.get("runtime"))) if e.get("runtime") else "") if x)
+            title = f"Payload variant: {cls} on {shape or 'any target'}"
+            body = [f"For a {cls} against {shape or 'any target'}, send: "
+                    f"{_s(e.get('payloads'))}."]
+            if e.get("proof"):
+                body.append("Proven by content only the real result has: "
+                            + "; ".join(f"{k} -> /{v}/" for k, v in (e["proof"] or {}).items())
+                            + ".")
+            if e.get("note"):
+                body.append(_s(e.get("note")))
+            docs.append((title, " ".join(" ".join(body).split())))
+    for r in (data.get("detection") or []):
+        if not isinstance(r, dict):
+            continue
+        what = " and ".join(x for x in (
+            ("os=" + _s(r.get("os"))) if r.get("os") else "",
+            ("runtime=" + _s(r.get("runtime"))) if r.get("runtime") else "") if x)
+        docs.append((
+            f"Target fingerprint: {r.get('id')}",
+            " ".join((f"When the {_s(r.get('where'))} "
+                      f"{_s(r.get('header')) or ''} matches /{_s(r.get('pattern'))}/, "
+                      f"the target is {what}. Confidence tier: "
+                      f"{_s(r.get('provenance'))}.").split())))
+    return docs
+
+
 RENDERERS = {
     "app_request_contracts": _render_app_request_contracts,
     "exploitation_tools": _render_exploitation_tools,
@@ -909,6 +949,7 @@ RENDERERS = {
     "web_auth_templates": _render_web_auth_templates,
     "fact_contradictions": _render_fact_contradictions,
     "vuln_classes": _render_vuln_classes,
+    "payload_variants": _render_payload_variants,
 }
 
 

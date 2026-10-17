@@ -220,9 +220,21 @@ def test_the_saved_file_is_labelled_for_review():
 
 
 def test_signatures_cover_the_common_proof_files():
-    sigs = _const("_FILE_READ_SIGNATURES")
+    """`_FILE_READ_SIGNATURES` is a projection of
+    knowledge/payload_variants.yaml now, so the OS is recoverable instead of
+    flattened away. Nothing it used to prove may be lost."""
+    import sys as _sys
+    from pathlib import Path as _P
+    _sys.path.insert(0, str(_P(__file__).resolve().parent.parent))
+    from etl import payload_variants as _pv
+    sigs = _pv.file_read_signatures()
+    assert sigs, "the projection is empty"
     for f in ("/etc/passwd", "/etc/hosts", "web.xml", "web.config"):
-        assert f in sigs, f"no content signature for {f}"
+        assert any(f.split("/")[-1] in k for k in sigs), (
+            "no content signature for %s" % f)
+    fallback = _const("_FILE_READ_SIGNATURES_FALLBACK")
+    assert fallback, "the fallback literal is gone — an unreadable table would "\
+                     "silently disable every file-read proof"
 
 
 # -- 5. a path traversal has no input field ---------------------------------
