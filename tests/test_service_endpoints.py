@@ -60,6 +60,7 @@ CONTAINER_INTERNAL = {
     "test_scan_parameters.py": "curl run via `docker exec rag-api sh -c`",
     "test_target_wordlists.py": "curl run via `docker exec rag-api sh -c`",
     "test_tool_command_check.py": "curl run via `docker exec kali-listener`",
+    "test_build_poc_intel.py": "curl run via _container.container_sh inside rag-api",
     # Migrated 2026-10-12 from private `subprocess.run(["docker","exec",...])`
     # copies to _container.container_sh / container_python. The URLs run INSIDE
     # rag-api, where localhost:8000 is the service's own endpoint.

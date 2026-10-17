@@ -46,6 +46,15 @@ def _const(name):
     pytest.fail(f"{name} not found in api.py")
 
 
+def _vc_mod():
+    """The real class table — the gate reads it, so the test must too."""
+    import sys as _sys
+    from pathlib import Path as _P
+    _sys.path.insert(0, str(_P(__file__).resolve().parent.parent))
+    from etl import vuln_classes as _m
+    return _m
+
+
 FILE_READ_SPELLINGS = [
     "lfi", "path-traversal", "path_traversal", "directory-traversal",
     "file-read", "arbitrary-file-read", "rfi",
@@ -58,18 +67,24 @@ FILE_READ_SPELLINGS = [
 def test_every_file_read_spelling_gets_guidance(spelling):
     """A classifier's wording must not decide whether guidance exists."""
     guidance = _const("_CRAFT_CLASS_GUIDANCE")
-    aliases = _const("_CRAFT_CLASS_ALIASES")
-    key = aliases.get(spelling, spelling)
+    key = _vc_mod().canonical(spelling)
     assert key in guidance, (
         f"class {spelling!r} resolves to {key!r}, which has no guidance — a "
         "CVE classified that way gets none at all and the model falls back to "
         "a canary assertion a file read can never satisfy")
 
 
-def test_every_alias_points_at_a_real_class():
-    guidance, aliases = _const("_CRAFT_CLASS_GUIDANCE"), _const("_CRAFT_CLASS_ALIASES")
-    bad = {k: v for k, v in aliases.items() if v not in guidance}
-    assert not bad, f"aliases pointing at non-existent classes: {bad}"
+def test_every_file_read_class_has_its_own_guidance():
+    """lfi, rfi and path-traversal prove the same way and are REACHED
+    differently, so each needs guidance that says where the payload goes. One
+    entry hedging between them is what let a traversal be told to find a
+    parameter."""
+    guidance = _const("_CRAFT_CLASS_GUIDANCE")
+    m = _vc_mod()
+    for cls in sorted(m.classes_where(file_read=True)):
+        if cls == "xxe":
+            continue            # body injection, guided as its own class
+        assert cls in guidance, f"{cls} has no craft guidance"
 
 
 def test_the_alias_map_is_actually_consulted():
@@ -80,8 +95,8 @@ def test_the_alias_map_is_actually_consulted():
                and n.name == "_class_guidance_block"), None)
     assert fn, "_class_guidance_block not found"
     seg = ast.unparse(fn)
-    assert "_CRAFT_CLASS_ALIASES" in seg, (
-        "_class_guidance_block does not consult the alias map, so alternate "
+    assert "_vc_canonical" in seg, (
+        "_class_guidance_block does not normalise the class name, so alternate "
         "spellings still fall through to no guidance")
 
 
@@ -158,7 +173,7 @@ def test_the_refine_loop_captures_retrieved_content():
     seg = ast.get_source_segment(_api_src(), _func("_run_refine_poc")) or ""
     assert "_file_read_evidence" in seg, (
         "the refine loop never captures what a file-read exploit retrieved")
-    assert "_FILE_READ_CLASSES" in seg, (
+    assert "_vc_is_file_read" in seg, (
         "evidence capture is not gated on the class, so it would run for "
         "injection classes where the response is not a retrieved file")
 
@@ -212,8 +227,14 @@ def test_signatures_cover_the_common_proof_files():
 
 # -- 5. a path traversal has no input field ---------------------------------
 
-PATH_CLASSES = ["lfi", "path-traversal", "path_traversal",
-                "directory-traversal", "file-read", "arbitrary-file-read", "rfi"]
+PATH_CLASSES = ["path-traversal", "path_traversal", "directory-traversal",
+                "Path Traversal"]
+# lfi and rfi were in this list until 2026-10-16. They are file reads reached
+# through a PARAMETER (`?page=../../etc/passwd`), and listing them as
+# path-injecting made the gather gate record input_field as satisfied by the
+# endpoint — so it never demanded the parameter for ANY file read.
+PARAMETER_FILE_READS = ["lfi", "rfi", "local-file-inclusion", "file-read",
+                        "arbitrary-file-read", "remote-file-inclusion"]
 
 
 @pytest.mark.parametrize("vc", PATH_CLASSES)
@@ -221,22 +242,40 @@ def test_path_based_classes_do_not_need_a_parameter(vc):
     """The payload IS the path. Demanding a parameter asks for the impossible.
 
     CVE-2026-21589 stopped `gather_incomplete:input_field` with 0 iterations
-    AFTER everything else was gathered — including the correct Atlassian
-    webresource traversal endpoint — because deep recon honestly reported
-    "only a JWT parameter on root path, no forms". It was right: there are no
-    parameters in a path traversal.
+    AFTER everything else was gathered — including the correct webresource
+    traversal endpoint — because deep recon honestly reported "only a JWT
+    parameter on root path, no forms". It was right: there are no parameters
+    in a path traversal.
     """
-    assert vc in _const("_GATHER_PATH_IS_THE_FIELD_CLASSES"), (
+    m = _vc_mod()
+    assert m.path_is_the_field(vc), (
         f"{vc} is not recognised as path-based, so the gather gate will "
         "demand an input_field that cannot exist and block the run")
+    # It stays REQUIRED — the endpoint is what satisfies it. Dropping the
+    # requirement would let a traversal with no endpoint through the gate
+    # with nothing to attack.
+    assert m.needs_input_field(vc)
+
+
+@pytest.mark.parametrize("vc", PARAMETER_FILE_READS)
+def test_a_file_read_through_a_parameter_still_needs_one(vc):
+    """The other half of the same bug, and the more expensive half: with lfi
+    treated as path-injecting, the gate stopped asking for the parameter on
+    every classic `?page=` file read and synth guessed it."""
+    m = _vc_mod()
+    assert m.is_file_read(vc), f"{vc} should still be a file read"
+    assert not m.path_is_the_field(vc), (
+        f"{vc} injects through a parameter; treating the path as its injection "
+        "point is what stopped the gate demanding one")
+    assert m.needs_input_field(vc)
 
 
 def test_the_endpoint_satisfies_the_field_for_path_classes():
     src = ast.get_source_segment(API.read_text(encoding="utf-8"),
                                  _func("_gather_manifest")) or ""
-    assert "_GATHER_PATH_IS_THE_FIELD_CLASSES" in src, (
-        "the gather manifest does not consult the path-based class set")
-    i = src.find("_GATHER_PATH_IS_THE_FIELD_CLASSES")
+    assert "_vc_path_is_the_field" in src, (
+        "the gather manifest does not consult the path-injection predicate")
+    i = src.find("_vc_path_is_the_field")
     window = src[i:i + 500]
     assert "path_is_the_field" in window, (
         "the item is satisfied without recording WHY — an operator reading "
@@ -246,18 +285,18 @@ def test_the_endpoint_satisfies_the_field_for_path_classes():
 
 def test_injection_classes_still_require_a_parameter():
     """The fix must not let a real injection class through without one."""
-    path_based = _const("_GATHER_PATH_IS_THE_FIELD_CLASSES")
-    for vc in ("sqli", "ssti", "cmdi", "xss", "idor"):
-        assert vc not in path_based, (
-            f"{vc} is treated as path-based — it injects into a parameter, "
-            "and skipping input_field for it would synthesise blind")
+    m = _vc_mod()
+    for vc in ("sqli", "ssti", "cmdi", "xss", "idor", "ssrf", "xxe"):
+        assert not m.path_is_the_field(vc), (
+            f"{vc} is treated as path-based — it injects into a parameter or a "
+            "body, and skipping input_field for it would synthesise blind")
 
 
 def test_a_path_class_with_no_endpoint_still_blocks():
     """The endpoint is what satisfies it; with none there is nothing to use."""
     src = ast.get_source_segment(API.read_text(encoding="utf-8"),
                                  _func("_gather_manifest")) or ""
-    i = src.find("_GATHER_PATH_IS_THE_FIELD_CLASSES")
+    i = src.find("_vc_path_is_the_field")
     cond = src[max(0, i - 120):i + 120]
     assert "endpoint" in cond, (
         "the path-is-the-field rule does not require an endpoint, so a run "
@@ -291,7 +330,7 @@ def test_the_path_rule_is_reapplied_when_the_class_arrives_late():
                 branch = body
                 break
     assert branch, "no `if name == \"vuln_class\"` branch that updates vc"
-    assert "_GATHER_PATH_IS_THE_FIELD_CLASSES" in branch, (
+    assert "_vc_path_is_the_field" in branch, (
         "the path-is-the-field rule is not re-applied after the class is "
         "learned, so a late vuln_class leaves input_field stuck at n/a and "
         "the gate blocks on an item absent from its own manifest")

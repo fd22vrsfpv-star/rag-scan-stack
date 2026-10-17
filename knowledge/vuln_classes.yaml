@@ -43,6 +43,19 @@
 version: 1
 owasp_top10_version: "2021"
 
+# kind — what sort of finding this is, and THE GATE READS ONLY `vulnerability`.
+#   vulnerability   an exploit mechanism: it has an injection point, a payload
+#                   and a proof, so a PoC can be built for it.
+#   misconfiguration  a setting that is wrong. There is no payload to craft and
+#                   nothing to assert, so it never enters the build-PoC gates.
+#   disclosure      information that leaked. Same: a finding, not a mechanism.
+#
+# `leads_to` is how a misconfiguration still earns its place: WebDAV PUT is not
+# exploitable AS a misconfiguration, it is exploitable because it hands you an
+# upload. The misconfiguration stays a finding; the class it enables is what
+# goes through the gates. Both lanes share this vocabulary, so the scanner and
+# the PoC builder stop having separate names for the same thing.
+
 # injects_via vocabulary — where the payload goes. `path` means the URL path IS
 # the injection point and there is no parameter to find.
 injection_points: [path, parameter, body, header, cookie, multipart, none]
@@ -66,15 +79,27 @@ injection_points: [path, parameter, body, header, cookie, multipart, none]
 # A lookup whose answer changes when someone reorders this file is not a
 # lookup, and a lookup that invents certainty it does not have is worse.
 
+# input_field_required — must a parameter / key / field be FOUND before synth?
+# NOT the same as "can inject through a parameter": auth-bypass can use one and
+# does not need one, because requesting a protected path directly is the whole
+# exploit. Inferring this from `injects_via` over-claimed and made the gather
+# gate demand a parameter for auth-bypass.
+#
+# path-traversal IS required and IS satisfied by the endpoint — two different
+# mechanisms. Dropping the requirement would let a traversal with no endpoint
+# through the gate with nothing to attack.
+
 # proof vocabulary — what counts as evidence the class actually fired.
 proof_kinds: [echo, oob, timing, file_content, status_change, side_effect]
 
 classes:
 
   - name: sqli
+    kind: vulnerability
     title: SQL Injection
     aliases: [sql-injection, blind-sqli, sqli-blind, union-sqli]
     injects_via: [parameter, body, header, cookie]
+    input_field_required: true
     file_read: false
     needs_oob_sink: false
     blind_capable: true
@@ -86,9 +111,11 @@ classes:
       - { id: CWE-89, name: "Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')" }
 
   - name: xss
+    kind: vulnerability
     title: Cross-Site Scripting
     aliases: [cross-site-scripting, xss-reflected, xss-stored, reflected-xss, stored-xss]
     injects_via: [parameter, body, header]
+    input_field_required: true
     file_read: false
     needs_oob_sink: false
     blind_capable: true
@@ -101,9 +128,11 @@ classes:
       - { id: CWE-80, name: "Improper Neutralization of Script-Related HTML Tags in a Web Page (Basic XSS)" }
 
   - name: cmdi
+    kind: vulnerability
     title: OS Command Injection
     aliases: [command-injection, os-command-injection, shell-injection, argument-injection]
     injects_via: [parameter, body, header]
+    input_field_required: true
     file_read: false
     needs_oob_sink: true
     blind_capable: true
@@ -121,9 +150,11 @@ classes:
       - { id: CWE-94, name: "Improper Control of Generation of Code ('Code Injection')" }
 
   - name: ssti
+    kind: vulnerability
     title: Server-Side Template Injection
     aliases: [template-injection, server-side-template-injection, jinja2-injection, velocity-injection]
     injects_via: [parameter, body]
+    input_field_required: true
     file_read: false
     needs_oob_sink: false
     blind_capable: true
@@ -136,9 +167,11 @@ classes:
       - { id: CWE-94, name: "Improper Control of Generation of Code ('Code Injection')" }
 
   - name: ssrf
+    kind: vulnerability
     title: Server-Side Request Forgery
     aliases: [server-side-request-forgery, ssrf-blind, outbound-request]
     injects_via: [parameter, body]
+    input_field_required: true
     file_read: false
     needs_oob_sink: true
     blind_capable: true
@@ -150,12 +183,14 @@ classes:
       - { id: CWE-918, name: "Server-Side Request Forgery (SSRF)" }
 
   - name: xxe
+    kind: vulnerability
     title: XML External Entity
     aliases: [xml-external-entity, xml-external-entities, xxe-oob]
     # A body injection. It CAN read files, which is why it belongs in a
     # file-read projection — and it is NOT a path injection, which is why a
     # single flat "file read" set could never serve both questions.
     injects_via: [body]
+    input_field_required: true
     file_read: true
     needs_oob_sink: true
     blind_capable: true
@@ -167,11 +202,13 @@ classes:
       - { id: CWE-611, name: "Improper Restriction of XML External Entity Reference" }
 
   - name: path-traversal
+    kind: vulnerability
     title: Path Traversal
     # Its OWN class, not an alias of lfi. The payload is the URL path, so there
     # is no parameter to find and parameter discovery cannot help.
     aliases: [directory-traversal, dir-traversal]
     injects_via: [path]
+    input_field_required: true
     file_read: true
     needs_oob_sink: false
     blind_capable: false
@@ -185,12 +222,14 @@ classes:
       - { id: CWE-36, name: "Absolute Path Traversal" }
 
   - name: lfi
+    kind: vulnerability
     title: Local File Inclusion
     # Injects through a PARAMETER (`?page=../../etc/passwd`). Listing lfi as a
     # path-injection class is what stopped the gather gate demanding a
     # parameter for every file read.
     aliases: [local-file-inclusion, file-read, arbitrary-file-read, file-disclosure, arbitrary-file-disclosure]
     injects_via: [parameter]
+    input_field_required: true
     file_read: true
     needs_oob_sink: false
     blind_capable: false
@@ -203,11 +242,13 @@ classes:
       - { id: CWE-73, name: "External Control of File Name or Path" }
 
   - name: rfi
+    kind: vulnerability
     title: Remote File Inclusion
     # Also a parameter, and it makes the server FETCH — so it needs an
     # out-of-band sink the way SSRF does. Aliasing it to lfi lost that.
     aliases: [remote-file-inclusion]
     injects_via: [parameter]
+    input_field_required: true
     file_read: true
     needs_oob_sink: true
     blind_capable: true
@@ -219,9 +260,11 @@ classes:
       - { id: CWE-98, name: "Improper Control of Filename for Include/Require Statement in PHP Program ('PHP Remote File Inclusion')" }
 
   - name: deserialization
+    kind: vulnerability
     title: Insecure Deserialization
     aliases: [deser, insecure-deserialization, unsafe-deserialization, object-injection]
     injects_via: [body, parameter, cookie]
+    input_field_required: false
     file_read: false
     needs_oob_sink: true
     blind_capable: true
@@ -233,9 +276,11 @@ classes:
       - { id: CWE-502, name: "Deserialization of Untrusted Data" }
 
   - name: upload
+    kind: vulnerability
     title: Unrestricted File Upload
     aliases: [file-upload, arbitrary-file-upload, unrestricted-upload, webshell-upload]
     injects_via: [multipart]
+    input_field_required: false
     file_read: false
     needs_oob_sink: false
     blind_capable: false
@@ -247,10 +292,12 @@ classes:
       - { id: CWE-434, name: "Unrestricted Upload of File with Dangerous Type" }
 
   - name: auth-bypass
+    kind: vulnerability
     title: Authentication / Authorization Bypass
     aliases: [authentication-bypass, authorization-bypass, missing-auth,
               improper-authentication, improper-authorization, privilege-escalation]
     injects_via: [path, header, cookie, parameter]
+    input_field_required: false
     file_read: false
     needs_oob_sink: false
     blind_capable: false
@@ -268,9 +315,11 @@ classes:
       - { id: CWE-798, name: "Use of Hard-coded Credentials" }
 
   - name: idor
+    kind: vulnerability
     title: Insecure Direct Object Reference
     aliases: [insecure-direct-object-reference, bola, broken-object-level-authorization]
     injects_via: [parameter, path]
+    input_field_required: true
     file_read: false
     needs_oob_sink: false
     blind_capable: false
@@ -283,9 +332,11 @@ classes:
       - { id: CWE-284, name: "Improper Access Control" }
 
   - name: csrf
+    kind: vulnerability
     title: Cross-Site Request Forgery
     aliases: [cross-site-request-forgery, xsrf]
     injects_via: [body, parameter]
+    input_field_required: false
     file_read: false
     needs_oob_sink: false
     blind_capable: false
@@ -297,9 +348,11 @@ classes:
       - { id: CWE-352, name: "Cross-Site Request Forgery (CSRF)" }
 
   - name: ldap-injection
+    kind: vulnerability
     title: LDAP Injection
     aliases: [ldapi]
     injects_via: [parameter, body]
+    input_field_required: false
     file_read: false
     needs_oob_sink: false
     blind_capable: true
@@ -311,9 +364,11 @@ classes:
       - { id: CWE-90, name: "Improper Neutralization of Special Elements used in an LDAP Query ('LDAP Injection')" }
 
   - name: nosql-injection
+    kind: vulnerability
     title: NoSQL Injection
     aliases: [nosqli, mongo-injection]
     injects_via: [parameter, body]
+    input_field_required: false
     file_read: false
     needs_oob_sink: false
     blind_capable: true
@@ -325,9 +380,11 @@ classes:
       - { id: CWE-943, name: "Improper Neutralization of Special Elements in Data Query Logic" }
 
   - name: prototype-pollution
+    kind: vulnerability
     title: Prototype Pollution
     aliases: [proto-pollution]
     injects_via: [body, parameter]
+    input_field_required: false
     file_read: false
     needs_oob_sink: false
     blind_capable: true
@@ -339,9 +396,11 @@ classes:
       - { id: CWE-1321, name: "Improperly Controlled Modification of Object Prototype Attributes ('Prototype Pollution')" }
 
   - name: open-redirect
+    kind: vulnerability
     title: Open Redirect
     aliases: [unvalidated-redirect, url-redirection]
     injects_via: [parameter]
+    input_field_required: false
     file_read: false
     needs_oob_sink: false
     blind_capable: false
@@ -353,6 +412,7 @@ classes:
       - { id: CWE-601, name: "URL Redirection to Untrusted Site ('Open Redirect')" }
 
   - name: rce
+    kind: vulnerability
     title: Remote Code Execution
     # A generic outcome rather than a mechanism — kept because
     # _SCAN_EVIDENCE_CWE_FOR_CLASS already keys on it and findings arrive
@@ -360,6 +420,7 @@ classes:
     # deserialization) when the advisory names one.
     aliases: [remote-code-execution, code-execution, code-injection, arbitrary-code-execution]
     injects_via: [parameter, body]
+    input_field_required: false
     file_read: false
     needs_oob_sink: true
     blind_capable: true
@@ -374,11 +435,16 @@ classes:
       - { id: CWE-502, name: "Deserialization of Untrusted Data" }
 
   - name: unknown
+    # NOT `vulnerability`: we do not know that it is one. Saying so keeps an
+    # unclassified CVE out of `exploitable_classes()` instead of letting the
+    # absence of an answer read as a mechanism.
+    kind: unclassified
     title: Unclassified
     # The honest answer, and a real class: the classifier returns it rather than
     # guessing, and the gates must have a defined behaviour for it.
     aliases: []
     injects_via: []
+    input_field_required: false
     file_read: false
     needs_oob_sink: false
     blind_capable: false
@@ -387,3 +453,266 @@ classes:
     wstg: []
     mitre: []
     cwes: []
+
+  # ── injection types the scanning lane already tested and this table did not
+  #    know. Each is here because its PAYLOAD or its PROOF differs; a type that
+  #    only differs by name is an alias, not a class.
+
+  - name: el-injection
+    kind: vulnerability
+    title: Expression Language / OGNL Injection
+    aliases: [expression-language-injection, ognl-injection, ognl, spel-injection, el]
+    input_field_required: true
+    injects_via: [parameter, body, header]
+    file_read: false
+    needs_oob_sink: false
+    blind_capable: true
+    proof: [echo, oob, timing]
+    owasp: "A03:2021 – Injection"
+    wstg: [WSTG-INPV-18]
+    mitre: [T1190, T1059]
+    cwes:
+      - { id: CWE-917, name: "Improper Neutralization of Special Elements used in an Expression Language Statement ('Expression Language Injection')" }
+
+  - name: jndi-injection
+    kind: vulnerability
+    title: JNDI Injection (Log4Shell family)
+    aliases: [log4shell, jndi, log4j, jndi-lookup]
+    input_field_required: true
+    injects_via: [parameter, body, header]
+    file_read: false
+    needs_oob_sink: true
+    blind_capable: true
+    proof: [oob]
+    owasp: "A03:2021 – Injection"
+    wstg: [WSTG-INPV-11]
+    mitre: [T1190, T1059]
+    cwes:
+      - { id: CWE-917, name: "Improper Neutralization of Special Elements used in an Expression Language Statement ('Expression Language Injection')" }
+
+  - name: crlf-injection
+    kind: vulnerability
+    title: CRLF Injection / HTTP Response Splitting
+    aliases: [crlf, http-response-splitting, response-splitting, header-injection]
+    input_field_required: true
+    injects_via: [parameter, header]
+    file_read: false
+    needs_oob_sink: false
+    blind_capable: false
+    proof: [echo]
+    owasp: "A03:2021 – Injection"
+    wstg: [WSTG-INPV-15]
+    mitre: [T1190]
+    cwes:
+      - { id: CWE-93, name: "Improper Neutralization of CRLF Sequences ('CRLF Injection')" }
+      - { id: CWE-113, name: "Improper Neutralization of CRLF Sequences in HTTP Headers ('HTTP Request/Response Splitting')" }
+
+  - name: host-header-injection
+    kind: vulnerability
+    title: Host Header Injection
+    aliases: [host-header, host-header-poisoning]
+    input_field_required: false
+    injects_via: [header]
+    file_read: false
+    needs_oob_sink: true
+    blind_capable: true
+    proof: [echo, oob, side_effect]
+    owasp: "A03:2021 – Injection"
+    wstg: [WSTG-INPV-17]
+    mitre: [T1190]
+    cwes:
+      - { id: CWE-644, name: "Improper Neutralization of HTTP Headers for Scripting Syntax" }
+
+  - name: ssi-injection
+    kind: vulnerability
+    title: Server-Side Includes Injection
+    aliases: [ssi, server-side-includes, server-side-include-injection]
+    input_field_required: true
+    injects_via: [parameter, body]
+    file_read: true
+    needs_oob_sink: false
+    blind_capable: false
+    proof: [echo, file_content]
+    owasp: "A03:2021 – Injection"
+    wstg: [WSTG-INPV-08]
+    mitre: [T1190, T1059]
+    cwes:
+      - { id: CWE-97, name: "Improper Neutralization of Server-Side Includes (SSI) Within a Web Page" }
+
+  - name: xpath-injection
+    kind: vulnerability
+    title: XPath Injection
+    aliases: [xpath, xpathi]
+    input_field_required: true
+    injects_via: [parameter, body]
+    file_read: false
+    needs_oob_sink: false
+    blind_capable: true
+    proof: [echo, status_change]
+    owasp: "A03:2021 – Injection"
+    wstg: [WSTG-INPV-09]
+    mitre: [T1190]
+    cwes:
+      - { id: CWE-643, name: "Improper Neutralization of Data within XPath Expressions ('XPath Injection')" }
+
+  - name: smtp-injection
+    kind: vulnerability
+    title: SMTP / IMAP Header Injection
+    aliases: [imap-injection, mail-injection, email-header-injection, imap-smtp-injection]
+    input_field_required: true
+    injects_via: [parameter, body]
+    file_read: false
+    needs_oob_sink: true
+    blind_capable: true
+    proof: [side_effect, oob]
+    owasp: "A03:2021 – Injection"
+    wstg: [WSTG-INPV-10]
+    mitre: [T1190]
+    cwes:
+      - { id: CWE-93, name: "Improper Neutralization of CRLF Sequences ('CRLF Injection')" }
+
+  - name: format-string
+    kind: vulnerability
+    title: Format String Injection
+    aliases: [format-string-injection]
+    input_field_required: true
+    injects_via: [parameter, body]
+    file_read: false
+    needs_oob_sink: false
+    blind_capable: false
+    proof: [echo, side_effect]
+    owasp: "A03:2021 – Injection"
+    wstg: [WSTG-INPV-13]
+    mitre: [T1190]
+    cwes:
+      - { id: CWE-134, name: "Use of Externally-Controlled Format String" }
+
+  - name: hpp
+    kind: vulnerability
+    title: HTTP Parameter Pollution
+    aliases: [http-parameter-pollution, parameter-pollution]
+    input_field_required: true
+    injects_via: [parameter]
+    file_read: false
+    needs_oob_sink: false
+    blind_capable: false
+    proof: [status_change, echo]
+    owasp: "A03:2021 – Injection"
+    wstg: [WSTG-INPV-04]
+    mitre: [T1190]
+    cwes:
+      - { id: CWE-235, name: "Improper Handling of Extra Parameters" }
+
+  # ── misconfigurations and disclosures ────────────────────────────────────
+  #
+  # NOT exploit mechanisms: no injection point, no payload, nothing to assert,
+  # so they never enter the build-PoC gates. They are here so both lanes share
+  # ONE vocabulary — the scanner and the PoC builder stop having separate names
+  # for the same finding — and so the ones that CHAIN can say what they enable.
+
+  - name: webdav-put
+    kind: misconfiguration
+    title: Writable HTTP Methods (PUT / WebDAV)
+    aliases: [webdav, webdav-enabled, put-method-enabled, dav-writable, dangerous-http-method]
+    leads_to: [upload]
+    input_field_required: false
+    injects_via: []
+    file_read: false
+    needs_oob_sink: false
+    blind_capable: false
+    proof: []
+    owasp: "A05:2021 – Security Misconfiguration"
+    wstg: [WSTG-CONF-06]
+    mitre: [T1505.003]
+    cwes:
+      - { id: CWE-650, name: "Trusting HTTP Permission Methods on the Server Side" }
+
+  - name: default-credentials
+    kind: misconfiguration
+    title: Default or Weak Credentials
+    aliases: [default-creds, default-password, weak-credentials]
+    leads_to: [auth-bypass]
+    input_field_required: false
+    injects_via: []
+    file_read: false
+    needs_oob_sink: false
+    blind_capable: false
+    proof: []
+    owasp: "A07:2021 – Identification and Authentication Failures"
+    wstg: [WSTG-ATHN-02]
+    mitre: [T1078, T1110]
+    cwes:
+      - { id: CWE-1392, name: "Use of Default Credentials" }
+
+  - name: cors-misconfiguration
+    kind: misconfiguration
+    title: Permissive CORS Policy
+    aliases: [cors, permissive-cors, cross-origin-misconfiguration]
+    leads_to: []
+    input_field_required: false
+    injects_via: []
+    file_read: false
+    needs_oob_sink: false
+    blind_capable: false
+    proof: []
+    owasp: "A05:2021 – Security Misconfiguration"
+    wstg: [WSTG-CLNT-07]
+    mitre: []
+    cwes:
+      - { id: CWE-942, name: "Permissive Cross-domain Policy with Untrusted Domains" }
+
+  - name: directory-listing
+    kind: disclosure
+    title: Directory Listing Enabled
+    aliases: [dir-listing, directory-browsing, directory-indexing]
+    leads_to: []
+    input_field_required: false
+    injects_via: []
+    file_read: false
+    needs_oob_sink: false
+    blind_capable: false
+    proof: []
+    owasp: "A05:2021 – Security Misconfiguration"
+    wstg: [WSTG-CONF-04]
+    mitre: []
+    cwes:
+      - { id: CWE-548, name: "Exposure of Information Through Directory Listing" }
+
+  - name: exposed-files
+    kind: disclosure
+    title: Backup / Source / Config File Exposure
+    aliases: [exposed-file, backup-file, source-disclosure, git-exposure, env-file]
+    # Source or a .env is routinely where the credential comes from, which is a
+    # chain worth recording even though the disclosure itself is not an exploit.
+    leads_to: [auth-bypass]
+    input_field_required: false
+    injects_via: []
+    file_read: false
+    needs_oob_sink: false
+    blind_capable: false
+    proof: []
+    owasp: "A05:2021 – Security Misconfiguration"
+    wstg: [WSTG-CONF-04]
+    mitre: []
+    cwes:
+      - { id: CWE-530, name: "Exposure of Backup File to an Unauthorized Control Sphere" }
+      - { id: CWE-540, name: "Inclusion of Sensitive Information in Source Code" }
+
+  - name: verbose-errors
+    kind: disclosure
+    title: Verbose Error Messages / Stack Traces
+    aliases: [stack-trace, verbose-error, error-handling, information-disclosure]
+    # A SQL error in a stack trace is how an injection point is found, so the
+    # chain is real even though the disclosure alone proves nothing.
+    leads_to: [sqli]
+    input_field_required: false
+    injects_via: []
+    file_read: false
+    needs_oob_sink: false
+    blind_capable: false
+    proof: []
+    owasp: "A05:2021 – Security Misconfiguration"
+    wstg: [WSTG-ERRH-01]
+    mitre: []
+    cwes:
+      - { id: CWE-209, name: "Generation of Error Message Containing Sensitive Information" }

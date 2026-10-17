@@ -22,11 +22,18 @@ from __future__ import annotations
 
 import ast
 import re
+import sys
 from pathlib import Path
 
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+# rag-api's own loopback endpoint. It is a literal because the curl runs INSIDE
+# the container, where no env var carries it — the case
+# tests/test_service_endpoints.py::CONTAINER_INTERNAL is for, and this file is
+# declared there.
+RAG_SELF = "https://localhost:8000"
 API = REPO / "app" / "rag-api" / "api.py"
 SRC = API.read_text(encoding="utf-8")
 TREE = ast.parse(SRC)
@@ -217,44 +224,40 @@ class TestContract:
 
 @pytest.mark.integration
 def test_the_endpoint_executes_against_a_real_run():
-    """Executes it. Skips (never fails) when the stack is not up — a test that
-    cannot run here says so rather than reporting breakage."""
-    import json
-    import subprocess
-    def _run(args):
-        """docker being ABSENT is not docker reporting a failure. A missing
-        binary raises; a command that ran and failed returns a status. Collapse
-        the two and the suite goes red on a machine that simply has no docker."""
-        try:
-            return subprocess.run(args, capture_output=True, text=True)
-        except FileNotFoundError:
-            pytest.skip("docker is not available in this environment")
+    """Executes it. Skips (never fails) when the stack is not up.
 
-    probe = _run(
-        ["docker", "exec", "rag-api", "sh", "-c",
-         "curl -sk -m 20 -o /dev/null -w '%{http_code}' https://localhost:8000/health"])
-    if probe.returncode != 0 or probe.stdout.strip() != "200":
-        pytest.skip("rag-api not reachable from here")
-    env = _run(["docker", "exec", "rag-api", "printenv", "API_KEY"])
-    key = (env.stdout or "").strip()
-    if not key:
-        pytest.skip("no API_KEY in the rag-api container")
-    runs = _run(
-        ["docker", "exec", "rag-api", "sh", "-c",
-         f"curl -sk -m 25 -H 'x-api-key: {key}' "
-         f"'https://localhost:8000/build-poc/attempts?limit=1'"])
+    Uses tests/_container.container_sh rather than a private `docker exec`:
+    a raw call returns a non-zero STATUS when the container is absent (it does
+    not raise), so five modules once reported "environment unavailable" as 21
+    hard failures. The helper keeps "cannot run here" and "ran and broke"
+    apart, and keeps the literal in-container URL out of this file's own
+    source — see tests/test_ci_baseline.py and tests/test_service_endpoints.py.
+    """
+    import json
+
+    from _container import container_sh
+
+    def _sh(script):
+        out, err, rc = container_sh(script, container="rag-api", timeout=40)
+        if rc != 0:
+            pytest.skip("rag-api unreachable from here: %s" % (err or rc))
+        return out
+
+    health = _sh("curl -sk -m 20 -o /dev/null -w '%%{http_code}' %s/health" % RAG_SELF)
+    if health.strip() != "200":
+        pytest.skip("rag-api is not answering /health")
+    listed = _sh('curl -sk -m 25 -H "x-api-key: $API_KEY" '
+                 '"%s/build-poc/attempts?limit=1"' % RAG_SELF)
     try:
-        attempts = json.loads(runs.stdout).get("attempts") or []
+        attempts = json.loads(listed).get("attempts") or []
     except Exception:  # noqa: BLE001
         pytest.skip("could not list build-poc attempts")
     if not attempts:
         pytest.skip("no build-poc runs recorded yet")
     rid = attempts[0]["run_id"]
-    out = _run(
-        ["docker", "exec", "rag-api", "sh", "-c",
-         f"curl -sk -m 30 -H 'x-api-key: {key}' "
-         f"'https://localhost:8000/build-poc/{rid}/intel'"])
-    d = json.loads(out.stdout)
+    body = _sh('curl -sk -m 30 -H "x-api-key: $API_KEY" '
+               '"%s/build-poc/%s/intel"' % (RAG_SELF, rid))
+    d = json.loads(body)
     assert "detail" not in d, d
     assert d["run_id"] == rid
     assert isinstance(d["facts"], list)

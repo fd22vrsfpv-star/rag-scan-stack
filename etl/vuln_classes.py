@@ -34,7 +34,7 @@ from __future__ import annotations
 import os
 import re
 import threading
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Set
 
 try:
     import yaml
@@ -194,6 +194,49 @@ def classes_where(**props) -> Set[str]:
     return out
 
 
+VULNERABILITY = "vulnerability"
+MISCONFIGURATION = "misconfiguration"
+DISCLOSURE = "disclosure"
+UNCLASSIFIED = "unclassified"
+KINDS = (VULNERABILITY, MISCONFIGURATION, DISCLOSURE, UNCLASSIFIED)
+
+
+def kind(name) -> str:
+    """What sort of finding this is.
+
+    A name the table does not know is `unclassified`, NOT a vulnerability:
+    the absence of an answer must not read as a mechanism, or a typo'd class
+    walks into the build-PoC gates.
+    """
+    return str((get(name) or {}).get("kind") or "") or UNCLASSIFIED
+
+
+def is_exploitable(name) -> bool:
+    """Can a PoC be built for this at all?
+
+    A misconfiguration has no injection point, no payload and nothing to
+    assert, so it must never enter the build-PoC gates. This is the filter
+    that keeps a finding out of a pipeline designed for mechanisms.
+    """
+    return kind(name) == VULNERABILITY
+
+
+def leads_to(name) -> List[str]:
+    """Classes this finding ENABLES, for one that is not exploitable itself.
+
+    WebDAV PUT is not exploitable as a misconfiguration; it is exploitable
+    because it hands you an upload. The misconfiguration stays a finding and
+    the class it enables is what goes through the gates — which is how a
+    finding earns its place in this table without pretending to be a
+    mechanism.
+    """
+    return list((get(name) or {}).get("leads_to") or [])
+
+
+def exploitable_classes() -> Set[str]:
+    return classes_where(kind=VULNERABILITY)
+
+
 def injection_points(name) -> List[str]:
     return list((get(name) or {}).get("injects_via") or [])
 
@@ -207,17 +250,29 @@ def path_is_the_field(name) -> bool:
     this table exists to end — it made the gather gate stop demanding a
     parameter for every file read.
     """
-    return injection_points(name) == ["path"]
+    return is_exploitable(name) and injection_points(name) == ["path"]
 
 
 def needs_input_field(name) -> bool:
-    """Is there a parameter / key / field to find at all?"""
-    pts = injection_points(name)
-    return bool(pts) and pts != ["path"]
+    """Must a parameter / key / field be FOUND before synthesis?
+
+    DECLARED, not inferred from `injects_via`. "Can inject through a parameter"
+    and "requires one" are different questions: auth-bypass can use a parameter
+    and does not need one, because requesting a protected path directly is the
+    whole exploit. Inferring it made the gate demand a parameter for
+    auth-bypass, which the set this replaced deliberately excluded.
+
+    Note `path-traversal` is required AND satisfied by the endpoint — see
+    `path_is_the_field`. Dropping the requirement would let a traversal with no
+    endpoint through the gate with nothing to attack.
+    """
+    if not is_exploitable(name):
+        return False
+    return bool((get(name) or {}).get("input_field_required"))
 
 
 def needs_oob_sink(name) -> bool:
-    return bool((get(name) or {}).get("needs_oob_sink"))
+    return is_exploitable(name) and bool((get(name) or {}).get("needs_oob_sink"))
 
 
 def is_file_read(name) -> bool:
@@ -339,5 +394,6 @@ def references(name) -> dict:
     vocabulary — CWE, OWASP Top 10, WSTG and ATT&CK in one call."""
     c = get(name) or {}
     return {"class": canonical(name), "title": c.get("title"),
+            "kind": kind(name), "leads_to": leads_to(name),
             "cwes": cwes_for(name), "owasp": c.get("owasp"),
             "wstg": wstg_for(name), "mitre": mitre_for(name)}

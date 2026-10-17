@@ -61,14 +61,34 @@ def _func(name: str) -> ast.FunctionDef:
     return fn
 
 
+
+# The class predicates `_gather_decide` now calls. Injected from the REAL
+# `etl/vuln_classes.py` rather than stubbed, so this exercises the shipped
+# table: the gate and the test cannot disagree about what `lfi` is.
+def _vc_predicates():
+    import sys as _sys
+    from pathlib import Path as _P
+    _sys.path.insert(0, str(_P(__file__).resolve().parent.parent))
+    from etl import vuln_classes as _m
+    return {"_vc_needs_input_field": _m.needs_input_field,
+            "_vc_needs_oob_sink": _m.needs_oob_sink,
+            "_vc_path_is_the_field": _m.path_is_the_field,
+            "_vc_canonical": _m.canonical,
+            "_vc_is_file_read": _m.is_file_read,
+            "_vc_cwe_ids_for": _m.cwe_ids_for,
+            "_vc_classes_for_cwe": _m.classes_for_cwe,
+            "_vc_resolve": _m.resolve,
+            "_vc_is_known": lambda n: _m.canonical(n) != "unknown"}
+
+
 def _decide():
     """_gather_decide is documented PURE, so it runs standalone."""
     src = API.read_text(encoding="utf-8")
-    ns = {}
-    # _gather_decide's follow-up text is now class-aware, so the path-based
-    # class set is a real dependency of this isolated exec.
-    needed = ["_GATHER_FIELD_REQUIRED_CLASSES", "_GATHER_OOB_CLASSES",
-              "_GATHER_FOLLOW_UP", "_GATHER_PATH_IS_THE_FIELD_CLASSES"]
+    ns = dict(_vc_predicates())
+    # The class SETS are gone — they are projections of
+    # knowledge/vuln_classes.yaml now — so only the follow-up text remains a
+    # module-level dependency of this exec.
+    needed = ["_GATHER_FOLLOW_UP"]
     body = []
     for n in ast.walk(ast.parse(src)):
         if isinstance(n, ast.Assign) and any(

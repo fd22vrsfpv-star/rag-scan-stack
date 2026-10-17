@@ -269,8 +269,12 @@ class TestInjectionSemantics:
         assert "parameter" in vc.injection_points("lfi")
 
     def test_a_path_traversal_has_no_parameter_to_find(self):
+        """The payload is the path. The item stays REQUIRED and the ENDPOINT
+        satisfies it — two different mechanisms. Dropping the requirement
+        would let a traversal with no endpoint through the gate with nothing
+        to attack."""
         assert vc.path_is_the_field("path-traversal") is True
-        assert vc.needs_input_field("path-traversal") is False
+        assert vc.needs_input_field("path-traversal") is True
 
     def test_rfi_injects_through_a_parameter_and_needs_a_sink(self):
         """It makes the server FETCH, so it is SSRF-shaped. Aliasing it to lfi
@@ -284,7 +288,46 @@ class TestInjectionSemantics:
         for cls in ("auth-bypass", "idor"):
             assert "path" in vc.injection_points(cls), cls
             assert vc.path_is_the_field(cls) is False, cls
-            assert vc.needs_input_field(cls) is True, cls
+
+    def test_requiring_a_parameter_is_declared_not_inferred(self):
+        """"Can inject through a parameter" and "requires one" are different
+        questions. auth-bypass can use a parameter and needs none — requesting
+        a protected path directly is the whole exploit. Inferring it from
+        injects_via made the gate demand a parameter for auth-bypass, which
+        the set this replaced deliberately excluded."""
+        assert "parameter" in vc.injection_points("auth-bypass")
+        assert vc.needs_input_field("auth-bypass") is False
+        assert vc.needs_input_field("idor") is True
+
+    def test_the_required_set_matches_the_set_it_replaced(self):
+        """Widening it blocks runs that used to proceed, so it is a separate
+        deliberate decision — not a side effect of modelling. Preserved
+        verbatim, plus rfi, which was split out of lfi."""
+        # Preserved verbatim from the removed _GATHER_FIELD_REQUIRED_CLASSES.
+        preserved = {"sqli", "ssrf", "ssti", "lfi", "cmdi", "xss", "idor",
+                     "path-traversal", "xxe"}
+        # Added deliberately, each an injection class the table gained after
+        # the migration. `rfi` was split out of `lfi`, which was in the set;
+        # the rest are the injection types the WSTG lane already tested and
+        # the class table did not know. Every one injects through a parameter,
+        # so demanding one is correct rather than a widening by accident.
+        added = {"rfi", "el-injection", "jndi-injection", "crlf-injection",
+                 "ssi-injection", "xpath-injection", "smtp-injection",
+                 "format-string", "hpp"}
+        expected = preserved | added
+        got = {n for n in vc.names() if vc.needs_input_field(n)}
+        assert got == expected, "required-parameter set drifted: %s" % (
+            sorted(got ^ expected))
+
+    def test_no_misconfiguration_demands_a_parameter(self):
+        """A finding has no payload, so it must never reach a gate that asks
+        for one."""
+        for n in vc.names():
+            if vc.is_exploitable(n):
+                continue
+            assert vc.needs_input_field(n) is False, n
+            assert vc.path_is_the_field(n) is False, n
+            assert vc.needs_oob_sink(n) is False, n
 
     def test_file_read_is_orthogonal_to_where_it_injects(self):
         """XXE reads files through a request BODY. One flat set could never
@@ -394,6 +437,116 @@ def test_the_renderer_is_registered_and_emits_a_document_per_class():
     assert len(docs) == len(CLASSES)
     joined = " ".join(b for _, b in docs)
     assert "CWE-22" in joined and "OWASP" in joined
+
+
+# ── kind: a misconfiguration is not an exploit mechanism ───────────────────
+
+@pytest.mark.unit
+class TestKind:
+    def test_every_class_declares_a_known_kind(self):
+        for c in CLASSES:
+            assert c.get("kind") in vc.KINDS, (c["name"], c.get("kind"))
+
+    def test_only_vulnerabilities_are_exploitable(self):
+        """A misconfiguration has no injection point, no payload and nothing
+        to assert. It must never enter the build-PoC gates."""
+        for c in CLASSES:
+            assert vc.is_exploitable(c["name"]) is (c["kind"] == vc.VULNERABILITY)
+
+    def test_a_non_vulnerability_declares_no_mechanism(self):
+        """If it had an injection point and a proof it would be a
+        vulnerability — the fields would be lying about the kind."""
+        for c in CLASSES:
+            if c["kind"] == vc.VULNERABILITY:
+                continue
+            assert not c["injects_via"], c["name"]
+            assert not c["proof"], c["name"]
+            assert c["input_field_required"] is False, c["name"]
+            assert c["needs_oob_sink"] is False, c["name"]
+
+    def test_an_unknown_name_is_not_an_exploitable_class(self):
+        assert vc.is_exploitable("not-a-real-class") is False
+        assert vc.is_exploitable("unknown") is False
+
+    def test_leads_to_names_a_real_exploitable_class(self):
+        """The chain is the point: a finding earns its place by saying which
+        MECHANISM it enables, not by pretending to be one."""
+        known = set(vc.names())
+        for c in CLASSES:
+            for t in (c.get("leads_to") or []):
+                assert t in known, (c["name"], t)
+                assert vc.is_exploitable(t), (
+                    "%s leads_to %s, which is not an exploit mechanism"
+                    % (c["name"], t))
+
+    def test_the_chains_that_matter_are_recorded(self):
+        """WebDAV PUT is not exploitable AS a misconfiguration — it is
+        exploitable because it hands you an upload. Both are IMPACTFUL tests
+        in knowledge/wstg_map.yaml, so the chain is already real elsewhere."""
+        assert vc.leads_to("webdav-put") == ["upload"]
+        assert vc.leads_to("default-credentials") == ["auth-bypass"]
+
+    def test_a_vulnerability_does_not_need_leads_to(self):
+        for c in CLASSES:
+            if c["kind"] == vc.VULNERABILITY:
+                assert not c.get("leads_to"), (
+                    "%s is a mechanism; it does not need a chain" % c["name"])
+
+    def test_both_lanes_share_one_vocabulary(self):
+        """The scanner's spellings resolve too — that is what stops the two
+        lanes having separate names for the same finding."""
+        for spelling, expect in (("webdav enabled", "webdav-put"),
+                                 ("put method enabled", "webdav-put"),
+                                 ("default password", "default-credentials"),
+                                 ("directory browsing", "directory-listing"),
+                                 ("stack trace", "verbose-errors"),
+                                 ("git exposure", "exposed-files")):
+            assert vc.canonical(spelling) == expect, spelling
+
+    def test_exploitable_classes_is_the_gate_filter(self):
+        got = vc.exploitable_classes()
+        assert got == {c["name"] for c in CLASSES if c["kind"] == vc.VULNERABILITY}
+        assert "webdav-put" not in got and "sqli" in got
+
+
+# ── the injection types the scanning lane already knew ─────────────────────
+
+@pytest.mark.unit
+class TestInjectionCoverage:
+    def test_the_wstg_injection_types_resolve(self):
+        """These were tested by knowledge/wstg_map.yaml and unknown to the
+        class table, so the same finding had two names across two lanes."""
+        for spelling, expect in (("xpath injection", "xpath-injection"),
+                                 ("crlf injection", "crlf-injection"),
+                                 ("http response splitting", "crlf-injection"),
+                                 ("host header injection", "host-header-injection"),
+                                 ("ssi injection", "ssi-injection"),
+                                 ("smtp injection", "smtp-injection"),
+                                 ("format string", "format-string"),
+                                 ("http parameter pollution", "hpp"),
+                                 ("log4shell", "jndi-injection"),
+                                 ("ognl injection", "el-injection")):
+            assert vc.canonical(spelling) == expect, spelling
+
+    def test_jndi_is_proven_only_out_of_band(self):
+        """Log4Shell returns a plain 200; the response proves nothing."""
+        assert vc.proof_kinds("jndi-injection") == ["oob"]
+        assert vc.needs_oob_sink("jndi-injection") is True
+
+    def test_crlf_injects_through_a_parameter_but_proves_in_a_header(self):
+        assert "parameter" in vc.injection_points("crlf-injection")
+        assert vc.needs_oob_sink("crlf-injection") is False
+
+    def test_host_header_injection_injects_through_a_header(self):
+        assert vc.injection_points("host-header-injection") == ["header"]
+        assert vc.needs_input_field("host-header-injection") is False
+
+    def test_el_injection_is_not_an_alias_of_ssti(self):
+        """Same gate profile, different payload syntax: `%{...}` and `${...}`
+        rather than `{{...}}`. Folding it into ssti would hand the crafter the
+        wrong delimiters."""
+        assert vc.canonical("ognl") == "el-injection"
+        assert vc.canonical("ssti") == "ssti"
 
 
 # ── the combination: name is primary, CWE narrows ──────────────────────────
