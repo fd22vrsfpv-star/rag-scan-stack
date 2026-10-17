@@ -17668,6 +17668,28 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
             endpoint, ep_source = rt["path"], "local_source"
     if not endpoint:
         probe_list = []
+        # ALREADY PROVEN REAL. `_run_one_building_block` records
+        # claim_type='endpoint_exists' when the readiness gate PROBED a path
+        # and it answered — 58 such rows existed on 2026-10-17 and nothing
+        # here ever read one. The gate did the work, stored the answer, and
+        # the selector went on to re-derive an endpoint from scratch.
+        # Seeded first so they are probed inside the 30-path cap, and ranked
+        # highest below. Fail-soft: an unreadable table is not evidence that
+        # no endpoint was confirmed, so it must not change the outcome.
+        _confirmed_eps = []
+        try:
+            with get_db() as _cc, _cc.cursor() as _ccur:
+                _ccur.execute(
+                    """SELECT DISTINCT claim_value FROM confirmed_facts
+                        WHERE claim_type = 'endpoint_exists'
+                          AND status = 'confirmed'
+                          AND target = %s
+                          AND claim_value LIKE '/%%'
+                        LIMIT 10""", (f"{ip}:{port or 80}",))
+                _confirmed_eps = [r[0] for r in _ccur.fetchall() if r and r[0]]
+        except Exception as _ce:  # noqa: BLE001
+            logging.debug("confirmed endpoint lookup skipped: %s", _ce)
+        probe_list += _confirmed_eps
         for _mp in mined["paths"]:
             probe_list += _path_variants(_mp)          # advisory path, then prefix-stripped
         probe_list += [c for c in (spec.get("candidate_endpoints") or []) if isinstance(c, str) and c.startswith("/") and c != "/"]
@@ -17749,6 +17771,7 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
         probe_list += _re.findall(r"Endpoints \(from JSON body\): ([^\n]+)", recon_text or "")[:1] and \
                       [x.strip() for x in _re.findall(r"Endpoints \(from JSON body\): ([^\n]+)", recon_text or "")[0].split(",")] or []
         seen = set()
+        _ranked = []
         import time as _time
         _probe_deadline = _time.time() + 60          # 30 paths × 3 verbs × 4 s worst case is 6 min
         try:
@@ -17766,7 +17789,9 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
                             if rp.status_code not in (404, 405):
                                 break
                         if rp is not None and rp.status_code != 404:
-                            if ep in mined["paths"]:
+                            if ep in _confirmed_eps:
+                                _note = " (probe-confirmed by the readiness gate)"
+                            elif ep in mined["paths"]:
                                 _note = " (advisory/derived path)"
                             elif any(ep in _path_variants(x) for x in mined["paths"]):
                                 _note = " (prefix-stripped advisory path)"
@@ -17776,13 +17801,65 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
                                 _note = f" (live recon: {_live_src[ep]})"
                             else:
                                 _note = ""
-                            endpoint, ep_source = ep, f"candidate_probe:{_m} HTTP {rp.status_code}{_note}"
-                            ep_probe_status = rp.status_code
-                            break
+                            # RANK, do not take the first answer. This used to
+                            # `break` on any non-404, so a 302 beat a 200 that
+                            # had not been probed yet and the refine loop spent
+                            # every iteration on the wrong URL — the dominant
+                            # exit was max_iters. Lower score wins; the loop
+                            # stops early only on the best possible class.
+                            _2xx = 200 <= rp.status_code < 300
+                            # THE WRITEUP WINS. The advisory names where the
+                            # BUG is; a confirmed_fact only says a path
+                            # EXISTS. Those are different claims, and ranking
+                            # "exists" above "is vulnerable" sends the refine
+                            # loop at a path nobody said was exploitable.
+                            # A 3xx on the advisory path is still the right
+                            # endpoint behind a login redirect — it beats a
+                            # 200 on some unrelated page.
+                            _adv = (ep in mined["paths"]
+                                    or any(ep in _path_variants(x)
+                                           for x in mined["paths"]))
+                            _conf = ep in _confirmed_eps
+                            if _adv and _2xx:
+                                _score = 0      # documented, and it answers
+                            elif _adv and _conf:
+                                _score = 1
+                            elif _adv:
+                                _score = 2      # documented, answered something
+                            elif _conf and _2xx:
+                                _score = 3
+                            elif _2xx:
+                                _score = 4
+                            elif _conf:
+                                _score = 5
+                            else:
+                                _score = 6
+                            _ranked.append(
+                                (_score, ep, f"candidate_probe:{_m} HTTP "
+                                             f"{rp.status_code}{_note}",
+                                 rp.status_code))
+                            if _score == 0:
+                                # The exploit writeup's own URL, answering.
+                                # Nothing can outrank it, so stop probing —
+                                # every further candidate is a chance to drift
+                                # onto a path nobody claimed was vulnerable.
+                                break
                     except Exception:  # noqa: BLE001
                         continue
         except Exception:  # noqa: BLE001
             pass
+        if _ranked:
+            _ranked.sort(key=lambda t: t[0])
+            _, endpoint, ep_source, ep_probe_status = _ranked[0]
+            if len(_ranked) > 1:
+                _poc_trace(run_id, "endpoint_ranked",
+                           response=("chose %s (%s) over %d other answering "
+                                     "candidate(s)" % (endpoint, ep_source,
+                                                       len(_ranked) - 1)),
+                           extra={"chosen": endpoint,
+                                  "candidates": [
+                                      {"path": e, "score": sc, "status": st}
+                                      for sc, e, _src, st in _ranked[:6]]})
     # header-borne vectors (Host / X-Forwarded-For …) ride on any path: the
     # root is the endpoint when the root answers and nothing better is known
     if not endpoint and mined["headers"]:
