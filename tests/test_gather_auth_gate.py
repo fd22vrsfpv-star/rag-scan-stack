@@ -241,26 +241,81 @@ def test_the_probe_status_is_captured_from_a_real_response():
 # -- 8. "pre-auth" contains "auth" ------------------------------------------
 
 def _needs_auth_logic():
-    """Exec just the needs_auth decision from _gather_manifest.
+    """Execute the REAL shared helper, `_auth_requirement`.
 
-    Extracted by source window rather than imported: _gather_manifest is a
-    ~700-line function that probes the network, and the decision under test is
-    a dozen lines of pure string logic inside it.
+    This used to extract a source window out of `_gather_manifest` and exec it,
+    keyed on the literal line `needs_auth = bool(_auth_positive) and not
+    _auth_negated`. That made the test pass only while the logic stayed inlined
+    AND duplicated: `_assess_exploit_readiness` carried its own bare membership
+    test that included the substring "auth", so "pre-authentication" and
+    "unauthenticated" both matched and a pre-auth CVE was blocked for lacking
+    the session it does not need. One definition now, exercised directly.
     """
-    import re as _re
-    src = ast.get_source_segment(API.read_text(encoding="utf-8"),
-                                 _func("_gather_manifest")) or ""
-    i = src.index("_blob = f\"{pre_blob} {desc}\"")
-    j = src.index("needs_auth = bool(_auth_positive) and not _auth_negated")
-    body = src[i:j] + "needs_auth = bool(_auth_positive) and not _auth_negated\n"
-    body = "\n".join(line[4:] if line.startswith("    ") else line
-                     for line in body.split("\n"))
+    import ast as _ast
+    fn = _func("_auth_requirement")
+    ns = {}
+    exec(compile(_ast.Module(body=[fn], type_ignores=[]), "<auth>", "exec"), ns)
+    helper = ns["_auth_requirement"]
 
     def run(pre_blob="", desc=""):
-        ns = {"_re": _re, "pre_blob": pre_blob.lower(), "desc": desc.lower()}
-        exec(compile(body, "<auth>", "exec"), ns)
-        return ns["needs_auth"], ns["_auth_negated"]
+        needs, negated, _why = helper(pre_blob, desc)
+        return needs, negated
     return run
+
+
+def test_both_gates_share_one_auth_definition():
+    """The gather gate and the readiness gate must call the SAME helper.
+
+    They disagreed for weeks: gather got the negation fix, readiness kept a
+    bare `any(k in pre_blob ...)` whose key list contained "auth".
+    """
+    for fname in ("_gather_manifest", "_assess_exploit_readiness"):
+        fn = _func(fname)
+        called = {getattr(n.func, "id", None) or getattr(n.func, "attr", None)
+                  for n in ast.walk(fn) if isinstance(n, ast.Call)}
+        assert "_auth_requirement" in called, (
+            f"{fname} must decide auth through the shared helper, not its own "
+            "copy of the logic")
+    # ...and the old bare membership test must not come back in either.
+    for fname in ("_gather_manifest", "_assess_exploit_readiness"):
+        for node in ast.walk(_func(fname)):
+            if not isinstance(node, ast.Call):
+                continue
+            if getattr(node.func, "id", "") != "any":
+                continue
+            lits = [c.value for c in ast.walk(node)
+                    if isinstance(c, ast.Constant) and isinstance(c.value, str)]
+            assert "auth" not in lits, (
+                f"{fname}: a bare membership test containing the literal "
+                f'"auth" matches "pre-authentication" and "unauthenticated"')
+
+
+def test_the_readiness_gate_lets_a_pre_auth_cve_through():
+    """The regression that motivated the shared helper, end to end.
+
+    Measured before the fix: the bare test said True on 3 of these 6, every
+    one in the blocking direction.
+    """
+    run = _needs_auth_logic()
+    OLD_KEYS = ("auth", "login", "session", "logged", "credential", "cookie",
+                "privilege", "user ", "account")
+    cases = [
+        ("pre-authentication arbitrary file access; allows unauthenticated "
+         "attackers to perform path traversal", False),
+        ("the vulnerability does not require authentication", False),
+        ("requires no credentials", False),
+        ("an authenticated user with admin privileges can trigger this", True),
+        ("the attacker must first obtain a valid session cookie", True),
+    ]
+    wrong_before = 0
+    for text, expect in cases:
+        needs, _neg = run(text, "")
+        assert needs is expect, f"{text[:50]!r}: expected {expect}, got {needs}"
+        if any(k in text.lower() for k in OLD_KEYS) != expect:
+            wrong_before += 1
+    assert wrong_before >= 3, (
+        "the old bare test should be demonstrably worse on this table; if it "
+        "is not, the table no longer covers the regression")
 
 
 PRE_AUTH = [

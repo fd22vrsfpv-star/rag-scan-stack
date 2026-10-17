@@ -17382,6 +17382,54 @@ def _gather_recon_text(ip, port, limit: int = 40) -> str:
         return ""
 
 
+def _auth_requirement(pre_blob, desc=""):
+    """Does the advisory text say this exploit needs a session FIRST?
+
+    ONE definition, because there were two and they disagreed. The gather gate
+    got the negation fix; `_assess_exploit_readiness` kept a bare membership
+    test that included the substring "auth" — which matches
+    "pre-authentication" and "unauthenticated", i.e. the exact phrases that say
+    NO session is needed. A pre-auth CVE was therefore blocked for lacking the
+    session it does not require.
+
+    A negation WINS: it is a stronger statement about the precondition than the
+    bare presence of the word, and the cost of getting it wrong this way round
+    is a run that never dispatches at all.
+
+    Returns `(needs_auth, negated_match, why)` — `negated_match` is the matched
+    phrase (or None) so the caller can SAY which words decided it, rather than
+    reporting a verdict with no provenance.
+    """
+    import re as _re
+    pre_blob = (pre_blob or "").lower()
+    desc = (desc or "").lower()
+    blob = f"{pre_blob} {desc}"
+    negated = _re.search(
+        r"(?:pre[-\s]?auth(?:entication|enticated)?|un[-\s]?authenticated|"
+        r"without\s+(?:any\s+)?(?:authentication|auth\b|credentials|login)|"
+        r"no\s+authentication(?:\s+(?:is\s+)?required)?|"
+        r"does\s+not\s+require\s+(?:authentication|auth\b|credentials|login)|"
+        r"anonymous(?:ly)?(?:\s+(?:access|exploitable|exploit))?|"
+        r"requires?\s+no\s+(?:authentication|credentials|login))", blob)
+    # The positive form must not fire on "unauthenticated" / "pre-authenticated"
+    # / "non-authenticated", which is how the bug got in.
+    _neg = r"(?<!un)(?<!un-)(?<!pre-)(?<!pre )(?<!non-)(?<!non )"
+    positive = (
+        any(k in pre_blob for k in ("login", "session", "logged", "credential", "cookie"))
+        or _re.search(_neg + r"authenticat(?:ed|ion)", pre_blob)
+        or any(k in desc for k in ("logged-in", "logged in", "requires login",
+                                   "admin privileges", "with admin"))
+        or _re.search(_neg + r"authenticated", desc))
+    needs = bool(positive) and not negated
+    if negated:
+        why = f"advisory says auth is NOT required ({negated.group(0).strip()!r})"
+    elif positive:
+        why = "advisory text names a session/credential precondition"
+    else:
+        why = "advisory text names no auth precondition"
+    return needs, negated, why
+
+
 def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan_verdicts=None,
                      session_info=None, auth=None, analysis=None, recon_text="", run_id=None,
                      timeout=4, id_pool=None, segments=None) -> dict:
@@ -17878,23 +17926,7 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
     # A negation WINS. It is a stronger statement about the precondition than
     # the bare presence of the word, and the cost of getting it wrong this way
     # round is a run that never dispatches at all.
-    _blob = f"{pre_blob} {desc}"
-    _auth_negated = _re.search(
-        r"(?:pre[-\s]?auth(?:entication|enticated)?|un[-\s]?authenticated|"
-        r"without\s+(?:any\s+)?(?:authentication|auth\b|credentials|login)|"
-        r"no\s+authentication(?:\s+(?:is\s+)?required)?|"
-        r"does\s+not\s+require\s+(?:authentication|auth\b|credentials|login)|"
-        r"anonymous(?:ly)?(?:\s+(?:access|exploitable|exploit))?|"
-        r"requires?\s+no\s+(?:authentication|credentials|login))", _blob)
-    # The positive form must not fire on "unauthenticated" / "pre-authenticated"
-    # / "non-authenticated", which is how the bug got in.
-    _auth_positive = (
-        any(k in pre_blob for k in ("login", "session", "logged", "credential", "cookie"))
-        or _re.search(r"(?<!un)(?<!un-)(?<!pre-)(?<!pre )(?<!non-)(?<!non )authenticat(?:ed|ion)", pre_blob)
-        or any(k in desc for k in ("logged-in", "logged in", "requires login",
-                                   "admin privileges", "with admin"))
-        or _re.search(r"(?<!un)(?<!un-)(?<!pre-)(?<!pre )(?<!non-)(?<!non )authenticated", desc))
-    needs_auth = bool(_auth_positive) and not _auth_negated
+    needs_auth, _auth_negated, _auth_why = _auth_requirement(pre_blob, desc)
     if vc == "auth-bypass":
         # The session is what the exploit PRODUCES. Demanding one first blocked
         # CVE-2024-3408 in round 5 ("missing: auth") by construction.
@@ -18061,9 +18093,6 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
         # wherever it already has an answer — the fallback only writes items
         # whose current status is `missing`.
         _METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD")
-        _VULN_CLASSES = ("sqli", "xss", "cmdi", "ssti", "ssrf", "xxe", "lfi",
-                         "rce", "idor", "upload", "auth-bypass", "deser",
-                         "path-traversal", "open-redirect", "rfi")
         import re as _re
         _IDENT = _re.compile(r"^[A-Za-z_][\w\[\]\-\.]{0,63}$")
         for name, val in (_llm_proposed or {}).items():
@@ -18085,9 +18114,16 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
                 if _IDENT.match(_bare):
                     keep = sv
             elif name == "vuln_class":
-                sv = str(val).strip().lower()
-                if sv in _VULN_CLASSES:
-                    keep = sv
+                # Validate through the ONE table, not a private tuple. The
+                # model answers in free text ("Path Traversal"), which a
+                # literal membership test rejects while `_vc_canonical`
+                # resolves it — so a hard-coded list here silently discarded
+                # the answers this branch exists to accept, and a class added
+                # to knowledge/vuln_classes.yaml was unusable until the tuple
+                # was edited too.
+                _cv = _vc_canonical(str(val).strip())
+                if _cv != "unknown":
+                    keep = _cv
             if keep is None:
                 continue
             # Rewrite the matching item in-place.
@@ -18267,36 +18303,24 @@ def _gather_llm_fallback(cve, ip, port, product, version, *, vc, missing,
     # Tolerant normalisation — the model ignores the enum/ident contract
     # often enough that strict validation threw away good answers
     # ("SQL injection" for sqli, "sortfield, sortorder" for a field).
-    _VC_SYN = {
-        "sql injection": "sqli", "sqli": "sqli", "sql": "sqli", "blind sqli": "sqli",
-        "cross-site scripting": "xss", "xss": "xss",
-        "command injection": "cmdi", "os command injection": "cmdi", "cmdi": "cmdi",
-        "server-side template injection": "ssti", "template injection": "ssti", "ssti": "ssti",
-        "server-side request forgery": "ssrf", "ssrf": "ssrf",
-        "xml external entity": "xxe", "xxe": "xxe",
-        "local file inclusion": "lfi", "lfi": "lfi", "file inclusion": "lfi",
-        "remote file inclusion": "rfi", "rfi": "rfi",
-        "path traversal": "path-traversal", "directory traversal": "path-traversal",
-        "path-traversal": "path-traversal", "file access": "path-traversal", "arbitrary file read": "path-traversal",
-        "remote code execution": "rce", "rce": "rce", "code execution": "rce",
-        "insecure direct object reference": "idor", "idor": "idor",
-        "file upload": "upload", "arbitrary file upload": "upload", "upload": "upload",
-        "authentication bypass": "auth-bypass", "auth bypass": "auth-bypass", "auth-bypass": "auth-bypass",
-        "deserialization": "deser", "insecure deserialization": "deser", "deser": "deser",
-        "open redirect": "open-redirect", "open-redirect": "open-redirect",
-    }
     out, rejected = {}, {}
     for k in needed:
         v = obj.get(k)
         if v in (None, "", "null"):
             continue
         if k == "vuln_class":
-            key = str(v).strip().lower()
-            if key in _VC_SYN:
-                v = _VC_SYN[key]
-            else:
-                rejected[k] = f"{v!r} not in vuln_class synonyms"
+            # The model answers in prose ("SQL injection", "arbitrary file
+            # read"); `_vc_canonical` is the ONE normalisation point and
+            # already knows every spelling. The 42-entry private synonym
+            # table that used to sit here drifted from it — it returned
+            # "deser" where the table's canonical name is "deserialization",
+            # so a good answer was normalised into a name no downstream
+            # consumer recognises.
+            _cv = _vc_canonical(str(v).strip())
+            if _cv == "unknown":
+                rejected[k] = f"{v!r} resolves to no known vuln class"
                 continue
+            v = _cv
         elif k == "input_field":
             # "sortfield, sortorder" / "a or b" → first identifier
             first = _re.split(r"[,\s/|]+(?:or\s+)?", str(v).strip().strip("\"'`"))[0]
@@ -29675,9 +29699,15 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             # the same path and tell the refiner when they differ.
             try:
                 _ib = _inband_baseline_diff(ip, port, command, timeout=5)
+                # THREE outcomes: it ran and differed, it ran and matched, or
+                # it could not run at all. `_inband_baseline_diff` computes a
+                # `reason` on every bail-out and the caller discarded all of
+                # them, so an absent `inband_diff` row meant BOTH "no
+                # difference" and "never checked" — unreachable read as
+                # absent, which is this repo's recurring bug.
+                _poc_trace(run_id, "inband_diff", iteration=it,
+                           extra={k: v for k, v in _ib.items() if k != "run_preview"})
                 if _ib.get("checked"):
-                    _poc_trace(run_id, "inband_diff", iteration=it,
-                               extra={k: v for k, v in _ib.items() if k != "run_preview"})
                     if _ib.get("changed"):
                         output = (f"INBAND_DIFF_FEEDBACK: the response to your request DIFFERS from the "
                                   f"unmodified baseline of the same path (baseline HTTP {_ib['baseline_status']} "
@@ -29700,6 +29730,13 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                 _conf = _timing_confirmation_rerun(
                     command, assertion, ip, port, listener, API_KEY, _vt,
                     delta=int(os.environ.get("TIMING_CONFIRM_DELTA_SEC", "7") or "7"))
+                # This re-runs the command against the TARGET, so it is a
+                # target run. `pattern is None` means no timing payload was
+                # found and nothing was dispatched, so it is not counted —
+                # every latency_confirmed verdict was otherwise short by
+                # exactly one dispatch.
+                if _conf.get("pattern"):
+                    metrics["target_runs"] = metrics.get("target_runs", 0) + 1
                 _conf["first_s"] = _this_iter_seconds
                 _poc_trace(run_id, "latency_confirmation", iteration=it,
                            extra=_conf)
@@ -40454,9 +40491,14 @@ def _assess_exploit_readiness(ip, port, analysis, session_info=None,
     pr = precond_result or {}
     blockers, satisfied = [], []
 
-    needs_auth = any(k in pre_blob for k in
-                     ("auth", "login", "session", "logged", "credential", "cookie",
-                      "privilege", "user ", "account"))
+    # ONE definition, shared with the gather gate. The bare membership test
+    # that used to live here included "auth", so "pre-authentication" and
+    # "unauthenticated" both matched and a pre-auth CVE was blocked for
+    # lacking a session it does not need.
+    # `pre_blob` already folds in the summary; the advisory is the other
+    # place a 'pre-authentication' phrasing shows up.
+    needs_auth, _ready_auth_neg, _ready_auth_why = _auth_requirement(
+        pre_blob, str(advisory_text or ""))
     cookie = si.get("cookie_header") if isinstance(si, dict) else None
 
     # 1. AUTH/SESSION — the #1 silent killer. If the exploit needs auth,
@@ -50066,14 +50108,24 @@ def queue_poc_for_finding(
         target_port = parsed_url.port or (443 if parsed_url.scheme == "https" else 80)
 
         # Map issue_type to exploit_type
-        issue_type = (finding.get("issue_type") or "").lower()
+        # issue_type -> exploit_type. These are TWO vocabularies: the key is a
+        # vuln class, the value is the `pending_exploits.exploit_type` CHECK
+        # enum, so the map itself stays explicit. What does NOT belong here is
+        # alias folding — `canonical()` already knows "sql-injection", "SQLI"
+        # and "sql injection" all mean sqli, and a private key list caught only
+        # the one spelling someone thought of, dropping the rest to "other".
+        issue_type = _vc_canonical(finding.get("issue_type") or "")
         type_map = {
-            "xss": "xss", "sqli": "sqli", "sql-injection": "sqli",
-            "command-injection": "command_injection", "ssrf": "ssrf",
-            "lfi": "lfi", "path-traversal": "lfi", "xxe": "xxe",
+            "xss": "xss", "sqli": "sqli", "cmdi": "command_injection",
+            "ssrf": "ssrf", "lfi": "lfi", "rfi": "rfi", "xxe": "xxe",
+            "csrf": "csrf", "rce": "rce", "upload": "file_upload",
+            "deserialization": "deserialization", "auth-bypass": "auth_bypass",
+            # A traversal read is carried as the file-read exploit type; it has
+            # no dedicated enum member of its own.
+            "path-traversal": "lfi",
             # 'open_redirect' is NOT an allowed exploit_type — map web-app issues
             # with no dedicated enum to the 'webapp_other' catch-all.
-            "csrf": "csrf", "open-redirect": "webapp_other",
+            "open-redirect": "webapp_other",
         }
         exploit_type = type_map.get(issue_type, "other")
 

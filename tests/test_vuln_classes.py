@@ -619,3 +619,349 @@ class TestResolve:
                      ("x", [None])):
             r = vc.resolve(t, c)
             assert r["class"] in vc.names() or r["class"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Regression guard: no NEW private taxonomy set
+# ---------------------------------------------------------------------------
+# The eight sets this module replaced are gone, but nothing stopped a ninth
+# appearing — and one had: `_VULN_CLASSES` in the LLM-fallback validator, which
+# rejected "Path Traversal" two lines above the `_vc_canonical` call that
+# exists to resolve exactly that. A migration with no guard is a migration that
+# gets re-done.
+#
+# Declared exceptions are keyed by (file, variable) and carry a reason. The
+# list RATCHETS: a stale entry fails, so it cannot outlive what it excuses.
+TAXONOMY_SET_DEBT = {
+    ("app/rag-api/api.py", "_CRAFT_CLASS_GUIDANCE"):
+        "per-class craft-and-prove guidance, ~30 classes of prose. It is the "
+        "single largest thing still keyed by class in Python, and moving it "
+        "is the point of the knowledge/ migration — but it is prompt text "
+        "with embedded regexes and escapes, so it moves on its own, with the "
+        "proof-expectation tests as the safety net. See Docs/OPEN_ITEMS.md.",
+    ("app/rag-api/api.py", "shapes"):
+        "payload SHAPES keyed by class (RCE/SQLi/LFI), not a class vocabulary "
+        "— the technique variants belong in knowledge/payload_variants.yaml "
+        "alongside the OS/runtime variants; migrating them is a separate "
+        "change from fixing the vocabulary. See Docs/OPEN_ITEMS.md.",
+}
+
+_SCAN_ROOTS = ("app/rag-api/api.py", "etl", "autogen_agents")
+
+
+def _candidate_sources():
+    out = []
+    for rel in _SCAN_ROOTS:
+        p = REPO / rel
+        if p.is_file():
+            out.append(p)
+        elif p.is_dir():
+            out.extend(sorted(p.glob("*.py")))
+    # the table's own reader legitimately names every class
+    return [p for p in out if p.name != "vuln_classes.py"]
+
+
+def _literal_sides(node):
+    """Describe a literal collection as (side, strings, total, all_strings).
+
+    `total` is the element count, so a collection only PARTLY made of string
+    literals is never judged. A dict yields both sides: which one carries the
+    class names is what separates an alias table from a translation table.
+    """
+    v = node
+    if isinstance(v, (ast.Set, ast.List, ast.Tuple)):
+        strs = [e.value for e in v.elts
+                if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+        return [("members", strs, len(v.elts), len(strs) == len(v.elts))]
+    if isinstance(v, ast.Dict):
+        keys = [k.value for k in v.keys
+                if isinstance(k, ast.Constant) and isinstance(k.value, str)]
+        vals = [x.value for x in v.values
+                if isinstance(x, ast.Constant) and isinstance(x.value, str)]
+        n = len(v.keys)
+        return [("keys", keys, n, len(keys) == n),
+                ("values", vals, n, len(vals) == n)]
+    if isinstance(v, ast.Call) and isinstance(v.func, ast.Name) \
+            and v.func.id in ("set", "frozenset"):
+        got, total = [], 0
+        for a in v.args:
+            if isinstance(a, (ast.Set, ast.List, ast.Tuple)):
+                got += [e.value for e in a.elts
+                        if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+                total += len(a.elts)
+        return [("members", got, total, total > 0 and len(got) == total)]
+    return []
+
+
+def _all_classes(strings, total, all_strings, minimum=3):
+    """True when this side is a vocabulary: every element a class name.
+
+    `is_known(s)` is the membership test, applied ONCE to the RAW string.
+    It accepts the literal `unknown` sentinel — which is a real class, and
+    appears as a key in the per-class guidance table — while rejecting
+    arbitrary strings.
+
+    Do NOT compose it as `is_known(canonical(s))`: that passes EVERYTHING,
+    because an unrecognised string canonicalises to `unknown`, which is then
+    reported as known. That composition made the first draft of this guard
+    return 60KB of false positives including '/etc/passwd' and 'nmap'.
+    """
+    if not all_strings or total < minimum or len(strings) != total:
+        return False
+    return all(vc.is_known(s) for s in strings)
+
+
+def _private_class_sets():
+    """Every literal collection that hard-codes the class vocabulary.
+
+    Three shapes are vocabularies, and one shape is not:
+
+      * a sequence of class names              -> a private class set
+      * a mapping that is a vocabulary on either side, UNLESS its keys are
+        all classes, every key is ALREADY CANONICAL, and its values are
+        TOKENS of another vocabulary rather than prose.
+
+    The key side is what separates the two, and the values side cannot: the
+    `exploit_type` enum spells the same concepts differently
+    (`command_injection`, `file_upload`, `auth_bypass`), so those values
+    canonicalise to real classes just as an alias table's do.
+
+    An alias table exists PRECISELY to hold non-canonical spellings
+    (`{"sql-injection": "sqli"}`), and a CWE map is keyed by something that
+    is not a class at all — both are drift, and `canonical()` /
+    `classes_for_cwe()` already answer them. A table keyed by canonical names
+    is a translation OUT to another vocabulary, which is legitimate, and
+    keeping its keys canonical is exactly what lets `canonical()` do the
+    folding in front of it.
+    """
+    found = []
+    for path in _candidate_sources():
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+        rel = str(path.relative_to(REPO))
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            names = [t.id for t in targets if isinstance(t, ast.Name)]
+            if not names:
+                continue
+            sides = {lbl: (strs, tot, allstr)
+                     for lbl, strs, tot, allstr in _literal_sides(node.value)}
+            if not sides:
+                continue
+            hit = None
+            if "members" in sides:
+                if _all_classes(*sides["members"]):
+                    hit = sides["members"][0]
+            else:
+                keys_vocab = _all_classes(*sides["keys"])
+                vals, _vtot, vals_all_str = sides["values"]
+                # A translation table maps to another vocabulary, so its
+                # values are TOKENS. Prose values mean this is class-keyed
+                # DATA (guidance, payload shapes) and belongs in a YAML the
+                # operator can edit without a deploy.
+                token_values = vals_all_str and all(
+                    v and len(v) <= 40 and not any(c.isspace() for c in v)
+                    for v in vals)
+                if keys_vocab and token_values and all(
+                        vc.canonical(k) == k for k in sides["keys"][0]):
+                    continue                      # translation table: legal
+                if _all_classes(*sides["values"]):
+                    hit = sides["values"][0]      # alias folding
+                elif keys_vocab:
+                    hit = sides["keys"][0]        # non-canonical class keys
+            if hit is not None:
+                found.append((rel, names[0], node.lineno, hit))
+    return found
+
+
+class TestNoPrivateTaxonomySet:
+    def test_no_module_hardcodes_a_class_vocabulary(self):
+        offenders = [f for f in _private_class_sets()
+                     if (f[0], f[1]) not in TAXONOMY_SET_DEBT]
+        assert not offenders, (
+            "hard-coded vuln-class vocabulary — read knowledge/vuln_classes.yaml "
+            "through etl/vuln_classes.py instead:\n" + "\n".join(
+                f"  {rel}:{line} {name} = {members}"
+                for rel, name, line, members in offenders))
+
+    def test_every_declared_exception_still_exists(self):
+        """A debt entry that no longer matches anything must be deleted."""
+        live = {(rel, name) for rel, name, _, _ in _private_class_sets()}
+        stale = sorted(k for k in TAXONOMY_SET_DEBT if k not in live)
+        assert not stale, (
+            f"TAXONOMY_SET_DEBT entries no longer present — delete them: {stale}")
+
+    def test_the_guard_can_actually_fail(self):
+        """Sabotage-proof: the detector must flag each shape it claims to.
+
+        Without this, a change to `canonical` that made everything `unknown`
+        would turn the guard into a no-op that still reports green.
+        """
+        def sides_of(src):
+            return {lbl: (strs, tot, allstr) for lbl, strs, tot, allstr
+                    in _literal_sides(ast.parse(src).body[0].value)}
+
+        # a private class sequence
+        seq = sides_of('X = ("sqli", "xss", "path traversal")')
+        assert _all_classes(*seq["members"])
+
+        # the sentinel class is a real member, not an accident
+        assert vc.is_known("unknown")
+        # ...and the composition trap must stay rejected
+        assert not vc.is_known("/etc/passwd")
+        assert vc.is_known(vc.canonical("/etc/passwd")), (
+            "is_known(canonical(x)) passes everything — never compose them")
+
+        # private alias folding: values are class names
+        alias = sides_of('X = {"CWE-78": "cmdi", "CWE-89": "sqli", "CWE-79": "xss"}')
+        assert _all_classes(*alias["values"])
+
+        # non-canonical class keys: a vocabulary spelled by hand
+        data = sides_of('X = {"SQLi": [1], "Path Traversal": [2], "RCE": [3]}')
+        assert _all_classes(*data["keys"])
+        assert not all(vc.canonical(k) == k for k in data["keys"][0])
+
+    def test_a_translation_table_is_not_flagged(self):
+        """class -> another vocabulary must stay legal, or the guard would
+        push callers back towards private alias lists to appease it."""
+        sides = {lbl: (strs, tot, allstr) for lbl, strs, tot, allstr
+                 in _literal_sides(ast.parse(
+                     'X = {"cmdi": "command_injection", "upload": "file_upload",'
+                     ' "auth-bypass": "auth_bypass"}').body[0].value)}
+        assert _all_classes(*sides["keys"])               # keys ARE classes
+        assert all(vc.canonical(k) == k for k in sides["keys"][0])
+        # values are single tokens, not prose — that is what makes it a
+        # translation rather than class-keyed data
+        assert all(" " not in v for v in sides["values"][0])
+        # and the values canonicalise too — which is why the VALUE side can
+        # never be the discriminator between this and an alias table
+        assert _all_classes(*sides["values"])
+
+
+class TestIssueTypeMapIsCanonical:
+    """The Burp/ZAP issue_type -> exploit_type map is two vocabularies.
+
+    Its keys must be canonical class names (so `canonical()` does the alias
+    folding) and its values must be members of the pending_exploits CHECK
+    enum (so every mapping is actually writable).
+    """
+
+    @staticmethod
+    def _type_map():
+        tree = ast.parse((REPO / "app/rag-api/api.py").read_text(encoding="utf-8"))
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Assign) and any(
+                    getattr(t, "id", "") == "type_map" for t in n.targets):
+                return {k.value: v.value for k, v in zip(n.value.keys, n.value.values)}
+        return None
+
+    @staticmethod
+    def _enum():
+        import re
+        sql = (REPO / "db_init/ensure_all_tables.sql").read_text(encoding="utf-8")
+        m = re.search(
+            r"pending_exploits_exploit_type_check\s*\n?\s*CHECK \(exploit_type IN \((.*?)\)\)",
+            sql, re.S)
+        return set(re.findall(r"'([a-z_]+)'", m.group(1))) if m else set()
+
+    def test_the_map_is_present(self):
+        assert self._type_map(), "type_map not found — did the handler move?"
+
+    def test_every_key_is_already_canonical(self):
+        tm = self._type_map()
+        bad = {k: vc.canonical(k) for k in tm if vc.canonical(k) != k}
+        assert not bad, (
+            "keys must be canonical class names so canonical() folds the "
+            f"aliases: {bad}")
+
+    def test_every_value_is_a_writable_exploit_type(self):
+        enum = self._enum()
+        assert enum, "could not read the exploit_type CHECK constraint"
+        bad = sorted(set(self._type_map().values()) - enum)
+        assert not bad, (
+            f"exploit_type values the CHECK constraint rejects: {bad}")
+
+
+class TestDeletedSynonymTableIsCovered:
+    """`_VC_SYN` — 42 hand-written synonyms in the LLM-fallback parser — is
+    gone. These pin what replaced it, because "canonical() surely knows that
+    spelling" is the assumption that let the table drift in the first place.
+    """
+
+    # every key of the deleted table, with the class IT returned
+    OLD = {
+        "sql injection": "sqli", "sqli": "sqli", "sql": "sqli",
+        "blind sqli": "sqli", "cross-site scripting": "xss", "xss": "xss",
+        "command injection": "cmdi", "os command injection": "cmdi",
+        "cmdi": "cmdi", "server-side template injection": "ssti",
+        "template injection": "ssti", "ssti": "ssti",
+        "server-side request forgery": "ssrf", "ssrf": "ssrf",
+        "xml external entity": "xxe", "xxe": "xxe",
+        "local file inclusion": "lfi", "lfi": "lfi", "file inclusion": "lfi",
+        "remote file inclusion": "rfi", "rfi": "rfi",
+        "path traversal": "path-traversal", "directory traversal": "path-traversal",
+        "path-traversal": "path-traversal", "file access": "path-traversal",
+        "arbitrary file read": "path-traversal", "remote code execution": "rce",
+        "rce": "rce", "code execution": "rce",
+        "insecure direct object reference": "idor", "idor": "idor",
+        "file upload": "upload", "arbitrary file upload": "upload",
+        "upload": "upload", "authentication bypass": "auth-bypass",
+        "auth bypass": "auth-bypass", "auth-bypass": "auth-bypass",
+        "deserialization": "deser", "insecure deserialization": "deser",
+        "deser": "deser", "open redirect": "open-redirect",
+        "open-redirect": "open-redirect",
+    }
+
+    # Spellings the private table mapped but the TABLE deliberately does not,
+    # because they name no single class. The fallback now rejects these with a
+    # reason instead of guessing — an ambiguous answer is not an answer.
+    AMBIGUOUS = {
+        "file inclusion": "local vs remote is the whole distinction (lfi/rfi)",
+        "file access": "names an outcome, not a mechanism",
+    }
+
+    # Where the old table and the table DISAGREE, and why the table is right.
+    CORRECTED = {
+        "deser": "deserialization",
+        "deserialization": "deserialization",
+        "insecure deserialization": "deserialization",
+        "arbitrary file read": "lfi",
+    }
+
+    def test_every_unambiguous_spelling_still_resolves(self):
+        missed = sorted(k for k in self.OLD
+                        if k not in self.AMBIGUOUS and vc.canonical(k) == "unknown")
+        assert not missed, (
+            "spellings the deleted table accepted that canonical() now "
+            f"rejects — add them as aliases in knowledge/vuln_classes.yaml: {missed}")
+
+    def test_the_ambiguous_spellings_are_rejected_not_guessed(self):
+        for spelling, why in self.AMBIGUOUS.items():
+            assert vc.canonical(spelling) == "unknown", (
+                f"{spelling!r} should stay unresolved ({why}); guessing a "
+                "class here is what the old table did")
+
+    def test_the_corrections_hold(self):
+        """The disagreements are deliberate, and each is the table's answer."""
+        for spelling, expect in self.CORRECTED.items():
+            assert vc.canonical(spelling) == expect, spelling
+
+    def test_deser_was_the_drift_that_motivated_the_deletion(self):
+        """The old table emitted `deser`, which is NOT a class name — so a
+        correctly-normalised answer became one no consumer recognised."""
+        assert self.OLD["deser"] == "deser"
+        assert "deser" not in vc.names()
+        assert vc.canonical("deser") == "deserialization"
+        assert "deserialization" in vc.names()
+
+    def test_everything_else_agrees(self):
+        """Outside the declared corrections, old and new must match — so a
+        future table edit that silently re-points a spelling fails here."""
+        for spelling, old_class in self.OLD.items():
+            if spelling in self.AMBIGUOUS or spelling in self.CORRECTED:
+                continue
+            assert vc.canonical(spelling) == old_class, spelling

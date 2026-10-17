@@ -97,7 +97,7 @@ classes:
   - name: sqli
     kind: vulnerability
     title: SQL Injection
-    aliases: [sql-injection, blind-sqli, sqli-blind, union-sqli]
+    aliases: [sql-injection, blind-sqli, sqli-blind, union-sqli, sql]
     injects_via: [parameter, body, header, cookie]
     input_field_required: true
     file_read: false

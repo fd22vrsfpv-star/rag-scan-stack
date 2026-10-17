@@ -1,0 +1,117 @@
+# ffuf — web fuzzing (content discovery, vhosts, parameters).
+#
+# Same category as gobuster, and the same gap: the runs landed as generic dumps
+# while the output plainly lists what answered. `etl/tool_output_parsers._ffuf`
+# reads the shape for `parsed_results`, but nothing turned it into `notable`
+# facts, because there was no spec here.
+#
+# TWO SHAPES, BOTH REAL (tests/fixtures/ffuf_results.txt and
+# tests/fixtures/ffuf_json_output.json, captured from this stack):
+#
+#   terminal (default):
+#     \r\x1b[2K.htaccess    [Status: 403, Size: 318, Words: 21, Lines: 10, Duration: 61ms]\x1b[0m
+#   -of json:
+#     {"results":[{"input":{"FUZZ":"index.php"},"status":200,...,"url":"http://host:9090/index.php"}]}
+#
+# The `\r\x1b[2K` erase sequence prefixes EVERY terminal hit line — ffuf writes
+# it even when stdout is not a tty, so the progress indicator can be
+# overwritten. A pattern anchored on `^` alone matches the escape sequence
+# instead of the word and yields `2K.hta`; hence the `\x1b\[2K` alternative.
+#
+# Only the matched WORD is on stdout. The URL template (`:: URL : http://.../FUZZ`)
+# appears solely in the stderr banner, and every caller of `analyse_output`
+# passes `tool_executions.output` alone — so no URL is reconstructed here
+# rather than guessed. `found_urls` fills only in the JSON shape, which carries
+# its own absolute URLs.
+#
+# NOT COVERED, deliberately: silent mode (`-s`, which the
+# knowledge/content_discovery.yaml templates use) prints the matched word with
+# no decoration at all. A bare-word regex cannot tell a result from any other
+# line, so inventing one here would fabricate paths. The registry parser does
+# not read that shape either.
+tool: ffuf
+description: Web fuzzing — the words ffuf matched and the status each one answered with.
+enabled: true
+max_chars: 40000
+
+deterministic:
+  # Terminal hit line: the matched word, then a bracketed status block.
+  found_paths:
+    pattern: '(?:\x1b\[2K|^)\s*([^\s\x1b]+)\s+\[Status:\s*\d{3},'
+    capture: all
+    type: list
+  # The same line, restricted to the statuses that say "this exists, but you
+  # may not have it" — the ones worth a manual look.
+  auth_required_paths:
+    pattern: '(?:\x1b\[2K|^)\s*([^\s\x1b]+)\s+\[Status:\s*(?:401|403),'
+    capture: all
+    type: list
+  # `-of json`: each result carries its own absolute URL. The file ALSO has a
+  # `config` block whose own `url` is the fuzz template
+  # (`http://host:8765/FUZZ`) — a request that was never made, so the lookahead
+  # drops any URL still carrying the keyword. Patterns run case-insensitively,
+  # so a genuine path literally named `fuzz` would be dropped with it; that is
+  # the cheaper mistake than reporting the template as a discovered URL.
+  found_urls:
+    pattern: '"url"\s*:\s*"(https?://(?![^"]*FUZZ)[^"]+)"'
+    capture: all
+    type: list
+
+schema:
+  found_paths:
+    type: list
+    description: words ffuf matched (terminal output); a path in dir mode, a label in vhost/param mode
+  auth_required_paths:
+    type: list
+    description: matched words that answered 401 or 403 — present but refused
+  found_urls:
+    type: list
+    description: absolute URLs from ffuf JSON output (`-of json`)
+
+prompt: |
+  Extract what `ffuf` matched. In the terminal output each result line is
+  `<word>  [Status: <code>, Size: <n>, Words: <n>, Lines: <n>]` — collect the
+  words, and separately those whose status is 401 or 403. In `-of json` output
+  each entry under `results` carries an absolute `url` — collect those.
+
+  Report only result lines. The banner, the `:: Progress:` counters and the
+  settings block are not results, and a word that was merely tried is not a
+  result either.
+
+examples:
+  - output: |
+      .htaccess               [Status: 403, Size: 318, Words: 21, Lines: 10, Duration: 61ms]
+      index.php               [Status: 200, Size: 2246, Words: 120, Lines: 79, Duration: 1ms]
+      stock                   [Status: 301, Size: 357, Words: 21, Lines: 10, Duration: 0ms]
+    extract: |
+      {"found_paths": [".htaccess", "index.php", "stock"],
+       "auth_required_paths": [".htaccess"]}
+
+notable:
+  - id: ffuf_paths_found
+    when: len(found_paths) > 0
+    severity: info
+    title: "{found_paths} path(s) matched by ffuf"
+    detail: >
+      Each match is a word the server answered to rather than 404'd — admin
+      panels, backups and config files surface here and are candidates for
+      manual review. In vhost or parameter mode the same list names the hosts
+      or parameters the target accepted.
+    params: [found_paths]
+  - id: ffuf_restricted_paths
+    when: len(auth_required_paths) > 0
+    severity: info
+    title: "{auth_required_paths} path(s) exist but refused access (401/403)"
+    detail: >
+      A 401/403 proves the resource EXISTS while refusing it, which is a
+      different fact from a 404 and a better lead: these are the targets for an
+      authentication or access-control bypass attempt, not for more brute force.
+    params: [auth_required_paths]
+  - id: ffuf_urls_found
+    when: len(found_urls) > 0
+    severity: info
+    title: "{found_urls} URL(s) matched by ffuf (JSON output)"
+    detail: >
+      The JSON shape carries absolute URLs, so these need no reconstruction
+      from the fuzz template — they are directly requestable in a manual tool.
+    params: [found_urls]

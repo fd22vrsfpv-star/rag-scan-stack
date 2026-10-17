@@ -308,6 +308,39 @@ export default function News() {
                 ? `Last fetched: ${new Date(lastFetched).toLocaleString()} · Daily auto-refresh`
                 : 'Never fetched yet'}
           </div>
+          {/* Per-source progress. A source that FAILED and a source that returned
+              zero articles are different outcomes, so they are styled differently:
+              the aggregate counter above cannot tell them apart. */}
+          {ingestRunning && !!runQ.data?.per_source?.length && (
+            <div className="mt-1.5 w-full max-w-xs flex flex-col gap-1 max-h-48 overflow-y-auto pr-1">
+              {runQ.data.per_source.map((s, i) => (
+                <div
+                  key={s.id || `${s.name}-${i}`}
+                  title={s.error ?? `${s.articles} articles fetched`}
+                  className={cn(
+                    'rounded border px-2 py-1 text-[10px] leading-tight',
+                    s.error
+                      ? 'bg-red-500/10 text-red-300 border-red-500/40'
+                      : s.articles === 0
+                        ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
+                        : 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30',
+                  )}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-medium truncate">{s.name}</span>
+                    <span className="whitespace-nowrap font-mono">
+                      {`${s.new} new · ${s.updated} upd`}
+                    </span>
+                  </div>
+                  {s.error
+                    ? <div className="mt-0.5 break-all"><span className="font-semibold">failed:</span> {s.error}</div>
+                    : s.articles === 0
+                      ? <div className="mt-0.5 opacity-80">no articles returned</div>
+                      : null}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Topic deep search */}

@@ -558,7 +558,13 @@ def test_the_rag_writer_can_actually_connect():
         "app/load_all.py imports etl.db, which is not a module in this repo — "
         "the file cannot be imported at all"
     )
-    assert "psycopg2.connect(DB_DSN)" in code, (
+    # Tolerate connect kwargs. This pinned the exact literal
+    # `psycopg2.connect(DB_DSN)` and went red the moment the connect gained
+    # `connect_timeout=` + `options=` session caps — the guard's INTENT (open
+    # its own connection from DB_DSN rather than import the nonexistent
+    # etl.db) was never violated. Exactly the brittleness
+    # tests/test_guard_style.py exists to warn about.
+    assert re.search(r"psycopg2\.connect\(\s*DB_DSN\b", code), (
         "the backfill does not open its own connection with DB_DSN, the way "
         "every other ETL module does"
     )
