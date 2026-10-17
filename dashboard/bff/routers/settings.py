@@ -912,6 +912,10 @@ LLM_ROUTE_TASKS = [
     ("extract", "Extractor learning — parsing tool output into fields"),
     ("triage", "Cloud/artifact triage"),
     ("chat", "Operator chat in the dashboard"),
+    # Kept in step with common/llm_settings.LLM_TASKS — the agreement is
+    # enforced by tests/test_llm_routing.py, which is what caught this list
+    # being a second copy when `challenge` was added to the resolver.
+    ("challenge", "Challenge agent — second opinion on derived facts"),
 ]
 
 

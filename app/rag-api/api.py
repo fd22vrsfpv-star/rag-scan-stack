@@ -18781,6 +18781,113 @@ def _challenge_intel(man: dict, probe_results: dict = None, *, product=None,
     }
 
 
+# ── The challenge agent: a SECOND opinion, from a different model ───────────
+#
+# `etl/fact_contradictions.py` catches what exact comparison can catch — a
+# template, another product's route, a parameter from the wrong class. It
+# cannot catch the semantic cases: an endpoint that is syntactically fine and
+# implausible for this product, a proof that would pass for the wrong reason.
+#
+# So this is advisory review by a model, and it is routed to its OWN model via
+# `LLM_ROUTE_FACT_CHALLENGE`, because a reviewer sharing the builder's model is
+# the same model grading its own homework.
+#
+# IT CAN ONLY WARN. Never clear, never downgrade, never confirm. CLAUDE.md:
+# "RAG proposes; the gate disposes" — a model must not be able to talk the
+# deterministic gate into or out of anything. Everything it says is recorded
+# with source="llm" so an operator can tell a measured contradiction from an
+# opinion.
+#
+# Bounded: it only runs when there is something to review — facts the model or
+# an advisory supplied, rather than facts a probe established. On a run whose
+# facts are all probe-confirmed it costs nothing.
+_LLM_CHALLENGE_SOURCES = {"model_inferred", "llm_fallback", "advisory_derived",
+                          "research", "derived_vector", "nvd+classifier"}
+
+_LLM_CHALLENGE_PROMPT = (
+    "You are reviewing the facts another system derived about ONE target "
+    "before it builds an exploit. You are a SECOND OPINION: you cannot "
+    "approve anything and you cannot stop anything. Name only concerns a "
+    "careful operator would raise.{NL}{NL}"
+    "CVE: {cve}   TARGET: {ip}:{port}   CLASS: {vc}{NL}"
+    "FACTS (value, where it came from):{NL}{facts}{NL}"
+    "ALREADY FOUND by deterministic checks (do NOT repeat these):{NL}{found}{NL}{NL}"
+    "Raise a concern only when you can say WHAT is wrong and WHY. Do not "
+    "speculate, do not suggest improvements, do not comment on style. If "
+    "nothing is wrong, return an empty list.{NL}"
+    'Return ONLY JSON: {{"concerns": [{{"item": "<fact name>", '
+    '"concern": "<one sentence>", "why": "<one sentence>"}}]}}'
+)
+
+
+def _llm_challenge_review(intel: dict, found: list, cve, ip, port, run_id=None,
+                          model=None) -> dict:
+    """Advisory review of the DERIVED facts by a separately-routed model.
+
+    Returns {ran, findings, reason}. `ran` is False when there was nothing to
+    review or the call failed — distinct outcomes, both reported, because
+    "the reviewer said nothing" and "the reviewer never spoke" are not the
+    same and an operator reading a clean report deserves to know which.
+    """
+    out = {"ran": False, "findings": [], "reason": None, "model": None}
+    facts = (intel or {}).get("facts") or {}
+    sources = (intel or {}).get("fact_sources") or {}
+    derived = {k: v for k, v in facts.items()
+               if str(sources.get(k, "")).split(":")[0] in _LLM_CHALLENGE_SOURCES}
+    if not derived:
+        out["reason"] = "no derived facts to review (all probe-established)"
+        return out
+    try:
+        fact_lines = chr(10).join(
+            "  %s = %s   (via %s)" % (k, str(v)[:160], sources.get(k) or "?")
+            for k, v in sorted(derived.items()))
+        found_lines = chr(10).join(
+            "  %s: %s" % (f.get("rule_id"), str(f.get("message"))[:140])
+            for f in (found or [])) or "  (none)"
+        prompt = _LLM_CHALLENGE_PROMPT.format(
+            NL=chr(10), cve=cve, ip=ip, port=port,
+            vc=(intel or {}).get("vuln_class") or "unknown",
+            facts=fact_lines, found=found_lines)
+        # ROUTED LIKE EVERY OTHER TASK. `llm.route.challenge` in app_settings
+        # (Settings -> LLM Tuning), with LLM_ROUTE_CHALLENGE as the env
+        # fallback and route.default when unset — the convention the stack
+        # already uses for recon, exploit, extract and the rest. An earlier
+        # draft of this invented a per-CALLER env var, which collided with
+        # that prefix while meaning something different.
+        if model is None:
+            try:
+                from common.llm_settings import get_route
+                model = (get_route("challenge") or {}).get("model") or None
+            except Exception as _re2:  # noqa: BLE001
+                logging.debug("challenge route lookup failed: %s", _re2)
+        res = _llm_for_model(prompt, model=model, caller="fact_challenge",
+                             num_predict=600, temperature=0.0)
+        out["model"] = (res or {}).get("model")
+        obj = _poc_extract_json((res or {}).get("response") or "") or {}
+        for c in (obj.get("concerns") or [])[:6]:
+            if not isinstance(c, dict) or not c.get("concern"):
+                continue
+            item = str(c.get("item") or "").strip()
+            if item and item not in facts:
+                continue        # an opinion about a fact we do not hold
+            out["findings"].append({
+                "rule_id": "llm_review",
+                "severity": "medium",      # capped: an opinion is never high
+                "action": "warn",          # and can never clear or downgrade
+                "source": "llm",
+                "item": item or "(general)",
+                "message": str(c.get("concern"))[:300],
+                "why": str(c.get("why") or "")[:300],
+                "remedy": "",
+            })
+        out["ran"] = True
+        out["reason"] = "reviewed %d derived fact(s)" % len(derived)
+    except Exception as e:  # noqa: BLE001
+        out["reason"] = "review did not run: %s" % type(e).__name__
+        logging.debug("llm challenge review failed: %s", e)
+    return out
+
+
 def _challenge_derived_facts(man: dict, cve, ip, port, eid=None, run_id=None,
                              product=None, probe_results=None,
                              auth_required=None, auth_observations=None,
@@ -18874,6 +18981,21 @@ def _challenge_derived_facts(man: dict, cve, ip, port, eid=None, run_id=None,
             itm = by_item.get(name)
             if itm is not None and itm.get("status") == "missing":
                 (man.setdefault("facts", {})).pop(name, None)
+
+    # SECOND OPINION, from a separately-routed model. Appended after the
+    # deterministic findings and after the actions have been applied, so it
+    # can only ever add warnings — it cannot influence what was cleared or
+    # downgraded above.
+    try:
+        _rev = _llm_challenge_review(intel, out["findings"], cve, ip, port,
+                                     run_id=run_id)
+        out["llm_review"] = {k: v for k, v in _rev.items() if k != "findings"}
+        for f in _rev["findings"]:
+            out["findings"].append(f)
+            out["medium"] = out.get("medium", 0) + 1
+    except Exception as e:  # noqa: BLE001
+        out["llm_review"] = {"ran": False, "reason": type(e).__name__}
+        logging.debug("llm challenge review wiring failed: %s", e)
 
     man["challenge"] = out
     try:
@@ -20637,17 +20759,62 @@ def _poc_target_family(command):
     return (host, seg)
 
 
-def _poc_assertion_is_anchored(assertion, canary):
-    """True only if the assertion is CVE-EFFECT-anchored: it requires the injected canary
-    (proof the exploit's own action landed) rather than a generic pattern that a
-    pre-existing/adjacent state could satisfy. A generic default assertion is NOT anchored."""
-    if not canary:
-        return False
-    a = assertion or {}
-    if a.get("cve_anchored") and a.get("canary") == canary:
-        return True
-    rx = a.get("expect_regex") or ""
-    return canary in rx
+def _vuln_class_from_gather_text(text):
+    """The class the gather check settled on, read back from its manifest text.
+
+    `_run_refine_poc` receives the manifest as PROSE (`gather_facts`), so the
+    class has to be parsed rather than passed. Absent -> None, which keeps the
+    original canary-only anchoring.
+    """
+    import re as _re
+    m = _re.search(r"vuln_class\s*=\s*([A-Za-z0-9_-]+)", str(text or ""))
+    return m.group(1) if m else None
+
+
+def _poc_assertion_is_anchored(assertion, canary, *, vuln_class=None,
+                               command=None, verdict_method=None):
+    """(anchored, why) — is the proof tied to THIS exploit's effect?
+
+    Was: the assertion must require the injected canary. That is exactly right
+    for a REFLECTION proof and structurally impossible for others. Measured on
+    the shipped rule:
+
+        echo / canary regex                   anchored=True
+        oob sink marker (SINK-VERIFIED:<c>)   anchored=True
+        file read, content signature          anchored=False   <-- root:x:0:0:
+        timing only ({"min_seconds": 5})      anchored=False
+
+    Since `verified = success and anchored`, a PERFECT file read could never be
+    verified: the craft guidance correctly tells that class to assert on
+    content only the real file has and that a returning canary is a
+    REFUTATION, so the canary rule was unsatisfiable by design. Blind timing
+    had the same problem. OOB survived only because the sink tail happens to
+    emit the canary inside its marker.
+
+    What ties a proof to the exploit differs by PROOF KIND, so the class table
+    answers it now — see etl/proof_anchor.py. With no class known this is the
+    original rule exactly, so nothing becomes verifiable by accident.
+    """
+    kinds, sigs = [], {}
+    try:
+        kinds = _vc_proof_kinds(vuln_class) if vuln_class else []
+        if "file_content" in kinds:
+            sigs = _file_read_signatures()
+    except Exception as e:  # noqa: BLE001
+        logging.debug("anchor: class lookup failed: %s", e)
+    try:
+        from etl.proof_anchor import is_anchored as _is_anchored
+    except Exception as e:  # noqa: BLE001
+        # Fail to the ORIGINAL rule, never to "anchored": an unavailable
+        # module must not be able to mark something verified.
+        logging.error("etl.proof_anchor unavailable (%s); canary rule only",
+                      type(e).__name__)
+        a = assertion or {}
+        ok = bool(canary and (canary in str(a.get("expect_regex") or "")
+                              or (a.get("cve_anchored") and a.get("canary") == canary)))
+        return ok, "canary rule (proof_anchor unavailable)"
+    return _is_anchored(assertion, canary, proof_kinds=kinds, command=command,
+                        verdict_method=verdict_method, signatures=sigs)
 
 
 def _poc_reflection_detected(command, canary, ip, port, listener, vt):
@@ -30323,7 +30490,31 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                                             "could only be unconfirmable"})
             assertion = _new_a
 
-    anchored = _poc_assertion_is_anchored(assertion, canary)
+    anchored, _anchor_why = _poc_assertion_is_anchored(
+        assertion, canary,
+        vuln_class=_vuln_class_from_gather_text(gather_facts),
+        command=command, verdict_method=verification_method)
+    # THE PROOF THAT WAS ACCEPTED, in a shape an operator can review. A
+    # verdict with nothing to look at has to be taken on faith; it cannot be
+    # disputed or put in a report. Built whether or not the run verified,
+    # because "why did this NOT count" is the question asked most often and
+    # the answer used to exist only as a boolean.
+    try:
+        from etl.proof_anchor import proof_record as _proof_record
+        _proof = _proof_record(
+            assertion=assertion, output=output, command=command,
+            verdict_method=verification_method, anchored=anchored,
+            anchor_why=_anchor_why,
+            proof_kinds=_vc_proof_kinds(_vuln_class_from_gather_text(gather_facts)),
+            canary=canary)
+    except Exception as _pe:  # noqa: BLE001
+        _proof = {"accepted": bool(anchored), "kind": "unavailable",
+                  "note": "proof record unavailable: %s" % type(_pe).__name__}
+    _poc_trace(run_id, "anchor_check", iteration=it,
+               response=("ANCHORED: " if anchored else "NOT anchored: ") + str(_anchor_why),
+               extra={"anchored": anchored, "why": _anchor_why,
+                      "verification_method": verification_method,
+                      "proof": _proof})
     # VERIFIED = the assertion passed AND it was anchored to the exploit's own effect.
     # A generic-pattern pass is success-but-unverified and is NOT stored as a proven PoC.
     verified = bool(success and anchored)
@@ -30511,7 +30702,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                 eid=eid)
     except Exception as e:  # noqa: BLE001
         logging.debug("refine judge-pass failed cve=%s run=%s: %s", cve, run_id, e)
-    return {"ok": True, "success": success, "verified": verified, "off_target": off_target,
+    return {"ok": True, "success": success, "verified": verified, "proof": _proof, "off_target": off_target,
             "drifted": drifted, "anchored": anchored, "reflection": reflection, "canary": canary,
             "iterations": iters, "final_command": command, "final_assertion": assertion,
             # The best attempt the loop produced, which is NOT the last one

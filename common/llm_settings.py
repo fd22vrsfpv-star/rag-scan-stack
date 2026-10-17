@@ -207,6 +207,11 @@ LLM_TASKS = (
     ("extract",     "Extractor learning — parsing tool output into fields"),
     ("triage",      "Cloud/artifact triage"),
     ("chat",        "Operator chat in the dashboard"),
+    # The reviewer of DERIVED facts. Deliberately its own task so it can be
+    # pointed at a DIFFERENT model from the one that produced the facts: a
+    # reviewer sharing the builder's model is the same model grading its own
+    # homework. Unset inherits route.default, i.e. today's behaviour.
+    ("challenge",   "Challenge agent — second opinion on derived facts"),
 )
 
 LLM_TASK_NAMES = tuple(t for t, _ in LLM_TASKS)
