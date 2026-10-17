@@ -240,6 +240,36 @@ CREATE INDEX IF NOT EXISTS rag_docs_fts_idx  ON public.rag_documents USING GIN (
 CREATE INDEX IF NOT EXISTS rag_docs_finding_idx ON public.rag_documents(finding_id);
 CREATE INDEX IF NOT EXISTS rag_docs_asset_idx   ON public.rag_documents(asset_id);
 
+-- FIRST-CLASS retrieval keys. These lived only inside `metadata` jsonb, so a
+-- PoC build could reach the sqli class document by SIMILARITY but could never
+-- ASK for it: there was nothing to filter or join on. A CVE's CWE ids and its
+-- classified vuln_class are facts the build already holds before it retrieves
+-- anything, which makes them the right keys to carry as columns.
+--
+-- Nullable by design: most rows are embedded FINDINGS, which have a cve but no
+-- vuln_class, and the knowledge rows are the reverse. A NULL here means "this
+-- document is not keyed that way", not "unknown".
+ALTER TABLE public.rag_documents ADD COLUMN IF NOT EXISTS vuln_class text;
+ALTER TABLE public.rag_documents ADD COLUMN IF NOT EXISTS cve         text;
+-- `service` mirrors exploit_chunks, which has carried service/port/tech since
+-- TIER 24 — the exploit corpus was service-scoped while the knowledge corpus
+-- was not, so "what do I run against SMB" could be narrowed on one and only
+-- guessed on the other. service_tools alone is 97 documents, every one keyed
+-- by a service that existed only inside its title string.
+ALTER TABLE public.rag_documents ADD COLUMN IF NOT EXISTS service     text;
+CREATE INDEX IF NOT EXISTS rag_docs_vuln_class_idx
+    ON public.rag_documents(vuln_class) WHERE vuln_class IS NOT NULL;
+CREATE INDEX IF NOT EXISTS rag_docs_cve_idx
+    ON public.rag_documents(cve) WHERE cve IS NOT NULL;
+CREATE INDEX IF NOT EXISTS rag_docs_service_idx
+    ON public.rag_documents(service) WHERE service IS NOT NULL;
+
+-- Backfill the cve column from the metadata that already carries it (the
+-- findings backfill wrote `metadata->>'cve'` long before this column existed).
+UPDATE public.rag_documents
+   SET cve = metadata->>'cve'
+ WHERE cve IS NULL AND metadata ? 'cve' AND metadata->>'cve' <> '';
+
 -- The ANN index Docs/README.md has always claimed ("Index via IVFFLAT is
 -- included") and which did not exist. Guarded twice: pgvector may be absent,
 -- and ivfflat needs the column. lists=100 suits the ~10^4-10^5 rows a

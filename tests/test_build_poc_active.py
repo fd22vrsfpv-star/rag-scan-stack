@@ -62,13 +62,18 @@ def test_the_run_is_recorded_before_the_graph_runs():
     rec = [n.lineno for n in ast.walk(fn)
            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
            and n.func.id == "_record_build_poc_attempt"]
+    # Whatever RUNS the graph — `.invoke()` directly, or the traced runner
+    # that streams it. Pinning the literal `graph.invoke` made this test fail
+    # when the run moved to `stream_mode=["debug","values"]`, though the
+    # ordering it guards was never violated.
     inv = [n.lineno for n in ast.walk(fn)
-           if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-           and n.func.attr == "invoke"]
+           if isinstance(n, ast.Call)
+           and (getattr(n.func, "attr", None) in ("invoke", "stream")
+                or getattr(n.func, "id", None) == "_run_graph_traced")]
     assert rec, "invoke_build_poc never records the run's start"
-    assert inv, "graph.invoke is gone"
+    assert inv, "nothing in invoke_build_poc runs the graph"
     assert min(rec) < min(inv), (
-        f"the start record (line {min(rec)}) happens AFTER graph.invoke "
+        f"the start record (line {min(rec)}) happens AFTER the graph runs "
         f"(line {min(inv)}) — it cannot answer 'did it start?'")
 
 

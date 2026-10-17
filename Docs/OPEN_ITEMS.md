@@ -27,6 +27,29 @@ named tests exist).
 
 ## Known gaps carried from earlier sessions
 
+### `knowledge/` subdirectory docs carry no retrieval keys of their own
+**Found:** 2026-10-17, while making vuln_class/cve/service first-class columns.
+**Evidence:** `rag_documents` now has `vuln_class`, `cve` and `service` columns
+(indexed, backfilled — 4,835 rows took a `cve` from existing metadata), and the
+class-keyed renderers emit them: 56 rows carry a `vuln_class`, 113 a `service`.
+The 91 documents rendered from `knowledge/extractors/` and `knowledge/playbooks/`
+carry `tool` / `playbook` / `doc_type` in metadata but **no `service` and no
+`vuln_class`**, so a PoC build cannot narrow to "the playbook phase for an SMB
+target" or "the extractor for the tool I just ran" — only similarity reaches
+them. `knowledge_service_tools` (97 docs) is keyed by service; the extractor
+specs are keyed by tool, and nothing maps a tool to the service it probes.
+**Where:** `etl/load_knowledge_documents.py` (`_render_extractor_spec`,
+`_render_playbook`), `knowledge/extractors/*.yaml`, `knowledge/playbooks/*.yaml`.
+**Done when:** extractor specs resolve a `service` (the tool catalogue already
+maps tool → service) and playbook phases carry the vuln_class or service they
+apply to, so `/rag/knowledge/search` can filter them the way it now filters
+class documents.
+**Enforced by:** not enforced. A test would assert every embedded doc carries at
+least one structured retrieval key, with a declared-debt list for the ones that
+legitimately cannot.
+*Why it matters:* the columns exist now, so a document without one is reachable
+only by luck — the exact gap the columns were added to close, one level down.
+
 ### 47 knowledge files are read deterministically and never embedded
 **Found:** 2026-10-17. Supersedes "`knowledge/extractors/` escapes the
 RAG-coverage invariant", whose blind spot is now CLOSED — and which

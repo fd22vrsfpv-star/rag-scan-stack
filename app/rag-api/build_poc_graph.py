@@ -149,7 +149,8 @@ def initial_state(cve: str, ip: str, port: int, product=None, version=None, eid=
                   hint: Optional[str] = None,
                   focused_urls: Optional[List[str]] = None,
                   fact_challenge: Optional[str] = None,
-                  reuse_recon: Optional[str] = None) -> BuildPocState:
+                  reuse_recon: Optional[str] = None,
+                  run_id: Optional[str] = None) -> BuildPocState:
     """Build the initial state dict handed to the graph. Mirrors the argument shape
     of _build_poc_core so the wrapper is trivial."""
     # Supplied credentials are the FIRST cred_hint so node_auto_login logs in
@@ -163,7 +164,13 @@ def initial_state(cve: str, ip: str, port: int, product=None, version=None, eid=
         "product": product, "version": version, "eid": eid,
         "max_iters": max_iters, "model": model, "research": research,
         "recon_first": recon_first, "recon_source": recon_source, "hint": hint,
-        "run_id": f"{cve}_{ip}_{int(time.time())}",
+        # The checkpoint key. Generated with a timestamp by default, so two
+        # builds of the same CVE never collide — but a CALLER may pin it,
+        # which is what makes recovery reachable from outside: re-POSTing the
+        # same run_id resumes that thread from its last completed node
+        # instead of starting a fresh build. Without this the checkpointer
+        # works and nothing can ever ask it to.
+        "run_id": run_id or f"{cve}_{ip}_{int(time.time())}",
         "t0": time.time(),
         "segments": [], "recon_metrics": {}, "intel_list": [],
         "zap_paths": [], "arjun_discovered": [], "focused_urls": list(focused_urls or []),
@@ -2324,7 +2331,7 @@ def _add_node(g, name: str, fn):
     g.add_node(name, _traced(name, fn))
 
 
-def build_graph():
+def build_graph(checkpointer=None):
     """Assemble the full StateGraph. Structure:
        START -> [recon block if recon_first]
               -> auth_establish -> load_hints -> research
@@ -2503,7 +2510,183 @@ def build_graph():
     g.add_edge("tool_handoff", "post_run_review")
     g.add_edge("post_run_review", END)
 
-    return g.compile()
+    return g.compile(checkpointer=checkpointer)
+
+
+def _saver_cm():
+    """Postgres checkpointer, the same mechanism agent sessions already use.
+
+    Mirrors `autogen_agents/langgraph_engine.py::_saver_cm` deliberately —
+    one checkpointing story, one set of tables, `thread_id` telling the two
+    apart. Returns None when the package or the DSN is absent, and the build
+    then runs exactly as before: a missing checkpointer must degrade recovery,
+    never block a build.
+    """
+    try:
+        from langgraph.checkpoint.postgres import PostgresSaver
+    except Exception as e:  # noqa: BLE001
+        import logging as _lg
+        _lg.getLogger(__name__).info(
+            "build-poc: checkpointing unavailable (%s) — running unrecoverable",
+            type(e).__name__)
+        return None
+    dsn = os.environ.get("DB_DSN")
+    if not dsn:
+        return None
+    try:
+        return PostgresSaver.from_conn_string(dsn)
+    except Exception as e:  # noqa: BLE001
+        import logging as _lg
+        _lg.getLogger(__name__).warning(
+            "build-poc: checkpointer init failed (%s) — running unrecoverable", e)
+        return None
+
+
+def _has_checkpoint(graph, cfg) -> bool:
+    """Has this thread_id run before?
+
+    Decides RESUME vs FRESH, and the distinction is load-bearing: with a
+    checkpointer, passing the full initial state again RESTARTS the graph,
+    while passing None resumes from the last completed node. Getting it
+    backwards would silently re-run a 12-iteration build from scratch.
+    """
+    try:
+        snap = graph.get_state(cfg)
+        return bool(snap and getattr(snap, "next", None))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _run_graph_traced(state, graph=None):
+    """Run the graph with LangGraph's OWN per-node instrumentation.
+
+    `.invoke()` returns the final state and nothing else, so a build that
+    exhausted its iterations left no record of WHICH nodes ran, how long each
+    took, or which one raised — the 61% of builds that stop at
+    off_target / axis_exhausted / max_iters were diagnosed from node-authored
+    trace lines alone, and a node that never ran authored none.
+
+    `stream_mode=["debug", "values"]` is built in, local, and needs no
+    checkpointer and no hosted service: "debug" yields a task / task_result
+    pair per node, "values" yields the state after each superstep. The LAST
+    "values" payload is byte-identical to what `.invoke()` returns — verified
+    against this langgraph build before the switch, because getting the final
+    state wrong would break every build rather than just the tracing.
+
+    Fail-soft in both directions: if the stream yields no "values" at all we
+    fall back to `.invoke()` rather than returning a half-state, and a tracing
+    error never interrupts the run.
+    """
+    import time as _t
+    from api import _poc_trace
+    run_id = state.get("run_id")
+
+    # CHECKPOINTED RUN. State lands in Postgres keyed on thread_id = run_id,
+    # so a build that dies mid-flight resumes from its last completed node
+    # instead of starting over. On 2026-10-17 a rag-api restart during a
+    # focused-10 killed all ten in-flight builds at HTTP:000; with a
+    # checkpointer those resume.
+    #
+    # Fail-soft in every direction: no package, no DSN, failed init or failed
+    # setup all fall through to an uncheckpointed graph. Losing recovery is
+    # acceptable; losing the build is not.
+    _cm = None if graph is not None else _saver_cm()
+    _entered = None
+    cfg = None
+    try:
+        if _cm is not None:
+            try:
+                _entered = _cm.__enter__()
+                _entered.setup()   # idempotent; shares the session tables
+                graph = build_graph(_entered)
+                cfg = {"configurable": {"thread_id": str(run_id or "")}}
+            except Exception as _e:  # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    "build-poc: checkpointing unavailable (%s) — running "
+                    "unrecoverable", _e)
+                if _entered is not None:
+                    try:
+                        _cm.__exit__(None, None, None)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    _entered = None
+                graph = None
+                cfg = None
+        if graph is None:
+            graph = build_graph()
+        return _stream_graph(graph, state, cfg, run_id, _poc_trace, _t)
+    finally:
+        if _entered is not None:
+            try:
+                _cm.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _stream_graph(graph, state, cfg, run_id, _poc_trace, _t):
+    """Stream the graph, tracing each node, and return the final state."""
+    final = None
+    started = {}
+    order = []
+    # RESUME vs FRESH is load-bearing: with a checkpointer, passing the full
+    # initial state again RESTARTS the graph, while passing None resumes from
+    # the last completed node. Backwards, this silently re-runs a
+    # 12-iteration build from scratch.
+    _resume = bool(cfg) and _has_checkpoint(graph, cfg)
+    if _resume:
+        try:
+            _poc_trace(run_id, "resume",
+                       response="resuming from the last completed node",
+                       extra={"resumed": True})
+        except Exception:  # noqa: BLE001
+            pass
+    _input = None if _resume else state
+    _kw = {"stream_mode": ["debug", "values"]}
+    if cfg:
+        _kw["config"] = cfg
+    for mode, payload in graph.stream(_input, **_kw):
+        if mode == "values":
+            final = payload
+            continue
+        if mode != "debug" or not isinstance(payload, dict):
+            continue
+        try:
+            kind = payload.get("type")
+            body = payload.get("payload") or {}
+            name = body.get("name")
+            if not name:
+                continue
+            if kind == "task":
+                started[name] = _t.time()
+                order.append(name)
+            elif kind == "task_result":
+                elapsed = None
+                if name in started:
+                    elapsed = round(_t.time() - started.pop(name), 3)
+                err = body.get("error")
+                _poc_trace(run_id, "node",
+                           response=("%s %s%s" % (
+                               name, "FAILED" if err else "ok",
+                               f" in {elapsed}s" if elapsed is not None else "")),
+                           extra={"node": name,
+                                  "step": payload.get("step"),
+                                  "seconds": elapsed,
+                                  "ok": not err,
+                                  "error": str(err)[:300] if err else None,
+                                  "interrupted": bool(body.get("interrupts"))})
+        except Exception:  # noqa: BLE001
+            # Instrumentation must never take down the build it observes.
+            pass
+    if final is None:
+        # The stream produced no state — do not hand back a half-built dict.
+        return graph.invoke(state, **({"config": cfg} if cfg else {}))
+    try:
+        _poc_trace(run_id, "node_path",
+                   response="%d node(s): %s" % (len(order), " -> ".join(order)),
+                   extra={"nodes": order, "node_count": len(order)})
+    except Exception:  # noqa: BLE001
+        pass
+    return final
 
 
 def summarize_state(final: Dict[str, Any], declared=None) -> Dict[str, Any]:
@@ -2580,7 +2763,6 @@ def invoke_build_poc(state: BuildPocState) -> Dict[str, Any]:
     """Run the graph and return the same dict shape _build_poc_core returned to
     its endpoint caller: {command, assertion, canary, success, verified,
     off_target, reflection, iterations, exploit_store_id, ...}."""
-    graph = build_graph()
     # ── Announce the run BEFORE doing any of it ─────────────────────────────
     #
     # `build_poc_endpoint` is a synchronous def: it blocks for the whole build
@@ -2606,7 +2788,7 @@ def invoke_build_poc(state: BuildPocState) -> Dict[str, Any]:
             "build-poc: could not record the start of %s: %s",
             state.get("run_id"), e)
     try:
-        final = graph.invoke(state)
+        final = _run_graph_traced(state)
     except Exception as e:  # noqa: BLE001
         # A crash between nodes used to leave no `result` and no index row
         # (CVE-2024-22120, 2026-10-08). Record it, then propagate.

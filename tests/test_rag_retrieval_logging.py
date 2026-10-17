@@ -133,6 +133,27 @@ class TestTheRecallBlockReportsItsSources:
             "the trace must carry structured `extra` naming each source; a "
             "character count cannot say what was recalled")
 
+    def test_disabled_is_not_reported_as_empty(self, tree):
+        """THREE outcomes at this level too.
+
+        The first version of this fix returned ("", []) both when the feature
+        flag was off and when every source genuinely returned nothing, and
+        traced both as "every source returned nothing" — recording a disabled
+        memory as an exhausted one. Caught in review, not by a test, which is
+        why there is now a test.
+        """
+        fn = _func(tree, "_compose_recall_context")
+        rets = [n for n in ast.walk(fn) if isinstance(n, ast.Return) and n.value]
+        dumps = [ast.dump(r) for r in rets]
+        assert any("not_queried" in d for d in dumps), (
+            "the disabled path must carry a reason, or it is indistinguishable "
+            "from an empty result")
+        caller = _func(tree, "_synthesize_cve_poc")
+        cdump = ast.dump(caller)
+        assert "not_queried" in cdump, (
+            "the caller must branch on the reason; a composer that reports it "
+            "to a caller that ignores it changes nothing")
+
     def test_an_empty_recall_is_still_traced(self, tree):
         """Three outcomes: recalled something, recalled nothing, never looked.
         Only tracing the non-empty case made the last two identical."""

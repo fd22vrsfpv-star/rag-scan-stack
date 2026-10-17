@@ -47,7 +47,8 @@ if not os.path.isdir(KNOWLEDGE_DIR):
     if os.path.isdir(_repo):
         KNOWLEDGE_DIR = _repo
 
-Doc = Tuple[str, str]
+# (title, body) or (title, body, extra_metadata)
+Doc = Tuple[str, ...]
 
 
 def _s(v: Any) -> str:
@@ -85,7 +86,8 @@ def _render_service_tools(data: Dict[str, Any]) -> List[Doc]:
             body += f"\nMetasploit: {msf}."
         if nuclei:
             body += f"\nNuclei tags: {nuclei}."
-        docs.append((f"Service tooling: {svc}", body.strip()))
+        docs.append((f"Service tooling: {svc}", body.strip(),
+                     {"service": svc, "doc_type": "service_tooling"}))
     return docs
 
 
@@ -141,7 +143,9 @@ def _render_service_access_methods(data: Dict[str, Any]) -> List[Doc]:
                 + (f"Attempt: `{m['attempt']}`. " if m.get("attempt") else "")
                 + (f"Metasploit: {m['msf']}. " if m.get("msf") else "")
                 + (f"Success when: {_s(m.get('success'))}." if m.get("success") else ""))
-        docs.append((title, body.strip()))
+        docs.append((title, body.strip(),
+                     {"service": svc, "doc_type": "service_access_method",
+                      "mutates": bool(m.get("mutates"))}))
     return docs
 
 
@@ -870,7 +874,16 @@ def _render_vuln_classes(data: Dict[str, Any]) -> List[Doc]:
         for cw in (c.get("cwes") or []):
             if isinstance(cw, dict) and cw.get("id"):
                 body.append(f"{cw['id']}: {_s(cw.get('name'))}.")
-        docs.append((title, " ".join(" ".join(body).split())))
+        # The keys a PoC build already HOLDS: the CVE's CWE ids, and the class
+        # name once classified. Without them this document is reachable only by
+        # similarity — the planner cannot ASK for it, so a CWE-89 CVE has no
+        # deterministic way to land on the sqli class.
+        _cwe_ids = [str(cw.get("id")) for cw in (c.get("cwes") or [])
+                    if isinstance(cw, dict) and cw.get("id")]
+        docs.append((title, " ".join(" ".join(body).split()),
+                     {"vuln_class": name, "cwes": _cwe_ids,
+                      "owasp": c.get("owasp"), "class_kind": c.get("kind"),
+                      "doc_type": "vuln_class"}))
     return docs
 
 
@@ -898,7 +911,9 @@ def _render_payload_variants(data: Dict[str, Any]) -> List[Doc]:
                             + ".")
             if e.get("note"):
                 body.append(_s(e.get("note")))
-            docs.append((title, " ".join(" ".join(body).split())))
+            docs.append((title, " ".join(" ".join(body).split()),
+                         {"vuln_class": cls, "doc_type": "payload_variant",
+                          "os": e.get("os"), "runtime": e.get("runtime")}))
     for r in (data.get("detection") or []):
         if not isinstance(r, dict):
             continue
@@ -953,6 +968,93 @@ RENDERERS = {
 }
 
 
+def _render_extractor_spec(data: Dict[str, Any], name: str = "") -> List[Doc]:
+    """One document per tool extractor spec.
+
+    What facts a tool's output yields IS "what to do next" knowledge, so
+    CLAUDE.md's RAG-first rule applies — but `app/rag-api/extractor_specs.py`
+    read these deterministically and nothing embedded them. They were invisible
+    to the coverage guard too, because its glob was flat.
+
+    The GATES keep reading the YAML by exact lookup; this is the recall half,
+    so an agent can ask "what does feroxbuster output tell me" and get the
+    answer without the spec being wired into a prompt by hand.
+    """
+    tool = str(data.get("tool") or name or "").strip()
+    if not tool:
+        return []
+    desc = str(data.get("description") or "").strip()
+    fields = sorted((data.get("deterministic") or {}).keys())
+    notable = data.get("notable") or []
+    lines = [f"Tool: {tool}"]
+    if desc:
+        lines.append(desc)
+    if fields:
+        lines.append("Facts extracted from its output: " + ", ".join(fields))
+    for rule in notable:
+        if not isinstance(rule, dict):
+            continue
+        fid = rule.get("finding_type") or rule.get("id") or "finding"
+        sev = rule.get("severity") or "info"
+        why = str(rule.get("title") or rule.get("message") or "").strip()
+        lines.append(f"Notable [{sev}] {fid}: {why}".rstrip(": "))
+    prompt = str(data.get("prompt") or "").strip()
+    if prompt:
+        lines.append("Analyst guidance: " + prompt)
+    title = f"Tool output extractor: {tool}"
+    return [(title, "\n".join(l for l in lines if l))]
+
+
+def _render_playbook(data: Dict[str, Any], name: str = "") -> List[Doc]:
+    """One document per playbook PHASE, not per file.
+
+    A playbook is a long ordered document; embedding it whole gives one
+    enormous chunk that matches everything weakly. Per phase keeps each
+    document about one thing, which is what similarity search needs.
+
+    `mutates` is carried into the text deliberately: a retrieved step that
+    CHANGES the target reads identically to one that only looks, and the
+    operator should see which is which before acting on a recalled step.
+    """
+    pb = str(data.get("title") or data.get("name") or name or "").strip()
+    if not pb:
+        return []
+    docs: List[Doc] = []
+    for phase in (data.get("phases") or []):
+        if not isinstance(phase, dict):
+            continue
+        pname = str(phase.get("name") or phase.get("id") or "").strip()
+        if not pname:
+            continue
+        steps = [st for st in (phase.get("steps") or []) if isinstance(st, dict)]
+        lines = [f"Playbook: {pb}", f"Phase: {pname}"]
+        for st in steps:
+            t = str(st.get("title") or st.get("id") or "").strip()
+            if not t:
+                continue
+            bits = [f"  - {t}"]
+            if st.get("mutates"):
+                bits.append("[MUTATES the target]")
+            acc = st.get("access_required")
+            if acc and str(acc).lower() != "none":
+                bits.append(f"[requires {acc}]")
+            lines.append(" ".join(bits))
+        if len(lines) <= 2:
+            continue
+        docs.append((f"Playbook {pb} - {pname}", "\n".join(lines)))
+    return docs
+
+
+# Renderers that apply to EVERY file in a knowledge subdirectory, rather than
+# to one named top-level file. `sync_all` globs the directory and renders each
+# file with the same function, so a new spec or playbook is embedded by being
+# added — no registry edit, which is the point of RAG-first knowledge.
+DIR_RENDERERS = {
+    "extractors": _render_extractor_spec,
+    "playbooks": _render_playbook,
+}
+
+
 def _embed(texts: List[str]) -> List[List[float]]:
     r = httpx.post(f"{EMBEDDER_URL.rstrip('/')}/embed", json={"texts": texts},
                    timeout=180, verify=False)
@@ -964,11 +1066,22 @@ def _embed(texts: List[str]) -> List[List[float]]:
 
 
 def render_file(stem: str, data: Dict[str, Any]) -> List[Doc]:
+    if "/" in stem:
+        # subdirectory file: one renderer serves the whole directory
+        d, base = stem.split("/", 1)
+        fn = DIR_RENDERERS.get(d)
+        if not fn:
+            return []
+        try:
+            return [d for d in fn(data or {}, base) if d[1] and d[1].strip()]
+        except Exception as e:  # noqa: BLE001
+            log.warning("renderer for %s failed: %s", stem, e)
+            return []
     fn = RENDERERS.get(stem)
     if not fn:
         return []
     try:
-        return [(t, b) for t, b in fn(data or {}) if b and b.strip()]
+        return [d for d in fn(data or {}) if d[1] and d[1].strip()]
     except Exception as e:  # noqa: BLE001
         log.warning("renderer for %s failed: %s", stem, e)
         return []
@@ -982,17 +1095,33 @@ def load_one(conn, stem: str, docs: List[Doc]) -> int:
         conn.commit()
         cur.close()
         return 0
-    vectors = _embed([f"{t}\n{b}" for t, b in docs])
+    # A doc is (title, body) or (title, body, extra_metadata). The third slot
+    # is what makes a knowledge row JOINABLE: every row used to carry only
+    # {source, kind, file}, so the class/CWE data sat in the BODY text and a
+    # PoC build for a CWE-89 CVE could reach the sqli document by similarity
+    # alone — never by asking for it. Structured keys (vuln_class, cwes, tool)
+    # let a reader FILTER, which is the deterministic half CLAUDE.md wants
+    # beside retrieval.
+    norm = [(d[0], d[1], (d[2] if len(d) > 2 and isinstance(d[2], dict) else {}))
+            for d in docs]
+    vectors = _embed([f"{t}\n{b}" for t, b, _ in norm])
     rows = []
-    for (title, text), vec in zip(docs, vectors):
+    for (title, text, extra), vec in zip(norm, vectors):
         vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
-        rows.append((title, text,
-                     _ex.Json({"source": source, "kind": "knowledge", "file": f"{stem}.yaml"}),
-                     vec_str))
+        meta = {"source": source, "kind": "knowledge", "file": f"{stem}.yaml"}
+        meta.update({k: v for k, v in (extra or {}).items() if v not in (None, "", [])})
+        # vuln_class and cve are COLUMNS, not just metadata keys, so a reader
+        # can filter or join on them instead of digging through jsonb. Kept in
+        # the metadata too: the jsonb stays the complete record of the doc.
+        rows.append((title, text, _ex.Json(meta), vec_str,
+                     (extra or {}).get("vuln_class") or None,
+                     (extra or {}).get("cve") or None,
+                     (extra or {}).get("service") or None))
     _ex.execute_values(
         cur,
-        "INSERT INTO rag_documents (title, text_chunk, metadata, embedding) VALUES %s",
-        rows, template="(%s, %s, %s, %s::vector)")
+        "INSERT INTO rag_documents (title, text_chunk, metadata, embedding,"
+        " vuln_class, cve, service) VALUES %s",
+        rows, template="(%s, %s, %s, %s::vector, %s, %s, %s)")
     conn.commit()
     cur.close()
     return len(rows)
@@ -1008,8 +1137,22 @@ def sync_all() -> Dict[str, Any]:
     conn = psycopg2.connect(DB_DSN)
     out: Dict[str, Any] = {"files": {}, "total": 0}
     try:
-        for stem in sorted(RENDERERS):
-            path = os.path.join(KNOWLEDGE_DIR, f"{stem}.yaml")
+        stems = [(stem, os.path.join(KNOWLEDGE_DIR, f"{stem}.yaml"))
+                 for stem in sorted(RENDERERS)]
+        # Subdirectory knowledge: every file in a DIR_RENDERERS directory.
+        # Discovered rather than registered, so adding a playbook or an
+        # extractor spec embeds it without a code change — the whole point of
+        # "new knowledge takes effect by being loaded, not by editing logic".
+        for d in sorted(DIR_RENDERERS):
+            ddir = os.path.join(KNOWLEDGE_DIR, d)
+            if not os.path.isdir(ddir):
+                continue
+            for fn in sorted(os.listdir(ddir)):
+                if not fn.endswith((".yaml", ".yml")) or fn.startswith("_"):
+                    continue
+                base = fn.rsplit(".", 1)[0]
+                stems.append((f"{d}/{base}", os.path.join(ddir, fn)))
+        for stem, path in stems:
             if not os.path.exists(path):
                 out["files"][stem] = {"error": "missing"}
                 continue

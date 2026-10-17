@@ -17108,7 +17108,28 @@ def _gather_decide(items: list, vuln_class: str, privileges_required: str = "") 
 # REMOVED _SCAN_EVIDENCE_CWE_FOR_CLASS — projected from knowledge/vuln_classes.yaml -> _vc_cwe_ids_for()
 
 
-def _scan_evidence_for_target(cve, ip, port, eid, vc) -> dict:
+def _scan_evidence_counts(out: dict) -> list:
+    """Per-source row counts for a `_scan_evidence_for_target` result, in the
+    `{source, rows}` shape the recall manifest uses. A count answers "did the
+    build already have the parameter it went looking for"; a character total
+    never did."""
+    counts = []
+    for k, v in sorted((out or {}).items()):
+        if isinstance(v, (list, tuple, dict)):
+            n = len(v)
+        elif isinstance(v, str):
+            n = 1 if v.strip() else 0
+        else:
+            n = 1 if v else 0
+        counts.append({"source": k, "rows": n})
+    return counts
+
+
+def _scan_evidence_total(out: dict) -> int:
+    return sum(c["rows"] for c in _scan_evidence_counts(out))
+
+
+def _scan_evidence_for_target(cve, ip, port, eid, vc, trace_run_id=None) -> dict:
     """Pull scan-side evidence already captured for this (ip, port, cve) so the
     build-poc gather + synth can solve from our own telemetry instead of
     re-mining advisory text.
@@ -17118,12 +17139,21 @@ def _scan_evidence_for_target(cve, ip, port, eid, vc) -> dict:
     LIMITs. Fail-soft on any error — an empty dict never breaks gather.
 
     Returns {poc_hints, discovered_params, web_findings, content, banner,
-    prior_runs}. All values are plain Python (no DB rows retained)."""
+    prior_runs}. All values are plain Python (no DB rows retained).
+
+    Traced (`recall_scan_evidence`) with a per-source row count, so a build
+    that re-discovered what we already had is visible as such. THREE outcomes:
+    no IP to key on (`not_queried`), the lookup raised (`query_failed` — note
+    the fail-soft `out` is returned either way, which is exactly why the
+    distinction has to be recorded), or it ran — `hit`/`empty`."""
     out = {"poc_hints": "", "discovered_params": [], "web_findings": [],
            "content": {}, "banner": None, "prior_runs": [], "prior_live_recon": []}
     try:
         ip_s = str(ip) if ip is not None else None
         if not ip_s:
+            _trace_retrieval(trace_run_id, "recall_scan_evidence", RETRIEVAL_NOT_QUERIED, count=0,
+                             note="scan evidence NOT queried: no target IP to key on",
+                             extra={"cve": cve, "port": port, "vuln_class": vc})
             return out
         port_i = int(port) if port is not None else None
         cwe_filter = _vc_cwe_ids_for(vc) or None
@@ -17345,6 +17375,31 @@ def _scan_evidence_for_target(cve, ip, port, eid, vc) -> dict:
                 logging.debug("scan_evidence sast failed: %s", e)
     except Exception as e:  # noqa: BLE001
         logging.debug("_scan_evidence_for_target top-level failed cve=%s: %s", cve, e)
+        _trace_retrieval(trace_run_id, "recall_scan_evidence", RETRIEVAL_FAILED,
+                         count=_scan_evidence_total(out),
+                         note="scan evidence lookup FAILED part-way (what follows is partial, "
+                              "not an empty telemetry store): %s" % str(e)[:200],
+                         items=_scan_evidence_counts(out),
+                         extra={"cve": cve, "ip": str(ip), "port": port, "vuln_class": vc,
+                                "error": str(e)[:300]})
+        return out
+    try:
+        _counts = _scan_evidence_counts(out)
+        _total = _scan_evidence_total(out)
+        _trace_retrieval(trace_run_id, "recall_scan_evidence",
+                         RETRIEVAL_HIT if _total else RETRIEVAL_EMPTY,
+                         count=_total, items=_counts,
+                         note=("scan evidence for %s:%s — %s"
+                               % (ip, port, ", ".join("%s=%s" % (c["source"], c["rows"])
+                                                      for c in _counts if c["rows"])))
+                              if _total else
+                              ("scan evidence QUERIED and empty: nothing captured for %s:%s "
+                               "(vuln_class=%s) — this target is genuinely un-enumerated"
+                               % (ip, port, vc)),
+                         extra={"cve": cve, "ip": str(ip), "port": port, "vuln_class": vc,
+                                "engagement_id": (str(eid) if eid else None)})
+    except Exception as _te:  # noqa: BLE001
+        logging.debug("recall_scan_evidence trace failed: %s", _te)
     return out
 
 
@@ -17472,7 +17527,7 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
     # manifest text carries it into synth's guidance block. Burp-sourced rows
     # are excluded inside the helper per operator intent 2026-10-08.
     try:
-        scan_ev = _scan_evidence_for_target(cve, ip, port, eid, vc)
+        scan_ev = _scan_evidence_for_target(cve, ip, port, eid, vc, trace_run_id=run_id)
     except Exception as e:  # noqa: BLE001
         logging.debug("gather: scan_evidence lookup failed: %s", e)
         scan_ev = {"poc_hints": "", "discovered_params": [], "web_findings": [],
@@ -18343,8 +18398,15 @@ def _gather_llm_fallback(cve, ip, port, product, version, *, vc, missing,
     return out
 
 
-def _gather_manifest_text(man: dict) -> str:
-    """Compact block for the synth prompt: confirmed facts first, then gaps."""
+def _gather_manifest_text(man: dict, run_id=None) -> str:
+    """Compact block for the synth prompt: confirmed facts first, then gaps.
+
+    `run_id` is optional and observability-only: it lets the lesson recall at
+    the bottom record what it returned into this run's trace. Omitted, the
+    recall behaves exactly as before and writes no row — so the two callers in
+    build_poc_graph.py (which hold no run_id at that point) are unaffected, and
+    `_record_gather_manifest` — which does hold one, and runs once per build —
+    is the path that produces the trace."""
     lines = [f"GATHER CHECK ({man.get('mode')}): {man.get('summary')}"]
     for i in man.get("items") or []:
         if i["status"] in ("gathered", "unverified"):
@@ -18540,13 +18602,21 @@ def _gather_manifest_text(man: dict) -> str:
     vuln_class = (facts.get("vuln_class") or "").strip().lower()
     if product:
         try:
-            recalled = _recall_lessons(product, vuln_class=vuln_class)
+            recalled = _recall_lessons(product, vuln_class=vuln_class, trace_run_id=run_id)
             note = _render_lessons_note(recalled)
             if note:
                 lines.append("")
                 lines.append(note)
         except Exception:  # noqa: BLE001
             pass
+    else:
+        # The helper's own not_queried row cannot fire from here — this guard
+        # short-circuits before the call — so emit it at the gate that made the
+        # decision. Otherwise "no product" is an absent row, and an absent row
+        # has always been read as "this product has no lessons".
+        _trace_retrieval(run_id, "recall_lessons", RETRIEVAL_NOT_QUERIED, count=0,
+                         note="lessons NOT queried: the gather manifest resolved no product",
+                         extra={"product": None, "vuln_class": vuln_class or None})
 
     return "\n".join(lines)
 
@@ -19053,7 +19123,8 @@ def _record_gather_manifest(man: dict, cve: str, ip, port, eid=None, run_id=None
     from psycopg2.extras import Json
     out = {"follow_up_id": None}
     try:
-        _poc_trace(run_id, "gather_check", response=_gather_manifest_text(man), extra={"gather_manifest": man})
+        _poc_trace(run_id, "gather_check", response=_gather_manifest_text(man, run_id=run_id),
+                   extra={"gather_manifest": man})
     except Exception:  # noqa: BLE001
         pass
     if not man.get("ready"):
@@ -20135,6 +20206,86 @@ def _trace_extra(entry: dict) -> dict:
     if isinstance(entry.get("extra"), dict):
         return entry["extra"]
     return {k: v for k, v in entry.items() if k not in _POC_TRACE_STD_KEYS}
+
+
+# ── Retrieval observability ──────────────────────────────────────────────────
+# Seven helpers retrieved prior knowledge that informed an attack and none of
+# them recorded what came back. The trace therefore could not answer the first
+# question a reviewer asks about a failed build: *what did it know?*
+#
+# THREE outcomes, never two. "The memory held nothing" and "the memory was
+# never consulted" are opposite facts that both arrive as an empty list, and
+# this repo keeps shipping the bug where the second is filed as the first — an
+# unexplored approach then reads as a disproven one. Every retrieval emits a
+# row, including the empty one; only the outcome differs.
+RETRIEVAL_HIT = "hit"                   # queried, rows returned
+RETRIEVAL_EMPTY = "empty"               # queried, zero rows — a real negative
+RETRIEVAL_NOT_QUERIED = "not_queried"   # precondition absent, no query sent
+RETRIEVAL_FAILED = "query_failed"       # query attempted and raised
+
+
+def _trace_retrieval(run_id, phase, outcome, *, iteration=0, count=None,
+                     items=None, note=None, extra=None):
+    """Record WHAT a retrieval returned — counts and identifiers, never a size.
+
+    `412 chars` tells a reviewer nothing; `3 prior errors, best sim 0.78,
+    signatures X/Y/Z` tells them whether the right thing was recalled. Mirrors
+    the `recall_context` manifest: a human-readable `response` line plus the
+    structured payload on `extra`, which `_trace_extra` reads back.
+
+    Fail-soft by construction: observing a retrieval must never break it, so
+    every path here is wrapped and a falsy `run_id` is a no-op rather than a
+    row written to `None.jsonl`.
+    """
+    try:
+        if not run_id:
+            return
+        _items = list(items or [])[:12]
+        n = len(_items) if count is None else int(count)
+        payload = {"retrieval": phase, "outcome": outcome, "count": n, "items": _items}
+        if extra:
+            payload.update(extra)
+        _poc_trace(run_id, phase, iteration=iteration,
+                   response=str(note or f"{phase}: {outcome}, {n} row(s)")[:1500],
+                   extra=payload)
+    except Exception as e:  # noqa: BLE001
+        logging.debug("retrieval trace failed phase=%s: %s", phase, e)
+
+
+def _trace_rag_hits(run_id, phase, rows, *, empty_note, id_keys=(), extra=None):
+    """`_trace_retrieval` for a vector search that returned `{title, metadata,
+    similarity}` rows. Records the identifier each row carries (criterion id,
+    CVE, product …) and the similarity that ranked it — a score is the only way
+    to tell a near-miss recall from a relevant one, and an ivfflat scan always
+    returns its LIMIT whether or not anything was close.
+
+    `rows` here is always a queried result; the caller handles the two
+    could-not-run outcomes before it gets this far."""
+    try:
+        rows = list(rows or [])
+        items = []
+        for r in rows[:12]:
+            md = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+            it = {"title": str(r.get("title") or "")[:80],
+                  "similarity": round(float(r.get("similarity") or 0.0), 3)}
+            for k in id_keys:
+                if md.get(k) is not None:
+                    it[k] = str(md.get(k))[:60]
+            items.append(it)
+        sims = [round(float(r.get("similarity") or 0.0), 3) for r in rows]
+        ids = [str(i.get(id_keys[0])) for i in items if id_keys and i.get(id_keys[0])] \
+            or [i["title"] for i in items]
+        _trace_retrieval(run_id, phase, RETRIEVAL_HIT if rows else RETRIEVAL_EMPTY,
+                         count=len(rows), items=items,
+                         note=("%d recalled: %s (similarity %s..%s)"
+                               % (len(rows), ", ".join(ids[:8]),
+                                  min(sims) if sims else "n/a", max(sims) if sims else "n/a"))
+                              if rows else empty_note,
+                         extra=dict(extra or {},
+                                    best_similarity=(max(sims) if sims else None),
+                                    worst_similarity=(min(sims) if sims else None)))
+    except Exception as e:  # noqa: BLE001
+        logging.debug("rag-hit trace failed phase=%s: %s", phase, e)
 
 
 def _touch_derived_spec_outcome(cve, verified, stop_reason=None):
@@ -22290,9 +22441,20 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
             # THREE outcomes. "No recall block" and "we never looked" produced
             # the same absence of a trace row, and absence is what 669 of 682
             # runs recorded.
-            _poc_trace(run_id, "recall_context",
-                       response="no recall context: every source returned nothing",
-                       extra={"recall_sources": [], "recall_chars": 0})
+            _disabled = next((m for m in (_ctx_manifest or [])
+                              if m.get("not_queried")), None)
+            if _disabled:
+                _poc_trace(run_id, "recall_context",
+                           response=("recall NOT QUERIED: "
+                                     + str(_disabled["not_queried"])),
+                           extra={"recall_sources": [], "recall_chars": 0,
+                                  "outcome": "not_queried",
+                                  "reason": _disabled["not_queried"]})
+            else:
+                _poc_trace(run_id, "recall_context",
+                           response="no recall context: every source returned nothing",
+                           extra={"recall_sources": [], "recall_chars": 0,
+                                  "outcome": "empty"})
     except Exception as e:  # noqa: BLE001
         logging.debug("recall_context skipped: %s", e)
     try:
@@ -30986,6 +31148,11 @@ class BuildPocBody(BaseModel):
     # folded into the operator hint channel so synth + refine aim there first.
     target_url: Optional[str] = None
     endpoint_hint: Optional[str] = None   # free-text operator note about the endpoint
+    # Pin the run_id to make a build RESUMABLE: re-POSTing the same value
+    # continues that run from its last completed node (thread_id = run_id)
+    # rather than starting over. Omitted => a fresh timestamped id, which is
+    # the old behaviour.
+    run_id: Optional[str] = None
     max_iters: int = 30
     recon_first: bool = True    # do a fast target recon (fetch page/robots/forms) and feed
                                 # what's found to synth; catches shape/params synth would miss.
@@ -33098,7 +33265,8 @@ def _zap_focused_active_scan(ip, port, urls, max_total_wait=300, per_url_wait=90
 
 def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=True, model=None,
                     auth=None, recon_first=False, recon_source="basic", hint=None,
-                    focused_urls=None, fact_challenge=None, reuse_recon=None):
+                    focused_urls=None, fact_challenge=None, reuse_recon=None,
+                    run_id=None):
     """Dispatch the full build-poc pipeline via the LangGraph in build_poc_graph.
 
     All ten recon phases (port_sweep -> waf_detect -> waf_characterize -> basic_recon ->
@@ -33127,7 +33295,7 @@ def _build_poc_core(cve, ip, port, product, version, eid, max_iters=3, research=
         max_iters=max_iters, research=research, model=model, auth=auth,
         recon_first=recon_first, recon_source=recon_source, hint=hint,
         focused_urls=focused_urls or [], fact_challenge=fact_challenge,
-        reuse_recon=reuse_recon,
+        reuse_recon=reuse_recon, run_id=run_id,
     )
     return _bpg.invoke_build_poc(_state)
 
@@ -33532,19 +33700,36 @@ def _record_error_memory(rows, cve, ip, port, eid, run_id, verified):
     return written
 
 
-def _similar_prior_errors(signature, cve=None, ip=None, exclude_run_id=None, limit=3, min_similarity=0.55):
+def _similar_prior_errors(signature, cve=None, ip=None, exclude_run_id=None, limit=3,
+                          min_similarity=0.55, trace_run_id=None):
     """Prior builds that hit the same (or a trigram-similar) error. Reads ACROSS
     engagements by design — the memory is methodology, the point is that the
     other target answered the same payload the same way. Ranked: resolved
     first, then verified, then same CVE, then similarity, then recency. Exact
-    match only when pg_trgm is unavailable."""
+    match only when pg_trgm is unavailable.
+
+    Traced (`recall_prior_errors`) with the signature asked for, the matched
+    builds, their similarity and whether each resolved — the memory that feeds
+    the refine loop used to leave no record of what it handed over. The trace
+    run defaults to `exclude_run_id`, which IS the asking run at both loop call
+    sites; the `/build-poc/error-memory` endpoint passes neither and so writes
+    no row, which is right — there is no run to attribute it to.
+
+    THREE outcomes: no signature to ask with (`not_queried`), the lookup raised
+    (`query_failed`), or it ran — `hit`/`empty`. The loop treats "no prior
+    error like this" as "unexplored"; an unavailable memory must not say that."""
+    _trace_rid = trace_run_id if trace_run_id is not None else exclude_run_id
     sig = str(signature or "")[:_ERR_SIG_MAX]
     if not sig:
+        _trace_retrieval(_trace_rid, "recall_prior_errors", RETRIEVAL_NOT_QUERIED, count=0,
+                         note="error memory NOT queried: this iteration produced no error signature")
         return []
     _ensure_build_poc_error_memory_table()
     cols = ("cve, ip, port, run_id, iteration, signature, status_tier, failing_command, next_command, "
             "next_status, change_summary, resolved, verified, created_at")
     lim = max(1, min(int(limit or 3), 20))
+    _sig_tail = sig.split("|", 2)[-1][:90]
+    _match_mode = "trigram"
     try:
         with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
             try:
@@ -33558,6 +33743,7 @@ def _similar_prior_errors(signature, cve=None, ip=None, exclude_run_id=None, lim
                      str(cve or "").upper(), lim))
             except Exception:  # noqa: BLE001 — no pg_trgm: exact match
                 conn.rollback()
+                _match_mode = "exact_no_pg_trgm"
                 cur.execute(f"""SELECT {cols}, 1.0 AS sim FROM build_poc_error_memory
                     WHERE run_id <> %s AND signature = %s
                     ORDER BY resolved DESC, verified DESC, (cve = %s) DESC,
@@ -33566,12 +33752,40 @@ def _similar_prior_errors(signature, cve=None, ip=None, exclude_run_id=None, lim
             rows = [dict(r) for r in cur.fetchall()]
     except Exception as e:  # noqa: BLE001
         logging.debug("similar prior errors lookup failed: %s", e)
+        _trace_retrieval(_trace_rid, "recall_prior_errors", RETRIEVAL_FAILED, count=0,
+                         note="error memory lookup FAILED (not an empty memory): %s" % str(e)[:200],
+                         extra={"signature_tail": _sig_tail, "match_mode": _match_mode,
+                                "error": str(e)[:300]})
         return []
     for r in rows:
         if r.get("created_at") is not None:
             r["created_at"] = str(r["created_at"])
         if r.get("sim") is not None:
             r["sim"] = round(float(r["sim"]), 3)
+    try:
+        _sims = [r["sim"] for r in rows if r.get("sim") is not None]
+        _items = [{"cve": r.get("cve"), "run_id": str(r.get("run_id") or "")[:12],
+                   "iteration": r.get("iteration"), "sim": r.get("sim"),
+                   "status_tier": r.get("status_tier"), "resolved": bool(r.get("resolved")),
+                   "verified": bool(r.get("verified")),
+                   "signature_tail": str(r.get("signature") or "").split("|", 2)[-1][:90]}
+                  for r in rows]
+        _resolved = sum(1 for r in rows if r.get("resolved"))
+        _trace_retrieval(_trace_rid, "recall_prior_errors",
+                         RETRIEVAL_HIT if rows else RETRIEVAL_EMPTY, items=_items,
+                         note=("%d prior error(s) for \"%s\" [%s]: %s resolved, best sim %s"
+                               % (len(rows), _sig_tail, _match_mode, _resolved,
+                                  (max(_sims) if _sims else "n/a")))
+                              if rows else
+                              ("error memory QUERIED and empty [%s]: no build has hit \"%s\""
+                               % (_match_mode, _sig_tail)),
+                         extra={"signature_tail": _sig_tail, "match_mode": _match_mode,
+                                "min_similarity": float(min_similarity),
+                                "best_similarity": (max(_sims) if _sims else None),
+                                "resolved_count": _resolved,
+                                "cve_asked": str(cve or "").upper() or None, "ip_asked": ip})
+    except Exception as _te:  # noqa: BLE001
+        logging.debug("recall_prior_errors trace failed: %s", _te)
     return rows
 
 
@@ -33814,13 +34028,24 @@ def _store_lessons(lessons, run_id):
     return stored
 
 
-def _recall_lessons(product, vuln_class=None, framework=None, limit=20):
+def _recall_lessons(product, vuln_class=None, framework=None, limit=20, trace_run_id=None):
     """Retrieve relevant lessons for a new build. Lessons are cross-engagement
     methodology — "on Cacti, the CSRF field is __csrf_magic". Returns a list
-    of lesson dicts ranked by confidence and confirmation count."""
+    of lesson dicts ranked by confidence and confirmation count.
+
+    Traced (`recall_lessons`) with each lesson's `type:key`, its confidence and
+    how many builds confirmed it. A lesson goes into synth's guidance as a
+    stated fact, so a wrong one is worse than none and has to be attributable.
+
+    THREE outcomes, and the first is the common one: the build never resolved a
+    product, so no lesson was ever looked up. That is NOT "this product has no
+    lessons", which is what an absent trace row read as."""
     _ensure_build_poc_lessons_table()
     product = str(product or "").strip().lower()
     if not product:
+        _trace_retrieval(trace_run_id, "recall_lessons", RETRIEVAL_NOT_QUERIED, count=0,
+                         note="lessons NOT queried: the build resolved no product to key on",
+                         extra={"vuln_class": vuln_class, "framework": framework})
         return []
     where = ["active = true", "product = %s"]
     params = [product]
@@ -33840,10 +34065,39 @@ def _recall_lessons(product, vuln_class=None, framework=None, limit=20):
                 WHERE {' AND '.join(where)}
                 ORDER BY confidence DESC, times_confirmed DESC, updated_at DESC
                 LIMIT %s""", params)
-            return [dict(r) for r in cur.fetchall()]
+            rows = [dict(r) for r in cur.fetchall()]
     except Exception as e:  # noqa: BLE001
         logging.debug("recall lessons failed: %s", e)
+        _trace_retrieval(trace_run_id, "recall_lessons", RETRIEVAL_FAILED, count=0,
+                         note="lesson lookup FAILED (not an absence of lessons): %s" % str(e)[:200],
+                         extra={"product": product, "vuln_class": vuln_class,
+                                "framework": framework, "error": str(e)[:300]})
         return []
+    try:
+        _items = [{"lesson": "%s:%s" % (r.get("lesson_type"), r.get("lesson_key")),
+                   "confidence": (round(float(r["confidence"]), 3)
+                                  if r.get("confidence") is not None else None),
+                   "times_confirmed": r.get("times_confirmed"),
+                   "times_contradicted": r.get("times_contradicted"),
+                   "source_cve": r.get("source_cve")}
+                  for r in rows]
+        _confs = [i["confidence"] for i in _items if i["confidence"] is not None]
+        _trace_retrieval(trace_run_id, "recall_lessons",
+                         RETRIEVAL_HIT if rows else RETRIEVAL_EMPTY, items=_items,
+                         note=("%d lesson(s) for %s: %s (confidence %s..%s)"
+                               % (len(rows), product,
+                                  ", ".join(i["lesson"] for i in _items[:8]),
+                                  min(_confs) if _confs else "n/a",
+                                  max(_confs) if _confs else "n/a"))
+                              if rows else
+                              ("lessons QUERIED and empty: no prior build has recorded a lesson "
+                               "for product=%s vuln_class=%s" % (product, vuln_class or "any")),
+                         extra={"product": product, "vuln_class": vuln_class,
+                                "framework": framework,
+                                "best_confidence": (max(_confs) if _confs else None)})
+    except Exception as _te:  # noqa: BLE001
+        logging.debug("recall_lessons trace failed: %s", _te)
+    return rows
 
 
 def _render_lessons_note(lessons, max_items=12):
@@ -34328,11 +34582,30 @@ def _load_build_poc_review_knowledge():
         return {"ok": False, "reason": str(e)[:200]}
 
 
-def _retrieve_review_criteria(run_context: str, top_k: int = 10) -> list:
-    """Retrieve relevant review criteria from RAG based on run context."""
+def _retrieve_review_criteria(run_context: str, top_k: int = 10, trace_run_id=None) -> list:
+    """Retrieve relevant review criteria from RAG based on run context.
+
+    Traced (`recall_review_criteria`) with each criterion's id, category,
+    severity and similarity. The review's findings are only ever as good as the
+    criteria it recalled, and a review that silently recalled none scored every
+    run the same way.
+
+    FOUR distinguishable outcomes, because the two failures mean different
+    repairs: `query_failed/stage=embed` is the embedder being unreachable,
+    `query_failed/stage=query` is the vector search, and `empty` means the
+    criteria were simply never loaded into `rag_documents` — that last one is a
+    real negative and must not be confused with either."""
     try:
         vec = _embed_text(run_context)
         vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+    except Exception as e:  # noqa: BLE001
+        logging.warning("review criteria retrieval failed (embed): %s", e)
+        _trace_retrieval(trace_run_id, "recall_review_criteria", RETRIEVAL_FAILED, count=0,
+                         note="review criteria NOT queried: embedding the run context failed",
+                         extra={"stage": "embed", "error": str(e)[:300],
+                                "source": BUILD_POC_REVIEW_RAG_SOURCE})
+        return []
+    try:
         with get_db() as conn, conn.cursor() as cur:
             cur.execute("SET LOCAL ivfflat.probes = 100")
             cur.execute("""
@@ -34344,22 +34617,47 @@ def _retrieve_review_criteria(run_context: str, top_k: int = 10) -> list:
                 LIMIT %s
             """, (vec_str, BUILD_POC_REVIEW_RAG_SOURCE, vec_str, top_k))
             rows = cur.fetchall()
-        return [{"title": r[0], "text": r[1],
-                 "metadata": r[2] if isinstance(r[2], dict) else {},
-                 "similarity": float(r[3])} for r in rows]
     except Exception as e:  # noqa: BLE001
         logging.warning("review criteria retrieval failed: %s", e)
+        _trace_retrieval(trace_run_id, "recall_review_criteria", RETRIEVAL_FAILED, count=0,
+                         note="review criteria lookup FAILED (not an empty corpus): %s" % str(e)[:200],
+                         extra={"stage": "query", "error": str(e)[:300],
+                                "source": BUILD_POC_REVIEW_RAG_SOURCE})
         return []
+    out = [{"title": r[0], "text": r[1],
+            "metadata": r[2] if isinstance(r[2], dict) else {},
+            "similarity": float(r[3])} for r in rows]
+    _trace_rag_hits(trace_run_id, "recall_review_criteria", out,
+                    empty_note="review criteria QUERIED and empty: no %s documents are "
+                               "embedded — the review ran with zero criteria"
+                               % BUILD_POC_REVIEW_RAG_SOURCE,
+                    id_keys=("criterion_id", "category", "severity"),
+                    extra={"source": BUILD_POC_REVIEW_RAG_SOURCE, "top_k": int(top_k),
+                           "ivfflat_probes": 100})
+    return out
 
 
-def _retrieve_prior_reviews(cve, product=None, top_k: int = 5) -> list:
-    """Retrieve learnings from prior reviews for the same product/CVE."""
+def _retrieve_prior_reviews(cve, product=None, top_k: int = 5, trace_run_id=None) -> list:
+    """Retrieve learnings from prior reviews for the same product/CVE.
+
+    Traced (`recall_prior_reviews`) with the recalled titles and similarities.
+    These learnings are promoted straight into the review's recommendations, so
+    "which prior run told us that?" has to be answerable. Same four outcomes as
+    `_retrieve_review_criteria`; the bare `except: return []` here made an
+    unreachable embedder and an empty learning corpus identical."""
+    query = f"build-PoC review learnings for {cve}"
+    if product:
+        query += f" {product}"
     try:
-        query = f"build-PoC review learnings for {cve}"
-        if product:
-            query += f" {product}"
         vec = _embed_text(query)
         vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+    except Exception as e:  # noqa: BLE001
+        logging.warning("prior review retrieval failed (embed): %s", e)
+        _trace_retrieval(trace_run_id, "recall_prior_reviews", RETRIEVAL_FAILED, count=0,
+                         note="prior review learnings NOT queried: embedding the query failed",
+                         extra={"stage": "embed", "error": str(e)[:300], "query": query[:200]})
+        return []
+    try:
         with get_db() as conn, conn.cursor() as cur:
             cur.execute("SET LOCAL ivfflat.probes = 100")
             cur.execute("""
@@ -34371,11 +34669,22 @@ def _retrieve_prior_reviews(cve, product=None, top_k: int = 5) -> list:
                 LIMIT %s
             """, (vec_str, vec_str, top_k))
             rows = cur.fetchall()
-        return [{"title": r[0], "text": r[1],
-                 "metadata": r[2] if isinstance(r[2], dict) else {},
-                 "similarity": float(r[3])} for r in rows]
     except Exception as e:  # noqa: BLE001
+        logging.warning("prior review retrieval failed: %s", e)
+        _trace_retrieval(trace_run_id, "recall_prior_reviews", RETRIEVAL_FAILED, count=0,
+                         note="prior review learnings lookup FAILED (not an empty corpus): %s" % str(e)[:200],
+                         extra={"stage": "query", "error": str(e)[:300], "query": query[:200]})
         return []
+    out = [{"title": r[0], "text": r[1],
+            "metadata": r[2] if isinstance(r[2], dict) else {},
+            "similarity": float(r[3])} for r in rows]
+    _trace_rag_hits(trace_run_id, "recall_prior_reviews", out,
+                    empty_note="prior review learnings QUERIED and empty: no build_poc_review_learning "
+                               "documents are embedded for this query",
+                    id_keys=("cve", "criterion_id", "product"),
+                    extra={"source": "build_poc_review_learning", "top_k": int(top_k),
+                           "ivfflat_probes": 100, "query": query[:200]})
+    return out
 
 
 def _evaluate_review_criterion(criterion, trace_summary, result, fa, session_info) -> dict:
@@ -34501,8 +34810,11 @@ def _post_run_review(run_id, cve, ip, port, product, result, fa, session_info,
                  f"stage={fa.get('stage_reached','')} "
                  f"verified={res.get('verified')} "
                  f"stop={res.get('stop_reason','')}")
-    criteria = _retrieve_review_criteria(context_q)
-    prior_learnings = _retrieve_prior_reviews(cve, product)
+    # `trace_run_id` so both recalls land in THIS run's JSONL: the review is
+    # the record of why a build was judged the way it was, and until now the
+    # two retrievals it is built from left no trace at all.
+    criteria = _retrieve_review_criteria(context_q, trace_run_id=run_id)
+    prior_learnings = _retrieve_prior_reviews(cve, product, trace_run_id=run_id)
     findings = []
     for crit in criteria:
         finding = _evaluate_review_criterion(crit, trace_summary, result, fa, session_info)
@@ -36183,7 +36495,8 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
                            recon_source=body.recon_source or "basic", hint=hint,
                            focused_urls=body.focused_urls or [],
                            fact_challenge=body.fact_challenge,
-                           reuse_recon=body.reuse_recon)
+                           reuse_recon=body.reuse_recon,
+                           run_id=body.run_id)
     return {"ok": True, "cve": cve,
             "test_mode": preset or "custom",
             "effective_knobs": {
@@ -44640,7 +44953,6 @@ def remove_from_scope(
     return {"ok": True, "name": name, "removed": removed}
 
 
-@app.post("/scope/auto-assign-unknown", tags=["Scope"])
 def _scope_engagement(cur, scope_name, default=None):
     """The engagement that owns a scope NAME, from the rows already in it.
 
@@ -44672,6 +44984,7 @@ def _scope_engagement(cur, scope_name, default=None):
     return eid or default
 
 
+@app.post("/scope/auto-assign-unknown", tags=["Scope"])
 def auto_assign_unknown_scope(authorized: bool = Depends(auth)):
     """Find all assets/hostnames not in any scope and assign them to 'unknown_scope'.
 
@@ -54753,7 +55066,11 @@ def _compose_recall_context(ip, product=None, limit=8):
     string when no matches (synth guidance unchanged). Cleaner than stacking
     conditional prepends for each source."""
     if not observed_facts_enabled():
-        return "", []
+        # NOT "empty" — not queried at all. Returning the same ("", []) for a
+        # disabled flag and an exhausted search is the two-outcome bug this
+        # whole change exists to remove, so the reason rides along.
+        return "", [{"source": "DISABLED", "rows": 0, "chars": 0,
+                     "not_queried": "observed_facts_enabled() is false"}]
     parts = []
     # 1. verified techniques FIRST — highest signal (something confirmed works)
     try:
@@ -55962,6 +56279,15 @@ class KnowledgeSearchBody(BaseModel):
     query: str
     top_k: int = 6
     sources: Optional[List[str]] = None    # optional metadata.source filter
+    # DETERMINISTIC narrowing, beside the similarity search. A PoC build knows
+    # the CVE and (once classified) the vuln_class BEFORE it retrieves, so it
+    # can ask for the right documents instead of hoping the embedding lands
+    # near them. Retrieve to decide, filter to act.
+    vuln_class: Optional[str] = None
+    cve: Optional[str] = None
+    # `service` mirrors exploit_chunks, which has been service-scoped since
+    # TIER 24 while the knowledge corpus was not.
+    service: Optional[str] = None
     # WHO is asking. Logged as `knowledge_search:<caller>` so a planner recall
     # is distinguishable from an agent tool call and from an operator poking
     # the endpoint by hand — without it every row reads the same and the log
@@ -55969,7 +56295,6 @@ class KnowledgeSearchBody(BaseModel):
     caller: Optional[str] = None
 
 
-@app.post("/rag/knowledge/search", tags=["RAG/Knowledge"])
 def _rag_log_retrieval(query, vec, rows, *, source, duration_ms=None,
                        llm_answer=None):
     """Record one knowledge retrieval: the query, what came back, how well.
@@ -55997,6 +56322,7 @@ def _rag_log_retrieval(query, vec, rows, *, source, duration_ms=None,
         conn.commit()
 
 
+@app.post("/rag/knowledge/search", tags=["RAG/Knowledge"])
 def rag_knowledge_search(body: KnowledgeSearchBody, _: bool = Depends(auth)):
     """Source-agnostic semantic search over the rag_documents knowledge corpus.
 
@@ -56028,6 +56354,15 @@ def rag_knowledge_search(body: KnowledgeSearchBody, _: bool = Depends(auth)):
     if body.sources:
         where += " AND metadata->>'source' = ANY(%s)"
         params.append(list(body.sources))
+    if body.vuln_class:
+        where += " AND vuln_class = %s"
+        params.append(str(body.vuln_class))
+    if body.cve:
+        where += " AND cve = %s"
+        params.append(str(body.cve))
+    if body.service:
+        where += " AND service = %s"
+        params.append(str(body.service))
     params.append(vec_str)
     params.append(top_k)
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:

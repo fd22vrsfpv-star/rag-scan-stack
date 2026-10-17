@@ -625,6 +625,10 @@ export interface NewsRun {
   per_source?: Array<{
     id: string
     name: string
+    /** 'fetching' is written BEFORE the fetch starts and updated in place, so a
+     *  source that hangs stays visible as in-flight rather than being absent.
+     *  Optional: run rows written before this field existed carry no status. */
+    status?: 'fetching' | 'ok' | 'error'
     articles: number
     new: number
     updated: number

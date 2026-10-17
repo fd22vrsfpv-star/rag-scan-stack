@@ -435,8 +435,20 @@ def test_the_renderer_is_registered_and_emits_a_document_per_class():
     exec(compile(ast.Module([helper, fn], []), "<r>", "exec"), ns)
     docs = ns["_render_vuln_classes"](RAW)
     assert len(docs) == len(CLASSES)
-    joined = " ".join(b for _, b in docs)
+    # A doc is (title, body) or (title, body, metadata) — the third slot
+    # carries the structured retrieval keys (vuln_class, cwes, owasp) that
+    # make a knowledge row filterable instead of reachable only by similarity.
+    joined = " ".join(d[1] for d in docs)
     assert "CWE-22" in joined and "OWASP" in joined
+    metas = [d[2] for d in docs if len(d) > 2]
+    assert len(metas) == len(docs), (
+        "every class document must carry its structured keys; a doc without "
+        "them is reachable only by similarity")
+    assert all(m.get("vuln_class") for m in metas), (
+        "vuln_class is the key a classified CVE already holds")
+    assert any(m.get("cwes") for m in metas), (
+        "at least some classes must carry their CWE ids — that is what lets "
+        "a CWE-89 CVE find the sqli document deterministically")
 
 
 # ── kind: a misconfiguration is not an exploit mechanism ───────────────────
