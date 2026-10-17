@@ -27,36 +27,40 @@ named tests exist).
 
 ## Known gaps carried from earlier sessions
 
-### `knowledge/extractors/` escapes the RAG-coverage invariant entirely
-**Found:** 2026-10-17, while adding ffuf + feroxbuster extractor specs.
-**Evidence:** CLAUDE.md requires every `knowledge/*.yaml` that defines scans or
-actions to have a loader embedding it into `rag_documents`, enforced by
-`tests/test_knowledge_rag_coverage.py`. That guard's `_knowledge_yamls()`
-(tests/test_knowledge_rag_coverage.py:96-101) globs only
-`knowledge/*.yaml` + `knowledge/*.yml` — **non-recursive**. Measured:
+### 47 knowledge files are read deterministically and never embedded
+**Found:** 2026-10-17. Supersedes "`knowledge/extractors/` escapes the
+RAG-coverage invariant", whose blind spot is now CLOSED — and which
+under-counted the problem by more than 3x.
+**Evidence:** `tests/test_knowledge_rag_coverage.py::_knowledge_yamls` globbed
+`knowledge/*.yaml` flat, so **eight** subdirectories escaped the rule, not one:
 
-    extractor specs on disk:            14
-    of those, visible to the guard:      0
-    example missed: _classes.yaml, enum4linux-ng.yaml, gobuster.yaml, ...
+    total yaml under knowledge/ (recursive):  90
+    visible to the guard:                     43
+    invisible:                                47
+    by directory: extractors 16, playbooks 12, seed 7,
+                  detection_rules/custom 6, detection_rules 2,
+                  scope_rules 2, mitre 1, artifact_rules 1
 
-So an entire directory of action-defining knowledge is neither embedded nor
-declared as debt, and adding a new spec there raises no failure — the rule
-reads as satisfied because the guard cannot see the files. (A first attempt to
-measure this returned a FALSE PASS: `_knowledge_yamls()` returns basenames, and
-the top-level `enumeration_extractors.yaml` contains the substring
-"extractors". The count above is the corrected measurement.)
-**Where:** `tests/test_knowledge_rag_coverage.py:96-101`,
-`knowledge/extractors/*.yaml`, `etl/load_knowledge_documents.py` (`RENDERERS`
-keys on top-level stems only).
-**Done when:** the guard walks `knowledge/` recursively, and every extractor
-spec is either embedded by a renderer or carries a `RAG_LOAD_DEBT` reason.
-Expect the glob change alone to fail ~14 files by name — that failure IS the
-finding, and the debt list is the honest first step.
-**Enforced by:** not enforced — this is a hole IN the enforcement. The guard
-passes today precisely because it cannot see these files.
-*Why it matters:* the extractor specs say what facts a tool's output yields,
-which is exactly the "what to do next" knowledge the RAG-first rule exists for.
-A ratchet with a blind spot is worse than a known gap, because it reports green.
+The glob is now recursive and keyed on paths relative to `knowledge/` (a
+top-level file's relpath IS its basename, so every pre-existing entry still
+matches). All 47 are declared in `RAG_LOAD_DEBT` with per-directory reasons.
+Each has a deterministic reader — `extractor_specs.py`, `rule_engine.py`,
+`etl/playbooks.py`, `attack_vectors.py`, `scope_classifier.py` — and **none**
+writes `rag_documents`; verified by checking every reader for that table.
+**Where:** `tests/test_knowledge_rag_coverage.py` (`RAG_LOAD_DEBT`),
+`etl/load_knowledge_documents.py` (`RENDERERS` keys on top-level stems only).
+**Done when:** the debt list shrinks — a renderer per directory, starting with
+`playbooks/` (CLAUDE.md names playbooks explicitly as RAG-first knowledge) and
+`extractors/` (what facts a tool's output yields is exactly "what to do next").
+`scope_rules/` is authorization-adjacent and must stay a deterministic lookup
+even once embedded — retrieve to decide, gate to act.
+**Enforced by:** `tests/test_knowledge_rag_coverage.py` — now genuinely. A new
+undeclared file in ANY subdirectory fails by name (sabotage-proven 2026-10-17:
+an undeclared `extractors/_sabotage_probe.yaml` failed, where before the
+recursive glob it passed silently).
+*Why it matters:* a ratchet with a blind spot is worse than a known gap,
+because it reports green. The previous entry's own count (14) came from looking
+only where the symptom was noticed.
 
 ### A soft feed error is recorded per-run but written back as `last_status='ok'`
 **Found:** 2026-10-17, while rendering per-source ingest progress.

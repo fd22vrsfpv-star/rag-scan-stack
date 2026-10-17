@@ -22276,11 +22276,23 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
     # (verified techniques, service fingerprints, endpoints, vulns) + credentials +
     # observed facts. Empty string when no matches: synth guidance unchanged.
     try:
-        _ctx = _compose_recall_context(ip, product=product, limit=8)
+        _ctx, _ctx_manifest = _compose_recall_context(ip, product=product, limit=8)
         if _ctx:
             guidance_extra = _ctx + "\n\n" + guidance_extra
             _poc_trace(run_id, "recall_context",
-                       response=f"composed recall block ({len(_ctx)} chars)")
+                       response="composed recall block ({} chars) from {}".format(
+                           len(_ctx),
+                           ", ".join(f"{m['source']}={m['rows']}"
+                                     for m in _ctx_manifest) or "no sources"),
+                       extra={"recall_sources": _ctx_manifest,
+                              "recall_chars": len(_ctx)})
+        else:
+            # THREE outcomes. "No recall block" and "we never looked" produced
+            # the same absence of a trace row, and absence is what 669 of 682
+            # runs recorded.
+            _poc_trace(run_id, "recall_context",
+                       response="no recall context: every source returned nothing",
+                       extra={"recall_sources": [], "recall_chars": 0})
     except Exception as e:  # noqa: BLE001
         logging.debug("recall_context skipped: %s", e)
     try:
@@ -54709,13 +54721,39 @@ def _backfill_tier1_to_rag(engagement_id=None, limit=500):
     return counts
 
 
+def _recall_manifest(parts):
+    """Per-SOURCE description of an assembled recall block.
+
+    The trace used to record `composed recall block (3779 chars)` and nothing
+    else, so for 669 of 682 PoC runs there was no record of what informed the
+    build, and for the other 13 the record was a character count. You could not
+    tell whether those characters held the right credential or a stale lesson
+    from a different target.
+
+    Derived from the assembled blocks rather than instrumented at each of the
+    eight append sites: every block opens with an UPPERCASE heading, so the
+    label is already there to read. Cheap, and it cannot drift from what was
+    actually sent — the manifest describes the SAME string the model receives.
+    """
+    out = []
+    for p in parts:
+        if not p:
+            continue
+        head = p.split("\n", 1)[0]
+        label = head.split("(", 1)[0].split(":", 1)[0].strip()[:48] or "UNLABELLED"
+        # body lines, excluding the heading itself: one line per recalled row
+        rows = max(0, len([ln for ln in p.split("\n")[1:] if ln.strip()]))
+        out.append({"source": label, "rows": rows, "chars": len(p)})
+    return out
+
+
 def _compose_recall_context(ip, product=None, limit=8):
     """Compose ONE ordered recall context block for synth guidance. Includes
     every enabled first-class RAG source, in a stable priority order. Empty
     string when no matches (synth guidance unchanged). Cleaner than stacking
     conditional prepends for each source."""
     if not observed_facts_enabled():
-        return ""
+        return "", []
     parts = []
     # 1. verified techniques FIRST — highest signal (something confirmed works)
     try:
@@ -54900,7 +54938,7 @@ def _compose_recall_context(ip, product=None, limit=8):
                     parts.append(f"SUBDOMAIN PATTERNS on {parent}:\n" + "\n".join(lines))
     except Exception:  # noqa: BLE001
         pass
-    return "\n\n".join(parts)
+    return "\n\n".join(parts), _recall_manifest(parts)
 
 
 def _load_web_finding_into_rag(finding_row, engagement_id=None, ip=None):
@@ -55924,9 +55962,41 @@ class KnowledgeSearchBody(BaseModel):
     query: str
     top_k: int = 6
     sources: Optional[List[str]] = None    # optional metadata.source filter
+    # WHO is asking. Logged as `knowledge_search:<caller>` so a planner recall
+    # is distinguishable from an agent tool call and from an operator poking
+    # the endpoint by hand — without it every row reads the same and the log
+    # answers "something retrieved this" rather than "the planner did".
+    caller: Optional[str] = None
 
 
 @app.post("/rag/knowledge/search", tags=["RAG/Knowledge"])
+def _rag_log_retrieval(query, vec, rows, *, source, duration_ms=None,
+                       llm_answer=None):
+    """Record one knowledge retrieval: the query, what came back, how well.
+
+    `rag_documents.id` is a uuid, so hits go in `top_k_doc_ids uuid[]` —
+    `top_k_chunk_ids` is bigint[] and belongs to the exploit_chunks corpus.
+    Casting between them would be a lie about which corpus answered.
+    """
+    eid = None
+    try:
+        eid = _resolve_engagement_id()
+    except Exception:  # noqa: BLE001
+        pass
+    doc_ids = [str(r["id"]) for r in rows if r.get("id") is not None]
+    sims = [round(float(r["similarity"]), 6) for r in rows
+            if r.get("similarity") is not None]
+    vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO rag_query_log
+                 (query, query_embedding, top_k_doc_ids, top_k_sims,
+                  llm_answer, source, engagement_id, duration_ms)
+               VALUES (%s, %s::vector, %s::uuid[], %s, %s, %s, %s::uuid, %s)""",
+            (query, vec_str, doc_ids, sims, llm_answer, source, eid, duration_ms))
+        conn.commit()
+
+
 def rag_knowledge_search(body: KnowledgeSearchBody, _: bool = Depends(auth)):
     """Source-agnostic semantic search over the rag_documents knowledge corpus.
 
@@ -55943,6 +56013,7 @@ def rag_knowledge_search(body: KnowledgeSearchBody, _: bool = Depends(auth)):
     list — exact for this size of corpus — and is transaction-scoped, so it
     reverts on commit and never leaks onto the pooled connection.
     """
+    _t0 = time.time()
     q = (body.query or "").strip()
     if not q:
         raise HTTPException(400, "query is required")
@@ -55962,7 +56033,8 @@ def rag_knowledge_search(body: KnowledgeSearchBody, _: bool = Depends(auth)):
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("SET LOCAL ivfflat.probes = 100")
         cur.execute(
-            f"""SELECT title,
+            f"""SELECT id,
+                       title,
                        text_chunk,
                        metadata->>'source'  AS source,
                        metadata->>'flow_id' AS flow_id,
@@ -55977,6 +56049,16 @@ def rag_knowledge_search(body: KnowledgeSearchBody, _: bool = Depends(auth)):
                 "source": r["source"], "flow_id": r["flow_id"],
                 "similarity": round(float(r["similarity"]), 4)}
                for r in rows]
+    # WHAT THE PLANNER RECALLED. `rag_query_log` existed but had exactly one
+    # writer — the operator's manual /ask — so all 498 rows were hand-typed
+    # questions and every agent-side retrieval was invisible. A planning
+    # decision could not be traced back to what justified it.
+    # Fail-soft: logging must never break the retrieval it observes.
+    try:
+        _rag_log_retrieval(q, vec, rows, source=f"knowledge_search:{(body.caller or 'unknown')}",
+                           duration_ms=int((time.time() - _t0) * 1000))
+    except Exception as _e:  # noqa: BLE001
+        logging.debug("rag retrieval log skipped: %s", _e)
     return {"query": q, "count": len(results), "results": results}
 
 

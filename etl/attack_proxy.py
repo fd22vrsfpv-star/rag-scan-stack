@@ -397,3 +397,160 @@ def note(decision: Decision, command: str = "") -> str:
     else:
         how = f"env ALL_PROXY; {detail}"
     return f"[proxy] routed via {decision.proxy_url} ({decision.label}, {decision.source}) [{how}]"
+
+
+# ── Per-engagement egress policy ──────────────────────────────────────────
+# `require_proxy` above is the GLOBAL attack-proxy switch. This section adds
+# the per-engagement one the OSINT runner needs: passive recon against an
+# external estate egressed from the operator's own public IP because
+# `osint_runner._build_proxy_env` applied a proxy only when one happened to be
+# passed, and a missing proxy silently meant direct.
+#
+# It lives HERE, beside resolve()/enforce(), for the reason the module header
+# gives: the fix must not be a SECOND copy of the policy. The scope gate
+# (etl/scope_gate.py) still decides WHETHER a target may be touched at all;
+# this decides only HOW the packets must leave. Two different questions, and
+# conflating them is how an "opsec" setting ends up granting authorisation.
+
+#: The engagement said yes — a proxy must be applied or the job is refused.
+POLICY_REQUIRED = "required"
+#: Provably nobody opted in, or this engagement opted out. Today's behaviour.
+POLICY_NOT_REQUIRED = "not_required"
+#: Could not be established. NOT the same as "not required" — see `.required`.
+POLICY_UNDETERMINED = "undetermined"
+
+#: SQLSTATEs that mean the FEATURE IS NOT DEPLOYED rather than "unreadable".
+#: 42703 undefined_column, 42P01 undefined_table. A database with no
+#: `engagements.require_proxy` column cannot hold an opt-in, so no engagement
+#: can have made one — that is a determined negative, not an unknown. Any
+#: OTHER error (connection refused, permission denied, timeout) leaves the
+#: question unanswered and must not read as permission.
+_SCHEMA_ABSENT_SQLSTATES = ("42703", "42P01")
+
+
+class PolicyVerdict(NamedTuple):
+    """verdict is one of POLICY_*; `required` is the fail-closed reading."""
+    verdict: str
+    engagement_id: Optional[str]
+    reason: str
+
+    @property
+    def required(self) -> bool:
+        """Fail closed: only an explicit NOT_REQUIRED permits direct egress."""
+        return self.verdict != POLICY_NOT_REQUIRED
+
+    @property
+    def determined(self) -> bool:
+        return self.verdict != POLICY_UNDETERMINED
+
+
+def _sqlstate(exc) -> str:
+    return str(getattr(exc, "pgcode", "") or "")
+
+
+def _policy_in_use(conn_factory) -> Optional[bool]:
+    """Has ANY engagement opted in? True / False / None = could not ask.
+
+    Asked FIRST and on its own so that the default installation — nobody has
+    set `require_proxy` — takes exactly the path it took before this existed,
+    with one cheap EXISTS and no engagement resolution at all.
+    """
+    try:
+        with conn_factory() as conn, conn.cursor() as cur:
+            cur.execute("SELECT EXISTS (SELECT 1 FROM engagements "
+                        "WHERE require_proxy IS TRUE)")
+            row = cur.fetchone()
+        if row is None:
+            return None
+        val = row[0] if not isinstance(row, dict) else list(row.values())[0]
+        return bool(val)
+    except Exception as e:  # noqa: BLE001
+        if _sqlstate(e) in _SCHEMA_ABSENT_SQLSTATES:
+            log.info("attack_proxy: engagements.require_proxy not present (%s) "
+                     "— no engagement can have opted in", _sqlstate(e))
+            return False
+        log.warning("attack_proxy: could not read the require_proxy policy: %s", e)
+        return None
+
+
+def engagement_for_target(conn_factory, target) -> Optional[str]:
+    """The engagement that owns `target`, via scope_targets — or None.
+
+    scope_targets is the attribution authority (assets frequently carry no
+    engagement). Blank targets are excluded: a '' row is the placeholder
+    sentinel and matches everything, which would attribute every target to
+    whichever engagement last had an empty scope.
+    """
+    t = str(target or "").strip().lower()
+    if not t:
+        return None
+    try:
+        with conn_factory() as conn, conn.cursor() as cur:
+            cur.execute(
+                """SELECT engagement_id FROM scope_targets
+                    WHERE engagement_id IS NOT NULL
+                      AND COALESCE(btrim(target), '') <> ''
+                      AND (lower(target) = %s OR %s LIKE '%%.' || lower(target))
+                    ORDER BY length(target) DESC
+                    LIMIT 1""", (t, t))
+            row = cur.fetchone()
+        if not row:
+            return None
+        val = row[0] if not isinstance(row, dict) else row.get("engagement_id")
+        return str(val) if val else None
+    except Exception as e:  # noqa: BLE001
+        log.warning("attack_proxy: engagement lookup for %r failed: %s", target, e)
+        raise
+
+
+def engagement_requires_proxy(conn_factory, engagement_id=None,
+                              target=None) -> PolicyVerdict:
+    """Must traffic for this engagement/target leave through a proxy?
+
+    THREE outcomes, never two. "Could not determine" is POLICY_UNDETERMINED
+    and `.required` reads it as yes, because the alternative is that an
+    unreachable database silently restores the leak this exists to stop.
+    """
+    in_use = _policy_in_use(conn_factory)
+    if in_use is False:
+        return PolicyVerdict(POLICY_NOT_REQUIRED, engagement_id and str(engagement_id),
+                             "no engagement requires a proxy")
+    if in_use is None:
+        return PolicyVerdict(POLICY_UNDETERMINED, engagement_id and str(engagement_id),
+                             "the require_proxy policy could not be read — "
+                             "treat as required, not as permitted")
+
+    eid = str(engagement_id).strip() if engagement_id else None
+    if not eid:
+        try:
+            eid = engagement_for_target(conn_factory, target)
+        except Exception as e:  # noqa: BLE001
+            return PolicyVerdict(POLICY_UNDETERMINED, None,
+                                 f"an engagement requires a proxy and the scope "
+                                 f"lookup for {target!r} failed ({e})")
+    if not eid:
+        return PolicyVerdict(POLICY_UNDETERMINED, None,
+                             f"an engagement requires a proxy and {target!r} "
+                             f"could not be attributed to any engagement")
+
+    try:
+        with conn_factory() as conn, conn.cursor() as cur:
+            cur.execute("SELECT require_proxy FROM engagements WHERE id = %s::uuid",
+                        (eid,))
+            row = cur.fetchone()
+    except Exception as e:  # noqa: BLE001
+        return PolicyVerdict(POLICY_UNDETERMINED, eid,
+                             f"the engagement's require_proxy could not be read ({e})")
+    if row is None:
+        return PolicyVerdict(POLICY_UNDETERMINED, eid,
+                             f"engagement {eid} is not in the engagements table")
+    val = row[0] if not isinstance(row, dict) else row.get("require_proxy")
+    if val is None:
+        return PolicyVerdict(POLICY_UNDETERMINED, eid,
+                             f"engagement {eid} has a NULL require_proxy")
+    if bool(val):
+        return PolicyVerdict(POLICY_REQUIRED, eid,
+                             f"engagement {eid} requires every scan to egress "
+                             f"through a proxy")
+    return PolicyVerdict(POLICY_NOT_REQUIRED, eid,
+                         f"engagement {eid} does not require a proxy")

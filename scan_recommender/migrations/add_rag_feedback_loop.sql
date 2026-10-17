@@ -23,6 +23,10 @@ CREATE TABLE IF NOT EXISTS public.rag_query_log (
     query           text NOT NULL,
     query_embedding vector(768),
     top_k_chunk_ids bigint[],
+    -- rag_documents.id is a UUID, so knowledge-corpus hits cannot go in
+    -- top_k_chunk_ids (bigint[], for exploit_chunks). Separate column rather
+    -- than a lossy cast: which documents came back is the point of the log.
+    top_k_doc_ids   uuid[],
     top_k_sims      float[],
     llm_answer      text,
     source          text NOT NULL,
@@ -54,3 +58,6 @@ CREATE INDEX IF NOT EXISTS rag_feedback_rating_idx
     ON public.rag_feedback(rating);
 CREATE INDEX IF NOT EXISTS rag_feedback_engagement_idx
     ON public.rag_feedback(engagement_id) WHERE engagement_id IS NOT NULL;
+
+-- Existing databases: the table predates top_k_doc_ids.
+ALTER TABLE public.rag_query_log ADD COLUMN IF NOT EXISTS top_k_doc_ids uuid[];

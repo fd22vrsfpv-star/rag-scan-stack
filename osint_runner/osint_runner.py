@@ -6,7 +6,7 @@ cloudlist, alterx, and mapcidr.
 
 import os, uuid, pathlib, subprocess, threading, logging, json, tempfile, shutil, ipaddress, re
 from urllib.parse import urlparse
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, NamedTuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import psycopg2
@@ -565,18 +565,180 @@ def _ingest_results(tool: str, output_path: str, job_id: str = None, source: str
 # Tool Runner Functions
 # ===============================
 
-def _build_proxy_env(proxy: str = None) -> dict:
-    """Build an env dict with API keys and optional SOCKS proxy vars."""
-    env = os.environ.copy()
-    api_keys = _get_api_keys()
-    for k, v in api_keys.items():
+# ── Egress policy (opsec) ─────────────────────────────────────────────────
+# WHY THIS EXISTS. `_build_proxy_env` was fail-OPEN by construction: it set
+# ALL_PROXY/HTTP_PROXY only `if proxy:`, and every request model declares
+# `proxy: Optional[str] = None`. A scan started without one therefore egressed
+# from this host's own public address, and the audit row recorded the bare
+# label "local" — an operator reading it could not tell "ran on the local
+# runner, proxied" from "ran on the local runner, from my own IP".
+#
+# This is an OPSEC control, not an authorisation one. The scope gate
+# (`_scope_refusal_for_targets`) still decides WHETHER a target may be touched;
+# this decides only HOW the packets may leave. The policy itself is NOT
+# implemented here: `etl/attack_proxy.py` already holds the one shared
+# definition used by exploit-runner, rag-api and kali-listener, and a second
+# copy in this file is exactly the divergence CLAUDE.md asks for an agreement
+# test about. `etl/` is bind-mounted into this image (the scope gate imports
+# from it above), so the same module is available here.
+try:
+    from etl.attack_proxy import (
+        engagement_requires_proxy as _eng_requires_proxy,
+        resolve as _resolve_proxy,
+        proxy_env as _attack_proxy_env,
+        POLICY_NOT_REQUIRED as _POLICY_NOT_REQUIRED,
+    )
+    EGRESS_POLICY_AVAILABLE = True
+except Exception as _proxy_err:                 # pragma: no cover
+    EGRESS_POLICY_AVAILABLE = False
+    logging.error("egress policy UNAVAILABLE (%s) — scans for an engagement "
+                  "that requires a proxy will be refused. Check the "
+                  "./etl:/runner/etl mount.", _proxy_err)
+
+#: The audit label for a scan that was NOT run because policy required a proxy
+#: and none could be resolved. A distinct value, because "blocked" recorded as
+#: "local" is the same lie the bare label told before.
+EXECUTION_MODE_BLOCKED = "required_proxy_missing"
+
+
+class EgressOutcome(NamedTuple):
+    """What actually happened to this job's egress, for the audit row."""
+    proxy: Optional[str]
+    env: dict
+    execution_mode: str      # proxied | local | required_proxy_missing
+    policy: str              # required | not_required | undetermined
+    engagement_id: Optional[str]
+    reason: str
+
+    def audit(self) -> dict:
+        """The fields every scan audit record carries about its egress."""
+        d = {"execution_mode": self.execution_mode,
+             "proxy": self.proxy or None,
+             "proxy_policy": self.policy}
+        if self.engagement_id:
+            d["engagement_id"] = self.engagement_id
+        if self.execution_mode != "proxied":
+            d["proxy_reason"] = self.reason
+        return d
+
+
+def _request_engagement_id():
+    """The engagement the caller is working in (X-Engagement-Id), or None."""
+    try:
+        from audit_writer import current_engagement_id  # type: ignore
+        return current_engagement_id.get()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _first_target(targets):
+    """One representative target, for attributing the job to an engagement."""
+    for t in (targets or []):
+        t = str(t or "").strip()
+        if not t:
+            continue
+        if "://" in t:
+            try:
+                t = urlparse(t).hostname or t
+            except Exception:  # noqa: BLE001
+                pass
+        return t
+    return None
+
+
+def _egress(proxy: str = None, targets=None, engagement_id=None,
+            audit_tool: str = None) -> EgressOutcome:
+    """Decide (and enforce) how this job's traffic leaves. Never returns an
+    outcome that silently went direct for an engagement that forbade it.
+
+    THREE outcomes, because "could not determine" is not "permitted":
+      * the engagement does not require a proxy  -> unchanged behaviour,
+        including no proxy at all when the caller supplied none;
+      * a proxy is required and one resolves     -> it is applied AND reported;
+      * a proxy is required and none resolves    -> HTTPException(400), and an
+        audit row recording EXECUTION_MODE_BLOCKED with the reason.
+    """
+    engagement_id = engagement_id or _request_engagement_id()
+    target = _first_target(targets)
+    api_env = os.environ.copy()
+    for k, v in _get_api_keys().items():
         if v:
-            env[k] = v
+            api_env[k] = v
+
+    if not EGRESS_POLICY_AVAILABLE:
+        # An unreachable policy is not an absent policy. Refusing here is the
+        # same rule the scope gate applies when etl/ is not importable.
+        _refuse_egress(EgressOutcome(
+            None, api_env, EXECUTION_MODE_BLOCKED, "undetermined",
+            engagement_id and str(engagement_id),
+            "etl.attack_proxy is not importable — the egress policy could not "
+            "be read, refusing rather than scanning from this host's own "
+            "address"), audit_tool, targets)
+
+    verdict = _eng_requires_proxy(conn, engagement_id=engagement_id, target=target)
+    if verdict.verdict == _POLICY_NOT_REQUIRED:
+        env = dict(api_env)
+        if proxy:
+            env.update(_attack_proxy_env(proxy))
+        return EgressOutcome(proxy or None, env,
+                             "proxied" if proxy else "local",
+                             verdict.verdict, verdict.engagement_id, verdict.reason)
+
     if proxy:
-        env["ALL_PROXY"] = proxy
-        env["HTTP_PROXY"] = proxy
-        env["HTTPS_PROXY"] = proxy
-    return env
+        eff, source, detail = proxy, "operator-supplied", \
+            "an explicit proxy was supplied with the request"
+    else:
+        decision = _resolve_proxy(conn, target=target,
+                                  engagement_id=verdict.engagement_id)
+        eff, source, detail = decision.proxy_url, decision.source, decision.reason
+
+    if not eff:
+        _refuse_egress(EgressOutcome(
+            None, api_env, EXECUTION_MODE_BLOCKED, verdict.verdict,
+            verdict.engagement_id,
+            f"{verdict.reason}, but no proxy is available ({detail}). Refusing "
+            f"to scan from this host's own address. Select a node for the "
+            f"engagement, bring a SOCKS node online, pass a proxy with the "
+            f"request, or clear engagements.require_proxy."), audit_tool, targets)
+
+    env = dict(api_env)
+    env.update(_attack_proxy_env(eff))
+    return EgressOutcome(eff, env, "proxied", verdict.verdict,
+                         verdict.engagement_id,
+                         f"{verdict.reason}; proxy selected by {source}")
+
+
+def _refuse_egress(outcome: "EgressOutcome", audit_tool, targets):
+    """Record the refusal, then raise. Always raises — never returns."""
+    try:
+        write_audit("scan_blocked", audit_tool or "osint", "osint_runner",
+                    dict(outcome.audit(),
+                         targets=[str(t) for t in (targets or [])][:10],
+                         targets_count=len(targets or [])))
+    except Exception as e:  # noqa: BLE001
+        logging.warning("[egress] could not audit the refusal: %s", e)
+    try:
+        emit_webhook_event("scan_blocked", audit_tool or "osint-runner",
+                           {"reason": EXECUTION_MODE_BLOCKED,
+                            "proxy_policy": outcome.policy,
+                            "engagement_id": outcome.engagement_id,
+                            "detail": outcome.reason})
+    except Exception as e:  # noqa: BLE001
+        logging.warning("[egress] could not emit the refusal webhook: %s", e)
+    logging.error("[egress] REFUSED (%s): %s", EXECUTION_MODE_BLOCKED, outcome.reason)
+    raise HTTPException(status_code=400, detail=f"fail-closed: {outcome.reason}")
+
+
+def _build_proxy_env(proxy: str = None, targets=None, engagement_id=None) -> dict:
+    """Env for a tool subprocess: API keys, plus the proxy POLICY SAYS to use.
+
+    This is the chokepoint — every tool this service spawns takes its
+    environment from here — so the fail-closed check lives inside it rather
+    than at ~25 call sites, one of which would eventually be added without it.
+    Raises HTTPException(400) when the engagement requires a proxy and none
+    can be resolved; returns exactly the old env when it does not.
+    """
+    return _egress(proxy, targets=targets, engagement_id=engagement_id).env
 
 
 # ── Scope gate ────────────────────────────────────────────────────────────
@@ -960,15 +1122,17 @@ def run_subfinder(req: SubfinderReq, background_tasks: BackgroundTasks):
     targets_file = _write_targets_file(req.domains)
     output_file = str(REPORT_DIR / f"subfinder_{job_id[:8]}.jsonl")
 
+    eg = _egress(req.proxy, targets=req.domains, audit_tool="subfinder")
+
     cmd = ["subfinder", "-dL", targets_file, "-json", "-o", output_file, "-silent"]
     if req.sources:
         cmd.extend(["-sources", req.sources])
     if req.max_time:
         cmd.extend(["-timeout", str(req.max_time)])
-    if req.proxy:
-        cmd.extend(["-proxy", req.proxy])
+    if eg.proxy:
+        cmd.extend(["-proxy", eg.proxy])
 
-    env = _build_proxy_env(req.proxy)
+    env = eg.env
     _job_tracker.update_progress(job_id, targets_count=len(req.domains))
     background_tasks.add_task(_run_tool_job, job_id, "subfinder", cmd, targets_file, output_file, env=env, no_ingest=req.no_ingest)
     return {"ok": True, "job_id": job_id, "status": "queued", "status_url": f"/jobs/{job_id}", "no_ingest": req.no_ingest}
@@ -996,7 +1160,11 @@ def run_dnsx(req: DnsxReq, background_tasks: BackgroundTasks):
             elif rt == "ns":
                 cmd.append("-ns")
 
-    env = _build_proxy_env()  # DNS is direct; proxy not applicable but ensure API keys in env
+    # A name lookup is traffic too: resolving the target from this host's own
+    # resolver attributes the interest to the operator just as a TCP connect
+    # would. The policy therefore applies here as well, and dnsx honours
+    # ALL_PROXY, so the resolved proxy is handed to it rather than ignored.
+    env = _build_proxy_env(req.proxy, targets=req.domains)
     _job_tracker.update_progress(job_id, targets_count=len(req.domains))
     background_tasks.add_task(_run_tool_job, job_id, "dnsx", cmd, targets_file, output_file, env=env, no_ingest=req.no_ingest)
     return {"ok": True, "job_id": job_id, "status": "queued", "status_url": f"/jobs/{job_id}", "no_ingest": req.no_ingest}
@@ -1036,7 +1204,7 @@ def _run_asnmap_job(job_id: str, targets: list, proxy: str = None, no_ingest: bo
         results = []
         # 1) asnmap binary — only worth trying when a PDCP key is configured.
         if os.environ.get("PDCP_API_KEY"):
-            env = _build_proxy_env(proxy)
+            env = _build_proxy_env(proxy, targets=targets)
             cmd = ["asnmap", "-f", targets_file, "-json", "-o", output_file, "-silent"]
             _job_tracker.push_command(job_id, "asnmap", " ".join(cmd))
             try:
@@ -1114,7 +1282,7 @@ def run_uncover(req: UncoverReq, background_tasks: BackgroundTasks):
     if req.engine:
         cmd.extend(["-e", req.engine])
 
-    env = _build_proxy_env(req.proxy)
+    env = _build_proxy_env(req.proxy, targets=[req.query])
 
     def _run():
         try:
@@ -1272,7 +1440,7 @@ def run_chaos(req: ChaosReq, background_tasks: BackgroundTasks):
 
     cmd = ["chaos", "-d", req.domain, "-json", "-o", output_file, "-silent"]
 
-    env = _build_proxy_env(req.proxy)
+    env = _build_proxy_env(req.proxy, targets=[req.domain])
 
     def _run():
         try:
@@ -1393,7 +1561,7 @@ def run_shuffledns(req: ShuffleDNSReq, background_tasks: BackgroundTasks):
     cmd = ["shuffledns", "-list", targets_file, "-w", wordlist,
            "-r", resolvers, "-json", "-o", output_file, "-silent"]
 
-    env = _build_proxy_env(req.proxy)
+    env = _build_proxy_env(req.proxy, targets=req.domains)
     _job_tracker.update_progress(job_id, targets_count=len(req.domains))
     background_tasks.add_task(_run_tool_job, job_id, "shuffledns", cmd, targets_file, output_file, ingest_as="subfinder", env=env)
     return {"ok": True, "job_id": job_id, "status": "queued", "status_url": f"/jobs/{job_id}"}
@@ -1425,6 +1593,9 @@ def run_vulnx(req: VulnxReq, background_tasks: BackgroundTasks):
         if req.severity:
             cmd.extend(["--severity", req.severity])
 
+    # No target host: vulnx queries a CVE database by product name. The
+    # policy still applies (the lookup leaves from this host), and the
+    # engagement comes from the request's X-Engagement-Id.
     env = _build_proxy_env(req.proxy)
 
     def _run():
@@ -1556,7 +1727,8 @@ def run_vulnx_scope(req: VulnxScopeReq, background_tasks: BackgroundTasks):
                 if req.severity:
                     cmd.extend(["--severity", req.severity])
 
-                env = _build_proxy_env(req.proxy)
+                env = _build_proxy_env(req.proxy, targets=[ip],
+                                       engagement_id=req.engagement_id)
 
                 try:
                     logging.info(f"[{job_id}] Scanning {product} {version}")
@@ -1834,7 +2006,7 @@ def run_recon_pipeline(req: ReconPipelineReq, background_tasks: BackgroundTasks)
     background_tasks.add_task(
         _run_recon_pipeline, job_id, classified, skip,
         req.uncover_engine or "shodan", req.uncover_limit or 100,
-        req.proxy,
+        req.proxy, _request_engagement_id(),
     )
     return {"ok": True, "job_id": job_id, "status": "queued",
             "classified": classified, "status_url": f"/jobs/{job_id}"}
@@ -1883,6 +2055,7 @@ def run_passive_recon(req: PassiveReconReq, background_tasks: BackgroundTasks):
         cert_chain_max_iterations=min(max(req.cert_chain_max_iterations or 2, 1), 3),
         scope_name=req.scope_name,
         proxy=req.proxy,
+        engagement_id=_request_engagement_id(),
     )
     return {"ok": True, "job_id": job_id, "status": "queued",
             "phases": phases_plan, "status_url": f"/jobs/{job_id}"}
@@ -2177,7 +2350,7 @@ def _asn_high_precision_filter(asn_hosts: list, in_scope_orgs: set,
 def _run_passive_recon(job_id: str, domains: list, include_spider: bool = False,
                         spider_depth: int = 2, include_cert_chain: bool = True,
                         cert_chain_max_iterations: int = 2, scope_name: str = None,
-                        proxy: str = None):
+                        proxy: str = None, engagement_id: str = None):
     """Background: passive-only recon pipeline."""
     import time as _time
     _job_tracker.update_job(job_id, status="running", started_at=datetime.now().isoformat())
@@ -2187,7 +2360,22 @@ def _run_passive_recon(job_id: str, domains: list, include_spider: bool = False,
     all_output_files = []
     all_hosts = set()
     short = job_id[:8]
-    env = _build_proxy_env(proxy)
+    # Rebind `proxy` to what POLICY chose: the nine phases below splice it into
+    # their own command lines (-proxy / --proxy / --chrome-proxy), and chromium
+    # in particular ignores ALL_PROXY entirely, so an env-only decision would
+    # screenshot every URL from this host's own address.
+    try:
+        _eg = _egress(proxy, targets=domains, engagement_id=engagement_id,
+                      audit_tool="passive-recon")
+    except HTTPException as _refusal:
+        _job_tracker.update_job(job_id, status="failed",
+                                error=str(_refusal.detail),
+                                completed_at=datetime.now().isoformat())
+        _job_tracker.update_progress(job_id, stage=EXECUTION_MODE_BLOCKED)
+        emit_webhook_event("scan_failed", "passive-recon",
+                           {"job_id": job_id, "reason": EXECUTION_MODE_BLOCKED})
+        return
+    proxy, env = _eg.proxy, _eg.env
 
     total_phases = 14  # subfinder, findomain, dnsdumpster, whois, reverse-whois, dnsx, crtsh, httpx, tlsx, cert-chain, gau+waybackurls, katana, gowitness, whatweb
     phase_num = 0
@@ -3050,7 +3238,7 @@ def _run_passive_recon(job_id: str, domains: list, include_spider: bool = False,
 
 def _run_recon_pipeline(job_id: str, classified: dict, skip: set,
                         uncover_engine: str, uncover_limit: int,
-                        proxy: str = None):
+                        proxy: str = None, engagement_id: str = None):
     """Background: run the full recon pipeline."""
     _job_tracker.update_job(job_id, status="running", started_at=datetime.now().isoformat())
     emit_webhook_event("scan_started", "recon-pipeline", {"job_id": job_id})
@@ -3059,7 +3247,25 @@ def _run_recon_pipeline(job_id: str, classified: dict, skip: set,
     all_output_files = []
     all_hosts = set()
 
-    env = _build_proxy_env(proxy)
+    # One decision for the whole pipeline. The phases below splice `proxy`
+    # into their own command lines (-proxy / --chrome-proxy), and chromium
+    # ignores ALL_PROXY, so an env-only decision would screenshot every URL
+    # from this host's own address.
+    try:
+        _eg = _egress(proxy,
+                      targets=(classified.get("domains") or [])
+                              + (classified.get("ips") or [])
+                              + (classified.get("urls") or []),
+                      engagement_id=engagement_id, audit_tool="recon-pipeline")
+    except HTTPException as _refusal:
+        _job_tracker.update_job(job_id, status="failed",
+                                error=str(_refusal.detail),
+                                completed_at=datetime.now().isoformat())
+        _job_tracker.update_progress(job_id, stage=EXECUTION_MODE_BLOCKED)
+        emit_webhook_event("scan_failed", "recon-pipeline",
+                           {"job_id": job_id, "reason": EXECUTION_MODE_BLOCKED})
+        return
+    proxy, env = _eg.proxy, _eg.env
 
     try:
         # --- Domain sub-pipeline and IP/ASN sub-pipeline run in parallel ---
@@ -3107,7 +3313,7 @@ def _run_recon_pipeline(job_id: str, classified: dict, skip: set,
             if proxy:
                 cmd.extend(["-proxy", proxy])
             subprocess.run(cmd, capture_output=True, text=True, timeout=3600,
-                           env=_build_proxy_env(proxy))
+                           env=env)
             httpx_results = _read_jsonl(httpx_out)
             _ingest_results("httpx", httpx_out, job_id=job_id)
             phases["httpx"] = {"probed": len(httpx_results)}
@@ -3137,8 +3343,7 @@ def _run_recon_pipeline(job_id: str, classified: dict, skip: set,
                 tls_file = _write_targets_file(tls_hosts)
                 tlsx_out = str(REPORT_DIR / f"pipeline_tlsx_{short}.jsonl")
                 cmd = ["tlsx", "-l", tls_file, "-json", "-o", tlsx_out, "-silent"]
-                tls_env = _build_proxy_env(proxy)
-                subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=tls_env)
+                subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=env)
                 tlsx_results = _read_jsonl(tlsx_out)
                 _ingest_results("tlsx", tlsx_out, job_id=job_id)
                 phases["tlsx"] = {"certs_analyzed": len(tlsx_results)}
@@ -3175,7 +3380,7 @@ def _run_recon_pipeline(job_id: str, classified: dict, skip: set,
                 if proxy:
                     cmd.extend(["--chrome-proxy", proxy])
                 subprocess.run(cmd, capture_output=True, text=True, timeout=3600,
-                               env=_build_proxy_env(proxy))
+                               env=env)
                 gw_count = len([f for f in os.listdir(gw_dir) if f.endswith(".png")])
                 gw_ingested_pipe = 0
                 if os.path.exists(gw_jsonl_pipe):
@@ -3715,7 +3920,7 @@ def run_amass(req: AmassReq, background_tasks: BackgroundTasks):
     if req.passive:
         cmd.append("-passive")
 
-    env = _build_proxy_env(req.proxy)
+    env = _build_proxy_env(req.proxy, targets=req.domains)
     _job_tracker.update_progress(job_id, targets_count=len(req.domains))
     # amass writes output_prefix.json automatically
     background_tasks.add_task(_run_tool_job, job_id, "amass", cmd, targets_file, output_file, env=env, no_ingest=req.no_ingest)
@@ -3734,7 +3939,7 @@ def run_gau(req: GauReq, background_tasks: BackgroundTasks):
     if req.providers:
         cmd[-1] = f"cat {targets_file} | gau --subs --o {output_file} --providers {req.providers}"
 
-    env = _build_proxy_env(req.proxy)
+    env = _build_proxy_env(req.proxy, targets=req.domains)
     _job_tracker.update_progress(job_id, targets_count=len(req.domains))
     background_tasks.add_task(_run_tool_job_recorded, job_id, "gau", cmd, targets_file,
                               output_file, list(req.domains), env=env, no_ingest=req.no_ingest)
@@ -3822,7 +4027,7 @@ def run_waybackurls(req: WaybackurlsReq, background_tasks: BackgroundTasks):
     # waybackurls reads from stdin, so use shell pipe: cat targets | waybackurls > output
     cmd = ["sh", "-c", f"cat {targets_file} | waybackurls > {output_file}"]
 
-    env = _build_proxy_env(req.proxy)
+    env = _build_proxy_env(req.proxy, targets=req.domains)
     _job_tracker.update_progress(job_id, targets_count=len(req.domains))
     background_tasks.add_task(_run_tool_job_recorded, job_id, "waybackurls", cmd,
                               targets_file, output_file, list(req.domains),
@@ -3843,7 +4048,7 @@ def run_trufflehog(req: TrufflehogReq, background_tasks: BackgroundTasks):
 
     cmd = ["trufflehog", scan_type, req.target, "--json", "--output", output_file]
 
-    env = _build_proxy_env(req.proxy)
+    env = _build_proxy_env(req.proxy, targets=[req.target])
     _job_tracker.update_progress(job_id, targets_count=1)
     background_tasks.add_task(_run_tool_job, job_id, "trufflehog", cmd, None, output_file, env=env, no_ingest=req.no_ingest)
     return {"ok": True, "job_id": job_id, "status": "queued", "status_url": f"/jobs/{job_id}", "no_ingest": req.no_ingest}
@@ -3860,6 +4065,8 @@ def run_censys(req: CensysReq, background_tasks: BackgroundTasks):
     if search_type not in allowed_types:
         raise HTTPException(status_code=400, detail=f"search_type must be one of: {allowed_types}")
 
+    _eid = _request_engagement_id()
+
     def _run_censys_job():
         try:
             import time as _time
@@ -3867,10 +4074,11 @@ def run_censys(req: CensysReq, background_tasks: BackgroundTasks):
             _job_tracker.update_job(job_id, status="running", started_at=datetime.now().isoformat())
             _job_tracker.update_progress(job_id, stage="running")
 
+            eg = _egress(req.proxy, targets=[req.query], engagement_id=_eid,
+                         audit_tool="censys")
             emit_webhook_event("scan_started", "censys", {"job_id": job_id, "scan_type": "censys"})
-            write_audit("scan_started", "censys", "osint_runner", {
-                "job_id": job_id, "execution_mode": "local",
-            })
+            write_audit("scan_started", "censys", "osint_runner",
+                        dict(eg.audit(), job_id=job_id))
 
             env_keys = _get_api_keys()
             api_id = env_keys.get("CENSYS_API_ID", "")
@@ -3880,10 +4088,10 @@ def run_censys(req: CensysReq, background_tasks: BackgroundTasks):
 
             # Set proxy env vars so the censys SDK (uses requests) routes through SOCKS tunnel
             _old_proxy = {}
-            if req.proxy:
+            if eg.proxy:
                 for var in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"):
                     _old_proxy[var] = os.environ.get(var)
-                    os.environ[var] = req.proxy
+                    os.environ[var] = eg.proxy
 
             results = []
 
@@ -3952,7 +4160,7 @@ def run_censys(req: CensysReq, background_tasks: BackgroundTasks):
                         break
 
             # Restore proxy env vars
-            if req.proxy:
+            if eg.proxy:
                 for var, old_val in _old_proxy.items():
                     if old_val is None:
                         os.environ.pop(var, None)
@@ -3988,9 +4196,8 @@ def run_censys(req: CensysReq, background_tasks: BackgroundTasks):
             emit_webhook_event("scan_completed", "censys", {
                 "job_id": job_id, "scan_type": "censys", "records": len(results), "elapsed_sec": round(elapsed, 1),
             })
-            write_audit("scan_completed", "censys", "osint_runner", {
-                "job_id": job_id, "execution_mode": "local", "records": len(results),
-            })
+            write_audit("scan_completed", "censys", "osint_runner",
+                        dict(eg.audit(), job_id=job_id, records=len(results)))
         except Exception as e:
             logging.error(f"[{job_id}] Censys error: {e}")
             _job_tracker.update_job(job_id, status="error", error=str(e))
@@ -4263,7 +4470,8 @@ def _ingest_gowitness_jsonl(jsonl_path: str, screenshot_dir: str, job_id: str) -
     return ingested
 
 
-def _run_gowitness_job(job_id, targets, timeout=10, resolution="1440x900", proxy=None):
+def _run_gowitness_job(job_id, targets, timeout=10, resolution="1440x900",
+                       proxy=None, engagement_id=None):
     """Run gowitness screenshots, save to /reports/screenshots/{job_id[:8]}/"""
     import time as _time
     _t0 = _time.time()
@@ -4275,6 +4483,9 @@ def _run_gowitness_job(job_id, targets, timeout=10, resolution="1440x900", proxy
 
         targets_file = _write_targets_file(targets)
         w, h = resolution.split("x") if "x" in resolution else ("1440", "900")
+        eg = _egress(proxy, targets=targets, engagement_id=engagement_id,
+                     audit_tool="gowitness")
+        proxy = eg.proxy
 
         jsonl_out = str(REPORT_DIR / f"gowitness_{job_id[:8]}.jsonl")
         cmd = ["gowitness", "scan", "file",
@@ -4290,12 +4501,12 @@ def _run_gowitness_job(job_id, targets, timeout=10, resolution="1440x900", proxy
 
         cmd_str = " ".join(cmd)
         _job_tracker.push_command(job_id, "gowitness", cmd_str)
-        write_audit("scan_started", "gowitness", "osint_runner", {
-            "job_id": job_id, "execution_mode": "proxied" if proxy else "local",
-            "targets": targets[:10], "targets_count": len(targets),
-            "command": cmd_str, "proxy": proxy or None,
-        })
-        env = _build_proxy_env(proxy)
+        write_audit("scan_started", "gowitness", "osint_runner", dict(
+            eg.audit(),
+            job_id=job_id, targets=targets[:10], targets_count=len(targets),
+            command=cmd_str,
+        ))
+        env = eg.env
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200, env=env)
         logging.info(f"[{job_id}] gowitness stdout: {result.stdout[:500]}")
         if result.stderr:
@@ -4343,7 +4554,8 @@ def run_gowitness(req: GoWitnessReq, background_tasks: BackgroundTasks):
     job_id = _job_tracker.create_job(job_type="gowitness")
     _job_tracker.update_progress(job_id, targets_count=len(req.targets))
     background_tasks.add_task(_run_gowitness_job, job_id, req.targets,
-                              req.timeout, req.resolution, req.proxy)
+                              req.timeout, req.resolution, req.proxy,
+                              _request_engagement_id())
     return {"ok": True, "job_id": job_id, "status": "queued",
             "status_url": f"/jobs/{job_id}"}
 
@@ -4366,6 +4578,8 @@ def run_greyhatwarfare(req: GHWReq, background_tasks: BackgroundTasks):
     if search_type not in ("buckets", "files"):
         raise HTTPException(400, "search_type must be 'buckets' or 'files'")
 
+    _eid = _request_engagement_id()
+
     def _run_ghw_job():
         import time as _time
         try:
@@ -4376,13 +4590,15 @@ def run_greyhatwarfare(req: GHWReq, background_tasks: BackgroundTasks):
 
             emit_webhook_event("scan_started", "greyhatwarfare",
                                {"job_id": job_id, "scan_type": "greyhatwarfare"})
+            eg = _egress(req.proxy, targets=[req.search_query],
+                         engagement_id=_eid, audit_tool="greyhatwarfare")
             write_audit("scan_started", "greyhatwarfare", "osint_runner",
-                        {"job_id": job_id, "execution_mode": "local"})
+                        dict(eg.audit(), job_id=job_id))
 
             session = requests.Session()
             session.headers["Authorization"] = f"Bearer {api_key}"
-            if req.proxy:
-                session.proxies = {"http": req.proxy, "https": req.proxy}
+            if eg.proxy:
+                session.proxies = {"http": eg.proxy, "https": eg.proxy}
 
             limit = min(req.limit or 100, 1000)
             base_url = "https://buckets.grayhatwarfare.com/api/v2"
@@ -4440,7 +4656,7 @@ def run_greyhatwarfare(req: GHWReq, background_tasks: BackgroundTasks):
             })
 
         except Exception as e:
-            log.error("GHW job %s failed: %s", job_id, e)
+            logging.error("GHW job %s failed: %s", job_id, e)
             _job_tracker.update_job(job_id, status="failed", error=str(e))
             emit_webhook_event("scan_failed", "greyhatwarfare",
                                {"job_id": job_id, "error": str(e)})
@@ -4692,11 +4908,13 @@ def run_wafw00f(req: Wafw00fReq, background_tasks: BackgroundTasks):
     targets_file = _write_targets_file(req.targets)
     output_file = str(REPORT_DIR / f"wafw00f_{job_id[:8]}.json")
 
-    cmd = ["wafw00f", "-i", targets_file, "-o", output_file, "-f", "json"]
-    if req.proxy:
-        cmd.extend(["-p", req.proxy])
+    eg = _egress(req.proxy, targets=req.targets, audit_tool="wafw00f")
 
-    env = _build_proxy_env(req.proxy)
+    cmd = ["wafw00f", "-i", targets_file, "-o", output_file, "-f", "json"]
+    if eg.proxy:
+        cmd.extend(["-p", eg.proxy])
+
+    env = eg.env
     _job_tracker.update_progress(job_id, targets_count=len(req.targets))
     background_tasks.add_task(_run_tool_job, job_id, "wafw00f", cmd, targets_file, output_file, env=env, no_ingest=req.no_ingest)
     return {"ok": True, "job_id": job_id, "status": "queued",
@@ -4818,14 +5036,16 @@ def run_subzy(req: SubzyReq, background_tasks: BackgroundTasks):
     targets_file = _write_targets_file(req.targets)
     output_file = str(REPORT_DIR / f"subzy_{job_id[:8]}.json")
 
+    eg = _egress(req.proxy, targets=req.targets, audit_tool="subzy")
+
     cmd = ["subzy", "run", "--targets", targets_file, "--output", output_file]
-    if req.proxy:
-        cmd.extend(["--proxy", req.proxy])
+    if eg.proxy:
+        cmd.extend(["--proxy", eg.proxy])
 
     _job_tracker.update_progress(job_id, targets_count=len(req.targets))
     _job_tracker.push_command(job_id, "subzy", f"subzy run --targets <{len(req.targets)} subdomains>")
     background_tasks.add_task(_run_tool_job, job_id, "subzy", cmd, targets_file, output_file,
-                              env=_build_proxy_env(req.proxy), no_ingest=req.no_ingest)
+                              env=eg.env, no_ingest=req.no_ingest)
     return {"ok": True, "job_id": job_id, "status": "queued"}
 
 
@@ -4853,7 +5073,7 @@ def run_golinkfinder(req: GoLinkFinderReq, background_tasks: BackgroundTasks):
     def _run_glf():
         try:
             _job_tracker.update_job(job_id, status="running")
-            env = _build_proxy_env(req.proxy)
+            env = _build_proxy_env(req.proxy, targets=[req.target])
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env)
 
             endpoints = []

@@ -4090,6 +4090,29 @@ DO $$ BEGIN
     ALTER TABLE engagements ADD COLUMN IF NOT EXISTS agent_dispatch_trusted boolean DEFAULT false;
     ALTER TABLE engagements ADD COLUMN IF NOT EXISTS agent_dispatch_trusted_by text;
     ALTER TABLE engagements ADD COLUMN IF NOT EXISTS agent_dispatch_trusted_at timestamptz;
+    -- Must every scan for this engagement EGRESS through a proxy?
+    --
+    -- An opsec control, not an authorisation one. `scope_targets` answers
+    -- "may this host be touched"; this answers "whose address may the packets
+    -- appear to come from". They are separate questions: an in-scope target
+    -- scanned from the operator's own residential IP is an authorised scan
+    -- that has still burned the operator.
+    --
+    -- Lives on `engagements` rather than `scope_targets` because egress
+    -- attribution is a property of the OPERATION, not of an individual host:
+    -- a per-target column would let one host in an engagement leak while its
+    -- sibling is protected, which is not a meaningful opsec boundary. It also
+    -- sits beside `node_id` — the column that selects WHICH proxy — so the
+    -- "which egress" and "must there be one" knobs are read together; and
+    -- scope_targets rows may legitimately carry a NULL engagement_id (the
+    -- global not_in_scope deny-list), which would make the policy on such a
+    -- row unattributable to any operation.
+    --
+    -- DEFAULT FALSE so existing engagements behave exactly as they did. The
+    -- readers (etl/attack_proxy.engagement_requires_proxy) treat an
+    -- UNREADABLE policy as required, so turning this on is the only way to
+    -- change behaviour and a broken database never silently turns it off.
+    ALTER TABLE engagements ADD COLUMN IF NOT EXISTS require_proxy boolean NOT NULL DEFAULT false;
 END $$;
 
 -- ── Sync trigger function ────────────────────────────────────────────

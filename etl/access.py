@@ -874,8 +874,27 @@ def refresh(target: str, *, rounds: int = None,
                         INSERT INTO public.obtained_access
                           (target, port, kind, handle, transport, whoami, uid,
                            is_root, os_info, probes, probes_ok, last_probe_at,
-                           last_error, score, status, engagement_id)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s,%s,%s,%s)
+                           last_error, score, status, engagement_id,
+                           source_exploit)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s,%s,%s,%s,
+                          -- WHICH EXPLOIT OPENED THIS. `discover()` enumerates
+                          -- live access and cannot know; the executor recorded
+                          -- it at the time, so resolve it here instead of
+                          -- leaving the column NULL on every row.
+                          -- `exploit_results.session_id` IS the handle for the
+                          -- kinds an exploit creates: a webshell's URL and an
+                          -- msf session's numeric id are stored verbatim in
+                          -- both tables. The kinds found by PROBING a port
+                          -- (bind_shell, ssh_credential, credential) have no
+                          -- originating exploit and correctly match nothing —
+                          -- NULL there means "nothing opened this", not
+                          -- "we failed to look".
+                          (SELECT er.pending_exploit_id
+                             FROM public.exploit_results er
+                            WHERE er.session_id = %s
+                              AND er.success
+                            ORDER BY er.executed_at DESC
+                            LIMIT 1))
                         ON CONFLICT (target, kind, handle) DO UPDATE SET
                           whoami = EXCLUDED.whoami, uid = EXCLUDED.uid,
                           is_root = EXCLUDED.is_root, os_info = EXCLUDED.os_info,
@@ -888,14 +907,20 @@ def refresh(target: str, *, rounds: int = None,
                           -- ruled one out is not overruled by it answering.
                           status = CASE
                               WHEN public.obtained_access.status = 'rejected'
-                                   THEN 'rejected' ELSE EXCLUDED.status END
+                                   THEN 'rejected' ELSE EXCLUDED.status END,
+                          -- COALESCE, not EXCLUDED: a later re-probe that
+                          -- cannot resolve the exploit must not erase an
+                          -- attribution an earlier one established.
+                          source_exploit = COALESCE(
+                              public.obtained_access.source_exploit,
+                              EXCLUDED.source_exploit)
                         """,
                         (cand["target"], cand.get("port"), cand["kind"],
                          cand["handle"], cand.get("transport", ""),
                          result["whoami"], result["uid"], result["is_root"],
                          result["os_info"], result["probes"], result["probes_ok"],
                          result["last_error"], result["score"], result["status"],
-                         engagement_id))
+                         engagement_id, cand["handle"]))
                     # REVALIDATE: feed a probed credential back into the
                     # credential model (mark valid + log the attempt).
                     _reconcile_credential(cur, cand, result, engagement_id)

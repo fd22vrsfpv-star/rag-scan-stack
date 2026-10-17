@@ -734,6 +734,7 @@ REQUIRED_COLUMNS=(
     "exploit_chunks:doc_kind"    # TIER 24
     "exploit_chunks:tech"        # TIER 24 — per-technology web-scan training
     "service_prompts:tech"       # TIER 24 — 'tech' prompt selector
+    "engagements:require_proxy"  # per-engagement egress policy (osint_runner)
 )
 
 for entry in "${REQUIRED_COLUMNS[@]}"; do

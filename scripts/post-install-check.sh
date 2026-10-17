@@ -367,6 +367,20 @@ else
   warn "node_scan_jobs.engagement_id check skipped (no DB connection helper available)"
 fi
 
+# engagements.require_proxy — the per-engagement egress policy the OSINT
+# runner reads before every scan. The column being ABSENT is the one state
+# that is safe (no engagement can have opted in, so nothing changes); the
+# column being absent on a stack where an operator THINKS they enabled it is
+# the dangerous one, which is why this is asserted rather than assumed.
+HAS_ENG_RP=$(_run_sql "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='engagements' AND column_name='require_proxy')")
+if [[ "$HAS_ENG_RP" == "t" ]]; then
+  pass "engagements.require_proxy column present"
+elif [[ "$HAS_ENG_RP" == "f" ]]; then
+  fail "engagements.require_proxy missing — run ./scripts/ensure_db_schema.sh (OSINT scans cannot be forced through a proxy without it)"
+else
+  warn "engagements.require_proxy check skipped (no DB connection helper available)"
+fi
+
 HAS_NSJ_UQ=$(_run_sql "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE tablename='node_scan_jobs' AND indexname='uq_node_scan_jobs_job_id')")
 if [[ "$HAS_NSJ_UQ" == "t" ]]; then
   pass "uq_node_scan_jobs_job_id unique index present"

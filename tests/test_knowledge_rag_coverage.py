@@ -90,15 +90,125 @@ RAG_LOAD_DEBT = {
     "seed_prompts.example.yaml":
         "EXAMPLE seed file for import-knowledge.sh, not live knowledge; the rules "
         "it seeds are embedded when imported, not the example itself.",
+
+    # --- Subdirectories, surfaced 2026-10-17 when the glob above became
+    # recursive. None of these is embedded; all are read deterministically.
+    # They are declared, not exempted: the ratchet now SEES them, which is
+    # the point. Shrink this list by adding renderers, directory at a time.
+    'artifact_rules/builtin.yaml':
+        'artifact action rules read by app/rag-api/artifact_actions.py; deterministic lookup only.',
+    'detection_rules/builtin.yaml':
+        'detection rule read by app/rag-api/rule_engine.py; deterministic lookup only, never embedded into rag_documents.',
+    'detection_rules/cloud.yaml':
+        'detection rule read by app/rag-api/rule_engine.py; deterministic lookup only, never embedded into rag_documents.',
+    'detection_rules/custom/customer_hosted_sites.yaml':
+        'operator-authored detection rule read by app/rag-api/rule_engine.py; deterministic lookup only, never embedded.',
+    'detection_rules/custom/interesting_files.yaml':
+        'operator-authored detection rule read by app/rag-api/rule_engine.py; deterministic lookup only, never embedded.',
+    'detection_rules/custom/microburst.yaml':
+        'operator-authored detection rule read by app/rag-api/rule_engine.py; deterministic lookup only, never embedded.',
+    'detection_rules/custom/scoped_login_detection.yaml':
+        'operator-authored detection rule read by app/rag-api/rule_engine.py; deterministic lookup only, never embedded.',
+    'detection_rules/custom/security_controls.yaml':
+        'operator-authored detection rule read by app/rag-api/rule_engine.py; deterministic lookup only, never embedded.',
+    'detection_rules/custom/unified_login_detection.yaml':
+        'operator-authored detection rule read by app/rag-api/rule_engine.py; deterministic lookup only, never embedded.',
+    'extractors/_classes.yaml':
+        "tool-output extractor spec, read deterministically by app/rag-api/extractor_specs.py (SPEC_DIR=/knowledge/extractors) and never embedded. Surfaced 2026-10-17 when this guard's glob was made recursive; the whole directory was invisible to it before.",
+    'extractors/enum4linux-ng.yaml':
+        "tool-output extractor spec, read deterministically by app/rag-api/extractor_specs.py (SPEC_DIR=/knowledge/extractors) and never embedded. Surfaced 2026-10-17 when this guard's glob was made recursive; the whole directory was invisible to it before.",
+    'extractors/enum4linux.yaml':
+        "tool-output extractor spec, read deterministically by app/rag-api/extractor_specs.py (SPEC_DIR=/knowledge/extractors) and never embedded. Surfaced 2026-10-17 when this guard's glob was made recursive; the whole directory was invisible to it before.",
+    'extractors/feroxbuster.yaml':
+        "tool-output extractor spec, read deterministically by app/rag-api/extractor_specs.py (SPEC_DIR=/knowledge/extractors) and never embedded. Surfaced 2026-10-17 when this guard's glob was made recursive; the whole directory was invisible to it before.",
+    'extractors/ffuf.yaml':
+        "tool-output extractor spec, read deterministically by app/rag-api/extractor_specs.py (SPEC_DIR=/knowledge/extractors) and never embedded. Surfaced 2026-10-17 when this guard's glob was made recursive; the whole directory was invisible to it before.",
+    'extractors/gobuster.yaml':
+        "tool-output extractor spec, read deterministically by app/rag-api/extractor_specs.py (SPEC_DIR=/knowledge/extractors) and never embedded. Surfaced 2026-10-17 when this guard's glob was made recursive; the whole directory was invisible to it before.",
+    'extractors/hydra.yaml':
+        "tool-output extractor spec, read deterministically by app/rag-api/extractor_specs.py (SPEC_DIR=/knowledge/extractors) and never embedded. Surfaced 2026-10-17 when this guard's glob was made recursive; the whole directory was invisible to it before.",
+    'extractors/medusa.yaml':
+        "tool-output extractor spec, read deterministically by app/rag-api/extractor_specs.py (SPEC_DIR=/knowledge/extractors) and never embedded. Surfaced 2026-10-17 when this guard's glob was made recursive; the whole directory was invisible to it before.",
+    'extractors/netexec.yaml':
+        "tool-output extractor spec, read deterministically by app/rag-api/extractor_specs.py (SPEC_DIR=/knowledge/extractors) and never embedded. Surfaced 2026-10-17 when this guard's glob was made recursive; the whole directory was invisible to it before.",
+    'extractors/onesixtyone.yaml':
+        "tool-output extractor spec, read deterministically by app/rag-api/extractor_specs.py (SPEC_DIR=/knowledge/extractors) and never embedded. Surfaced 2026-10-17 when this guard's glob was made recursive; the whole directory was invisible to it before.",
+    'extractors/rpcinfo.yaml':
+        "tool-output extractor spec, read deterministically by app/rag-api/extractor_specs.py (SPEC_DIR=/knowledge/extractors) and never embedded. Surfaced 2026-10-17 when this guard's glob was made recursive; the whole directory was invisible to it before.",
+    'extractors/smbclient.yaml':
+        "tool-output extractor spec, read deterministically by app/rag-api/extractor_specs.py (SPEC_DIR=/knowledge/extractors) and never embedded. Surfaced 2026-10-17 when this guard's glob was made recursive; the whole directory was invisible to it before.",
+    'extractors/smbmap.yaml':
+        "tool-output extractor spec, read deterministically by app/rag-api/extractor_specs.py (SPEC_DIR=/knowledge/extractors) and never embedded. Surfaced 2026-10-17 when this guard's glob was made recursive; the whole directory was invisible to it before.",
+    'extractors/smtp-user-enum.yaml':
+        "tool-output extractor spec, read deterministically by app/rag-api/extractor_specs.py (SPEC_DIR=/knowledge/extractors) and never embedded. Surfaced 2026-10-17 when this guard's glob was made recursive; the whole directory was invisible to it before.",
+    'extractors/snmpwalk.yaml':
+        "tool-output extractor spec, read deterministically by app/rag-api/extractor_specs.py (SPEC_DIR=/knowledge/extractors) and never embedded. Surfaced 2026-10-17 when this guard's glob was made recursive; the whole directory was invisible to it before.",
+    'extractors/sslscan.yaml':
+        "tool-output extractor spec, read deterministically by app/rag-api/extractor_specs.py (SPEC_DIR=/knowledge/extractors) and never embedded. Surfaced 2026-10-17 when this guard's glob was made recursive; the whole directory was invisible to it before.",
+    'mitre/attack_map.yaml':
+        'MITRE technique map read by app/rag-api/attack_vectors.py as a deterministic lookup table; never embedded into rag_documents.',
+    'playbooks/active_directory_attacks.yaml':
+        'authored playbook, read by etl/playbooks.py. CLAUDE.md names playbooks explicitly as RAG-first knowledge, so this is real debt rather than an exemption — it should be embedded, not just read.',
+    'playbooks/code_injection.yaml':
+        'authored playbook, read by etl/playbooks.py. CLAUDE.md names playbooks explicitly as RAG-first knowledge, so this is real debt rather than an exemption — it should be embedded, not just read.',
+    'playbooks/credential_dumping.yaml':
+        'authored playbook, read by etl/playbooks.py. CLAUDE.md names playbooks explicitly as RAG-first knowledge, so this is real debt rather than an exemption — it should be embedded, not just read.',
+    'playbooks/database_methodology.yaml':
+        'authored playbook, read by etl/playbooks.py. CLAUDE.md names playbooks explicitly as RAG-first knowledge, so this is real debt rather than an exemption — it should be embedded, not just read.',
+    'playbooks/defense_evasion.yaml':
+        'authored playbook, read by etl/playbooks.py. CLAUDE.md names playbooks explicitly as RAG-first knowledge, so this is real debt rather than an exemption — it should be embedded, not just read.',
+    'playbooks/lateral_movement.yaml':
+        'authored playbook, read by etl/playbooks.py. CLAUDE.md names playbooks explicitly as RAG-first knowledge, so this is real debt rather than an exemption — it should be embedded, not just read.',
+    'playbooks/metasploitable-2-exploitability-guide.yaml':
+        'authored playbook, read by etl/playbooks.py. CLAUDE.md names playbooks explicitly as RAG-first knowledge, so this is real debt rather than an exemption — it should be embedded, not just read.',
+    'playbooks/network_services.yaml':
+        'authored playbook, read by etl/playbooks.py. CLAUDE.md names playbooks explicitly as RAG-first knowledge, so this is real debt rather than an exemption — it should be embedded, not just read.',
+    'playbooks/persistence_techniques.yaml':
+        'authored playbook, read by etl/playbooks.py. CLAUDE.md names playbooks explicitly as RAG-first knowledge, so this is real debt rather than an exemption — it should be embedded, not just read.',
+    'playbooks/smb_methodology.yaml':
+        'authored playbook, read by etl/playbooks.py. CLAUDE.md names playbooks explicitly as RAG-first knowledge, so this is real debt rather than an exemption — it should be embedded, not just read.',
+    'playbooks/ssh_methodology.yaml':
+        'authored playbook, read by etl/playbooks.py. CLAUDE.md names playbooks explicitly as RAG-first knowledge, so this is real debt rather than an exemption — it should be embedded, not just read.',
+    'playbooks/web_methodology.yaml':
+        'authored playbook, read by etl/playbooks.py. CLAUDE.md names playbooks explicitly as RAG-first knowledge, so this is real debt rather than an exemption — it should be embedded, not just read.',
+    'scope_rules/builtin.yaml':
+        'scope classification rules read by app/rag-api/scope_classifier.py; deterministic, and authorization-adjacent so it must stay a lookup — but it is still unembedded knowledge.',
+    'scope_rules/custom.yaml':
+        'scope classification rules read by app/rag-api/scope_classifier.py; deterministic, and authorization-adjacent so it must stay a lookup — but it is still unembedded knowledge.',
+    'seed/gtfobins.yaml':
+        'seed data imported by scan_recommender rather than embedded; the rules it seeds are embedded on import, the seed file itself is not.',
+    'seed/htb-attack-paths.yaml':
+        'seed data imported by scan_recommender rather than embedded; the rules it seeds are embedded on import, the seed file itself is not.',
+    'seed/htb-web-cheatsheet.yaml':
+        'seed data imported by scan_recommender rather than embedded; the rules it seeds are embedded on import, the seed file itself is not.',
+    'seed/knowledge-base.yaml':
+        'seed data imported by scan_recommender rather than embedded; the rules it seeds are embedded on import, the seed file itself is not.',
+    'seed/metasploitable-2-exploitability-guide.yaml':
+        'seed data imported by scan_recommender rather than embedded; the rules it seeds are embedded on import, the seed file itself is not.',
+    'seed/native-tools-gaps.yaml':
+        'seed data imported by scan_recommender rather than embedded; the rules it seeds are embedded on import, the seed file itself is not.',
+    'seed/wstg.yaml':
+        'seed data imported by scan_recommender rather than embedded; the rules it seeds are embedded on import, the seed file itself is not.',
 }
 
 
 def _knowledge_yamls():
-    files = glob.glob(os.path.join(KNOWLEDGE, "*.yaml")) + \
-            glob.glob(os.path.join(KNOWLEDGE, "*.yml"))
+    """Every knowledge YAML, RECURSIVELY, keyed by path relative to knowledge/.
+
+    This globbed `knowledge/*.yaml` only — flat — so eight subdirectories
+    escaped the rule entirely: 43 of 90 files were visible, and adding a spec
+    under `knowledge/extractors/` raised no failure at all. The guard reported
+    green because it could not see the files, which is worse than a known gap.
+
+    Top-level names are unchanged (`relpath` of a top-level file IS its
+    basename), so every pre-existing RAG_LOADED / RAG_LOAD_DEBT key still
+    matches; subdirectory files now appear as `extractors/ffuf.yaml`.
+    """
+    files = glob.glob(os.path.join(KNOWLEDGE, "**", "*.yaml"), recursive=True) + \
+            glob.glob(os.path.join(KNOWLEDGE, "**", "*.yml"), recursive=True)
     if not files:
         pytest.skip("no knowledge/*.yaml found — repo layout changed?")
-    return sorted(os.path.basename(f) for f in files)
+    return sorted(os.path.relpath(f, KNOWLEDGE) for f in files)
 
 
 def test_every_knowledge_yaml_is_loaded_or_declared_debt():
