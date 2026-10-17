@@ -919,14 +919,18 @@ def build_existing_target_context(target_description: str) -> Optional[str]:
 
 
 def list_agent_sessions(
-    status: Optional[str] = None,
+    status=None,
     limit: int = 50
 ) -> List[Dict]:
     """
     List agent sessions
 
     Args:
-        status: Filter by status (active, completed, failed)
+        status: Filter by status — one name, or a list/tuple of them.
+            A sequence matters: a session that is WORKING may be 'active' OR
+            'scanning', and a caller that asks for only one silently ignores
+            the other. The watchdog asked for 'active' alone, which is how two
+            'scanning' sessions survived 478 hours claiming to be running.
         limit: Maximum number of sessions
 
     Returns:
@@ -934,15 +938,26 @@ def list_agent_sessions(
     """
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         if status:
-            cur.execute(
-                """
-                SELECT * FROM agent_sessions
-                WHERE status = %s
-                ORDER BY created_at DESC
-                LIMIT %s
-                """,
-                (status, limit)
-            )
+            if isinstance(status, (list, tuple, set)):
+                cur.execute(
+                    """
+                    SELECT * FROM agent_sessions
+                    WHERE status = ANY(%s)
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (list(status), limit)
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT * FROM agent_sessions
+                    WHERE status = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (status, limit)
+                )
         else:
             cur.execute(
                 """

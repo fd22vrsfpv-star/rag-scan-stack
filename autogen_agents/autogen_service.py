@@ -821,7 +821,13 @@ async def session_watchdog():
             await asyncio.sleep(SESSION_WATCHDOG_INTERVAL)
 
             # Get all active sessions
-            sessions = list_agent_sessions(status="active", limit=100)
+            # BOTH working statuses. This asked for "active" alone, so a
+            # 'scanning' session was invisible to the watchdog: two sat at
+            # 'scanning' for 478 hours (2026-09-27 -> 2026-10-17), with the
+            # dashboard polling them as live scans the whole time.
+            # 'awaiting_approval' is deliberately NOT here — it is waiting on
+            # a human, not a dead process.
+            sessions = list_agent_sessions(status=("active", "scanning"), limit=100)
 
             now = datetime.utcnow()
 
