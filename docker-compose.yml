@@ -264,7 +264,13 @@ services:
       # OLLAMA_URL stays at real Ollama for anything that needs raw Ollama.
       POSTEX_SEMANTIC_ENUMERATE: ${POSTEX_SEMANTIC_ENUMERATE:-1}
       BUILD_POC_LANGGRAPH: ${BUILD_POC_LANGGRAPH:-1}   # StateGraph refactor of _build_poc_core (default ON post-migration; set 0 to fall back)
-      RAG_OBSERVED_FACTS: ${RAG_OBSERVED_FACTS:-0}     # Embed observed target facts + enum_facts into rag_documents so prior observations recall across builds (off by default; opt-in)
+      # ON by default since 2026-10-17. It was opt-in and nobody opted in, so
+      # EVERY build ran with no recall context at all — the trace said
+      # 'recall NOT QUERIED: observed_facts_enabled() is false'. Builds had
+      # no memory of what previously worked on a target while 61% of them
+      # exhausted the refine loop. The CODE default stays off so a bare
+      # import never writes to the DB (tests/test_rag_observed_facts.py).
+      RAG_OBSERVED_FACTS: ${RAG_OBSERVED_FACTS:-1}     # Embed observed target facts + enum_facts into rag_documents so prior observations recall across builds (off by default; opt-in)
       POC_SEMANTIC_VERIFY: ${POC_SEMANTIC_VERIFY:-1}   # Hybrid regex+semantic PoC verification; regex-first, canary-grounded LLM fallback (on by default)
       ZAP_URL: ${ZAP_URL:-http://zap:8090}
       ZAP_API_KEY: ${ZAP_API_KEY:-changeme}
@@ -484,7 +490,7 @@ services:
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       # Engagement-wide scan ceiling. Bounds concurrent tool execution in
       # common/tool_job.py — PER SERVICE, not globally (see that module).
-      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-10}
       # web-scanner writes findings straight to Postgres, so it never
       # needed to authenticate to rag-api and had no API_KEY at all. It
       # now POSTs raw ZAP/nikto output to /ingest/raw-artifact, which 401s
@@ -649,7 +655,7 @@ services:
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       # Engagement-wide scan ceiling. Bounds concurrent tool execution in
       # common/tool_job.py — PER SERVICE, not globally (see that module).
-      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-10}
       TZ: ${TZ:-America/New_York}
       # Trust the stack's self-signed cert WITHOUT disabling verification.
       # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
@@ -731,7 +737,7 @@ services:
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       # Engagement-wide scan ceiling. Bounds concurrent tool execution in
       # common/tool_job.py — PER SERVICE, not globally (see that module).
-      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-10}
       TZ: ${TZ:-America/New_York}
       # Trust the stack's self-signed cert WITHOUT disabling verification.
       # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
@@ -861,7 +867,7 @@ services:
       BUILD_VERSION: ${BUILD_VERSION:-dev}
       # Engagement-wide scan ceiling. Bounds concurrent tool execution in
       # common/tool_job.py — PER SERVICE, not globally (see that module).
-      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-10}
       TZ: ${TZ:-America/New_York}
       # Trust the stack's self-signed cert WITHOUT disabling verification.
       # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
@@ -916,7 +922,7 @@ services:
       # The engagement-wide scan ceiling. The recommender bounds both its
       # /next_scan admission and its auto-execute dispatches by this, so a
       # single number governs how much activity an engagement generates.
-      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-10}
       TZ: ${TZ:-America/New_York}
       # Trust the stack's self-signed cert WITHOUT disabling verification.
       # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
@@ -995,7 +1001,7 @@ services:
       # The engagement-wide scan ceiling. The recommender bounds both its
       # /next_scan admission and its auto-execute dispatches by this, so a
       # single number governs how much activity an engagement generates.
-      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-10}
       TZ: ${TZ:-America/New_York}
       # Trust the stack's self-signed cert WITHOUT disabling verification.
       # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
@@ -1107,7 +1113,7 @@ services:
       # common/tool_job.py, or via routers/scans.get_max_concurrent) and used to
       # fall back to a hardcoded 5 because it was never passed in — so raising
       # MAX_CONCURRENT_SCANS in .env changed nothing here.
-      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-10}
       TZ: ${TZ:-America/New_York}
       # Trust the stack's self-signed cert WITHOUT disabling verification.
       # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
@@ -1201,7 +1207,7 @@ services:
       # common/tool_job.py, or via routers/scans.get_max_concurrent) and used to
       # fall back to a hardcoded 5 because it was never passed in — so raising
       # MAX_CONCURRENT_SCANS in .env changed nothing here.
-      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-10}
       TZ: ${TZ:-America/New_York}
       # Trust the stack's self-signed cert WITHOUT disabling verification.
       # /certs/ca-bundle.crt = public CA roots + certs/server.crt, so internal
@@ -1696,7 +1702,7 @@ services:
     environment:
       # Without this the shared ceiling silently defaults to 5 instead of
       # using the number the operator actually set.
-      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-10}
       SSL_CERTFILE: /certs/server.crt
       PYTHONHTTPSVERIFY: "0"
       SSL_KEYFILE: /certs/server.key
@@ -2345,7 +2351,7 @@ services:
     mem_limit: ${DEFAULT_MEM_LIMIT:-4g}
     cpus: ${DEFAULT_CPUS:-2.0}
     environment:
-      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-10}
       SSL_CERTFILE: /certs/server.crt
       SSL_KEYFILE: /certs/server.key
       PYTHONHTTPSVERIFY: "0"
@@ -2503,7 +2509,7 @@ services:
       # common/tool_job.py, or via routers/scans.get_max_concurrent) and used to
       # fall back to a hardcoded 5 because it was never passed in — so raising
       # MAX_CONCURRENT_SCANS in .env changed nothing here.
-      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-10}
       TZ: ${TZ:-America/New_York}
       # Trust the stack's self-signed cert WITHOUT disabling verification.
       # 14 other services already had this; pentest-dashboard did not, and it

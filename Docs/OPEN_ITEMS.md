@@ -85,51 +85,6 @@ recursive glob it passed silently).
 because it reports green. The previous entry's own count (14) came from looking
 only where the symptom was noticed.
 
-### A soft feed error is recorded per-run but written back as `last_status='ok'`
-**Found:** 2026-10-17, while rendering per-source ingest progress.
-**Evidence:** `news_runner/news_agent.py:688-705` — `_fetch_feed` returns
-`(articles, fetch_error)`. A non-empty `fetch_error` is deliberately *recorded,
-not raised* ("one dead feed must not abort the other sixteen"), landing in
-`src_stats["error"]`. Control then falls straight into:
-
-    UPDATE news_sources
-       SET last_fetched_at = now(), last_status = 'ok', last_error = NULL
-     WHERE id = %s
-
-Only a raised exception reaches the `except` branch that writes
-`last_status='error'`. So a feed that soft-fails every run is stored as clean.
-The Sources panel renders `s.last_error` (`dashboard/frontend/src/pages/News.tsx:1116`),
-so it shows that feed as healthy — now directly contradicting the per-source
-row for the SAME run, which shows it failed.
-**Where:** `news_runner/news_agent.py:698-705`.
-**Done when:** the write reflects the outcome — `last_status='error'` and
-`last_error = fetch_error` when `fetch_error` is non-empty, `'ok'` otherwise —
-and the Sources panel agrees with the run's `per_source` entry for the same
-source.
-**Enforced by:** not enforced. A test would call the update path with a
-soft-errored fetch and assert the stored `last_status`.
-*Why it matters:* this is the three-outcomes rule on the storage side. "Fetched
-and fine", "fetched with errors" and "could not fetch" are three states stored
-as two, and the one that disappears is the one needing attention.
-
-### A STALLED news source contributes no row at all while it hangs
-**Found:** 2026-10-17, while rendering per-source ingest progress.
-**Evidence:** `news_runner/news_agent.py:731` appends `src_stats` to
-`stats["per_source"]` only AFTER the per-source `try/except` completes, and
-`_update_run` persists the list only then. A source hanging mid-fetch therefore
-contributes nothing — it is visible only as the arithmetic gap between
-`sources_fetched` and `len(sources)`, which no view computes. The per-source
-panel added 2026-10-17 shows failed and empty sources, but cannot show a
-hanging one, because the producer has not emitted it yet.
-**Where:** `news_runner/news_agent.py:~687-731`.
-**Done when:** a pending entry is appended BEFORE the fetch starts and updated
-in place on completion, so a source in flight renders as "fetching" and one
-that hangs stays visibly in flight rather than being absent.
-**Enforced by:** not enforced.
-*Why it matters:* the half of the original item that is still open. A stalled
-source and a source that has not started are indistinguishable, which is the
-same unreachable-is-not-absent bug in the producer rather than the reader.
-
 ### Nothing measures whether retrieval improved
 **Found:** before 2026-09-11
 **Evidence:** `SELECT count(*) FROM rag_feedback` returns **0** — the table the
@@ -297,13 +252,6 @@ approval path, gated behind an explicit policy flag (Tier 3).
 - **Where:** knowledge/cve_exploit_specs.yaml (add a verified spec each); derive from the app's actual vulnerable source / the published CVE PoC, verify live (SLEEP timing) before adding.
 - **Done when:** both verify end-to-end (latency_confirmed) from their cve_exploit_specs entries, like CVE-2024-36779.
 - **Enforced by:** not enforced (per-CVE exploit research).
-
-### OSINT scans against external targets leak the operator's real IP (`execution_mode=local`, `proxy=null`)
-**Found:** 2026-10-06, after an operator reported seeing "local host" source attribution for scans targeting 205.139.105.12 in the OpSec console.
-**Evidence:** `grep "205.139.105.12" scan_audit/audit.jsonl` returns two entries from 2026-10-06T16:10 for `gowitness` (headless Chromium screenshot), both with `"source": "osint_runner"`, `"execution_mode": "local"`, `"proxy": null`, and `"external_ip": "199.168.198.186"` (the operator's own public IP). The scan opened a TLS session straight from the osint-runner container to the external target — no node-SOCKS proxy, no scope-gate check for proxy requirement. The current scope-gate (`etl/scope_gate.py`) refuses out-of-scope dispatch but does not enforce *how* in-scope targets are reached. For an external pentest / red-team engagement this is an attribution leak: every browser hit, every TLS handshake carries the operator's IP, and nothing in the UI warns before Create.
-**Where:** `osint_runner/osint_runner.py` — the gowitness dispatch path. Any other `osint_runner` scan without a `proxy` set has the same problem (sweep: `grep -nE "subprocess|requests\.|httpx\." osint_runner/osint_runner.py | wc -l` → 100s of call sites; need an audit).
-**Done when:** engagements can declare a mandatory proxy (per-engagement `require_proxy=true` on `engagements` or `scope_targets`); the OSINT dispatcher fail-closes a scan whose target is in such an engagement when no `proxy` is configured; `scan_audit/audit.jsonl` records the actual proxy node_id used (or `required_proxy_missing` + reason); and the OpSec console labels local-execution scans as 🚨 ATTRIBUTION LEAK rather than the neutral "local". Agreement test with `tests/test_dispatch_invariants.py` so the sibling scope-gate rule is proven not duplicated.
-**Enforced by:** not enforced.
 
 ## Build-PoC deep-test loop
 
@@ -677,31 +625,6 @@ timeouts and `post-install-check` shows 0 duplicate `ports` rows.
 `tests/test_db_long_transactions_endpoint.py` (the read path executes);
 the keepalive / second-host parts are not enforced.
 
-### Two more one-transaction-per-batch loops (ingest paths, not live services)
-**Found:** 2026-10-10, auditing the codebase for the sweep's transaction shape
-after the four-hour-transaction incident.
-**Evidence:** an AST pass over every `*.py` for "connection held across a loop
-that does network / embedding / DNS work between statements, commit only at
-the end" flagged 5 sites; 3 were fixed in the PR above (`osint_agent`,
-`etl/access.py::refresh`, `scan_recommender/exploits_rag.py` ×2). Two remain:
-`app/load_all.py:41-43 backfill_findings_into_rag` (embeds inside one
-transaction; a one-off backfill that has never run in production) and
-`etl/parse_httpx.py:36 parse_httpx` (`socket.gethostbyname` per record inside
-one transaction with per-record savepoints; an upload parser, bounded by the
-file size).
-**Correction (2026-10-17):** `app/load_all.py` is NOT the shape described —
-`conn.autocommit = True` has been set since commit 90037788 (2026-09-09),
-predating this finding, so each INSERT commits on its own. Only the connect
-options are missing there. `etl/parse_httpx.py` IS unchanged and is the real
-instance: one `conn.commit()` at :200 after the loop, with a blocking
-`gethostbyname` at :88 inside it.
-**Where:** `app/load_all.py`, `etl/parse_httpx.py`.
-**Done when:** both commit per record (or resolve / embed before opening the
-transaction) and their connections carry the same
-`idle_in_transaction_session_timeout` / `lock_timeout` options as
-`etl/access.py::_connect`.
-**Enforced by:** not enforced
-
 ### BFF polls of autogen-agents time out at connect while a session is scanning
 **Found:** 2026-10-10 00:10–00:31 UTC, reading the dashboard log after the rebuild deploy.
 **Evidence:** `docker logs pentest-dashboard` shows `httpx.ConnectTimeout` at a
@@ -775,49 +698,6 @@ discovery-of-hosts and `web_findings` discovery-of-URLs, with `parse_ffuf` and
 `parse_gau` moved to the latter. Not attempted here: `recon_findings` rows from
 the upload route already exist in the live database and moving them is a
 migration, not a parser change.
-**Enforced by:** not enforced
-
-### ffuf and feroxbuster have no `knowledge/extractors/*.yaml` spec
-**Found:** 2026-10-12
-**Evidence:** `ls knowledge/extractors/` lists 13 specs including
-`gobuster.yaml`, whose `notable:` block turns "N paths discovered by content
-brute force" into a `recon_findings` fact via
-`app/rag-api/output_analysis.analyse_output` →
-`post_review_agent.ingest_extracted_facts`. `_spec_for("ffuf")` and
-`_spec_for("feroxbuster")` both return None, so neither tool contributes a
-notable fact to a post-review report even though both now parse. gobuster is the
-DEFAULT content-discovery tool (`knowledge/content_discovery.yaml:
-default_tool: gobuster`) and ffuf/feroxbuster are its two alternates, so the
-three behave differently in the review surface purely by accident of which got a
-spec first.
-**Where:** `knowledge/extractors/` (no `ffuf.yaml`, no `feroxbuster.yaml`).
-**Done when:** both tools have a spec with the same `notable:` facts gobuster
-declares, OR `analyse_output` reads the `PARSERS` registry result when no spec
-exists so a registry parser also produces notable facts. Note the RAG-coverage
-ratchet: a new `knowledge/*.yaml` must ship its loader in the same change
-(`tests/test_knowledge_rag_coverage.py`).
-**Enforced by:** not enforced
-
-### `priority` on a scope rule sorts ASCENDING — a high number is a WEAK rule
-**Found:** 2026-10-12
-**Evidence:** `scope_classifier.py::load_rules` ends with
-`sorted(merged, key=lambda r: r.get("priority", 100))` and its DB query is
-`ORDER BY priority` — both ascending — while `_check_rules` returns on the FIRST
-match. So the lowest number wins, which is the opposite of what the column name
-implies. A new rule `customer:sky-tenant-instances` created at priority **60**
-(chosen to beat the existing rule at 50) silently did nothing: every target still
-resolved via `auto:*.examplecorp.com->examplecorp`, confirmed live —
-`GET /scope/classify/altru11000a.sky.examplecorp.com` returned
-`"reasoning":"Rule 'auto:*.examplecorp.com->examplecorp': domain_pattern match"`.
-Re-creating it at priority **10** made the same call return
-`"Rule 'customer:sky-tenant-instances': composite match"`. The two seeded rules
-both sit at 50, so nothing in the existing data reveals the direction.
-**Where:** `app/rag-api/scope_classifier.py::load_rules` / `_check_rules`;
-`app/rag-api/api.py` rule-creation endpoint; the Scope Intel rule UI.
-**Done when:** the ordering is unambiguous at the point of authoring — either the
-column is renamed (`rank`/`evaluation_order`), or the create/edit UI and endpoint
-docstring state "lower runs first" and the API rejects a rule whose priority
-would place it behind a broader pattern for the same scope.
 **Enforced by:** not enforced
 
 ### Accepting a scope suggestion distils an apex-wide auto-apply rule
@@ -926,26 +806,3 @@ plus a 4-character minimum and a requirement that the name contains a letter.
 "Country" alone appears on 66 hosts and in a large share of headlines — match
 on it and every story reports an asset hit, which is worse than matching
 nothing because the operator learns to ignore the feature.
-
-### News ingest reports only a boolean while it is running
-**Found:** 2026-10-15
-**Evidence:** operator: "the news intell shows running ingest, but I don't see
-anything that is happening". A run takes ~2 minutes and walks 17 sources
-(today: 10:00:53 -> 10:02:39, 280 articles, 89 new), and for that whole window
-the page can say nothing more specific than "running".
-
-The data to show it already exists and is already persisted **per source,
-inside the loop**: `news_agent.py:337` calls `_update_run` immediately after
-appending each source's `src_stats` to `per_source`, and
-`GET /news/runs/{run_id}` returns that column. The News page polls that
-endpoint and reads only `runQ.data?.status === 'running'` (News.tsx:225) —
-`per_source` is never rendered anywhere in the frontend.
-**Where:** `dashboard/frontend/src/pages/News.tsx:225` (`ingestRunning`);
-producer `news_runner/news_agent.py:335-337`; endpoint
-`app/rag-api/api.py:3546` `/news/runs/{run_id}`.
-**Done when:** while a run is in flight the page shows which sources have been
-checked and what each returned — the `per_source` entries already carry
-`name`, `new` and an error field — so a stalled or failing source is visible
-while it is happening rather than only in the final summary.
-**Enforced by:** not enforced.
-

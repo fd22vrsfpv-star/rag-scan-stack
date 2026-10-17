@@ -45953,21 +45953,60 @@ def list_classification_rules(authorized: bool = Depends(auth)):
 
 @app.post("/scope/classification-rules", tags=["Scope Classification"])
 def create_classification_rule(body: dict, authorized: bool = Depends(auth)):
-    """Create a new DB-based classification rule."""
+    """Create a DB-based classification rule.
+
+    PRIORITY IS AN EVALUATION ORDER, AND **LOWER RUNS FIRST**. `load_rules`
+    sorts ascending and `_check_rules` returns on the FIRST match, so the
+    SMALLEST number wins — the opposite of what the column name suggests.
+
+    Measured 2026-10-12: a rule authored at priority 60 (chosen to "beat" an
+    existing rule at 50) silently never fired; every target kept resolving via
+    the broader rule. The same rule re-created at 10 matched immediately. The
+    two seeded rules both sit at 50, so nothing in the existing data reveals
+    the direction — the author has no way to discover it except by failing.
+
+    So the endpoint now SAYS where the rule lands: the response carries
+    `evaluation_order`, the rules that will be tried before it for the same
+    scope, and a `warning` when a rule is created behind a broader pattern it
+    can therefore never beat. It is advisory, not a refusal — an operator may
+    legitimately want a catch-all last, and refusing a valid rule is worse
+    than explaining it.
+
+    The default stays 100 (effectively last) rather than becoming "first",
+    because a rule created with no opinion about order should not pre-empt
+    deliberately-placed ones.
+    """
     required = ("name", "scope_name", "rule_type", "conditions")
     for f in required:
         if f not in body:
             raise HTTPException(400, f"Missing field: {f}")
+    priority = int(body.get("priority", 100))
     with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
             INSERT INTO scope_classification_rules (id, name, scope_name, priority, rule_type, conditions, auto_apply)
             VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s)
             RETURNING id
-        """, (body["name"], body["scope_name"], body.get("priority", 100),
+        """, (body["name"], body["scope_name"], priority,
               body["rule_type"], json.dumps(body["conditions"]), body.get("auto_apply", False)))
         rule_id = str(cur.fetchone()["id"])
         conn.commit()
-    return {"ok": True, "id": rule_id}
+        # Which enabled rules are evaluated BEFORE this one (lower = earlier).
+        cur.execute("""
+            SELECT name, priority, rule_type FROM scope_classification_rules
+             WHERE enabled AND id <> %s::uuid AND priority <= %s
+             ORDER BY priority LIMIT 10
+        """, (rule_id, priority))
+        earlier = [{"name": r["name"], "priority": r["priority"],
+                    "rule_type": r["rule_type"]} for r in cur.fetchall()]
+    out = {"ok": True, "id": rule_id, "priority": priority,
+           "evaluation_order": "lower priority runs FIRST; the first match wins",
+           "rules_evaluated_before_this_one": earlier}
+    if earlier:
+        out["warning"] = (
+            f"{len(earlier)} enabled rule(s) run before priority {priority} and "
+            "the first match wins, so this rule only fires for targets none of "
+            "them match. Lower the priority to evaluate it earlier.")
+    return out
 
 
 @app.delete("/scope/classification-rules/{rule_id}", tags=["Scope Classification"])

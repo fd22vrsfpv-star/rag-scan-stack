@@ -1333,9 +1333,22 @@ function AutoClassifyPanel() {
               className="px-2 py-1 text-[10px] rounded border border-purple-500/30 text-purple-400 hover:bg-purple-500/10"
             >{learnRules.isPending ? 'Analyzing...' : 'Learn from Decisions'}</button>
           </div>
+          {/* Rules are evaluated in ascending priority and the FIRST match
+              wins, so the SMALLEST number decides. The column name implies the
+              reverse: a rule authored at 60 to beat one at 50 silently never
+              fired (2026-10-12). The list is shown in evaluation order with
+              the number visible, so the direction is observable rather than
+              something an operator has to discover by failing. */}
+          <p className="text-[10px] text-muted-foreground mb-1">
+            Evaluated top to bottom — <span className="font-medium">lower number runs first</span>, first match wins.
+          </p>
           <div className="max-h-48 overflow-y-auto space-y-1">
-            {rules.map((r, i) => (
+            {[...rules].sort((a, b) => (a.priority ?? 100) - (b.priority ?? 100)).map((r, i) => (
               <div key={r.id || i} className="flex items-center gap-2 text-xs bg-muted/50 rounded px-2 py-1.5">
+                <span
+                  title={`Priority ${r.priority ?? 100} — lower runs first`}
+                  className="px-1 py-0.5 rounded text-[9px] font-mono bg-muted border border-border text-muted-foreground"
+                >{r.priority ?? 100}</span>
                 <span className="font-medium flex-1 truncate">{r.name}</span>
                 <span className="px-1.5 py-0.5 rounded text-[10px] bg-primary/10 text-primary">{r.scope_name}</span>
                 <span className="px-1 py-0.5 rounded text-[9px] bg-muted border border-border">{r.rule_type}</span>
