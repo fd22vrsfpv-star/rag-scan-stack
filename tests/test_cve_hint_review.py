@@ -49,3 +49,22 @@ def test_failed_fetch_is_not_recorded_so_it_is_retried():
     or the resume logic would skip that CVE forever with no class."""
     src = SCRIPT.read_text(encoding="utf-8")
     assert 'if row.get("error"):' in src and "_append(path, row)" in src
+
+
+def test_writeups_merge_only_fills_missing_advisories():
+    m = _mod()
+    enrich = [{"cve": "A", "advisory_poc": ""}, {"cve": "B", "advisory_poc": "ghsa text"},
+              {"cve": "C", "advisory_poc": ""}]
+    writeups = [{"cve": "A", "advisory_poc": "blog post"},
+                {"cve": "B", "advisory_poc": "other"}, {"cve": "C", "advisory_poc": ""}]
+    got = {r["cve"]: r for r in m.merged_rows(enrich, writeups)}
+    assert got["A"]["advisory_poc"] == "blog post" and got["A"]["writeup_from"] == "search"
+    assert got["B"]["advisory_poc"] == "ghsa text", "an enrich advisory must not be overwritten"
+    assert "writeup_from" not in got["C"]
+
+
+def test_enrich_disables_the_web_search():
+    """80 of 82 s per CVE was the DuckDuckGo search; enrich must turn it off."""
+    src = SCRIPT.read_text(encoding="utf-8")
+    body = src[src.index("def phase_enrich"):src.index("def phase_writeups")]
+    assert "_BUILD_POC_WEB_SEARCH = False" in body

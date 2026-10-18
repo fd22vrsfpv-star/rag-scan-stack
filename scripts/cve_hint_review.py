@@ -11,10 +11,14 @@ side effects -- every daemon starts from a startup hook):
 PHASES (each resumable -- a CVE already recorded in the phase's JSONL is skipped,
 so a rag-api restart costs nothing but the in-flight CVE):
 
-  enrich   NVD description, CWE, refs and advisory PoC via _fetch_cve_details
-           (cached in software_research_cache), then the CWE-first class.
-           Rate-limited for NVD's public API (no key: ~5 requests / 30 s).
-  read     For each EXPLOITABLE class: _read_description_requirements with the
+  enrich   NVD description, CWE, refs and GHSA advisory PoC via
+           _fetch_cve_details (cached in software_research_cache), then the
+           CWE-first class. The DuckDuckGo writeup search is OFF here: it was
+           80 of 82 s per CVE (~21 h for a year), and 3,000 back-to-back
+           searches would get the search blocked.
+  writeups DuckDuckGo writeup search, ONLY for exploitable CVEs that enrich
+           found no advisory PoC for, paced at one CVE per --search-pause s.
+  read     For each EXPLOITABLE class (writeups merged over enrich rows): _read_description_requirements with the
            class's reading hints, the advisory/writeup text as extra context.
            One LLM call per CVE. Yields the per-CVE exploit path.
   propose  Per class: aggregate the read requirements, then ONE LLM call that
@@ -37,6 +41,7 @@ import time
 
 OUT_DIR = os.environ.get("HINT_REVIEW_DIR", "/app/poc_logs/hint_review")
 NVD_PAUSE_S = float(os.environ.get("HINT_REVIEW_NVD_PAUSE", "6.5"))
+SEARCH_PAUSE_S = float(os.environ.get("HINT_REVIEW_SEARCH_PAUSE", "20"))
 
 
 def _done(path, key="cve"):
@@ -89,6 +94,7 @@ def phase_enrich(api, year, limit):
     done = _done(path)
     todo = [c for c in _year_cves(api, year) if c not in done][: limit or None]
     print(f"enrich: {len(done)} done, {len(todo)} to go", flush=True)
+    api._BUILD_POC_WEB_SEARCH = False      # see the module docstring
     vc = api._vc()
     for i, cve in enumerate(todo, 1):
         t0 = time.monotonic()
@@ -122,8 +128,43 @@ def phase_enrich(api, year, limit):
           {"phase": "enrich", "year": year, "processed": len(todo)})
 
 
-def phase_read(api, limit):
+def phase_writeups(api, limit, pause):
     src = [r for r in _rows(os.path.join(OUT_DIR, "enrich.jsonl"))
+           if r.get("ok") and r.get("exploitable") and not r.get("advisory_poc")]
+    path = os.path.join(OUT_DIR, "writeups.jsonl")
+    done = _done(path)
+    todo = [r for r in src if r["cve"] not in done][: limit or None]
+    print(f"writeups: {len(done)} done, {len(todo)} to go", flush=True)
+    api._BUILD_POC_WEB_SEARCH = True
+    for i, r in enumerate(todo, 1):
+        try:
+            d = api._fetch_cve_details(r["cve"]) or {}
+            _append(path, {"cve": r["cve"],
+                           "advisory_poc": (d.get("advisory_poc") or "")[:3000],
+                           "refs": (d.get("refs") or [])[:30]})
+        except Exception as e:  # noqa: BLE001
+            print(f"  {r['cve']}: ERROR {type(e).__name__}: {e}"[:300], flush=True)
+        if i % 10 == 0:
+            print(f"  {i}/{len(todo)}", flush=True)
+        time.sleep(pause)
+    _emit("hint_review_phase_completed", {"phase": "writeups", "processed": len(todo)})
+
+
+def merged_rows(enrich_rows, writeup_rows):
+    """Enrich rows with any writeup the search phase found merged in. Pure."""
+    found = {w["cve"]: w for w in writeup_rows if w.get("advisory_poc")}
+    out = []
+    for r in enrich_rows:
+        w = found.get(r.get("cve"))
+        if w and not r.get("advisory_poc"):
+            r = dict(r, advisory_poc=w["advisory_poc"], writeup_from="search")
+        out.append(r)
+    return out
+
+
+def phase_read(api, limit):
+    src = [r for r in merged_rows(_rows(os.path.join(OUT_DIR, "enrich.jsonl")),
+                                  _rows(os.path.join(OUT_DIR, "writeups.jsonl")))
            if r.get("ok") and r.get("exploitable")]
     path = os.path.join(OUT_DIR, "read.jsonl")
     done = _done(path)
@@ -205,7 +246,9 @@ def phase_propose(api, min_support):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--phase", required=True, choices=("enrich", "read", "propose"))
+    ap.add_argument("--phase", required=True,
+                    choices=("enrich", "writeups", "read", "propose"))
+    ap.add_argument("--search-pause", type=float, default=SEARCH_PAUSE_S)
     ap.add_argument("--year", default="2026")
     ap.add_argument("--limit", type=int, default=0, help="max CVEs this run (0 = all)")
     ap.add_argument("--min-support", type=int, default=3)
@@ -215,6 +258,8 @@ def main(argv=None):
     import api  # noqa: E402  -- side-effect free at import (see docstring)
     if args.phase == "enrich":
         phase_enrich(api, args.year, args.limit)
+    elif args.phase == "writeups":
+        phase_writeups(api, args.limit, args.search_pause)
     elif args.phase == "read":
         if not hasattr(api, "_read_description_requirements"):
             sys.exit("read phase needs the description-read step -- deploy it first")
