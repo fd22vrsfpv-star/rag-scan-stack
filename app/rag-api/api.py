@@ -42081,7 +42081,161 @@ def _gather_cve_intel(cve, product=None, version=None, ip=None, port=None,
     }
 
 
-def _research_exploit(cve, ip=None, port=None, product=None, version=None, eid=None, model=None):
+# ─── Multi-model research helpers (operator may ask for 1-3 LLMs in parallel) ──
+_RESEARCH_FANOUT_MAX = 3
+_RESEARCH_CALL_TIMEOUT_S = float(os.environ.get("RESEARCH_FANOUT_TIMEOUT_S", "180") or "180")
+
+
+def _dedup_models(models, fallback):
+    """Return at most _RESEARCH_FANOUT_MAX distinct model names.
+
+    `fallback` is the single-model argument (the pre-existing API). It is used
+    only when `models` is empty, and even then the LIST contains that one entry
+    so the downstream code treats the single-model case uniformly: one fanout
+    "worker", one candidate, no comparison call. [None] (route-decides) is a
+    valid single-model request too.
+    """
+    picked, seen = [], set()
+    for m in (models or [fallback]):
+        key = (str(m).strip().lower() if m and str(m).strip() else "")
+        if key in seen:
+            continue
+        seen.add(key)
+        picked.append(m if (m and str(m).strip()) else None)
+        if len(picked) >= _RESEARCH_FANOUT_MAX:
+            break
+    return picked or [None]
+
+
+def _research_exploit_fanout(prompt, models):
+    """Run the SAME prompt through each model in parallel. One candidate per
+    model, with its elapsed seconds and any error. A failed call becomes a
+    candidate with analysis=None + error -- never a silent exclusion.
+    """
+    import time as _tm
+    def _call(mdl):
+        t0 = _tm.monotonic()
+        row = {"model": mdl, "requested_model": mdl, "duration_s": 0.0,
+               "analysis": None, "error": None, "raw_text": ""}
+        text = ""
+        try:
+            # Retry once on an empty reply, same as the single-model path did.
+            for _ in range(2):
+                res = _llm_for_model(prompt, model=mdl, caller="exploit_research")
+                text = res.get("response", "") if isinstance(res, dict) else str(res or "")
+                if isinstance(res, dict) and res.get("model"):
+                    row["model"] = res["model"]
+                obj = _poc_extract_json(text) or {}
+                if obj.get("summary") or obj.get("seed_command") or obj.get("payload"):
+                    row["analysis"] = obj
+                    break
+            if row["analysis"] is None and not text.strip():
+                row["error"] = "empty reply from the LLM path (unreachable is not absent)"
+            elif row["analysis"] is None:
+                row["error"] = "model answered but produced no usable research fields"
+            row["raw_text"] = text[:2000]
+        except Exception as e:  # noqa: BLE001
+            row["error"] = f"{type(e).__name__}: {e}"[:300]
+        row["duration_s"] = round(_tm.monotonic() - t0, 2)
+        return row
+    if len(models) <= 1:
+        return [_call(models[0] if models else None)]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(models)) as exe:
+        futures = {exe.submit(_call, m): m for m in models}
+        out = []
+        for fut in concurrent.futures.as_completed(futures, timeout=_RESEARCH_CALL_TIMEOUT_S + 30):
+            try:
+                out.append(fut.result(timeout=_RESEARCH_CALL_TIMEOUT_S))
+            except Exception as e:  # noqa: BLE001
+                out.append({"model": futures[fut], "requested_model": futures[fut],
+                            "duration_s": 0.0, "analysis": None,
+                            "error": f"fanout error: {type(e).__name__}: {e}"[:300]})
+    # Stable order: match the operator's requested order so a two-column UI
+    # does not shuffle on every call.
+    order = {id(m): i for i, m in enumerate(models)}
+    out.sort(key=lambda r: order.get(id(r.get("requested_model")), 99))
+    return out
+
+
+def _research_pick_best(candidates):
+    """Default pick when the comparison call has not run (single model, or
+    comparison failed). Highest `confidence` wins; a result that at least has a
+    `seed_command` beats one that only has a summary.
+    """
+    scored = []
+    for c in candidates:
+        a = c.get("analysis") or {}
+        if not a:
+            continue
+        # Seed command is EVIDENCE (a runnable PoC string); confidence is a
+        # self-rating models often inflate. Weight accordingly: a result that
+        # names a seed_command outranks one that is merely confident.
+        score = float(a.get("confidence") or 0)
+        score += 0.5 if a.get("seed_command") else 0
+        score += 0.2 if a.get("payload") else 0
+        score += 0.1 if a.get("target_endpoint") else 0
+        scored.append((score, c))
+    if not scored:
+        return candidates[0] if candidates else {"model": None, "analysis": None}
+    scored.sort(key=lambda t: -t[0])
+    return scored[0][1]
+
+
+def _research_compare(candidates, model=None):
+    """Review the 2-3 candidate analyses and pick the best, naming agreements
+    and disagreements. One LLM call; the reviewer is routed through the normal
+    cve_description_read lane. On any failure returns `None` and the default
+    picker's choice still applies: the comparison is a nice-to-have, not a
+    gate -- `_research_pick_best` has already produced a usable answer.
+    """
+    usable = [c for c in candidates if (c.get("analysis") or {})]
+    if len(usable) < 2:
+        return None
+    import json as _json
+    rows = []
+    for c in usable:
+        a = c["analysis"]
+        rows.append({
+            "model": c.get("model"),
+            "duration_s": c.get("duration_s"),
+            "summary": (a.get("summary") or "")[:400],
+            "target_endpoint": a.get("target_endpoint"),
+            "http_method": a.get("http_method"),
+            "params": a.get("params"),
+            "payload": (str(a.get("payload") or ""))[:400],
+            "success_signal": a.get("success_signal"),
+            "seed_command": (str(a.get("seed_command") or ""))[:600],
+            "confidence": a.get("confidence"),
+        })
+    prompt = (
+        "Three security analysts researched the same CVE and returned structured "
+        "JSON. Compare their answers field by field. Pick the ONE most likely "
+        "correct answer -- prefer agreement between models over a lone claim; "
+        "prefer answers backed by the advisory shape over invented endpoints.\n"
+        "ANALYSES:\n" + _json.dumps(rows, indent=2)[:12000] + "\n\n"
+        'Return ONE JSON object: {"picked_model": "<model name as given>", '
+        '"rationale": "<why in one sentence>", '
+        '"agreement": {"<field>": "<value they agreed on>"}, '
+        '"disagreement": {"<field>": {"<model>": "<their answer>"}}}'
+        ". Output JSON only, no prose.")
+    try:
+        res = _llm_for_model(prompt, model=model, caller="exploit_research_compare")
+        text = res.get("response", "") if isinstance(res, dict) else str(res or "")
+        obj = _poc_extract_json(text) or {}
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"compare call failed: {type(e).__name__}: {e}"[:200]}
+    pick = obj.get("picked_model")
+    return {
+        "picked_model": pick,
+        "rationale": (obj.get("rationale") or "")[:600],
+        "agreement": obj.get("agreement") or {},
+        "disagreement": obj.get("disagreement") or {},
+        "candidates_compared": [c.get("model") for c in usable],
+    }
+
+
+def _research_exploit(cve, ip=None, port=None, product=None, version=None, eid=None,
+                     model=None, models=None):
     """Reference-PoC research: pull public exploit material for a CVE (Metasploit module,
     ExploitDB PoC text, NVD refs, GitHub/Gitee advisories via DDG) and have the LLM
     explain WHAT THE EXPLOIT CONSISTS OF — preconditions, endpoint, method, params,
@@ -42116,22 +42270,32 @@ def _research_exploit(cve, ip=None, port=None, product=None, version=None, eid=N
               f'"success_signal": "<what in the response confirms the weakness>", '
               f'"seed_command": "<an example curl request that VALIDATES it against {tgt}, or empty>", '
               f'"confidence": 0.0}}. Output JSON only, no prose.')
-    analysis, llm_model = {}, None
-    for _ in range(2):  # gpt-5-mini occasionally returns empty; retry like synth
-        try:
-            res = _llm_for_model(prompt, model=model, caller="exploit_research")
-            text = res.get("response", "") if isinstance(res, dict) else str(res or "")
-            if isinstance(res, dict) and res.get("model"):
-                llm_model = res["model"]
-            obj = _poc_extract_json(text) or {}
-        except Exception:  # noqa: BLE001
-            obj = {}
-        if obj.get("summary") or obj.get("seed_command") or obj.get("payload"):
-            analysis = obj
-            break
+    # Operator may ask for up to THREE models to run the SAME prompt (optional,
+    # 1-3). A single-model call is unchanged -- same model, same prompt, same
+    # shape (`analysis`, `llm_model`) -- so every existing caller still works.
+    # With 2-3 models we fan out in parallel, keep each candidate verbatim
+    # (success or error), and run ONE post-review call that compares them and
+    # picks the best. The chosen candidate still fills `analysis` / `llm_model`
+    # so downstream callers get the SAME shape they had.
+    #
+    # Added 2026-10-18 at operator request so research answers can be compared
+    # across models without running a separate build for each.
+    picked_models = _dedup_models(list(models or []) if models else [], model)
+    candidates = _research_exploit_fanout(prompt, picked_models)
+    comparison = _research_compare(candidates, model=model) if len(candidates) > 1 else None
+    chosen = _research_pick_best(candidates)
+    if comparison and comparison.get("picked_model"):
+        for c in candidates:
+            if c.get("analysis") and c.get("model") == comparison["picked_model"]:
+                chosen = c
+                break
+    analysis = chosen.get("analysis") or {}
+    llm_model = chosen.get("model")
     return {
         "cve": cve,
         "analysis": analysis,
+        "candidates": candidates,
+        "comparison": comparison,
         "sources": {
             "msf": [m.get("module") for m in msf],
             "exploitdb": [{"edb_id": e.get("edb_id"), "title": e.get("title"),
@@ -42153,6 +42317,10 @@ class ResearchExploitBody(BaseModel):
     product: Optional[str] = None
     version: Optional[str] = None
     model: Optional[str] = None
+    # Optional multi-model fanout for the research phase: send the SAME prompt
+    # to 1-3 models and compare at a post-review step. When provided, overrides
+    # `model` as the fanout list; omit to keep single-model behaviour.
+    models: Optional[List[str]] = None
 
 
 @app.get("/exploit-store/meta/models", tags=["Exploit Store"])
@@ -42174,13 +42342,18 @@ def research_exploit_endpoint(body: ResearchExploitBody, authorized: bool = Depe
     cve = (body.cve or "").strip().upper()
     if not cve.startswith("CVE-"):
         raise HTTPException(400, "cve must be a CVE id")
-    out = _research_exploit(cve, body.ip, body.port, body.product, body.version, model=body.model)
+    out = _research_exploit(cve, body.ip, body.port, body.product, body.version,
+                             model=body.model, models=body.models)
     try:
         from webhooks import emit_webhook
         emit_webhook("exploit_research_run", "exploit_store",
                      {"cve": cve, "target": body.ip,
                       "has_public_module": out["sources"]["has_public_module"],
-                      "seed": bool((out.get("analysis") or {}).get("seed_command"))})
+                      "seed": bool((out.get("analysis") or {}).get("seed_command")),
+                      "models_requested": body.models or ([body.model] if body.model else []),
+                      "models_used": [c.get("model") for c in (out.get("candidates") or [])],
+                      "models_failed": [c.get("model") for c in (out.get("candidates") or [])
+                                        if c.get("error")]})
     except Exception:  # noqa: BLE001
         pass
     return {"ok": True, **out}
