@@ -24171,7 +24171,7 @@ def _resolve_refine_assertion(la, prev_assertion, command, canary, timing_mode):
 
 
 def _timing_confirmation_rerun(command, assertion, ip, port, listener,
-                                 api_key, vt, delta=7, tolerance=2.5):
+                                 api_key, vt, delta=7, tolerance=2.5, first_s=None):
     """Confirm a blind-timing exploit by re-running with a larger payload.
 
     A blind SQLi SLEEP(5) that lands in a target just happens to be slow
@@ -24218,14 +24218,26 @@ def _timing_confirmation_rerun(command, assertion, ip, port, listener,
                 "scaled_cmd": scaled_cmd,
                 "reason": f"confirmation run failed: {e}"}
     expected = float(min_s) + delta
-    # Signal: second run should block ~delta seconds longer than the first
-    # (within tolerance). If elapsed < expected - tolerance, the server
-    # is NOT scaling with the payload → false positive.
-    confirmed = elapsed >= (expected - tolerance)
+    # Signal: the second run must block ~delta seconds LONGER THAN THE FIRST.
+    # The absolute floor alone (elapsed >= expected - tolerance) passes any
+    # target that is simply slow: CVE-2023-37999 on 2026-10-18 took 23.2s for
+    # SLEEP(5) and 9.7s for SLEEP(12) -- the bigger sleep was 13.5s FASTER --
+    # and was stored as latency_confirmed because 9.7 >= 12 - 2.5. A server
+    # executing the payload adds the delta; one that is merely slow does not.
+    floor_ok = elapsed >= (expected - tolerance)
+    scaled_ok = True
+    if first_s is not None:
+        try:
+            scaled_ok = (elapsed - float(first_s)) >= (delta - tolerance)
+        except (TypeError, ValueError):
+            scaled_ok = False
+    confirmed = floor_ok and scaled_ok
     return {
         "confirmed": confirmed,
         "pattern": pattern,
-        "first_s": None,  # caller fills from the original run
+        "first_s": first_s,  # the original run's elapsed (caller-supplied)
+        "scaled_by_s": (round(elapsed - float(first_s), 2)
+                        if isinstance(first_s, (int, float)) else None),
         "second_s": elapsed,
         "expected_s": expected,
         "scaled_cmd": scaled_cmd,
@@ -24233,8 +24245,10 @@ def _timing_confirmation_rerun(command, assertion, ip, port, listener,
         "scaled_payload_new": new_n,
         "output_sample": _out_sample,
         "reason": (f"confirmation run elapsed {elapsed:.1f}s "
-                   f"(expected >= {expected - tolerance:.1f}s "
-                   f"after scaling {pattern}({old_n})→{pattern}({new_n})) → "
+                   f"(expected >= {expected - tolerance:.1f}s"
+                   + (f" and >= first run {float(first_s):.1f}s + {delta - tolerance:.1f}s"
+                      if isinstance(first_s, (int, float)) else "")
+                   + f" after scaling {pattern}({old_n})→{pattern}({new_n})) → "
                    f"{'CONFIRMED' if confirmed else 'UNCONFIRMED (target may be slow, not exploitable)'}")
     }
 
@@ -30313,7 +30327,8 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             try:
                 _conf = _timing_confirmation_rerun(
                     command, assertion, ip, port, listener, API_KEY, _vt,
-                    delta=int(os.environ.get("TIMING_CONFIRM_DELTA_SEC", "7") or "7"))
+                    delta=int(os.environ.get("TIMING_CONFIRM_DELTA_SEC", "7") or "7"),
+                    first_s=_this_iter_seconds)
                 # This re-runs the command against the TARGET, so it is a
                 # target run. `pattern is None` means no timing payload was
                 # found and nothing was dispatched, so it is not counted —
