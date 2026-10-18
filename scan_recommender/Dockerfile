@@ -10,6 +10,9 @@ COPY scan_recommender.py /app/scan_recommender.py
 # llm_settings now comes from the ./common bind mount as
 # `common.llm_settings` — one copy, not four. See common/llm_settings.py.
 COPY exploits_rag.py      /app/exploits_rag.py
+# The cadence that re-runs the retrieval eval. Started by rag_router's startup
+# handler, so a missing copy here is a feature that silently never runs.
+COPY rag_eval_scheduler.py /app/rag_eval_scheduler.py
 COPY multi_app.py         /app/multi_app.py
 COPY log_manager.py       /app/log_manager.py
 COPY csv_to_json.py       /app/csv_to_json.py

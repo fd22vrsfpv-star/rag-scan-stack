@@ -37,6 +37,11 @@ API = REPO / "app" / "rag-api" / "api.py"
 
 
 def _const(name):
+    # Moved to knowledge/craft_guidance.yaml on 2026-10-17; read it there,
+    # with duplicate-key rejection, rather than as an api.py literal.
+    if name == "_CRAFT_CLASS_GUIDANCE":
+        from _craft_guidance import load_guidance
+        return load_guidance()
     if not API.exists():
         pytest.skip("api.py not found")
     for n in ast.walk(ast.parse(API.read_text(encoding="utf-8"))):

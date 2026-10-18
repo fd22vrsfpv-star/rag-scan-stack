@@ -149,11 +149,34 @@ def _check_route_product_mismatch(rule: dict, intel: dict) -> List[dict]:
     return out
 
 
+def _path_is_the_field(vc: str) -> bool:
+    """Ask the CLASS TABLE, not a private list.
+
+    This rule used to carry its own `path_is_the_field_classes` in
+    fact_contradictions.yaml, and that copy had drifted: it listed `lfi` (plus
+    `file-read`, `file-disclosure` and `arbitrary-file-read`, which all
+    canonicalise to lfi). The class table says LFI injects through a PARAMETER
+    (`?page=../../etc/passwd`). The rule's action is `clear`, so on every LFI
+    build a correctly-gathered parameter was DELETED as a "contradiction".
+
+    Fail-soft to False: when the table cannot be read we decline to clear
+    anything — wrongly keeping a field is recoverable, wrongly deleting the
+    one real injection point is not.
+    """
+    try:
+        try:
+            from etl import vuln_classes as _VC
+        except ImportError:
+            import vuln_classes as _VC  # type: ignore
+        return bool(_VC.path_is_the_field(_VC.canonical(vc)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _check_field_kind_mismatch(rule: dict, intel: dict) -> List[dict]:
     vc = _norm(intel.get("vuln_class"))
-    classes = {_norm(c) for c in (rule.get("path_is_the_field_classes") or [])}
     field = (intel.get("facts") or {}).get("input_field")
-    if vc not in classes or not field:
+    if not vc or not field or not _path_is_the_field(vc):
         return []
     # The path-is-the-field upgrade records the ROUTE as the input field, with
     # an explanation. That is the correct state, not a contradiction.

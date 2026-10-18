@@ -274,6 +274,33 @@ else
   warn "scan_recommendations.target_kind check skipped (no DB connection helper available)"
 fi
 
+# discovered_params.engagement_id — half of uq_discovered_params_identity.
+# url_pattern carries only scheme://netloc/path, so without the engagement two
+# engagements pointed at the same address shared one row and the second crawl
+# UPDATEd the first's counters. Missing column => the ON CONFLICT in
+# etl/parse_katana.py and playwright_scanner/param_extractor.py matches no
+# index and EVERY discovered param insert raises instead of storing.
+HAS_DP_ENG=$(_run_sql "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='discovered_params' AND column_name='engagement_id')")
+if [[ "$HAS_DP_ENG" == "t" ]]; then
+  pass "discovered_params.engagement_id column present"
+elif [[ "$HAS_DP_ENG" == "f" ]]; then
+  fail "discovered_params.engagement_id missing — run ./scripts/ensure_db_schema.sh (every param upsert will raise 'no unique or exclusion constraint matching the ON CONFLICT specification')"
+else
+  warn "discovered_params.engagement_id check skipped (no DB connection helper available)"
+fi
+
+# The index itself: the column alone is not the key. COALESCE, not a partial
+# index — a NULL in an indexed column makes rows non-equal in Postgres, so an
+# unresolved engagement would be unconstrained rather than deduped.
+HAS_DP_IDX=$(_run_sql "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE tablename='discovered_params' AND indexname='uq_discovered_params_identity')")
+if [[ "$HAS_DP_IDX" == "t" ]]; then
+  pass "uq_discovered_params_identity present (engagement-scoped param dedup)"
+elif [[ "$HAS_DP_IDX" == "f" ]]; then
+  fail "uq_discovered_params_identity missing — run ./scripts/ensure_db_schema.sh (discovered param upserts cannot match their ON CONFLICT target)"
+else
+  warn "uq_discovered_params_identity check skipped (no DB connection helper available)"
+fi
+
 # Asset identity: a hostname equal to the IP is not a virtual host, it is
 # "hostname unknown" written wrongly — and ix_assets_ip_hostname(ip,
 # COALESCE(hostname,'')) counts it as a DIFFERENT row from hostname=NULL. Ports

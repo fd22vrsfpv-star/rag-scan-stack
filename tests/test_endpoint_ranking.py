@@ -118,3 +118,45 @@ class TestItRanksRatherThanTakingTheFirst:
         assert "endpoint_ranked" in _strings(gather), (
             "when several candidates answer, the trace must record which was "
             "chosen and what it beat")
+
+
+class TestTheRootIsNotAFinding:
+    """Every web target answers on "/" and the readiness gate confirms it.
+
+    Seeding confirmed endpoints therefore made "/" a top candidate on every
+    host. Measured in the 2026-10-17 21:19 round, within ONE round of the
+    change landing: **5 of 11** builds chose "/" over five other answering
+    candidates, including real paths like /wp-admin/admin-ajax.php and
+    /business-directory. The refine loop then attacked a homepage.
+    """
+
+    def test_the_root_is_never_seeded_from_confirmed_facts(self, gather):
+        sql = " ".join(s for s in _strings(gather) if "confirmed_facts" in s)
+        assert sql, "the confirmed-endpoint query is gone"
+        import re as _re
+        assert _re.search(r"claim_value\s*<>\s*'/'", sql), (
+            "the query must exclude the root; `claim_value LIKE '/%'` matches "
+            f"'/' itself and the gate confirms it on every target. SQL: {sql}")
+
+    def test_the_root_ranks_last(self, gather):
+        src = ast.get_source_segment(API.read_text(encoding="utf-8"), gather) or ""
+        i = src.find('if ep == "/":')
+        assert i > 0, "the root must be special-cased in the ranking"
+        # it must not be able to inherit advisory/confirmed standing
+        window = src[i:i + 200]
+        import re as _re
+        neutralised = _re.search(r"_adv\s*=\s*_conf\s*=\s*False", window)
+        demoted = _re.search(r"_score\s*=\s*9", src[i:])
+        assert neutralised or demoted, (
+            "the root must neither count as advisory nor as confirmed, and "
+            "must score below every real candidate")
+
+    def test_the_root_is_still_reachable_as_a_last_resort(self, gather):
+        """A header-borne vector (Host, X-Forwarded-For) rides on any path,
+        so the root must remain selectable when nothing else answers —
+        demoted, not banned."""
+        src = ast.get_source_segment(API.read_text(encoding="utf-8"), gather) or ""
+        import re as _re
+        assert _re.search(r"_score\s*=\s*9", src), (
+            "the root must still receive a score so it can be chosen when it "
+            "is the only answering candidate")

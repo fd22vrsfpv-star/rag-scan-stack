@@ -738,6 +738,10 @@ REQUIRED_COLUMNS=(
     "rag_documents:vuln_class"   # first-class retrieval key (PoC build)
     "rag_documents:cve"          # first-class retrieval key (PoC build)
     "rag_documents:service"      # first-class retrieval key (mirrors exploit_chunks)
+    "discovered_params:engagement_id"  # per-engagement param identity; without
+                                       # it the ON CONFLICT in parse_katana /
+                                       # param_extractor matches no index and
+                                       # every param insert raises
 )
 
 for entry in "${REQUIRED_COLUMNS[@]}"; do
@@ -777,6 +781,34 @@ else
     echo "  ❌ pending_exploits.source still rejects 'webshell'"
     MISSING=$((MISSING + 1))
 fi
+
+# ── discovered_params: engagement-scoped identity index ───────────────────
+# url_pattern carries only scheme://netloc/path, so the legacy
+# UNIQUE(url_pattern, param_name, http_method, param_location) made two
+# engagements on the same address share one row — the second crawl UPDATEd the
+# first's counters instead of inserting. COALESCE rather than a partial index:
+# a NULL in an indexed column makes rows non-equal in Postgres, so an
+# unresolved engagement would be unconstrained altogether.
+echo "🔍 Verifying discovered_params engagement-scoped identity index..."
+DP_LEGACY=$(_psql -tAc \
+  "SELECT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conrelid='public.discovered_params'::regclass AND con.contype='u' AND (SELECT array_agg(att.attname::text ORDER BY att.attname::text) FROM unnest(con.conkey) AS k JOIN pg_attribute att ON att.attrelid=con.conrelid AND att.attnum=k) = ARRAY['http_method','param_location','param_name','url_pattern'])" 2>/dev/null)
+if [ "$DP_LEGACY" = "t" ]; then
+    echo "  ⚠  Legacy engagement-blind UNIQUE still present on discovered_params — dropping now"
+    _psql -c \
+      "DO \$\$ DECLARE c record; BEGIN FOR c IN SELECT con.conname FROM pg_constraint con WHERE con.conrelid='public.discovered_params'::regclass AND con.contype='u' AND (SELECT array_agg(att.attname::text ORDER BY att.attname::text) FROM unnest(con.conkey) AS k JOIN pg_attribute att ON att.attrelid=con.conrelid AND att.attnum=k) = ARRAY['http_method','param_location','param_name','url_pattern'] LOOP EXECUTE format('ALTER TABLE public.discovered_params DROP CONSTRAINT %I', c.conname); END LOOP; END \$\$;" >/dev/null 2>&1
+fi
+_psql -c \
+  "CREATE UNIQUE INDEX IF NOT EXISTS uq_discovered_params_identity ON public.discovered_params (COALESCE(engagement_id, '00000000-0000-0000-0000-000000000000'::uuid), url_pattern, param_name, COALESCE(http_method, 'GET'), COALESCE(param_location, 'query'))" >/dev/null 2>&1
+DP_INDEX=$(_psql -tAc \
+  "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE tablename='discovered_params' AND indexname='uq_discovered_params_identity')" 2>/dev/null)
+if [ "$DP_INDEX" = "t" ]; then
+    echo "  ✓ uq_discovered_params_identity present (engagement-scoped param dedup)"
+else
+    echo "  ❌ Failed to create uq_discovered_params_identity — every discovered_params upsert will raise 'no unique or exclusion constraint matching the ON CONFLICT specification'"
+    MISSING=$((MISSING + 1))
+fi
+
+echo ""
 
 echo "🔍 Verifying scope_targets schema migration..."
 LEGACY=$(_psql -tAc \

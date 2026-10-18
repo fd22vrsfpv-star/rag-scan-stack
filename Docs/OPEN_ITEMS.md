@@ -27,28 +27,54 @@ named tests exist).
 
 ## Known gaps carried from earlier sessions
 
-### `knowledge/` subdirectory docs carry no retrieval keys of their own
-**Found:** 2026-10-17, while making vuln_class/cve/service first-class columns.
-**Evidence:** `rag_documents` now has `vuln_class`, `cve` and `service` columns
-(indexed, backfilled — 4,835 rows took a `cve` from existing metadata), and the
-class-keyed renderers emit them: 56 rows carry a `vuln_class`, 113 a `service`.
-The 91 documents rendered from `knowledge/extractors/` and `knowledge/playbooks/`
-carry `tool` / `playbook` / `doc_type` in metadata but **no `service` and no
-`vuln_class`**, so a PoC build cannot narrow to "the playbook phase for an SMB
-target" or "the extractor for the tool I just ran" — only similarity reaches
-them. `knowledge_service_tools` (97 docs) is keyed by service; the extractor
-specs are keyed by tool, and nothing maps a tool to the service it probes.
-**Where:** `etl/load_knowledge_documents.py` (`_render_extractor_spec`,
-`_render_playbook`), `knowledge/extractors/*.yaml`, `knowledge/playbooks/*.yaml`.
-**Done when:** extractor specs resolve a `service` (the tool catalogue already
-maps tool → service) and playbook phases carry the vuln_class or service they
-apply to, so `/rag/knowledge/search` can filter them the way it now filters
-class documents.
-**Enforced by:** not enforced. A test would assert every embedded doc carries at
-least one structured retrieval key, with a declared-debt list for the ones that
-legitimately cannot.
-*Why it matters:* the columns exist now, so a document without one is reachable
-only by luck — the exact gap the columns were added to close, one level down.
+### `vuln_class` is not in the graph state, so phases re-derive it — one branch never ran
+**Found:** 2026-10-17
+**Evidence:** `vuln_class` is derived at 12 call sites by 3 functions
+(`_vuln_class_from_cve`, `_vuln_classes_from_cve`, `_vuln_class_from_gather_text`),
+and `BuildPocState` declares none of 72 keys for it. Between phases it travels as
+PROSE: `build_poc_graph.py` passes
+`gather_facts=_gather_manifest_text(state["gather_manifest"])` — a string — and
+`_run_refine_poc` reads it as `(gather_facts or {}).get("vuln_class")` inside a
+`try`. `str` has no `.get`, the AttributeError is swallowed, and the file-read
+evidence branch (proof capture + echo refutation for lfi / path-traversal) never
+executes: `file_read_evidence` appears in **0 of 682** PoC trace files.
+**Where:** `app/rag-api/build_poc_graph.py` (`BuildPocState`, the `_run_refine_poc`
+call), `app/rag-api/api.py::_run_refine_poc`.
+**Done when:** `vuln_class` and `vuln_class_chain` are declared state keys set once
+at classification, `_run_refine_poc` receives them (or the structured manifest)
+rather than prose, and the file-read branch is shown to fire on an lfi build.
+**Enforced by:** not enforced.
+*Why it matters:* a deterministic fact flattened into text and re-parsed is how a
+whole verification branch sat dead with nothing failing.
+
+### The readiness gate's endpoint check covers only slash-prefixed strings, and any non-404 "exists"
+**Found:** 2026-10-17, by the prose-gate guard's author while reading the gate.
+**Evidence:** `_assess_exploit_readiness` §4: `if tep and "{" in tep: ... elif tep and
+tep.startswith("/"): <probe for 404>`. A `target_endpoint` written as
+`http://host/admin.php`, `admin.php` or `?action=x` matches neither leg, so it is
+never probed and never blocked. The probe sits in `except Exception: pass`, so an
+unreachable probe reads like a clean one, and the success leg records
+`endpoint {tep} exists (HTTP {status})` for ANY non-404 — a 302 or a 500 included.
+**Where:** `app/rag-api/api.py::_assess_exploit_readiness` (§4).
+**Done when:** every endpoint form is normalised to a path before the check, the
+probe distinguishes answered / refused / unreachable, and only a 2xx (or a 3xx to
+the same origin) is recorded as "exists".
+**Enforced by:** not enforced — the prose-gate guard deliberately does not cover it
+(an endpoint is a locator, not prose).
+
+### Captcha-guarded logins leave authenticated targets crawled anonymously
+**Found:** 2026-10-17
+**Evidence:** the 21:19 round's auto-login reported `AUTO-LOGIN SKIPPED: all
+candidate login pages require captcha. Captcha-guarded paths: ['/admin/login.php']`
+and `_auto_cookie` appeared in 0 traces. The crawl can now carry an established
+session (item closed today), but none is established. Every CVE-Bench challenge
+grants a user account, so the authenticated surface is never discovered.
+**Where:** the auto-login node (`recon:auto_login`) and the challenge's credentials.
+**Done when:** for a target whose login is captcha-guarded, the build obtains a
+session another way (an API/token login path, or the challenge's documented
+credentials against a non-captcha endpoint) and the trace records which, or records
+that none exists — never silently proceeding anonymous.
+**Enforced by:** not enforced.
 
 ### 47 knowledge files are read deterministically and never embedded
 **Found:** 2026-10-17. Supersedes "`knowledge/extractors/` escapes the
@@ -96,6 +122,12 @@ is the gap" is stale — the per-chunk rating UI has existed since commit
 03cdcde8 (2026-06-01). The actual remaining code gap is that NOTHING re-runs
 the evaluator: the only caller of `/rag/eval/run` is a manual UI mutation
 (dashboard/frontend/src/api/rag.ts:201). No cron, scheduler or sweep.
+**Progress 2026-10-17:** something now re-runs it — `scan_recommender/rag_eval_scheduler.py`
+runs the evaluator on a cadence (default daily, `app_settings` toggle re-read each
+cycle) and records every cycle in `rag_eval_runs` as `scored` / `skipped_empty` /
+`failed`, with metrics NULL rather than 0.0 when nothing was scored. REMAINING:
+enough operator-rated queries for the eval set to be non-empty, and a BFF proxy +
+Settings tab for the toggle (reachable today only on scan-recommender).
 **Where:** the RAG feedback path.
 **Update 2026-09-21:** the MACHINERY exists and WORKS — `POST /api/rag/eval/run`
 replays rated queries into NDCG@K / MRR / recall@K / precision@K in
@@ -294,50 +326,6 @@ gap between two rows. (The stage-level bound is done — see the update above.)
 **Enforced by:** `tests/test_derive_budget.py` covers the bound; the per-call
 tracing is not enforced.
 
-### Class-keyed data still lives in api.py, not in knowledge/
-**Found:** 2026-10-16 (as "eight hard-coded sets"; re-measured 2026-10-17)
-**Evidence:** of the thirteen vocabularies originally named, **ten are gone** —
-replaced by `knowledge/vuln_classes.yaml` read through `etl/vuln_classes.py`
-(deterministic) and embedded by `_render_vuln_classes` (RAG). Two of the
-remaining three were MISCOUNTED by the original entry and are not class
-vocabularies at all: `_CLASSIFIER_TO_FAILURE_KEY` is keyed by classifier label
-(`auth_rejected`, `sql_error_echo`) and `_GATHER_FOLLOW_UP` by gather item
-(`target_reachable`, `endpoint`).
-
-What actually remains is class-keyed DATA, which the new guard reports:
-
-    app/rag-api/api.py:19460  _CRAFT_CLASS_GUIDANCE  29 classes of prose
-    app/rag-api/api.py:31876  shapes                  3 classes of payload shapes
-    knowledge/fact_contradictions.yaml:107,128        path_is_the_field_classes,
-                                                      class_field_hints
-
-The guard also found a **tenth** set the original count missed, now removed:
-`_VC_SYN` (api.py, 42 hand-written synonyms in the LLM-fallback JSON parser).
-It had drifted exactly as predicted — it mapped `deserialization` to `"deser"`,
-which is NOT a class name, so a correctly-normalised answer became one no
-downstream consumer recognised. Three further spellings it accepted (`sql`,
-`file inclusion`, `file access`) resolved to nothing; `sql` is now an alias in
-the YAML and the other two are rejected with a reason rather than guessed,
-because `file inclusion` is precisely the lfi/rfi distinction.
-
-**Where:** `app/rag-api/api.py` (`_CRAFT_CLASS_GUIDANCE`, `shapes`),
-`knowledge/fact_contradictions.yaml` (two duplicated class lists).
-**Done when:** `_CRAFT_CLASS_GUIDANCE` and `shapes` move into
-`knowledge/*.yaml` — guidance alongside the per-class `proof` kinds, payload
-shapes alongside the OS/runtime variants in `knowledge/payload_variants.yaml`
-— and `fact_contradictions.yaml` reads the class table instead of restating
-it. Each then has both readers (deterministic lookup + the RAG loader), and
-its `TAXONOMY_SET_DEBT` entry is deleted.
-**Enforced by:** `tests/test_vuln_classes.py::TestNoPrivateTaxonomySet` — a new
-hard-coded class vocabulary fails by file:line, and `TAXONOMY_SET_DEBT`
-ratchets (a stale entry fails, so the debt cannot outlive the code).
-`::TestDeletedSynonymTableIsCovered` pins every spelling `_VC_SYN` accepted,
-including the corrections.
-*Why it matters:* a class taxonomy that can only be changed by editing Python
-means every new vulnerability class costs a deploy, and the operator who knows
-the class cannot add it. `knowledge/` is bind-mounted into 8 services and takes
-effect live.
-
 ### Gates make SEMANTIC decisions with substring matches, and it keeps costing runs
 **Found:** 2026-10-16 (three separate failures in one day, one root cause)
 **Evidence:** a string test standing in for a judgement, in four gates:
@@ -366,6 +354,14 @@ now share `_auth_requirement()`, which returns `(needs, matched_phrase, why)`
 so a verdict carries its provenance. STILL OPEN: the general ratcheting guard
 that no gate reaches a block/allow decision from a prose substring test alone.
 *Partly enforced by:* `tests/test_gather_auth_gate.py::test_both_gates_share_one_auth_definition` (sabotage-proven).
+**Progress 2026-10-17 (2):** the ratcheting guard now exists —
+`tests/test_prose_gate_guard.py` flags a gate reaching a block/allow action from
+a substring over prose with no dominating observation, sabotage-proven twice. Its
+first run found a FIFTH instance, now its one debt entry:
+`_assess_exploit_readiness` clears `version_unconfirmed` on `version in adv`, so
+`"2.4"` matches `"12.4.0"` or `"2024"`, and an advisory naming the FIXED version
+makes a patched target read as affected — suppressing the vendor-doc check that
+would catch it. Remaining: fix that clause the way `_auth_requirement()` was fixed.
 **Where:** `_gather_manifest` item 7 (`needs_auth`), `_class_guidance_block`,
 `_poc_assertion_verdict*`, `etl/attack_proxy.env_mechanism`, the readiness-gate
 preconditions.
@@ -386,7 +382,7 @@ they are stored as claims in `confirmed_facts` with provenance, and a claim at
 calibrated; the gates simply do not consult it.** A gate that must read prose
 records WHICH phrase it matched, so a wrong match is visible rather than
 silent.
-**Enforced by:** not enforced. A guard would assert that no gate's block/allow
+**Enforced by:** `tests/test_prose_gate_guard.py::test_no_new_prose_gates` (ratchets via `PROSE_GATE_DEBT`).
 decision is reached solely from a substring test over `description`,
 `preconditions` or advisory text without a corresponding `confirmed_facts`
 lookup.
@@ -446,6 +442,13 @@ class-specific ordered variation list — `_proof_expectation_block` carries the
 ordered `_pv_payloads` but its only caller is `_synthesize_cve_poc`, so it
 never reaches `_run_refine_poc`.
 *Enforced by:* `tests/test_refine_loop_accounting.py::TestInbandDiffReportsWhyItCouldNotRun` (sabotage-proven).
+**Progress 2026-10-17 (2):** half (a) landed — the refine re-ask now carries the
+class's ordered payload forms (`_pv_payloads`) with already-sent forms marked by
+EVIDENCE from dispatched commands, traced as `variant_menu`. The table had no
+forms for the classes that actually occur (round classes: auth-bypass 68, sqli 54,
+ssrf 27; table covered path-traversal/lfi/cmdi), so `sqli` and `ssrf` forms were
+added. REMAINING: `auth-bypass`, the largest class, has none — deliberately, since
+a bypass is target-specific and a generic ordered list would be fabrication.
 **Where:** the refine prompt in `_run_refine_poc` (it states the facts but not a variation
 plan), and `_inband_baseline_diff` (did not run — the first segment is not parsed as a curl
 the Python lane can execute; see `_can_execute_in_python`).
@@ -456,27 +459,6 @@ failed iteration whose first request targets the host, with a trace row saying w
 cannot.
 **Enforced by:** not enforced.
 
-
-### The deep-recon "authenticated crawl" cannot carry a session cookie
-**Found:** 2026-10-09
-**Evidence:** `_deep_recon_for_gaps` (api.py, step `auth_crawl`) passes the
-`_auto_cookie` session into `_playwright_sitemap(ip, port, auth=a, …)`, but that
-helper forwards only `login_url, login_data, username, password` into the
-scanner's `/crawl` body, and `playwright_scanner.CrawlRequest.auth` accepts only
-those four keys — there is no cookie field. A session obtained from mined
-credentials (no username/password in `auth`) is therefore dropped and the
-"authenticated crawl" runs unauthenticated. 20 of 33 CVE-Bench runs on
-2026-10-08/09 took this path; every `deep_recon:auth_crawl` note reads
-"40 urls (unauthenticated crawl)" or forwards the supplied creds only.
-**Where:** `app/rag-api/api.py::_playwright_sitemap`,
-`playwright_scanner/playwright_scanner.py::CrawlRequest` and the `/crawl` handler.
-**Done when:** `CrawlRequest` accepts a `cookie_header` (or `cookies` list) that the
-crawl handler installs via `context.add_cookies()` for the target origin before
-navigation, `_playwright_sitemap` forwards `auth["_auto_cookie"]` /
-`session_info["cookie_header"]` into it, and a build-poc trace shows a
-`deep_recon:auth_crawl` note of "N urls (authenticated crawl)" after a mined-cred
-login with no supplied username.
-**Enforced by:** not enforced
 
 ### Scan evidence is keyed by IP; CVE-Bench reuses one IP for every target
 **Found:** 2026-10-09
@@ -500,6 +482,14 @@ still keys `UNIQUE(url_pattern, param_name, http_method, param_location)`
 clauses are unchanged. Any OTHER reused IP still bumps the prior engagement's
 rows. The reader was partly fixed (api.py:17130) but filters via the shared
 `assets` row, which does not separate two engagements on one IP.
+**Progress 2026-10-17:** the schema and both writers are fixed —
+`discovered_params.engagement_id`, unique index
+`uq_discovered_params_identity` with every nullable key column COALESCEd, both
+`ON CONFLICT` clauses repeating it exactly, engagement resolved at write time via
+`resolve_engagement_for_host`. Verified on a throwaway Postgres 16. REMAINING: the
+READERS — `_scan_evidence_for_target` and four queries in playwright_scanner.py
+still filter through the joined `assets` row, which on a reused IP is shared;
+they can now filter on `dp.engagement_id` directly.
 **Where:** `db_init/ensure_all_tables.sql` (`discovered_params`),
 `etl/parse_katana.py::_upsert_param`, `playwright_scanner/param_extractor.py`,
 `app/rag-api/api.py::_scan_evidence_for_target`.
@@ -508,7 +498,7 @@ includes it or the asset), the two writers resolve the engagement at write time,
 and `_scan_evidence_for_target` filters by `(engagement_id, cve)` with IP as a
 secondary filter — verified by a run on a reused IP returning only that
 engagement's rows.
-**Enforced by:** not enforced
+**Enforced by:** `tests/test_discovered_params_engagement.py` (write path, sabotage-proven); the read path is not enforced.
 
 ### Orphaned idle-in-transaction DB sessions survive the owning container's restart
 **Found:** 2026-10-09, diagnosing a stalled build-PoC run.

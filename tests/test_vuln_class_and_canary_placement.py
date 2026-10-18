@@ -70,11 +70,17 @@ def _dict_literal(src: str, name: str):
 
 def test_craft_class_guidance_has_no_duplicate_keys():
     """A duplicate key is silently dropped by Python — only the last survives."""
-    d = _dict_literal(_src(), "_CRAFT_CLASS_GUIDANCE")
-    keys = [k.value for k in d.keys if isinstance(k, ast.Constant)]
-    dupes = {k for k in keys if keys.count(k) > 1}
+    # The guidance is YAML now (knowledge/craft_guidance.yaml). The loader
+    # used here REJECTS duplicate keys — a YAML mapping drops all but the last
+    # just as a dict literal did — so a duplicate raises inside load_guidance.
+    from _craft_guidance import load_guidance
+    try:
+        load_guidance()
+        dupes = set()
+    except ValueError as e:
+        dupes = {str(e)}
     assert not dupes, (
-        f"duplicate key(s) {sorted(dupes)} in _CRAFT_CLASS_GUIDANCE — the "
+        f"duplicate key(s) {sorted(dupes)} in craft_guidance.yaml — the "
         "earlier entry is dead code that silently never applies"
     )
 
@@ -121,12 +127,9 @@ def test_no_class_lists_the_same_cwe_twice():
 
 def test_sqli_guidance_leads_with_a_reflected_canary():
     """Blind timing must be the documented fallback, not the opening move."""
-    d = _dict_literal(_src(), "_CRAFT_CLASS_GUIDANCE")
-    text = None
-    for k, v in zip(d.keys, d.values):
-        if isinstance(k, ast.Constant) and k.value == "sqli":
-            text = ast.literal_eval(v)
-    assert text, "no `sqli` entry in _CRAFT_CLASS_GUIDANCE"
+    from _craft_guidance import load_guidance
+    text = load_guidance().get("sqli")
+    assert text, "no `sqli` entry in craft_guidance.yaml"
     low = text.lower()
     i_union = min([i for i in (low.find("union"), low.find("expect_regex")) if i != -1] or [-1])
     i_blind = min([i for i in (low.find("sleep("), low.find("min_seconds")) if i != -1] or [-1])
@@ -144,11 +147,8 @@ def test_sqli_guidance_leads_with_a_reflected_canary():
 
 
 def test_sqli_guidance_warns_about_the_two_canary_placement_bugs():
-    d = _dict_literal(_src(), "_CRAFT_CLASS_GUIDANCE")
-    text = ""
-    for k, v in zip(d.keys, d.values):
-        if isinstance(k, ast.Constant) and k.value == "sqli":
-            text = ast.literal_eval(v)
+    from _craft_guidance import load_guidance
+    text = load_guidance().get("sqli", "")
     low = text.lower()
     assert "placeholder" in low, "guidance must forbid leaving a {CANARY} placeholder"
     assert "comment" in low, "guidance must forbid placing the canary only in a SQL comment"
@@ -204,8 +204,8 @@ def test_every_producible_class_has_craft_guidance():
     regression, not a feature.
     """
     src = _src()
-    guide_d = _dict_literal(src, "_CRAFT_CLASS_GUIDANCE")
-    guide_keys = {k.value for k in guide_d.keys if isinstance(k, ast.Constant)}
+    from _craft_guidance import load_guidance
+    guide_keys = set(load_guidance())
     missing = sorted(_producible_classes(src) - guide_keys)
     assert not missing, (
         f"class(es) the classifier can return with no _CRAFT_CLASS_GUIDANCE "

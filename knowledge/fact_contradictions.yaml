@@ -103,10 +103,11 @@ rules:
     action: clear
     check: field_kind_mismatch
     severity: high
-    # Classes whose injection point IS the URL path — there is no parameter.
-    path_is_the_field_classes:
-      [path-traversal, lfi, directory-traversal, file-read, file-disclosure,
-       arbitrary-file-read, zip-slip]
+    # Which classes inject through the URL PATH is answered by the class table
+    # (knowledge/vuln_classes.yaml, `injects_via: [path]`), not restated here.
+    # The copy that used to live here listed `lfi`, which injects through a
+    # parameter, and this rule's action is `clear` — so it deleted the real
+    # injection point on every LFI build.
     message: >-
       vuln_class '{vuln_class}' injects through the URL PATH, but input_field is
       set to the query parameter '{value}'

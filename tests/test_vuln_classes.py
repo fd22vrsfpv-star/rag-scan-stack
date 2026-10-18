@@ -679,17 +679,8 @@ class TestResolve:
 # Declared exceptions are keyed by (file, variable) and carry a reason. The
 # list RATCHETS: a stale entry fails, so it cannot outlive what it excuses.
 TAXONOMY_SET_DEBT = {
-    ("app/rag-api/api.py", "_CRAFT_CLASS_GUIDANCE"):
-        "per-class craft-and-prove guidance, ~30 classes of prose. It is the "
-        "single largest thing still keyed by class in Python, and moving it "
-        "is the point of the knowledge/ migration — but it is prompt text "
-        "with embedded regexes and escapes, so it moves on its own, with the "
-        "proof-expectation tests as the safety net. See Docs/OPEN_ITEMS.md.",
-    ("app/rag-api/api.py", "shapes"):
-        "payload SHAPES keyed by class (RCE/SQLi/LFI), not a class vocabulary "
-        "— the technique variants belong in knowledge/payload_variants.yaml "
-        "alongside the OS/runtime variants; migrating them is a separate "
-        "change from fixing the vocabulary. See Docs/OPEN_ITEMS.md.",
+    # empty: _CRAFT_CLASS_GUIDANCE and the WAF `shapes` moved to knowledge/
+    # on 2026-10-17. A new entry needs a reason and is a regression.
 }
 
 _SCAN_ROOTS = ("app/rag-api/api.py", "etl", "autogen_agents")
@@ -1011,3 +1002,40 @@ class TestDeletedSynonymTableIsCovered:
             if spelling in self.AMBIGUOUS or spelling in self.CORRECTED:
                 continue
             assert vc.canonical(spelling) == old_class, spelling
+
+
+class TestFactContradictionsReadTheClassTable:
+    """`path_class_with_a_query_parameter` (action: clear) carried a private
+    copy of the path-is-the-field classes that listed `lfi`. LFI injects
+    through a PARAMETER, so the rule deleted the real injection point on every
+    LFI build. It now asks the class table; these pin the behaviour, not the
+    wiring.
+    """
+
+    @staticmethod
+    def _check(vc, field):
+        from etl import fact_contradictions as F
+        return F._check_field_kind_mismatch(
+            {"check": "field_kind_mismatch"},
+            {"vuln_class": vc, "facts": {"input_field": field}})
+
+    def test_an_lfi_parameter_is_kept(self):
+        assert self._check("lfi", "page") == [], (
+            "LFI injects through a parameter; clearing `page` deletes the one "
+            "real injection point")
+
+    def test_a_parameter_on_a_path_traversal_is_still_flagged(self):
+        assert self._check("path-traversal", "file"), (
+            "a traversal has no parameter — a recorded one is a leftover")
+
+    def test_a_route_on_a_path_traversal_is_kept(self):
+        assert self._check("path-traversal", "/download/x") == []
+
+    def test_the_yaml_no_longer_restates_the_list(self):
+        y = yaml.safe_load((REPO / "knowledge" / "fact_contradictions.yaml")
+                           .read_text(encoding="utf-8"))
+        rules = y.get("rules") or y.get("contradictions") or []
+        for r in (rules if isinstance(rules, list) else []):
+            assert "path_is_the_field_classes" not in (r or {}), (
+                "a private class list in fact_contradictions.yaml can drift "
+                "from the table again — it did, and it listed lfi")

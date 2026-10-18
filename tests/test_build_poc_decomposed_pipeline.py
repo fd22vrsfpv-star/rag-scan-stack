@@ -106,11 +106,9 @@ def test_crafter_class_guidance_covers_major_classes():
     # guard that fails when the code IMPROVES.
     import ast as _ast
     tree = _ast.parse(API.read_text())
-    guidance = next(
-        (_ast.literal_eval(n.value) for n in _ast.walk(tree)
-         if isinstance(n, _ast.Assign)
-         and any(getattr(t, "id", "") == "_CRAFT_CLASS_GUIDANCE" for t in n.targets)),
-        None)
+    # The table is YAML now (knowledge/craft_guidance.yaml).
+    from _craft_guidance import load_guidance
+    guidance = load_guidance()
     assert guidance is not None, "class guidance dict missing"
     # Each major class gets guidance, reached under any spelling a classifier
     # may emit (the alias map is what makes `path-traversal` resolve to `lfi`).

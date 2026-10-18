@@ -405,6 +405,10 @@ WHERE port IS NULL AND url LIKE 'http://%';
 CREATE TABLE IF NOT EXISTS public.discovered_params (
     id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     asset_id         uuid REFERENCES public.assets(id) ON DELETE CASCADE,
+    -- Collected target data: which engagement's crawl saw this parameter.
+    -- Declared WITHOUT the FK because public.engagements is created further
+    -- down this file; the constraint is attached in the engagement block.
+    engagement_id    uuid,
     url_pattern      text NOT NULL,
     param_name       text NOT NULL,
     param_type       text DEFAULT 'string',
@@ -414,12 +418,101 @@ CREATE TABLE IF NOT EXISTS public.discovered_params (
     occurrence_count integer DEFAULT 1,
     discovery_source text DEFAULT 'katana',
     first_seen       timestamptz DEFAULT now(),
-    last_seen        timestamptz DEFAULT now(),
-    UNIQUE(url_pattern, param_name, http_method, param_location)
+    last_seen        timestamptz DEFAULT now()
+    -- No inline UNIQUE: the identity key is engagement-scoped and lives in
+    -- uq_discovered_params_identity below.
 );
 CREATE INDEX IF NOT EXISTS idx_discovered_params_asset ON public.discovered_params(asset_id);
 CREATE INDEX IF NOT EXISTS idx_discovered_params_name ON public.discovered_params(param_name);
 CREATE INDEX IF NOT EXISTS idx_discovered_params_url ON public.discovered_params(url_pattern);
+
+-- ── discovered_params identity is per-ENGAGEMENT ───────────────────────────
+--
+-- url_pattern carries only scheme://netloc/path, so two engagements pointed at
+-- the same address (a benchmark harness that reuses one IP for every target,
+-- or a host re-purposed between engagements) produced the SAME key. The second
+-- engagement's crawl then took the ON CONFLICT UPDATE branch and bumped the
+-- first engagement's row -- one occurrence_count and one sample_values shared
+-- by two unrelated applications, and the purge of either engagement reaching a
+-- row the other still needs. asset_id did not save it: a reused IP resolves to
+-- the same asset, which is exactly why the reader's join to assets was not a
+-- fix either.
+--
+-- COALESCE, not a partial index and not a plain 5-column UNIQUE: in Postgres a
+-- NULL in any indexed column makes two rows non-equal, so either of those would
+-- leave every row whose engagement could not be resolved COMPLETELY
+-- unconstrained -- unlimited duplicates with dedup silently off. The nil UUID
+-- is the "no engagement resolved" bucket, so those rows still dedupe against
+-- each other exactly as they did before this change.
+--
+-- Any ON CONFLICT targeting this index MUST repeat the expression EXACTLY
+-- (etl/parse_katana.py, playwright_scanner/param_extractor.py) or Postgres
+-- raises "no unique or exclusion constraint matching the ON CONFLICT
+-- specification" on every row -- the failure mode credential_findings hit:
+-- 23 records seen, 23 errors, 0 stored.
+DO $$ BEGIN ALTER TABLE public.discovered_params ADD COLUMN IF NOT EXISTS engagement_id uuid; EXCEPTION WHEN OTHERS THEN NULL; END $$;
+
+-- Drop the legacy engagement-blind UNIQUE(url_pattern, param_name,
+-- http_method, param_location). Found by its COLUMN SET, not by name: Postgres
+-- truncated the generated name to 63 characters, so the literal name is not
+-- something a migration can rely on.
+DO $DPUQ$
+DECLARE c record;
+BEGIN
+    FOR c IN
+        SELECT con.conname
+          FROM pg_constraint con
+         WHERE con.conrelid = 'public.discovered_params'::regclass
+           AND con.contype = 'u'
+           AND (SELECT array_agg(att.attname::text ORDER BY att.attname::text)
+                  FROM unnest(con.conkey) AS k
+                  JOIN pg_attribute att
+                    ON att.attrelid = con.conrelid AND att.attnum = k)
+               = ARRAY['http_method','param_location','param_name','url_pattern']
+    LOOP
+        EXECUTE format('ALTER TABLE public.discovered_params DROP CONSTRAINT %I', c.conname);
+    END LOOP;
+EXCEPTION WHEN undefined_table THEN NULL; END $DPUQ$;
+
+-- Backfill: an existing row belongs to its asset's engagement. Rows whose asset
+-- carries no engagement stay NULL -- never guess one (see
+-- etl/identity_upsert.resolve_engagement_for_host, which fails closed the same
+-- way at write time).
+DO $DPBF$ BEGIN
+    UPDATE public.discovered_params dp
+       SET engagement_id = a.engagement_id
+      FROM public.assets a
+     WHERE dp.asset_id = a.id
+       AND dp.engagement_id IS NULL
+       AND a.engagement_id IS NOT NULL;
+EXCEPTION WHEN undefined_column THEN NULL; WHEN undefined_table THEN NULL; END $DPBF$;
+
+-- Collapse any pre-existing duplicate under the new key before the unique index
+-- is built (an upgrade that got as far as dropping the old constraint and no
+-- further would otherwise fail here forever). Keeps the busiest, then the most
+-- recently seen; id makes the ordering strict.
+DELETE FROM public.discovered_params a
+ USING public.discovered_params b
+ WHERE COALESCE(a.engagement_id, '00000000-0000-0000-0000-000000000000'::uuid)
+     = COALESCE(b.engagement_id, '00000000-0000-0000-0000-000000000000'::uuid)
+   AND a.url_pattern = b.url_pattern
+   AND a.param_name  = b.param_name
+   AND COALESCE(a.http_method, 'GET')      = COALESCE(b.http_method, 'GET')
+   AND COALESCE(a.param_location, 'query') = COALESCE(b.param_location, 'query')
+   AND a.id <> b.id
+   AND (COALESCE(a.occurrence_count, 0), COALESCE(a.last_seen, a.first_seen, 'epoch'::timestamptz), a.id)
+     < (COALESCE(b.occurrence_count, 0), COALESCE(b.last_seen, b.first_seen, 'epoch'::timestamptz), b.id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_discovered_params_identity
+    ON public.discovered_params (
+        COALESCE(engagement_id, '00000000-0000-0000-0000-000000000000'::uuid),
+        url_pattern,
+        param_name,
+        COALESCE(http_method, 'GET'),
+        COALESCE(param_location, 'query')
+    );
+CREATE INDEX IF NOT EXISTS idx_discovered_params_engagement
+    ON public.discovered_params(engagement_id) WHERE engagement_id IS NOT NULL;
 
 -- vulns
 CREATE TABLE IF NOT EXISTS public.vulns (
@@ -2908,6 +3001,18 @@ ALTER TABLE public.recon_findings     ADD COLUMN IF NOT EXISTS engagement_id uui
 ALTER TABLE public.credential_findings ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES public.engagements(id);
 ALTER TABLE public.assets             ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES public.engagements(id);
 ALTER TABLE public.playwright_findings ADD COLUMN IF NOT EXISTS engagement_id uuid REFERENCES public.engagements(id);
+
+-- discovered_params.engagement_id is declared above WITHOUT the FK (engagements
+-- did not exist yet). ADD COLUMN IF NOT EXISTS would not attach it: the column
+-- already exists, so the statement is a no-op and the constraint never appears.
+-- ON DELETE CASCADE -- a crawled parameter is collected data belonging to that
+-- engagement, exactly like the asset_id cascade above it.
+DO $DPFK$ BEGIN
+    ALTER TABLE public.discovered_params
+      ADD CONSTRAINT discovered_params_engagement_fk
+      FOREIGN KEY (engagement_id) REFERENCES public.engagements(id) ON DELETE CASCADE;
+EXCEPTION WHEN duplicate_object THEN NULL; WHEN undefined_table THEN NULL;
+          WHEN undefined_column THEN NULL; END $DPFK$;
 
 -- security_tests / security_test_runs declare engagement_id WITHOUT the FK,
 -- because they are created before this point. Attach it here.

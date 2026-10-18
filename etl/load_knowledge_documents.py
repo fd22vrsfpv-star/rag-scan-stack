@@ -21,6 +21,7 @@ a separate corpus. seed_prompts.example.yaml is example material, not live
 knowledge.
 """
 import os
+import re
 import sys
 import glob
 import logging
@@ -29,6 +30,8 @@ from typing import Any, Dict, List, Tuple
 import httpx
 import psycopg2
 import psycopg2.extras as _ex
+
+from etl import vuln_classes as _vuln_classes
 
 try:
     import yaml
@@ -833,6 +836,24 @@ def _render_fact_contradictions(data: Dict[str, Any]) -> List[Doc]:
     return docs
 
 
+def _render_craft_guidance(data: Dict[str, Any]) -> List[Doc]:
+    """One document per class: how to craft it and what proves it.
+
+    The crafter reads this table DETERMINISTICALLY (etl/craft_guidance.py ->
+    `_CRAFT_CLASS_GUIDANCE`). Embedding it is the recall half: a planner asking
+    "how is an SSRF proven" retrieves the same text the crafter is handed,
+    filterable by the `vuln_class` column.
+    """
+    docs: List[Doc] = []
+    for cls, text in ((data or {}).get("guidance") or {}).items():
+        t = str(text or "").strip()
+        if not t:
+            continue
+        docs.append((f"Craft guidance: {cls}", t,
+                     {"vuln_class": str(cls), "doc_type": "craft_guidance"}))
+    return docs
+
+
 def _render_vuln_classes(data: Dict[str, Any]) -> List[Doc]:
     """One document per vulnerability class.
 
@@ -964,8 +985,97 @@ RENDERERS = {
     "web_auth_templates": _render_web_auth_templates,
     "fact_contradictions": _render_fact_contradictions,
     "vuln_classes": _render_vuln_classes,
+    "craft_guidance": _render_craft_guidance,
     "payload_variants": _render_payload_variants,
 }
+
+
+_TOOL_SERVICE_CACHE = {}
+
+
+def _services_for_tool(tool: str) -> List[str]:
+    """Which services a tool probes, inverted from knowledge/service_tools.yaml.
+
+    Extractor specs are keyed by TOOL and `rag_documents.service` by SERVICE,
+    so without this the extractor documents carry no key the search can
+    filter on — reachable only by similarity, which is the gap the columns
+    were added to close.
+
+    Inverted from the operator-editable catalogue (97 services, 103 tools)
+    rather than a second hand-kept map: adding a tool to a service there makes
+    its extractor findable by that service on the next sync, no code change.
+    """
+    if not _TOOL_SERVICE_CACHE:
+        try:
+            with open(os.path.join(KNOWLEDGE_DIR, "service_tools.yaml"),
+                      encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            for svc, spec in (data.get("services") or {}).items():
+                for key in ("tools", "primary", "secondary", "commands"):
+                    for t in ((spec or {}).get(key) or []):
+                        nm = t if isinstance(t, str) else \
+                            (t or {}).get("tool") or (t or {}).get("name")
+                        if nm:
+                            _TOOL_SERVICE_CACHE.setdefault(
+                                str(nm).split()[0].lower(), set()).add(svc)
+        except Exception as e:  # noqa: BLE001
+            log.warning("tool->service map unavailable: %s", e)
+            _TOOL_SERVICE_CACHE["__tried__"] = set()
+    return sorted(_TOOL_SERVICE_CACHE.get(str(tool).lower(), ()))
+
+
+_SERVICE_CATALOGUE: Dict[str, Any] = {}
+
+
+def _service_catalogue() -> Dict[str, Any]:
+    """{"names": {service}, "ports": {port: service}} from service_tools.yaml.
+
+    The same operator-editable catalogue `_services_for_tool` inverts, read the
+    other way round: by its own service names and by its port_hints table. A
+    service added there becomes derivable here on the next sync with no code
+    change — the RAG-first rule applied to the retrieval KEY as well as to the
+    text.
+
+    Returns an EMPTY catalogue when the file is unreadable, and logs that it
+    did. Nothing resolves then, which is the fail-closed answer: a key that
+    could not be derived must not read as a key that does not apply.
+    """
+    if not _SERVICE_CATALOGUE:
+        _SERVICE_CATALOGUE["names"] = set()
+        _SERVICE_CATALOGUE["ports"] = {}
+        try:
+            with open(os.path.join(KNOWLEDGE_DIR, "service_tools.yaml"),
+                      encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            _SERVICE_CATALOGUE["names"] = {
+                str(s).lower() for s in (data.get("services") or {})}
+            _SERVICE_CATALOGUE["ports"] = {
+                str(p): str(s).lower()
+                for p, s in (data.get("port_hints") or {}).items() if s}
+        except Exception as e:  # noqa: BLE001
+            log.warning("service catalogue unavailable: %s", e)
+    return _SERVICE_CATALOGUE
+
+
+def _services_named(text: str) -> List[str]:
+    """Which catalogue services a heading names — by whole token, then by port.
+
+    `MySQL/MariaDB (Port 3306)` -> ["mysql"]; `SMB Relay Attacks` -> ["smb"];
+    `Microsoft SQL Server (Port 1433)` -> ["mssql"], where no word in the prose
+    is a catalogue name but the port is.
+
+    Whole tokens only, never substrings: `Technology Fingerprinting` must not
+    match the `finger` service. A NAME beats a PORT because a port is shared —
+    `NFS (Port 2049/111)` names nfs and mentions 111, which port_hints calls
+    rpc, and taking both would file the phase under a service it never
+    discusses.
+    """
+    cat = _service_catalogue()
+    toks = [t for t in re.split(r"[^a-z0-9]+", str(text or "").lower()) if t]
+    named = [t for t in toks if t in cat["names"]]
+    if named:
+        return sorted(set(named))
+    return sorted({cat["ports"][t] for t in toks if t in cat["ports"]})
 
 
 def _render_extractor_spec(data: Dict[str, Any], name: str = "") -> List[Doc]:
@@ -1002,7 +1112,76 @@ def _render_extractor_spec(data: Dict[str, Any], name: str = "") -> List[Doc]:
     if prompt:
         lines.append("Analyst guidance: " + prompt)
     title = f"Tool output extractor: {tool}"
-    return [(title, "\n".join(l for l in lines if l))]
+    # `service` is the key a caller already holds: they just ran a tool
+    # against a port whose service is known. One service => the column; several
+    # (hydra covers 16) => metadata only, because the column takes ONE value
+    # and picking the first would misreport the other fifteen.
+    _svcs = _services_for_tool(tool)
+    _meta = {"tool": tool, "doc_type": "extractor_spec"}
+    if _svcs:
+        _meta["services"] = _svcs
+        if len(_svcs) == 1:
+            _meta["service"] = _svcs[0]
+    return [(title, "\n".join(l for l in lines if l), _meta)]
+
+
+def _playbook_keys(title: str, phase: str,
+                   step_titles: List[str]) -> Dict[str, Any]:
+    """The retrieval keys a playbook phase can HONESTLY claim.
+
+    76 playbook_phase documents carried none, so they were reachable by
+    similarity and never by filter. The rules below are deliberately narrow:
+    a wrong key is worse than none, because it makes a document findable under
+    a class it does not describe, and the operator has no way to see that the
+    key was guessed.
+
+    service — from the phase heading first, else from the playbook title.
+        A service scope NESTS: every phase of "SSH Penetration Testing
+        Methodology" is ssh work, including the one called
+        "Post-Exploitation". Several services named (none today, but
+        `MySQL/MariaDB` is one rename away) -> metadata `services` list and NO
+        column, the same rule the extractor specs use, because the column
+        takes one value and picking the first misreports the rest.
+
+    vuln_class — from the PHASE heading only, never the playbook title, and
+        never when the heading also names a service.
+        * Not from the title, because a class is a CLAIM and claims do not
+          nest the way a scope does. `code-injection` is an alias of `rce`, so
+          "Code Injection & Process Injection Techniques" would file all three
+          of its phases — CreateRemoteThread, shellcode, APC injection — as
+          remote code execution, and a PoC build asking for an RCE playbook
+          would be handed Windows process injection.
+        * Not when a service is named, because in a service methodology the
+          class word belongs to a PRODUCT name. "Microsoft SQL Server (Port
+          1433)" resolves to `sqli` on the `sql` alias — the same mistake
+          `vuln_classes._strip_locators` fixes for paths, one level up.
+
+    vuln_classes — metadata only, never the column: the classes the phase's
+        own STEP titles name. "Manual Testing" names six, "Post-Exploitation"
+        names `upload` from one step of two. That is a true statement about
+        the steps and a false one about the phase, so it informs a reader
+        without ever being filtered on as the phase's subject.
+    """
+    svcs = _services_named(phase) or _services_named(title)
+    out: Dict[str, Any] = {}
+    if svcs:
+        out["services"] = svcs
+        if len(svcs) == 1:
+            out["service"] = svcs[0]
+    if not svcs:
+        r = _vuln_classes.resolve(phase)
+        if r.get("basis") == "name" and not r.get("ambiguous") \
+                and r.get("class") != _vuln_classes.UNKNOWN:
+            out["vuln_class"] = r["class"]
+    step_cls = []
+    for st in step_titles:
+        r = _vuln_classes.resolve(st)
+        if r.get("class") != _vuln_classes.UNKNOWN and not r.get("ambiguous") \
+                and r["class"] not in step_cls:
+            step_cls.append(r["class"])
+    if step_cls:
+        out["vuln_classes"] = sorted(step_cls)
+    return out
 
 
 def _render_playbook(data: Dict[str, Any], name: str = "") -> List[Doc]:
@@ -1015,6 +1194,9 @@ def _render_playbook(data: Dict[str, Any], name: str = "") -> List[Doc]:
     `mutates` is carried into the text deliberately: a retrieved step that
     CHANGES the target reads identically to one that only looks, and the
     operator should see which is which before acting on a recalled step.
+
+    The `service` / `vuln_class` keys come from `_playbook_keys`, which states
+    what may be derived and what may not.
     """
     pb = str(data.get("title") or data.get("name") or name or "").strip()
     if not pb:
@@ -1041,7 +1223,16 @@ def _render_playbook(data: Dict[str, Any], name: str = "") -> List[Doc]:
             lines.append(" ".join(bits))
         if len(lines) <= 2:
             continue
-        docs.append((f"Playbook {pb} - {pname}", "\n".join(lines)))
+        meta = {"playbook": pb, "phase": pname,
+                "doc_type": "playbook_phase",
+                # A retrieved step that CHANGES the target reads
+                # identically to one that only looks; the operator
+                # should be able to filter on that before acting.
+                "mutates": any(bool(st.get("mutates")) for st in steps)}
+        meta.update(_playbook_keys(
+            pb, pname,
+            [str(st.get("title") or st.get("id") or "") for st in steps]))
+        docs.append((f"Playbook {pb} - {pname}", "\n".join(lines), meta))
     return docs
 
 

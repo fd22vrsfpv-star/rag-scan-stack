@@ -4,6 +4,10 @@ from psycopg2.extras import RealDictCursor
 from urllib.parse import urlparse, parse_qs
 from etl.fingerprint import web_fingerprint
 from etl.scope_gate import load_ingest_scope, host_in_scope
+# The ONE answer to "which engagement does this host belong to?" (asset first,
+# then its scope entry, None when it cannot be tied to one). Never re-implement
+# it here -- a second resolver is how the question comes to mean two things.
+from etl.identity_upsert import resolve_engagement_for_host
 
 
 def _is_ip(value: str) -> bool:
@@ -322,13 +326,55 @@ def _extract_params(url: str, method: str, raw_request: str = ""):
     return results
 
 
-def _upsert_param(cur, asset_id, param):
-    """Upsert a single discovered param into the DB."""
+# A row whose engagement cannot be resolved stays NULL here and is folded into
+# the nil-UUID bucket by uq_discovered_params_identity's COALESCE -- a NULL in
+# an indexed column makes two rows non-equal in Postgres, so leaving it NULL in
+# the KEY would switch dedup off for that row entirely.
+def _engagement_for_url(cur, url, cache):
+    """engagement_id for a crawled URL's host, memoised per host for the run."""
+    try:
+        host = (urlparse(url or "").hostname or "").strip()
+    except Exception:
+        host = ""
+    if not host:
+        return None
+    if host not in cache:
+        # Its own savepoint: the helper swallows its exception, but Postgres
+        # leaves the transaction ABORTED, so without this the whole record --
+        # web finding included -- would be rolled back by the outer handler.
+        try:
+            cur.execute("SAVEPOINT katana_eng")
+            cache[host] = resolve_engagement_for_host(cur, host)
+            cur.execute("RELEASE SAVEPOINT katana_eng")
+        except Exception:
+            try:
+                cur.execute("ROLLBACK TO SAVEPOINT katana_eng")
+            except Exception:
+                pass
+            cache[host] = None
+    return cache[host]
+
+
+def _upsert_param(cur, asset_id, param, engagement_id=None):
+    """Upsert a single discovered param into the DB.
+
+    The identity key is engagement-scoped: url_pattern carries only
+    scheme://netloc/path, so without engagement_id a second engagement crawling
+    the same address UPDATEd the first engagement's row instead of inserting its
+    own. The ON CONFLICT expression must stay character-identical to
+    uq_discovered_params_identity in db_init/ensure_all_tables.sql -- a mismatch
+    is not a silent fallback, it raises "no unique or exclusion constraint
+    matching the ON CONFLICT specification" on every row.
+    """
     cur.execute("""
         INSERT INTO discovered_params
-            (asset_id, url_pattern, param_name, param_type, http_method, param_location, sample_values, occurrence_count)
-        VALUES (%s, %s, %s, %s, %s, %s, ARRAY[%s], 1)
-        ON CONFLICT (url_pattern, param_name, http_method, param_location)
+            (asset_id, engagement_id, url_pattern, param_name, param_type, http_method, param_location, sample_values, occurrence_count)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, ARRAY[%s], 1)
+        ON CONFLICT (COALESCE(engagement_id, '00000000-0000-0000-0000-000000000000'::uuid),
+                     url_pattern,
+                     param_name,
+                     COALESCE(http_method, 'GET'),
+                     COALESCE(param_location, 'query'))
         DO UPDATE SET
             occurrence_count = discovered_params.occurrence_count + 1,
             last_seen = now(),
@@ -341,6 +387,7 @@ def _upsert_param(cur, asset_id, param):
             )
     """, (
         asset_id,
+        engagement_id,
         param["url_pattern"],
         param["param_name"],
         param["param_type"],
@@ -425,6 +472,8 @@ def parse_katana(path: str, profile: str = "upload", job_id: str = None):
             # this parser is called for uploads and jobs that carry no engagement
             # id, and a finding is legitimate if it is in scope for ANY of them.
             _enforce_scope, _scope_rows = load_ingest_scope(cur)
+            # host -> engagement_id, resolved once per host for this parse.
+            _eng_cache = {}
             if not _enforce_scope:
                 print("[katana] WARNING: no scope_targets configured — "
                       "ingesting every host without scope filtering")
@@ -565,9 +614,14 @@ def parse_katana(path: str, profile: str = "upload", job_id: str = None):
                     if isinstance(request, dict):
                         raw_request = request.get("raw", "") or ""
                     params = _extract_params(url, method, raw_request)
+                    # Collected target data MUST carry the engagement (CLAUDE.md
+                    # "Engagement attribution is mandatory"), and here it is also
+                    # half the dedup key -- resolved from the crawled host, never
+                    # invented when the host ties to no engagement.
+                    _eng = _engagement_for_url(cur, url, _eng_cache)
                     for p in params:
                         try:
-                            _upsert_param(cur, asset_id, p)
+                            _upsert_param(cur, asset_id, p, _eng)
                             stats["params_extracted"] += 1
                         except Exception:
                             pass  # Don't fail the main loop for param extraction issues

@@ -279,3 +279,21 @@ def note(sel: dict) -> str:
         return ("[variants] %d applied, %s — trying every form and recording "
                 "which answers" % (n, sel.get("reason")))
     return "[variants] %d applied, %s" % (n, sel.get("reason"))
+
+
+def waf_shapes() -> Dict[str, List[tuple]]:
+    """{family_label: [(variant_label, payload), ...]} for WAF characterisation.
+
+    Was a function-local dict literal in app/rag-api/api.py::_characterize_waf.
+    Returns {} when the table is unreadable; the caller then skips WAF
+    characterisation and says so, rather than probing with nothing.
+    """
+    out: Dict[str, List[tuple]] = {}
+    for e in (load().get("raw") or {}).get("waf_shapes") or []:
+        if not isinstance(e, dict) or not e.get("family"):
+            continue
+        pairs = [tuple(v) for v in (e.get("variants") or [])
+                 if isinstance(v, (list, tuple)) and len(v) == 2]
+        if pairs:
+            out[str(e["family"])] = pairs
+    return out

