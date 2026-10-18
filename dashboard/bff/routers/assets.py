@@ -433,6 +433,31 @@ async def revoke_poc(ip: str, port: int = None):
         return safe_json(resp)
 
 
+@router.post("/api/software/build-poc/preview")
+async def build_poc_preview(request: Request):
+    """Preview a PoC build without sending anything to the target (class, ATT&CK,
+    reading hints, requirements, graded goal, scope verdict, optional suggested
+    command). At most two LLM calls, so a short read timeout is wrong; 180 s."""
+    s = get_settings()
+    body = await request.json()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=10.0)) as c:
+        resp = await c.post(f"{s.rag_api_url}/software/build-poc/preview", json=body,
+                            headers={"x-api-key": s.api_key, **engagement_headers()})
+    # httpx does not raise on 4xx/5xx -- report the upstream failure, never
+    # a success-shaped body.
+    if resp.status_code >= 400:
+        from fastapi import HTTPException
+        _detail = resp.text
+        try:
+            _j = resp.json()
+            if isinstance(_j, dict) and "detail" in _j:
+                _detail = _j["detail"]
+        except Exception:  # noqa: BLE001
+            pass
+        raise HTTPException(status_code=resp.status_code, detail=_detail)
+    return safe_json(resp)
+
+
 @router.post("/api/software/build-poc")
 async def build_poc(request: Request):
     """Run the CVE PoC-builder (research -> synthesize -> run-and-refine). Long-running
