@@ -270,7 +270,7 @@ services:
       # no memory of what previously worked on a target while 61% of them
       # exhausted the refine loop. The CODE default stays off so a bare
       # import never writes to the DB (tests/test_rag_observed_facts.py).
-      RAG_OBSERVED_FACTS: ${RAG_OBSERVED_FACTS:-1}     # Embed observed target facts + enum_facts into rag_documents so prior observations recall across builds (off by default; opt-in)
+      RAG_OBSERVED_FACTS: ${RAG_OBSERVED_FACTS:-1}     # Embed observed target facts + enum_facts into rag_documents so prior observations recall across builds (on by default; set RAG_OBSERVED_FACTS=0 to disable)
       POC_SEMANTIC_VERIFY: ${POC_SEMANTIC_VERIFY:-1}   # Hybrid regex+semantic PoC verification; regex-first, canary-grounded LLM fallback (on by default)
       ZAP_URL: ${ZAP_URL:-http://zap:8090}
       ZAP_API_KEY: ${ZAP_API_KEY:-changeme}

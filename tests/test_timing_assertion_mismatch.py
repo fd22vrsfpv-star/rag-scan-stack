@@ -388,3 +388,48 @@ def test_bash_absence_falls_back_rather_than_failing():
         "the comment must record that None means the previous /bin/sh "
         "behaviour, not a crash"
     )
+
+
+# -------------------------------------- F2c: a proxy refusal is not a run
+#
+# 2026-10-18, CVE-2023-37999 iteration 2: the attack proxy policy refused the
+# command (fail-closed, no SOCKS node online), yet the verdict read
+# `latency: elapsed 12.4s >= min_seconds 5` -- the 12.4s was spent resolving
+# the proxy. The helper knew three never-dispatched markers and missed this
+# one (exit 46) and the failed pre-run probe (exit 44). EXECUTED, not grepped:
+# the function is pure, so it is compiled out of api.py and called.
+
+def _not_executed_fn():
+    import ast as _ast
+    tree = _ast.parse(_src())
+    node = next(n for n in tree.body
+                if isinstance(n, _ast.FunctionDef)
+                and n.name == "_poc_command_not_executed")
+    ns = {}
+    exec(compile(_ast.Module([node], []), "api.py", "exec"), ns)
+    return ns["_poc_command_not_executed"]
+
+
+_REFUSED = ("[proxy] REFUSED\nfail-closed: attacks must route through a node "
+            "SOCKS proxy, but no online node exposes a SOCKS port. Refusing to "
+            "run this attack directly.")
+
+
+@pytest.mark.parametrize("output,code", [
+    (_REFUSED, 46),
+    (_REFUSED, None),                                    # marker alone
+    ("PRERUN_PROBE_FEEDBACK status=400 body=0\n\n" + _REFUSED, None),  # prepended
+    ("PRERUN_PROBE_FAIL method=POST url=http://t/x status=404 reason=x", 44),
+])
+def test_refused_and_probe_failed_runs_are_not_executed(output, code):
+    assert _not_executed_fn()(output, code), (
+        "a command that never left the runner was treated as dispatched, so "
+        "its elapsed time would be graded as a timing result")
+
+
+@pytest.mark.parametrize("output", [
+    "[proxy] DIRECT - the caller resolved no proxy for this target\nHTTP/1.1 200 OK",
+    "[proxy] routed via socks5://10.0.0.5:1080\n<html>ok</html>",
+])
+def test_dispatched_runs_are_still_executed(output):
+    assert _not_executed_fn()(output, 0) is None

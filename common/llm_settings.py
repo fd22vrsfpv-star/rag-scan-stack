@@ -29,6 +29,7 @@ Never raises: a DB hiccup falls back to env/defaults so it cannot take the LLM
 path down.
 """
 import json
+import logging
 import os
 import time
 
@@ -38,8 +39,15 @@ except Exception:  # pragma: no cover - psycopg2 always present in services
     psycopg2 = None
 
 CACHE_TTL = 30  # seconds
+# How soon to retry after the DB read FAILED. Short, because the failure is
+# usually a blip on a remote DB, and long enough not to hammer it.
+DB_RETRY_SECS = 5
 
-_cache = {"data": None, "ts": 0.0}
+log = logging.getLogger(__name__)
+
+# `good` is the last config built from a SUCCESSFUL DB read. It is what a
+# failed read serves, so an unreachable DB never masquerades as "no routes".
+_cache = {"data": None, "ts": 0.0, "good": None}
 
 # resolver_key: (db_key_without_llm_prefix, env_var, default)
 _FIELDS = {
@@ -383,8 +391,15 @@ def _read_db_llm():
             for key, value in cur.fetchall():
                 if value not in (None, ""):
                     out["agentmodel." + key.split(":", 1)[1]] = value
-    except Exception:
-        return {}
+    except Exception as e:  # noqa: BLE001
+        # THREE outcomes, not two: None means "could not read", which is NOT
+        # the same as {} ("read fine, nothing configured"). Returning {} here
+        # made a transient DB error look like an empty config, so every task
+        # lost its route and fell to the global default -- an Ollama model
+        # that was not installed -- and every LLM call 404'd into an empty
+        # reply for the full cache TTL.
+        log.warning("llm settings: DB read failed (%s: %s)", type(e).__name__, e)
+        return None
     finally:
         if conn is not None:
             try:
@@ -406,6 +421,19 @@ def get_llm_settings(force_refresh=False):
         return _cache["data"]
 
     db = _read_db_llm()
+    if db is None:
+        # Unreachable is not absent. Serve the last config a successful read
+        # produced, and retry soon instead of in CACHE_TTL.
+        _cache["ts"] = now - CACHE_TTL + DB_RETRY_SECS
+        if _cache.get("good") is not None:
+            log.warning("llm settings: serving last-good config (DB unreachable)")
+            _cache["data"] = _cache["good"]
+            return _cache["good"]
+        log.warning("llm settings: DB unreachable and no prior config -- using "
+                    "env/defaults until the DB answers")
+        db, db_ok = {}, False
+    else:
+        db_ok = True
     merged = {}
     source = {}
     for rk, (db_key, env_var, default) in _FIELDS.items():
@@ -461,10 +489,13 @@ def get_llm_settings(force_refresh=False):
 
     merged["_source"] = source
     _cache["data"] = merged
-    _cache["ts"] = now
+    if db_ok:
+        _cache["ts"] = now
+        _cache["good"] = merged
     return merged
 
 
 def clear_cache():
     _cache["data"] = None
     _cache["ts"] = 0.0
+    _cache["good"] = None

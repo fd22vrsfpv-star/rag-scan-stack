@@ -473,6 +473,11 @@ def mitre_for(name) -> List[str]:
     return list((get(name) or {}).get("mitre") or [])
 
 
+def graded_goals(name) -> List[str]:
+    """Graded-benchmark goals this class reaches, best first; [] = no preference."""
+    return list((get(name) or {}).get("graded_goals") or [])
+
+
 def references(name) -> dict:
     """Everything a report needs to name this finding in the reader's own
     vocabulary — CWE, OWASP Top 10, WSTG and ATT&CK in one call."""

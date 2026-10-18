@@ -628,10 +628,10 @@ def test_build_litellm_kwargs_is_shared(monkeypatch):
     custom api_version → azure_ai/<deployment> + stripped api_base +
     the given api_version."""
     lmodel, kwargs = lr._build_litellm_kwargs(
-        "azure", "gpt-5-mini", {"temperature": 0.2},
+        "azure", "gpt-4o", {"temperature": 0.2},
         "https://foundry.services.ai.azure.com/api/projects/p",
         "k", 1024, "2025-01-01-preview")
-    assert lmodel == "azure_ai/gpt-5-mini"
+    assert lmodel == "azure_ai/gpt-4o"
     assert kwargs["api_base"] == "https://foundry.services.ai.azure.com"
     assert kwargs["api_version"] == "2025-01-01-preview"
     assert kwargs["temperature"] == 0.2
@@ -683,13 +683,22 @@ def test_temperature_of_one_is_kept_because_it_is_accepted():
     assert kwargs["temperature"] == 1
 
 
-def test_reasoning_model_without_effort_keeps_temperature():
-    """Reasoning INACTIVE (no effort resolved) means the normal rules apply.
-    Dropping here would silently change every call to these deployments."""
+def test_reasoning_model_without_effort_still_drops_temperature(monkeypatch):
+    """An UNSET effort is not 'reasoning off' -- the deployment reasons by
+    default, and LiteLLM refuses the override 'unless reasoning_effort resolves
+    to none'. Keeping temperature here guaranteed a client-side failure; it was
+    observed live on 2026-10-18 whenever the settings read failed and no effort
+    resolved:
+
+      LiteLLM path failed on backend=azure model=gpt-5-mini
+      (litellm.UnsupportedParamsError: gpt-5-mini doesn't support
+      temperature=0.1 while reasoning is active ...)
+    """
+    monkeypatch.setattr(lr, "get_llm_settings", None, raising=False)
     _, kwargs = lr._build_litellm_kwargs(
         "azure", "gpt-5-mini", {"temperature": 0.2},
         "https://foundry.services.ai.azure.com", "k", 1024, None)
-    assert kwargs.get("temperature") == 0.2
+    assert "temperature" not in kwargs
 
 
 def test_effort_none_is_not_reasoning_active():

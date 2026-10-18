@@ -489,7 +489,13 @@ def _build_litellm_kwargs(backend: str,
         # request into a quietly different one. This drops exactly the two
         # params that are known-unsupported, only on reasoning models, only when
         # reasoning is actually on, and says so in the log.
-        _reasoning_on = bool(effort) and str(effort).lower() != "none"
+        # Reasoning is ON unless effort is explicitly "none". An UNSET effort
+        # is not "off": the deployment reasons by default, and LiteLLM refuses
+        # temperature != 1 "unless reasoning_effort resolves to 'none'". The
+        # old `bool(effort) and ...` kept temperature whenever no effort
+        # resolved -- which happened every time the settings read failed --
+        # so each such call died client-side (seen 7x on 2026-10-18).
+        _reasoning_on = str(effort or "").lower() != "none"
         if _reasoning_on:
             _dropped = [k for k in ("temperature", "top_p")
                         if k in kwargs and kwargs[k] not in (1, 1.0)]

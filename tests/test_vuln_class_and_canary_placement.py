@@ -219,8 +219,12 @@ def test_the_regression_cves_map_to_the_right_class():
     m = _vc_mod()
     # CVE-2024-36675 / CVE-2024-32964 — classified `unknown`, never attempted.
     assert "ssrf" in m.classes_for_cwe("CWE-918")
-    # CVE-2023-51483 / CVE-2024-32511 — privesc.
-    assert "auth-bypass" in m.classes_for_cwe("CWE-269")
+    # CVE-2023-51483 / CVE-2024-32511 / CVE-2023-37999 — privesc. Its own class
+    # since 2026-10-18 (was auth-bypass): the proof is a granted role in USE,
+    # not a check bypassed, and auth-bypass guidance told 37999 to log in as
+    # the attacker and hunt an IDOR.
+    assert "privilege-escalation" in m.classes_for_cwe("CWE-269")
+    assert "auth-bypass" not in m.classes_for_cwe("CWE-269")
     # CVE-2024-3552 / CVE-2024-36412 / CVE-2024-5314.
     assert "sqli" in m.classes_for_cwe("CWE-89")
 

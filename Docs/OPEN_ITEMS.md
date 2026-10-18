@@ -755,3 +755,43 @@ plus a 4-character minimum and a requirement that the name contains a letter.
 "Country" alone appears on 66 hosts and in a large share of headlines — match
 on it and every story reports an asset hit, which is worse than matching
 nothing because the operator learns to ignore the feature.
+
+### Schema repair leaves 30 statements lock-blocked on the remote DB, incl. `engagements.require_proxy`
+**Found:** 2026-10-18
+**Evidence:** `scripts/ensure_db_schema.sh` (full run, no outer timeout) exited 1:
+`29 statement(s) hit lock_timeout — retrying once in 20 s` then
+`30 statement(s) still blocked after retry`, and
+`❌ Missing required column: engagements.require_proxy`. The column is absent on
+the live DB (`information_schema.columns` returns no `%proxy%` column on
+`engagements`) although `db_init/ensure_all_tables.sql:4250` declares it. Blocked
+input lines include 360, 366, 390, 2350, 2891, 2998–3002, 3072–3081, 3254–3318,
+3784, 4251, 4315, 4502, 4599, 4733, 4798, 6280, 6384, 6570, 7337 (touching `assets`,
+`web_findings`, among others). At the time, `pg_stat_activity` showed no
+transaction older than 52 s, so this is lock contention from steady traffic rather
+than one stuck sweep.
+**Where:** `scripts/ensure_db_schema.sh` (lock_timeout + single retry),
+`db_init/ensure_all_tables.sql`; reader `etl/attack_proxy.engagement_requires_proxy`
+(called only from `osint_runner`), which fails closed (treats the unreadable
+policy as "proxy required").
+**Done when:** a schema run reports 0 blocked statements and
+`engagements.require_proxy` exists on the live DB — e.g. run it in a quiet
+window, or retry blocked statements more than once with backoff.
+**Enforced by:** not enforced (the `ensure_db_schema.sh` required-column check exits 1 while it is open, but no test fails).
+*Why it matters:* the script prints `✓ Schema update completed successfully` before
+the blocked-statement summary, so an operator who reads only the top line would think
+the repair applied.
+
+### CVE-Bench target CVE-2024-2359 crashes at startup
+**Found:** 2026-10-18
+**Evidence:** `cve-2024-2359-target-1` was `Up 7 hours (unhealthy)`; its log ends in
+`ValueError: No configuration loaded.` raised from
+`lollms_core/lollms/config.py:317` via `LollmsPaths.find_paths` in `app.py:62`.
+`docker restart` reproduced the same traceback, and port 9090 never answered
+(`curl` → `000`). Excluded from round `round_20261018_0023` (11 CVEs ran).
+**Where:** the CVE-Bench compose project for CVE-2024-2359 (target image / its
+`configs/config.yaml` provisioning; `secrets_init` exited 0).
+**Done when:** the target answers HTTP on 9090 after a fresh `up` and it is back in
+the round driver's target list.
+**Enforced by:** not enforced.
+*Why it matters:* a run against a crashed target produces an exploit "failure" that
+measures the environment, not the PoC pipeline.

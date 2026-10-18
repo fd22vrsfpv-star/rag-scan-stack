@@ -131,7 +131,75 @@ def test_db_failure_falls_back_to_env(mod, monkeypatch):
     monkeypatch.setenv("OPENAI_MODEL", "gpt-4o")
     def _boom():
         raise RuntimeError("db down")
-    # _read_db_llm swallows internally, but prove get_llm_settings never raises
-    monkeypatch.setattr(mod, "_read_db_llm", lambda: {})
+    # _read_db_llm swallows internally and reports a failed read as None;
+    # prove get_llm_settings never raises and falls back to env.
+    monkeypatch.setattr(mod, "_read_db_llm", lambda: None)
     s = mod.get_llm_settings(force_refresh=True)
     assert s["openai_model"] == "gpt-4o"
+
+
+# ---------------------------------------------------------------------------
+# An unreachable DB is not an empty config
+# ---------------------------------------------------------------------------
+# _read_db_llm used to return {} on ANY exception, so a transient DB error was
+# indistinguishable from "nothing configured". get_llm_settings then built a
+# config with no routes, cached it for CACHE_TTL, and every task resolved to
+# the global env backend -- observed 2026-10-18 as
+# `route task=cve_poc_refine -> ollama:qwen2.5:32b (global)` on 10 of 66 refine
+# calls, a model that was not installed, so each one 404'd into an empty reply
+# and ended the PoC build after one iteration.
+
+_GOOD = {"backend": "azure", "route.cve_poc_refine": "azure-main:DeepSeek-V4-Pro",
+         "route.default": "azure-main:gpt-5-mini"}
+
+
+def test_failed_read_serves_last_good_routes(mod, monkeypatch):
+    monkeypatch.setenv("LLM_BACKEND", "ollama")
+    monkeypatch.setattr(mod, "_read_db_llm", lambda: dict(_GOOD))
+    good = mod.get_llm_settings(force_refresh=True)
+    assert good["routes"]["cve_poc_refine"] == "azure-main:DeepSeek-V4-Pro"
+
+    monkeypatch.setattr(mod, "_read_db_llm", lambda: None)  # DB now unreachable
+    s = mod.get_llm_settings(force_refresh=True)
+    assert s["routes"].get("cve_poc_refine") == "azure-main:DeepSeek-V4-Pro", (
+        "a failed DB read discarded the routes -- every task falls to the "
+        "global env backend")
+    assert s["backend"] == "azure"
+
+
+def test_failed_read_is_not_cached_for_the_full_ttl(mod, monkeypatch):
+    calls = {"n": 0}
+
+    def _down():
+        calls["n"] += 1
+        return None
+    monkeypatch.setattr(mod, "_read_db_llm", _down)
+    t = [1000.0]
+    monkeypatch.setattr(mod.time, "time", lambda: t[0])
+    mod.get_llm_settings()
+    t[0] += mod.DB_RETRY_SECS + 0.1          # well inside CACHE_TTL
+    assert mod.DB_RETRY_SECS < mod.CACHE_TTL
+    monkeypatch.setattr(mod, "_read_db_llm", lambda: dict(_GOOD))
+    s = mod.get_llm_settings()
+    assert s["routes"].get("cve_poc_refine"), (
+        "a failed read was cached for the full TTL, so the recovered DB was "
+        "ignored and routes stayed missing")
+
+
+def test_a_successful_empty_read_is_still_empty(mod, monkeypatch):
+    """{} means 'read fine, nothing configured' -- it must NOT serve stale data."""
+    monkeypatch.setattr(mod, "_read_db_llm", lambda: dict(_GOOD))
+    mod.get_llm_settings(force_refresh=True)
+    monkeypatch.setattr(mod, "_read_db_llm", lambda: {})
+    s = mod.get_llm_settings(force_refresh=True)
+    assert "cve_poc_refine" not in s["routes"]
+
+
+def test_read_db_llm_reports_failure_as_none(mod, monkeypatch):
+    """The reader itself must return None, not {}, when the query raises."""
+    class _Boom:
+        def connect(self, *a, **k):
+            raise RuntimeError("could not connect to server")
+    monkeypatch.setenv("DB_DSN", "postgresql://x@nowhere/db")
+    monkeypatch.setattr(mod, "psycopg2", _Boom())
+    assert mod._read_db_llm() is None

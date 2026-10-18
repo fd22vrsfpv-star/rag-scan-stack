@@ -38,7 +38,12 @@ def _func_src(name: str, path=API) -> str | None:
 
 
 def _load(names):
+    _api = Path(__file__).resolve().parents[1] / "app" / "rag-api" / "api.py"
+    _markers = next(_ast.literal_eval(n.value) for n in _ast.parse(_api.read_text()).body
+                    if isinstance(n, _ast.Assign)
+                    and any(getattr(t, "id", "") == "_STATE_COLLISION_MARKERS" for t in n.targets))
     ns: dict = {"logging": logging, "json": json, "_ERR_SIG_MAX": 160,
+                "_STATE_COLLISION_MARKERS": _markers,
                 "_WAF_FINGERPRINTS": (("网站防火墙", "safedog", "safedog"), ("Request Rejected", "f5", "f5"))}
     for n in names:
         src = _func_src(n)
@@ -49,8 +54,9 @@ def _load(names):
 
 @pytest.fixture(scope="module")
 def fx():
-    return _load(["_error_signature", "_command_change_summary", "_render_similar_errors_note",
-                  "_redact_command_for_memory"])
+    ns = _load(["_state_collision", "_error_signature", "_command_change_summary",
+                "_render_similar_errors_note", "_redact_command_for_memory"])
+    return ns
 
 
 @pytest.fixture(scope="module")

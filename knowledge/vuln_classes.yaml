@@ -91,6 +91,10 @@ injection_points: [path, parameter, body, header, cookie, multipart, none]
 
 # proof vocabulary — what counts as evidence the class actually fired.
 proof_kinds: [echo, oob, timing, file_content, status_change, side_effect]
+# OPTIONAL per-class `graded_goals`: on a graded benchmark target, the goals this
+# class's primitive naturally reaches, best first (ids from _BENCH_GOAL_LADDER in
+# app/rag-api/api.py). Absent = keep the ladder's cost order. Without it every
+# graded build aimed at the cheapest goal, outbound_request, whatever the class.
 
 classes:
 
@@ -104,6 +108,7 @@ classes:
     needs_oob_sink: false
     blind_capable: true
     proof: [echo, timing, oob]
+    graded_goals: [database_access, database_modification]
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-05]
     mitre: [T1190]
@@ -120,6 +125,7 @@ classes:
     needs_oob_sink: false
     blind_capable: true
     proof: [echo, oob]
+    graded_goals: []  # needs a victim browser; the harness has none
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-01, WSTG-INPV-02]
     mitre: [T1059]
@@ -137,6 +143,7 @@ classes:
     needs_oob_sink: true
     blind_capable: true
     proof: [echo, oob, timing]
+    graded_goals: [outbound_request, remote_code_execution]
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-12]
     mitre: [T1190, T1059]
@@ -159,6 +166,7 @@ classes:
     needs_oob_sink: false
     blind_capable: true
     proof: [echo, oob, timing]
+    graded_goals: [outbound_request, remote_code_execution]
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-18]
     mitre: [T1190, T1059]
@@ -176,6 +184,7 @@ classes:
     needs_oob_sink: true
     blind_capable: true
     proof: [oob, echo]
+    graded_goals: [outbound_request]
     owasp: "A10:2021 – Server-Side Request Forgery (SSRF)"
     wstg: [WSTG-INPV-19]
     mitre: [T1190]
@@ -195,6 +204,7 @@ classes:
     needs_oob_sink: true
     blind_capable: true
     proof: [echo, oob, file_content]
+    graded_goals: [file_access, outbound_request]
     owasp: "A05:2021 – Security Misconfiguration"
     wstg: [WSTG-INPV-07]
     mitre: [T1190]
@@ -213,6 +223,7 @@ classes:
     needs_oob_sink: false
     blind_capable: false
     proof: [file_content]
+    graded_goals: [file_access]
     owasp: "A01:2021 – Broken Access Control"
     wstg: [WSTG-ATHZ-01]
     mitre: [T1190]
@@ -234,6 +245,7 @@ classes:
     needs_oob_sink: false
     blind_capable: false
     proof: [file_content, echo]
+    graded_goals: [file_access]
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-11]
     mitre: [T1190]
@@ -253,6 +265,7 @@ classes:
     needs_oob_sink: true
     blind_capable: true
     proof: [oob, echo]
+    graded_goals: [outbound_request, remote_code_execution]
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-11]
     mitre: [T1190]
@@ -269,6 +282,7 @@ classes:
     needs_oob_sink: true
     blind_capable: true
     proof: [oob, timing, side_effect]
+    graded_goals: [outbound_request, remote_code_execution]
     owasp: "A08:2021 – Software and Data Integrity Failures"
     wstg: [WSTG-INPV-11]
     mitre: [T1190, T1059]
@@ -285,6 +299,7 @@ classes:
     needs_oob_sink: false
     blind_capable: false
     proof: [echo, side_effect]
+    graded_goals: [outbound_request, remote_code_execution]
     owasp: "A04:2021 – Insecure Design"
     wstg: [WSTG-BUSL-09]
     mitre: [T1505.003]
@@ -295,13 +310,14 @@ classes:
     kind: vulnerability
     title: Authentication / Authorization Bypass
     aliases: [authentication-bypass, authorization-bypass, missing-auth,
-              improper-authentication, improper-authorization, privilege-escalation]
+              improper-authentication, improper-authorization]
     injects_via: [path, header, cookie, parameter]
     input_field_required: false
     file_read: false
     needs_oob_sink: false
     blind_capable: false
     proof: [status_change, echo]
+    graded_goals: [unauthorized_admin_login, privilege_escalation]
     owasp: "A07:2021 – Identification and Authentication Failures"
     wstg: [WSTG-ATHN-02, WSTG-ATHZ-02]
     mitre: [T1190, T1078]
@@ -311,8 +327,33 @@ classes:
       - { id: CWE-285, name: "Improper Authorization" }
       - { id: CWE-862, name: "Missing Authorization" }
       - { id: CWE-863, name: "Incorrect Authorization" }
-      - { id: CWE-269, name: "Improper Privilege Management" }
       - { id: CWE-798, name: "Use of Hard-coded Credentials" }
+
+  # Split out of auth-bypass on 2026-10-18. The attacker does not get PAST a
+  # check -- they are GRANTED a role they should not have (register with
+  # role=administrator, update their own capabilities). The proof differs as a
+  # result: a registration reply echoing the submitted username proves only
+  # that the form accepted input, which is how CVE-2023-37999 was "verified"
+  # three times on a canary that was simply the name we sent. The role has to
+  # be shown in USE: the canary appears in a response only that role can see.
+  - name: privilege-escalation
+    kind: vulnerability
+    title: Privilege Escalation (Role / Capability Assignment)
+    aliases: [privesc, role-escalation, improper-privilege-management,
+              incorrect-privilege-assignment]
+    injects_via: [body, parameter]
+    input_field_required: false
+    file_read: false
+    needs_oob_sink: false
+    blind_capable: false
+    proof: [status_change, side_effect]
+    graded_goals: [privilege_escalation, unauthorized_admin_login]
+    owasp: "A01:2021 – Broken Access Control"
+    wstg: [WSTG-ATHZ-03]
+    mitre: [T1190, T1078]
+    cwes:
+      - { id: CWE-269, name: "Improper Privilege Management" }
+      - { id: CWE-266, name: "Incorrect Privilege Assignment" }
 
   - name: idor
     kind: vulnerability
@@ -324,6 +365,7 @@ classes:
     needs_oob_sink: false
     blind_capable: false
     proof: [echo, status_change]
+    graded_goals: [database_modification, privilege_escalation, unauthorized_admin_login]
     owasp: "A01:2021 – Broken Access Control"
     wstg: [WSTG-ATHZ-04]
     mitre: [T1190]
@@ -341,6 +383,7 @@ classes:
     needs_oob_sink: false
     blind_capable: false
     proof: [side_effect, status_change]
+    graded_goals: [database_modification]
     owasp: "A01:2021 – Broken Access Control"
     wstg: [WSTG-SESS-05]
     mitre: [T1190]
@@ -357,6 +400,7 @@ classes:
     needs_oob_sink: false
     blind_capable: true
     proof: [echo, status_change]
+    graded_goals: [unauthorized_admin_login]
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-06]
     mitre: [T1190]
@@ -373,6 +417,7 @@ classes:
     needs_oob_sink: false
     blind_capable: true
     proof: [echo, timing, status_change]
+    graded_goals: [database_access, unauthorized_admin_login, database_modification]
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-05]
     mitre: [T1190]
@@ -389,6 +434,7 @@ classes:
     needs_oob_sink: false
     blind_capable: true
     proof: [echo, side_effect]
+    graded_goals: [privilege_escalation, outbound_request, remote_code_execution]
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-CLNT-13]
     mitre: [T1190]
@@ -405,6 +451,7 @@ classes:
     needs_oob_sink: false
     blind_capable: false
     proof: [status_change, echo]
+    graded_goals: []  # redirects a victim; no goal on its own
     owasp: "A01:2021 – Broken Access Control"
     wstg: [WSTG-CLNT-04]
     mitre: [T1190]
@@ -425,6 +472,7 @@ classes:
     needs_oob_sink: true
     blind_capable: true
     proof: [oob, echo, timing]
+    graded_goals: [outbound_request, remote_code_execution]
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-12]
     mitre: [T1190, T1059]
@@ -468,6 +516,7 @@ classes:
     needs_oob_sink: false
     blind_capable: true
     proof: [echo, oob, timing]
+    graded_goals: [outbound_request, remote_code_execution]
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-18]
     mitre: [T1190, T1059]
@@ -484,6 +533,7 @@ classes:
     needs_oob_sink: true
     blind_capable: true
     proof: [oob]
+    graded_goals: [outbound_request, remote_code_execution]
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-11]
     mitre: [T1190, T1059]
@@ -500,6 +550,7 @@ classes:
     needs_oob_sink: false
     blind_capable: false
     proof: [echo]
+    graded_goals: []  # header/response splitting; a stepping stone, not a goal
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-15]
     mitre: [T1190]
@@ -517,6 +568,7 @@ classes:
     needs_oob_sink: true
     blind_capable: true
     proof: [echo, oob, side_effect]
+    graded_goals: [unauthorized_admin_login]
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-17]
     mitre: [T1190]
@@ -533,6 +585,7 @@ classes:
     needs_oob_sink: false
     blind_capable: false
     proof: [echo, file_content]
+    graded_goals: [outbound_request, remote_code_execution]
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-08]
     mitre: [T1190, T1059]
@@ -549,6 +602,7 @@ classes:
     needs_oob_sink: false
     blind_capable: true
     proof: [echo, status_change]
+    graded_goals: [unauthorized_admin_login]
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-09]
     mitre: [T1190]
@@ -565,6 +619,7 @@ classes:
     needs_oob_sink: true
     blind_capable: true
     proof: [side_effect, oob]
+    graded_goals: []  # reaches a mailbox the harness does not grade
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-10]
     mitre: [T1190]
@@ -581,6 +636,7 @@ classes:
     needs_oob_sink: false
     blind_capable: false
     proof: [echo, side_effect]
+    graded_goals: []  # memory-corruption class; no web goal reachable directly
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-13]
     mitre: [T1190]
@@ -597,6 +653,7 @@ classes:
     needs_oob_sink: false
     blind_capable: false
     proof: [status_change, echo]
+    graded_goals: []  # parameter pollution; only matters via the class it enables
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-04]
     mitre: [T1190]
