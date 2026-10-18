@@ -235,3 +235,51 @@ def test_every_exploitable_class_declares_its_graded_goals():
                if c.get("kind") == "vulnerability" and "graded_goals" not in c]
     assert not missing, (
         "exploitable class(es) with no graded_goals decision: %s" % missing)
+
+
+# --------------------------------------------- inputs the earlier code dropped
+
+def _fn(name):
+    for n in ast.parse(API.read_text(encoding="utf-8")).body:
+        if isinstance(n, ast.FunctionDef) and n.name == name:
+            return n
+    pytest.fail(name + " is gone")
+
+
+def test_synthesis_profile_is_given_the_cve_and_a_real_class():
+    """`_benchmark_profile` reads the challenge's eval.yml through spec["cve"].
+    The synthesis call passed no cve and read `vuln_class` from a local that
+    did not exist, so the authoritative prompt never saw the harness's own
+    facts and every class got the cost-order goal (observed 2026-10-18:
+    CVE-2023-51483, class privilege-escalation, goal outbound_request)."""
+    found = False
+    for c in ast.walk(_fn("_synthesize_cve_poc")):
+        if not (isinstance(c, ast.Call) and getattr(c.func, "id", "") == "_benchmark_profile"):
+            continue
+        spec = next((a for a in c.args if isinstance(a, ast.Dict)), None)
+        assert spec is not None, "profile spec is not a dict literal any more"
+        keys = {k.value for k in spec.keys if isinstance(k, ast.Constant)}
+        assert "cve" in keys, "the profile spec has no `cve` -- eval.yml is never read"
+        vc = spec.values[[getattr(k, "value", None) for k in spec.keys].index("vuln_class")]
+        assert not any(isinstance(x, ast.Call) and getattr(x.func, "attr", "") == "get"
+                       and isinstance(x.func.value, ast.Call)
+                       and getattr(x.func.value.func, "id", "") == "locals"
+                       for x in ast.walk(vc)), "vuln_class is read from locals() again"
+        found = True
+    assert found, "_synthesize_cve_poc no longer builds a benchmark profile"
+
+
+def test_followthrough_classifies_with_the_cves_details():
+    """`_vuln_class_from_cve(cve, None)` answers `unknown` for every CVE."""
+    for c in ast.walk(_fn("_run_refine_poc")):
+        if isinstance(c, ast.Call) and getattr(c.func, "id", "") == "_vuln_class_from_cve":
+            arg = c.args[1] if len(c.args) > 1 else None
+            assert not (isinstance(arg, ast.Constant) and arg.value is None), (
+                "the follow-through classifies with details=None -> always 'unknown'")
+
+
+def test_followthrough_gate_accepts_sql_evidence_whatever_the_class():
+    """The gate must consult the command's own SQL slot, not only the label."""
+    called = {c.func.id for c in ast.walk(_fn("_benchmark_followthrough"))
+              if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+    assert {"_postex_blind_slot", "_postex_template_slot"} <= called

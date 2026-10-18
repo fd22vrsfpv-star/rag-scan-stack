@@ -19607,9 +19607,17 @@ def _benchmark_followthrough(cve, ip, port, eid, run_id, confirmed_command,
     if not _poc_grant_active(ip, port, eid):
         res["reason"] = "no active grant for this target — post-ex is impactful"
         return res
+    # Keyed on EVIDENCE, not the label: a command that already carries a
+    # proven SQL slot (error-based concat or a SLEEP the server executed) is a
+    # database primitive whatever the CVE is classed as. CVE-2023-51483 is
+    # privilege-escalation and was verified by a SQL SLEEP on 2026-10-18; a
+    # class-only gate refused to use it.
     vc = str(vclass or "").lower()
-    if vc not in ("sqli", "sql_injection"):
-        res["reason"] = "class %r has no database follow-through" % (vclass,)
+    _sql_evidence = bool(_postex_template_slot(confirmed_command)
+                         or _postex_blind_slot(confirmed_command))
+    if vc not in ("sqli", "sql_injection") and not _sql_evidence:
+        res["reason"] = ("class %r and no SQL slot in the confirmed command — "
+                         "no database follow-through" % (vclass,))
         return res
     prof = _benchmark_profile(ip, port, {"cve": cve, "vuln_class": "sqli"})
     if "database_access" not in (prof.get("goals_offered") or []):
@@ -22734,8 +22742,17 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
     # Empty string when no harness is present, so a normal engagement is
     # unchanged.
     try:
+        # `cve` is what unlocks the challenge's own eval.yml (attacker role,
+        # credentials, the harness's vulnerability description, secret table,
+        # upload URL). It was never passed, and `vuln_class` was read from a
+        # local that does not exist here, so this authoritative path got the
+        # generic defaults and the cost-order goal on every graded build.
+        try:
+            _bench_vc = _vuln_class_from_cve(cve, details)
+        except Exception:  # noqa: BLE001
+            _bench_vc = ""
         _bench = _benchmark_profile(ip, port, {
-            "vuln_class": (locals().get("vuln_class") or ""),
+            "cve": cve, "vuln_class": _bench_vc or "",
             "username": None, "password": None})
         _gb = _benchmark_goal_block({"benchmark": _bench})
         if _gb:
@@ -31325,7 +31342,9 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
     _followthrough = None
     if verified and verification_method != "benchmark_oracle":
         try:
-            _ft_class = _vuln_class_from_cve(cve, None)
+            # The classifier is CWE-first and needs the CVE's details; with
+            # None it answered `unknown` for every CVE (CVE-2023-51483).
+            _ft_class = _vuln_class_from_cve(cve, _fetch_cve_details(cve))
         except Exception:  # noqa: BLE001
             _ft_class = None
         try:
