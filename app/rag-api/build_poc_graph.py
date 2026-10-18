@@ -1802,6 +1802,79 @@ def node_run_refine(state: BuildPocState) -> Dict[str, Any]:
         # can't substitute an invented id for one the login actually proved.
         resolved_ids=(state.get("precond_result") or {}).get("resolved"),
         prior_cmd_signatures=state.get("prior_cmd_signatures"))
+    # CHAIN FALLBACK (operator ask, 2026-10-18: "2 as a backup"). On a real
+    # exhaust (max_iters, axis_exhausted, drifted) with another class available
+    # in the CVE's chain, re-synth with the backup class pinned and run refine
+    # once more. Keep the better of the two (a verified attempt beats any
+    # exhausted one; otherwise the higher-scoring best_attempt).
+    # One retry only (we are not going to triple build time); env-gated.
+    if (not result.get("verified")
+            and result.get("backup_classes_available")
+            and (os.environ.get("BUILD_POC_CLASS_FALLBACK", "on") or "on").lower() != "off"):
+        from api import _synthesize_cve_poc
+        backup = result["backup_classes_available"][0]
+        _poc_trace(state["run_id"], "class_fallback_retry",
+                   response=f"primary={result.get('primary_class')} exhausted "
+                            f"({result.get('stop_reason')}); re-synthing as {backup}",
+                   extra={"primary": result.get("primary_class"),
+                          "backup": backup,
+                          "stop_reason": result.get("stop_reason"),
+                          "chain": result.get("backup_classes_available")})
+        try:
+            built2 = _synthesize_cve_poc(
+                state["cve"], state["ip"], state["port"],
+                state.get("product"), state.get("version"), state.get("eid"),
+                run_id=state["run_id"], model=state.get("model"),
+                vuln_class_override=backup)
+        except Exception as e:  # noqa: BLE001
+            built2 = None
+            _poc_trace(state["run_id"], "class_fallback_synth_failed",
+                       response=f"{type(e).__name__}: {e}"[:300])
+        if built2 and built2.get("command"):
+            result2 = _run_refine_poc(
+                state["cve"], state["ip"], state["port"],
+                built2["command"], built2["assertion"], state.get("eid"),
+                state["run_id"], rationale=built2.get("rationale", ""),
+                product=state.get("product"), version=state.get("version"),
+                max_iters=state["max_iters"],
+                canary=built2.get("canary"), origin_family=built2.get("origin_family"),
+                llm_model=built2.get("llm_model"), model=state.get("model"),
+                recon_source_used=state.get("recon_source"),
+                arjun_discovered=state.get("arjun_discovered"),
+                focused_urls_from_body=state.get("focused_urls"),
+                gather_facts=(_gather_manifest_text(state["gather_manifest"])
+                              if state.get("gather_manifest") else None),
+                metrics={**(built2.get("metrics") or {}),
+                         "refine_passes": int((result.get("metrics") or {})
+                                              .get("refine_passes") or 0) + 1,
+                         "class_fallback_pass": 1,
+                         "_session_cookie_header": (
+                             (state.get("session_info") or {}).get("cookie_header")
+                             or (state.get("auth") or {}).get("_auto_cookie") or "")},
+                resolved_ids=(state.get("precond_result") or {}).get("resolved"),
+                prior_cmd_signatures=state.get("prior_cmd_signatures"),
+                vuln_class_override=backup,
+                tried_classes=list((result.get("tried_classes") or [])))
+            _poc_trace(state["run_id"], "class_fallback_outcome",
+                       extra={"backup": backup, "verified": bool(result2.get("verified")),
+                              "stop_reason": result2.get("stop_reason")})
+            # A verified fallback wins outright. Otherwise keep whichever
+            # produced the higher-scoring best_attempt (verified>any exhaust;
+            # higher best_score > lower; ties keep the ORIGINAL primary so the
+            # recorded primary class is stable).
+            def _better(a, b):
+                if bool(a.get("verified")) != bool(b.get("verified")):
+                    return a if a.get("verified") else b
+                return a if float(a.get("best_score") or 0) >= float(b.get("best_score") or 0) else b
+            picked = _better(result, result2)
+            picked["chain_fallback"] = {
+                "fired": True, "backup_class": backup,
+                "primary_result": {k: result.get(k) for k in
+                                   ("verified", "stop_reason", "best_score", "iterations")},
+                "backup_result": {k: result2.get(k) for k in
+                                  ("verified", "stop_reason", "best_score", "iterations")},
+                "winner": "backup" if picked is result2 else "primary"}
+            result = picked
     return {"result": result,
             "verified": bool(result.get("verified")),
             "reflection": bool(result.get("reflection")),

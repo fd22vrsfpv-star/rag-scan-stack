@@ -23053,10 +23053,19 @@ def _augment_with_sink_verification(command, canary, target_ip, sink_url):
     return f"( {command} ) >/dev/null 2>&1; {tail}"
 
 
-def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guidance_extra="", model=None):
+def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None,
+                        guidance_extra="", model=None, vuln_class_override=None):
     """Increment 1: research the CVE + synthesize a first-draft PoC (command+assertion).
     Writes research+synth to the filesystem trail. Does NOT persist a security_test
-    (only a converged PoC is stored, by _run_refine_poc). Always returns a dict."""
+    (only a converged PoC is stored, by _run_refine_poc). Always returns a dict.
+
+    `vuln_class_override`: when the CHAIN FALLBACK re-synths after an exhaust,
+    the first attempt's class is skipped and the next class in the chain is
+    used as primary. Everything else -- CWEs, advisory, prompt shape -- is the
+    same. Default None preserves the pre-existing behaviour.
+    """
+    def _primary_class():
+        return vuln_class_override or _vuln_class_from_cve(cve, details)
     cve = (cve or "").strip().upper()
     port = port or 80
     run_id = run_id or f"{cve}_{ip}_{int(__import__('time').time())}"
@@ -23066,7 +23075,7 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
     # The class decides whether an OOB listener is offered. Derived once, from
     # the CVE, rather than inferred from whatever words the guidance contains.
     try:
-        _listener_vc = _vuln_class_from_cve(cve, details)
+        _listener_vc = _primary_class()
     except Exception:  # noqa: BLE001
         _listener_vc = None
     # Proactive precondition detection: if the target exposes CSRF tokens/nonces,
@@ -23103,7 +23112,7 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
         # local that does not exist here, so this authoritative path got the
         # generic defaults and the cost-order goal on every graded build.
         try:
-            _bench_vc = _vuln_class_from_cve(cve, details)
+            _bench_vc = _primary_class()
         except Exception:  # noqa: BLE001
             _bench_vc = ""
         _bench = _benchmark_profile(ip, port, {
@@ -23244,7 +23253,7 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
     # reaching nothing in practice. Fail-soft: a classifier error must not stop
     # a synthesis that worked without this block for its whole life.
     try:
-        _vc = _vuln_class_from_cve(cve, details)
+        _vc = _primary_class()
         _class_block = _class_guidance_block(_vc, _vuln_classes_from_cve(cve, details))
     except Exception as _cge:  # noqa: BLE001
         logging.debug("class guidance failed for %s: %s", cve, _cge)
@@ -29892,7 +29901,8 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                     origin_family=None, llm_model=None, metrics=None, model=None,
                     recon_source_used=None, arjun_discovered=None,
                     focused_urls_from_body=None, resolved_ids=None, gather_facts=None,
-                    prior_cmd_signatures=None):
+                    prior_cmd_signatures=None, vuln_class_override=None,
+                    tried_classes=None):
     """Increment 2: run the PoC against the target; on failure, refine via the LLM,
     re-run — up to max_iters. Verbose trail -> filesystem.
 
@@ -31823,9 +31833,27 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                 eid=eid)
     except Exception as e:  # noqa: BLE001
         logging.debug("refine judge-pass failed cve=%s run=%s: %s", cve, run_id, e)
+    # Backup classes the chain fallback can retry with. The current primary
+    # (`_primary_class`) and anything in `tried_classes` are excluded. Only an
+    # EXHAUST stop qualifies for a backup -- a verified or legitimately-stopped
+    # build does not retry.
+    _primary = (vuln_class_override
+                or (lambda: _vuln_class_from_cve(cve, _fetch_cve_details(cve)))())
+    _tried = set(tried_classes or []) | ({_primary} if _primary else set())
+    _backup = []
+    _exhausted = (_stop_reason or "") in ("max_iters", "axis_exhausted", "drifted")
+    if _exhausted and not verified:
+        try:
+            _chain = _vuln_classes_from_cve(cve, _fetch_cve_details(cve))
+        except Exception:  # noqa: BLE001
+            _chain = []
+        _backup = [c for c in _chain if c and c not in _tried and c != "unknown"]
     return {"ok": True, "success": success, "verified": verified, "proof": _proof, "off_target": off_target,
             "drifted": drifted, "anchored": anchored, "reflection": reflection, "canary": canary,
             "iterations": iters, "final_command": command, "final_assertion": assertion,
+            "primary_class": _primary,
+            "tried_classes": sorted(_tried),
+            "backup_classes_available": _backup,
             # The best attempt the loop produced, which is NOT the last one
             # when the loop drifted. node_save_store prefers this for the
             # stored PoC so the Store holds the closest thing to a working

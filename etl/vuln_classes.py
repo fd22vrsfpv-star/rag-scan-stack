@@ -418,9 +418,26 @@ def resolve(text=None, cwes=None) -> dict:
             _pick = named[0][1]
             if _cwe_cands and _pick not in _cwe_cands \
                     and not _behaviourally_same(_pick, _cwe_cands):
-                # The text named a class the CWEs do not support. Fall through
-                # to the CWE path rather than overruling the taxonomy, and say
-                # so, because a silent disagreement is unreviewable.
+                # The text named a class the CWEs do not support.
+                # A MECHANISM named in the text (sqli, cmdi, lfi...) wins over
+                # CWE candidates that are only CONSEQUENCES (privilege-
+                # escalation, auth-bypass, idor): the CWE catalogue often marks
+                # the IMPACT (CWE-269) when the WEAKNESS is actually the sqli
+                # that enables it, and steering the build at the consequence
+                # loses the mechanism's exploit path. CVE-2023-51483 verified
+                # by SQLi in round 8 but was steered at unauthorized_admin_login
+                # in round 9 and never landed.
+                _pick_role = role(_pick)
+                _cwe_roles = {role(c) for c in _cwe_cands}
+                if _pick_role == "mechanism" and _cwe_roles == {"consequence"}:
+                    return {"class": _pick,
+                            "candidates": sorted({c for _, c in named}),
+                            "basis": "name_over_consequence",
+                            "cwe_consequence_candidates": sorted(_cwe_cands),
+                            "ambiguous": False}
+                # Otherwise fall through to the CWE path rather than overruling
+                # the taxonomy, and say so, because a silent disagreement is
+                # unreviewable.
                 _disagreed = _pick
             else:
                 return {"class": _pick,
@@ -471,6 +488,15 @@ def wstg_for(name) -> List[str]:
 
 def mitre_for(name) -> List[str]:
     return list((get(name) or {}).get("mitre") or [])
+
+
+def role(name) -> str:
+    """`mechanism` (HOW the attack works) or `consequence` (WHAT it achieves).
+    Default `mechanism` for an unknown or untagged class -- the safer side:
+    overriding a mechanism with a mechanism needs more evidence than text, and
+    this is the pre-existing behaviour."""
+    r = (get(name) or {}).get("role")
+    return str(r) if r == "consequence" else "mechanism"
 
 
 def graded_goals(name) -> List[str]:

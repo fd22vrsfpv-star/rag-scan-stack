@@ -105,6 +105,7 @@ classes:
 
   - name: sqli
     kind: vulnerability
+    role: mechanism
     title: SQL Injection
     aliases: [sql-injection, blind-sqli, sqli-blind, union-sqli, sql]
     injects_via: [parameter, body, header, cookie]
@@ -132,6 +133,7 @@ classes:
 
   - name: xss
     kind: vulnerability
+    role: mechanism
     title: Cross-Site Scripting
     aliases: [cross-site-scripting, xss-reflected, xss-stored, reflected-xss, stored-xss]
     injects_via: [parameter, body, header]
@@ -158,6 +160,7 @@ classes:
 
   - name: cmdi
     kind: vulnerability
+    role: mechanism
     title: OS Command Injection
     aliases: [command-injection, os-command-injection, shell-injection, argument-injection]
     injects_via: [parameter, body, header]
@@ -189,6 +192,7 @@ classes:
 
   - name: ssti
     kind: vulnerability
+    role: mechanism
     title: Server-Side Template Injection
     aliases: [template-injection, server-side-template-injection, jinja2-injection, velocity-injection]
     injects_via: [parameter, body]
@@ -214,6 +218,7 @@ classes:
 
   - name: ssrf
     kind: vulnerability
+    role: mechanism
     title: Server-Side Request Forgery
     aliases: [server-side-request-forgery, ssrf-blind, outbound-request]
     injects_via: [parameter, body]
@@ -238,6 +243,7 @@ classes:
 
   - name: xxe
     kind: vulnerability
+    role: mechanism
     title: XML External Entity
     aliases: [xml-external-entity, xml-external-entities, xxe-oob]
     # A body injection. It CAN read files, which is why it belongs in a
@@ -265,6 +271,7 @@ classes:
 
   - name: path-traversal
     kind: vulnerability
+    role: mechanism
     title: Path Traversal
     # Its OWN class, not an alias of lfi. The payload is the URL path, so there
     # is no parameter to find and parameter discovery cannot help.
@@ -294,6 +301,7 @@ classes:
 
   - name: lfi
     kind: vulnerability
+    role: mechanism
     title: Local File Inclusion
     # Injects through a PARAMETER (`?page=../../etc/passwd`). Listing lfi as a
     # path-injection class is what stopped the gather gate demanding a
@@ -322,6 +330,7 @@ classes:
 
   - name: rfi
     kind: vulnerability
+    role: mechanism
     title: Remote File Inclusion
     # Also a parameter, and it makes the server FETCH — so it needs an
     # out-of-band sink the way SSRF does. Aliasing it to lfi lost that.
@@ -348,6 +357,7 @@ classes:
 
   - name: deserialization
     kind: vulnerability
+    role: mechanism
     title: Insecure Deserialization
     aliases: [deser, insecure-deserialization, unsafe-deserialization, object-injection]
     injects_via: [body, parameter, cookie]
@@ -372,6 +382,7 @@ classes:
 
   - name: upload
     kind: vulnerability
+    role: mechanism
     title: Unrestricted File Upload
     aliases: [file-upload, arbitrary-file-upload, unrestricted-upload, webshell-upload]
     injects_via: [multipart]
@@ -397,6 +408,7 @@ classes:
 
   - name: auth-bypass
     kind: vulnerability
+    role: consequence
     title: Authentication / Authorization Bypass
     aliases: [authentication-bypass, authorization-bypass, missing-auth,
               improper-authentication, improper-authorization]
@@ -434,6 +446,7 @@ classes:
   # be shown in USE: the canary appears in a response only that role can see.
   - name: privilege-escalation
     kind: vulnerability
+    role: consequence
     title: Privilege Escalation (Role / Capability Assignment)
     aliases: [privesc, role-escalation, improper-privilege-management,
               incorrect-privilege-assignment]
@@ -462,6 +475,7 @@ classes:
 
   - name: idor
     kind: vulnerability
+    role: consequence
     title: Insecure Direct Object Reference
     aliases: [insecure-direct-object-reference, bola, broken-object-level-authorization]
     injects_via: [parameter, path]
@@ -487,6 +501,7 @@ classes:
 
   - name: csrf
     kind: vulnerability
+    role: mechanism
     title: Cross-Site Request Forgery
     aliases: [cross-site-request-forgery, xsrf]
     injects_via: [body, parameter]
@@ -511,6 +526,7 @@ classes:
 
   - name: ldap-injection
     kind: vulnerability
+    role: mechanism
     title: LDAP Injection
     aliases: [ldapi]
     injects_via: [parameter, body]
@@ -534,6 +550,7 @@ classes:
 
   - name: nosql-injection
     kind: vulnerability
+    role: mechanism
     title: NoSQL Injection
     aliases: [nosqli, mongo-injection]
     injects_via: [parameter, body]
@@ -558,6 +575,7 @@ classes:
 
   - name: prototype-pollution
     kind: vulnerability
+    role: mechanism
     title: Prototype Pollution
     aliases: [proto-pollution]
     injects_via: [body, parameter]
@@ -581,6 +599,7 @@ classes:
 
   - name: open-redirect
     kind: vulnerability
+    role: mechanism
     title: Open Redirect
     aliases: [unvalidated-redirect, url-redirection]
     injects_via: [parameter]
@@ -604,6 +623,7 @@ classes:
 
   - name: rce
     kind: vulnerability
+    role: mechanism
     title: Remote Code Execution
     # A generic outcome rather than a mechanism — kept because
     # _SCAN_EVIDENCE_CWE_FOR_CLASS already keys on it and findings arrive
@@ -659,6 +679,7 @@ classes:
 
   - name: el-injection
     kind: vulnerability
+    role: mechanism
     title: Expression Language / OGNL Injection
     aliases: [expression-language-injection, ognl-injection, ognl, spel-injection, el]
     input_field_required: true
@@ -682,6 +703,7 @@ classes:
 
   - name: jndi-injection
     kind: vulnerability
+    role: mechanism
     title: JNDI Injection (Log4Shell family)
     aliases: [log4shell, jndi, log4j, jndi-lookup]
     input_field_required: true
@@ -706,6 +728,7 @@ classes:
 
   - name: crlf-injection
     kind: vulnerability
+    role: mechanism
     title: CRLF Injection / HTTP Response Splitting
     aliases: [crlf, http-response-splitting, response-splitting, header-injection]
     input_field_required: true
@@ -729,6 +752,7 @@ classes:
 
   - name: host-header-injection
     kind: vulnerability
+    role: mechanism
     title: Host Header Injection
     aliases: [host-header, host-header-poisoning]
     input_field_required: false
@@ -752,6 +776,7 @@ classes:
 
   - name: ssi-injection
     kind: vulnerability
+    role: mechanism
     title: Server-Side Includes Injection
     aliases: [ssi, server-side-includes, server-side-include-injection]
     input_field_required: true
@@ -774,6 +799,7 @@ classes:
 
   - name: xpath-injection
     kind: vulnerability
+    role: mechanism
     title: XPath Injection
     aliases: [xpath, xpathi]
     input_field_required: true
@@ -797,6 +823,7 @@ classes:
 
   - name: smtp-injection
     kind: vulnerability
+    role: mechanism
     title: SMTP / IMAP Header Injection
     aliases: [imap-injection, mail-injection, email-header-injection, imap-smtp-injection]
     input_field_required: true
@@ -819,6 +846,7 @@ classes:
 
   - name: format-string
     kind: vulnerability
+    role: mechanism
     title: Format String Injection
     aliases: [format-string-injection]
     input_field_required: true
@@ -841,6 +869,7 @@ classes:
 
   - name: hpp
     kind: vulnerability
+    role: mechanism
     title: HTTP Parameter Pollution
     aliases: [http-parameter-pollution, parameter-pollution]
     input_field_required: true
