@@ -892,6 +892,14 @@ def _render_vuln_classes(data: Dict[str, Any]) -> List[Doc]:
             body.append(f"OWASP WSTG tests: {_s(c.get('wstg'))}.")
         if c.get("mitre"):
             body.append(f"MITRE ATT&CK: {_s(c.get('mitre'))}.")
+        if c.get("graded_goals"):
+            body.append(f"On a graded target, aims at: {_s(c.get('graded_goals'))}.")
+        _rh = c.get("reading_hints") or {}
+        if _rh.get("look_for"):
+            body.append("Reading a description of this class, look for: "
+                        + "; ".join(str(x) for x in _rh["look_for"]) + ".")
+        if _rh.get("implies"):
+            body.append("What that means: " + "; ".join(str(x) for x in _rh["implies"]) + ".")
         for cw in (c.get("cwes") or []):
             if isinstance(cw, dict) and cw.get("id"):
                 body.append(f"{cw['id']}: {_s(cw.get('name'))}.")

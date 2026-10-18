@@ -95,6 +95,11 @@ proof_kinds: [echo, oob, timing, file_content, status_change, side_effect]
 # class's primitive naturally reaches, best first (ids from _BENCH_GOAL_LADDER in
 # app/rag-api/api.py). Absent = keep the ladder's cost order. Without it every
 # graded build aimed at the cheapest goal, outbound_request, whatever the class.
+# REQUIRED per exploitable class `reading_hints`: what to pull out of a CVE / challenge
+# description (`look_for`) and what each finding means for crafting and proof
+# (`implies`). Fed to the description-reading step before the first craft, so a
+# requirement like "this creates an account -> fresh identity per attempt" is known
+# up front instead of learned from a failed attempt.
 
 classes:
 
@@ -109,6 +114,16 @@ classes:
     blind_capable: true
     proof: [echo, timing, oob]
     graded_goals: [database_access, database_modification]
+    reading_hints:
+      look_for:
+        - "the vulnerable endpoint and the exact parameter, header or cookie"
+        - "whether the query result is shown on the page, in an error, or not at all (blind)"
+        - "the database engine (MySQL, PostgreSQL, MSSQL, SQLite)"
+        - "whether a login or role is needed to reach the endpoint"
+      implies:
+        - "reflected or error output -> read data with UNION / error-based extraction"
+        - "nothing reflected -> blind; prove with a scaled SLEEP, then extract by timing"
+        - "the quoting context (numeric, single-quoted, inside LIKE/ORDER BY) decides the prefix"
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-05]
     mitre: [T1190]
@@ -126,6 +141,14 @@ classes:
     blind_capable: true
     proof: [echo, oob]
     graded_goals: []  # needs a victim browser; the harness has none
+    reading_hints:
+      look_for:
+        - "the parameter or field that is echoed back and where it lands (HTML, attribute, script)"
+        - "whether it is stored (shown to other users) or reflected"
+        - "any sanitiser or encoding the description mentions"
+      implies:
+        - "the canary must appear UNENCODED in the response context that executes"
+        - "stored XSS needs a viewer to fire; reflected proof is the unescaped echo"
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-01, WSTG-INPV-02]
     mitre: [T1059]
@@ -144,6 +167,14 @@ classes:
     blind_capable: true
     proof: [echo, oob, timing]
     graded_goals: [outbound_request, remote_code_execution]
+    reading_hints:
+      look_for:
+        - "the parameter passed to a shell command and the command it feeds"
+        - "the separator the description implies (;, |, &&, backticks, $())"
+        - "whether command output is returned or the call is blind"
+      implies:
+        - "output returned -> echo the canary; blind -> sleep timing or an outbound request"
+        - "a filtered separator means try the next one, not a different payload"
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-12]
     mitre: [T1190, T1059]
@@ -167,6 +198,13 @@ classes:
     blind_capable: true
     proof: [echo, oob, timing]
     graded_goals: [outbound_request, remote_code_execution]
+    reading_hints:
+      look_for:
+        - "the template engine (Jinja2, Twig, Freemarker, Velocity, ERB)"
+        - "the field whose value is rendered through the template"
+      implies:
+        - "confirm with arithmetic (7*7 -> 49) before reaching for code execution"
+        - "the engine decides the payload syntax; read it from the description, do not guess"
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-18]
     mitre: [T1190, T1059]
@@ -185,6 +223,13 @@ classes:
     blind_capable: true
     proof: [oob, echo]
     graded_goals: [outbound_request]
+    reading_hints:
+      look_for:
+        - "the parameter the server fetches (URL, webhook, import, avatar, callback)"
+        - "any allow-list or scheme restriction the description mentions"
+      implies:
+        - "the request ARRIVING at the outbound URL is the proof"
+        - "internal targets (localhost, metadata IPs) are the follow-on, not the first step"
     owasp: "A10:2021 – Server-Side Request Forgery (SSRF)"
     wstg: [WSTG-INPV-19]
     mitre: [T1190]
@@ -205,6 +250,13 @@ classes:
     blind_capable: true
     proof: [echo, oob, file_content]
     graded_goals: [file_access, outbound_request]
+    reading_hints:
+      look_for:
+        - "the endpoint that parses XML (or SVG/DOCX/SOAP uploads)"
+        - "whether the parsed result is reflected or the parse is blind"
+      implies:
+        - "reflected -> external entity reading a local file"
+        - "blind -> parameter entity to an outbound URL (out-of-band)"
     owasp: "A05:2021 – Security Misconfiguration"
     wstg: [WSTG-INPV-07]
     mitre: [T1190]
@@ -224,6 +276,14 @@ classes:
     blind_capable: false
     proof: [file_content]
     graded_goals: [file_access]
+    reading_hints:
+      look_for:
+        - "the path segment or file parameter that reaches the filesystem"
+        - "the base directory and how many ../ steps reach the root"
+        - "any extension appended or filter on ../"
+      implies:
+        - "the proof is a known file's CONTENT (e.g. /etc/passwd root:x:0:0)"
+        - "an appended extension needs a null byte or a path the app does not suffix"
     owasp: "A01:2021 – Broken Access Control"
     wstg: [WSTG-ATHZ-01]
     mitre: [T1190]
@@ -246,6 +306,13 @@ classes:
     blind_capable: false
     proof: [file_content, echo]
     graded_goals: [file_access]
+    reading_hints:
+      look_for:
+        - "the include/require parameter and the directory it is resolved against"
+        - "whether PHP wrappers (php://filter) are reachable"
+      implies:
+        - "prove by reading a known file's content"
+        - "php://filter/convert.base64-encode reads source without executing it"
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-11]
     mitre: [T1190]
@@ -266,6 +333,13 @@ classes:
     blind_capable: true
     proof: [oob, echo]
     graded_goals: [outbound_request, remote_code_execution]
+    reading_hints:
+      look_for:
+        - "the include parameter that accepts a URL"
+        - "whether allow_url_include-style fetching is enabled"
+      implies:
+        - "the include fetching our outbound URL is the first proof"
+        - "code execution follows only if the fetched file is interpreted"
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-11]
     mitre: [T1190]
@@ -283,6 +357,13 @@ classes:
     blind_capable: true
     proof: [oob, timing, side_effect]
     graded_goals: [outbound_request, remote_code_execution]
+    reading_hints:
+      look_for:
+        - "the serialized object's carrier (cookie, body, parameter) and format (PHP, Java, .NET, Python pickle)"
+        - "the library or gadget chain the advisory names"
+      implies:
+        - "use the gadget chain for the named library; a generic one will not load"
+        - "prove with an outbound request or a timing side effect"
     owasp: "A08:2021 – Software and Data Integrity Failures"
     wstg: [WSTG-INPV-11]
     mitre: [T1190, T1059]
@@ -300,6 +381,14 @@ classes:
     blind_capable: false
     proof: [echo, side_effect]
     graded_goals: [outbound_request, remote_code_execution]
+    reading_hints:
+      look_for:
+        - "the upload field name, endpoint and accepted extensions / content types"
+        - "where uploaded files are stored and whether that path is web-served"
+        - "whether the upload needs a logged-in user"
+      implies:
+        - "the proof is fetching the uploaded file back and seeing it executed"
+        - "an existing filename collides -> use a unique name per attempt"
     owasp: "A04:2021 – Insecure Design"
     wstg: [WSTG-BUSL-09]
     mitre: [T1505.003]
@@ -318,6 +407,13 @@ classes:
     blind_capable: false
     proof: [status_change, echo]
     graded_goals: [unauthorized_admin_login, privilege_escalation]
+    reading_hints:
+      look_for:
+        - "the protected action or page and the check that is skipped"
+        - "the header, cookie, path variant or parameter that bypasses it"
+      implies:
+        - "the proof is reaching the protected resource WITHOUT valid credentials"
+        - "compare against the same request unauthenticated to show the difference"
     owasp: "A07:2021 – Identification and Authentication Failures"
     wstg: [WSTG-ATHN-02, WSTG-ATHZ-02]
     mitre: [T1190, T1078]
@@ -348,6 +444,15 @@ classes:
     blind_capable: false
     proof: [status_change, side_effect]
     graded_goals: [privilege_escalation, unauthorized_admin_login]
+    reading_hints:
+      look_for:
+        - "the endpoint that creates or updates the account (registration, profile, user API)"
+        - "the parameter that carries the role or capability"
+        - "whether the action needs an existing login or is unauthenticated"
+      implies:
+        - "it CREATES state -> a unique email/username on every attempt (build it from the canary)"
+        - "the proof is the role IN USE: log in as the account and reach an admin-only page"
+        - "the registration reply echoing the name you sent proves nothing"
     owasp: "A01:2021 – Broken Access Control"
     wstg: [WSTG-ATHZ-03]
     mitre: [T1190, T1078]
@@ -366,6 +471,13 @@ classes:
     blind_capable: false
     proof: [echo, status_change]
     graded_goals: [database_modification, privilege_escalation, unauthorized_admin_login]
+    reading_hints:
+      look_for:
+        - "the object identifier (numeric id, uuid, filename) and where it travels"
+        - "which user owns the object and which user is attacking"
+      implies:
+        - "the proof is another user's object returned (or modified) for the attacker's session"
+        - "log in as the attacker first; an unauthenticated request proves auth-bypass, not idor"
     owasp: "A01:2021 – Broken Access Control"
     wstg: [WSTG-ATHZ-04]
     mitre: [T1190]
@@ -384,6 +496,13 @@ classes:
     blind_capable: false
     proof: [side_effect, status_change]
     graded_goals: [database_modification]
+    reading_hints:
+      look_for:
+        - "the state-changing request and whether it carries an anti-CSRF token"
+        - "which authenticated user must trigger it"
+      implies:
+        - "needs a victim session; on its own it reaches only database_modification via that user"
+        - "the proof is the state change, not the request being sent"
     owasp: "A01:2021 – Broken Access Control"
     wstg: [WSTG-SESS-05]
     mitre: [T1190]
@@ -401,6 +520,12 @@ classes:
     blind_capable: true
     proof: [echo, status_change]
     graded_goals: [unauthorized_admin_login]
+    reading_hints:
+      look_for:
+        - "the login or search field passed into an LDAP filter"
+      implies:
+        - "a filter that always matches (*)(uid=*) is the usual login bypass"
+        - "proof is authenticating or listing entries you should not see"
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-06]
     mitre: [T1190]
@@ -418,6 +543,13 @@ classes:
     blind_capable: true
     proof: [echo, timing, status_change]
     graded_goals: [database_access, unauthorized_admin_login, database_modification]
+    reading_hints:
+      look_for:
+        - "the JSON or query parameter reaching a MongoDB-style query"
+        - "whether the request body is parsed as JSON (operators like $ne, $gt)"
+      implies:
+        - "operator injection ({\"$ne\": null}) is the usual login bypass"
+        - "blind -> $regex prefix matching or $where timing to read data"
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-05]
     mitre: [T1190]
@@ -435,6 +567,12 @@ classes:
     blind_capable: true
     proof: [echo, side_effect]
     graded_goals: [privilege_escalation, outbound_request, remote_code_execution]
+    reading_hints:
+      look_for:
+        - "the JSON merge / assignment that accepts __proto__ or constructor.prototype"
+        - "the property the application later reads (isAdmin, role, a template option)"
+      implies:
+        - "pollution alone proves nothing; the proof is the polluted property CHANGING behaviour"
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-CLNT-13]
     mitre: [T1190]
@@ -452,6 +590,12 @@ classes:
     blind_capable: false
     proof: [status_change, echo]
     graded_goals: []  # redirects a victim; no goal on its own
+    reading_hints:
+      look_for:
+        - "the redirect parameter (next, url, return, redirect_uri)"
+      implies:
+        - "the proof is a 30x Location header pointing at an attacker host"
+        - "on its own it reaches no graded goal; it is a stepping stone (OAuth token theft)"
     owasp: "A01:2021 – Broken Access Control"
     wstg: [WSTG-CLNT-04]
     mitre: [T1190]
@@ -473,6 +617,13 @@ classes:
     blind_capable: true
     proof: [oob, echo, timing]
     graded_goals: [outbound_request, remote_code_execution]
+    reading_hints:
+      look_for:
+        - "the input that reaches code execution and the language/runtime"
+        - "whether a login or role is needed first"
+      implies:
+        - "prove with an outbound request or a canary written and read back"
+        - "the cheapest graded proof is the server fetching the outbound URL, not a shell"
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-12]
     mitre: [T1190, T1059]
@@ -517,6 +668,12 @@ classes:
     blind_capable: true
     proof: [echo, oob, timing]
     graded_goals: [outbound_request, remote_code_execution]
+    reading_hints:
+      look_for:
+        - "the framework (Spring, Struts/OGNL, JSF) and the field evaluated as an expression"
+      implies:
+        - "confirm with arithmetic ${7*7} before code execution"
+        - "the framework decides the expression syntax"
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-18]
     mitre: [T1190, T1059]
@@ -534,6 +691,13 @@ classes:
     blind_capable: true
     proof: [oob]
     graded_goals: [outbound_request, remote_code_execution]
+    reading_hints:
+      look_for:
+        - "every logged field the attacker controls (headers, username, user-agent)"
+        - "the Java library and version (log4j, logback)"
+      implies:
+        - "the proof is the outbound LDAP/DNS lookup arriving"
+        - "send the lookup string in each logged field; one of them is the sink"
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-11]
     mitre: [T1190, T1059]
@@ -551,6 +715,11 @@ classes:
     blind_capable: false
     proof: [echo]
     graded_goals: []  # header/response splitting; a stepping stone, not a goal
+    reading_hints:
+      look_for:
+        - "the parameter reflected into a response header"
+      implies:
+        - "the proof is an injected header (Set-Cookie, Location) in the raw response"
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-15]
     mitre: [T1190]
@@ -569,6 +738,12 @@ classes:
     blind_capable: true
     proof: [echo, oob, side_effect]
     graded_goals: [unauthorized_admin_login]
+    reading_hints:
+      look_for:
+        - "where the Host / X-Forwarded-Host value is reflected (links, password reset mail)"
+      implies:
+        - "password-reset poisoning sends a victim's token to our host"
+        - "the proof is our host appearing in the generated link"
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-17]
     mitre: [T1190]
@@ -586,6 +761,11 @@ classes:
     blind_capable: false
     proof: [echo, file_content]
     graded_goals: [outbound_request, remote_code_execution]
+    reading_hints:
+      look_for:
+        - "the field written into a page parsed for <!--# directives"
+      implies:
+        - "<!--#exec cmd=...--> or <!--#include--> output appearing is the proof"
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-08]
     mitre: [T1190, T1059]
@@ -603,6 +783,12 @@ classes:
     blind_capable: true
     proof: [echo, status_change]
     graded_goals: [unauthorized_admin_login]
+    reading_hints:
+      look_for:
+        - "the login or search field reaching an XPath query"
+      implies:
+        - "' or '1'='1 style always-true predicates bypass login"
+        - "blind -> boolean predicates read the XML document character by character"
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-09]
     mitre: [T1190]
@@ -620,6 +806,11 @@ classes:
     blind_capable: true
     proof: [side_effect, oob]
     graded_goals: []  # reaches a mailbox the harness does not grade
+    reading_hints:
+      look_for:
+        - "the form field that becomes a mail header (to, subject, from)"
+      implies:
+        - "injected CRLF adds recipients or headers; proof needs a mailbox you can read"
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-10]
     mitre: [T1190]
@@ -637,6 +828,11 @@ classes:
     blind_capable: false
     proof: [echo, side_effect]
     graded_goals: []  # memory-corruption class; no web goal reachable directly
+    reading_hints:
+      look_for:
+        - "the input passed as a printf-style format argument"
+      implies:
+        - "%x/%p leaking stack values is the proof; writes need %n and are rarely web-reachable"
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-13]
     mitre: [T1190]
@@ -654,6 +850,11 @@ classes:
     blind_capable: false
     proof: [status_change, echo]
     graded_goals: []  # parameter pollution; only matters via the class it enables
+    reading_hints:
+      look_for:
+        - "the parameter that is repeated and which occurrence each layer reads"
+      implies:
+        - "the proof is two layers disagreeing (one validates the first value, another uses the second)"
     owasp: "A03:2021 – Injection"
     wstg: [WSTG-INPV-04]
     mitre: [T1190]

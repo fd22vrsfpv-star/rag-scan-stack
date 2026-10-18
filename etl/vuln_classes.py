@@ -478,6 +478,14 @@ def graded_goals(name) -> List[str]:
     return list((get(name) or {}).get("graded_goals") or [])
 
 
+def reading_hints(name) -> Dict[str, List[str]]:
+    """{"look_for": [...], "implies": [...]} for reading a description of this
+    class; both lists empty for an unknown or unhinted class."""
+    rh = (get(name) or {}).get("reading_hints") or {}
+    return {"look_for": [str(x) for x in (rh.get("look_for") or [])],
+            "implies": [str(x) for x in (rh.get("implies") or [])]}
+
+
 def references(name) -> dict:
     """Everything a report needs to name this finding in the reader's own
     vocabulary — CWE, OWASP Top 10, WSTG and ATT&CK in one call."""

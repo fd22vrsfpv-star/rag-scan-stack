@@ -43,6 +43,10 @@ call), `app/rag-api/api.py::_run_refine_poc`.
 **Done when:** `vuln_class` and `vuln_class_chain` are declared state keys set once
 at classification, `_run_refine_poc` receives them (or the structured manifest)
 rather than prose, and the file-read branch is shown to fire on an lfi build.
+The description-read requirements (`_read_description_requirements`, added
+2026-10-18) have the same problem in a second form: they live in the in-memory
+`_RUN_REQUIREMENTS` map keyed by run_id, so a build resumed from a checkpoint after
+a rag-api restart loses them. They belong in the same state.
 **Enforced by:** not enforced.
 *Why it matters:* a deterministic fact flattened into text and re-parsed is how a
 whole verification branch sat dead with nothing failing.

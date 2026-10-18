@@ -19927,6 +19927,106 @@ def _proof_expectation_block(vuln_class, canary, os=None, runtime=None) -> str:
     return chr(10).join(out) + chr(10)
 
 
+def _class_reading_hints_block(vclass) -> str:
+    """What to look for in a description of this class, and what it implies.
+
+    Deterministic, from `reading_hints` in knowledge/vuln_classes.yaml, so it
+    reaches every prompt with no extra LLM call. "" for an unhinted class.
+    """
+    try:
+        _m = _vc()
+        rh = _m.reading_hints(vclass) if (_m and vclass) else {}
+    except Exception:  # noqa: BLE001
+        rh = {}
+    lf, im = rh.get("look_for") or [], rh.get("implies") or []
+    if not (lf or im):
+        return ""
+    out = "READING THE DESCRIPTION (%s):\n" % vclass
+    if lf:
+        out += "  Look for: " + "; ".join(lf) + ".\n"
+    if im:
+        out += "  This means: " + "; ".join(im) + ".\n"
+    return out
+
+
+# Requirements read from a CVE's description, per build run. Read once before
+# the first craft and consulted by every refine iteration of the same run.
+# Bounded; a lost entry (rag-api restart) only drops the block, never fails.
+_RUN_REQUIREMENTS: dict = {}
+_RUN_REQUIREMENTS_MAX = 256
+
+_REQUIREMENT_KEYS = ("endpoint", "parameter", "auth_required", "creates_state",
+                     "identity_fields", "role_parameter", "output_visible",
+                     "proof", "preconditions")
+
+
+def _read_description_requirements(cve, description, vclass, extra_text="",
+                                   model=None, run_id=None):
+    """ONE LLM call that reads the description with the class's reading hints
+    and returns the exploit's REQUIREMENTS as structured facts.
+
+    The point is to know before the first attempt what a failed attempt would
+    otherwise teach: CVE-2023-37999 (registration privilege escalation)
+    re-sent the same email for 10 iterations because "this creates an account"
+    was never stated, only discovered as "Email Already in Use".
+
+    Returns {} on any failure — the build proceeds exactly as before. Values
+    the description does not state come back as null, never guessed.
+    """
+    desc = (str(description or "") + ("\n" + str(extra_text) if extra_text else "")).strip()
+    if not desc:
+        return {}
+    hints = _class_reading_hints_block(vclass) or ""
+    prompt = (
+        "AUTHORIZED lab pentest. Read this vulnerability description and extract "
+        "what the exploit REQUIRES. Do not write an exploit.\n"
+        f"CVE: {cve}\nClass: {vclass or 'unknown'}\n{hints}"
+        f"DESCRIPTION:\n{desc[:3000]}\n\n"
+        "Return ONE JSON object, no prose, with exactly these keys. Use null for "
+        "anything the description does not state — do NOT guess:\n"
+        '{"endpoint": "<path or null>", "parameter": "<name or null>", '
+        '"auth_required": true|false|null, "creates_state": true|false|null, '
+        '"identity_fields": ["<fields that must be unique per attempt>"], '
+        '"role_parameter": "<name or null>", "output_visible": true|false|null, '
+        '"proof": "<what observable result proves it>", '
+        '"preconditions": ["<steps needed before the exploit>"]}')
+    try:
+        res = _llm_for_model(prompt, model=model, caller="cve_description_read")
+        text = res.get("response", "") if isinstance(res, dict) else str(res or "")
+    except Exception as e:  # noqa: BLE001
+        logging.debug("description read failed for %s: %s", cve, e)
+        return {}
+    obj = _poc_extract_json(text) or {}
+    req = {k: obj.get(k) for k in _REQUIREMENT_KEYS if obj.get(k) not in (None, "", [])}
+    if run_id and req:
+        if len(_RUN_REQUIREMENTS) >= _RUN_REQUIREMENTS_MAX:
+            _RUN_REQUIREMENTS.pop(next(iter(_RUN_REQUIREMENTS)))
+        _RUN_REQUIREMENTS[str(run_id)] = req
+    if run_id:
+        _poc_trace(run_id, "description_read",
+                   response=("%d requirement(s) read" % len(req)) if req
+                   else ("empty reply" if not text.strip() else "no usable requirements"),
+                   extra={"requirements": req, "vuln_class": vclass})
+    return req
+
+
+def _requirements_block(req) -> str:
+    """Render read requirements for a prompt. "" when there are none."""
+    if not req:
+        return ""
+    lines = ["REQUIREMENTS READ FROM THE DESCRIPTION (follow these):"]
+    for k in _REQUIREMENT_KEYS:
+        v = req.get(k)
+        if v in (None, "", []):
+            continue
+        lines.append("  %s: %s" % (k, ", ".join(map(str, v)) if isinstance(v, list) else v))
+    if req.get("creates_state") or req.get("identity_fields"):
+        lines.append("  => This exploit CREATES state. Use a UNIQUE value for every "
+                     "identity field on EVERY attempt (build it from the canary plus "
+                     "$RANDOM); a reused value answers \"already exists\".")
+    return "\n".join(lines) + "\n"
+
+
 def _class_guidance_block(vuln_class: str, chain=None) -> str:
     """Payload-family guidance for a CVE's class, plus every OTHER mapped class.
 
@@ -19959,6 +20059,9 @@ def _class_guidance_block(vuln_class: str, chain=None) -> str:
     out = ""
     if base:
         out = f"VULN-CLASS GUIDANCE ({vc}):\n{base}\n"
+    _rh = _class_reading_hints_block(vc)
+    if _rh:
+        out += _rh
     try:
         extra = [c for c in (chain or [])
                  if c != vc and c in _CRAFT_CLASS_GUIDANCE]
@@ -22896,6 +22999,16 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
         _class_block = ""
     if _class_block:
         _poc_trace(run_id, "class_guidance", response=_class_block[:400])
+    # Read the description ONCE, with the class's reading hints, into structured
+    # requirements every later phase can follow. Fail-soft: {} changes nothing.
+    try:
+        _req = _read_description_requirements(
+            cve, details.get("description") or "", locals().get("_vc"),
+            model=model, run_id=run_id)
+    except Exception as _rde:  # noqa: BLE001
+        logging.debug("description read failed for %s: %s", cve, _rde)
+        _req = {}
+    _class_block = (_class_block or "") + _requirements_block(_req)
     prompt = (f"AUTHORIZED lab pentest. Build a proof-of-concept for {cve} on {tgt} "
               f"({product or ''} {version or ''}).\n"
               f"CVE description: {details.get('description') or '(none)'}\n"
@@ -30826,6 +30939,12 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         # The repeated outcome names WHICH axis is dead, so the instruction can
         # be specific instead of "try something else". Placed last of the notes
         # so it is the final thing read before the task line.
+        _req_note = ""
+        try:
+            _req_note = "\n" + _requirements_block(_RUN_REQUIREMENTS.get(str(run_id))) \
+                if _RUN_REQUIREMENTS.get(str(run_id)) else ""
+        except Exception:  # noqa: BLE001
+            _req_note = ""
         _state_note = ""
         _collided = _state_collision(output)
         if _collided:
@@ -30887,7 +31006,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         rprompt = (f"AUTHORIZED lab pentest. The PoC for {cve} on http://{ip}:{port} did NOT "
                    f"succeed.\nCommand: {command}\nOutput:\n{(output or '')[:1500]}{precond}{gather_note}"
                    f"{_refuted_note}"
-                   f"{shell_syntax_note}{refusal_note}{_assert_switch_note}{rag_pattern_notes}{regress_note}{model_switch_note}{path_discovery_note}{waf_hit_note}{similar_note}{escalation_guidance}{anchor_note}{_state_note}{_axis_note}{_variant_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
+                   f"{shell_syntax_note}{refusal_note}{_assert_switch_note}{rag_pattern_notes}{regress_note}{model_switch_note}{path_discovery_note}{waf_hit_note}{similar_note}{escalation_guidance}{anchor_note}{_req_note}{_state_note}{_axis_note}{_variant_note}\nFix the command so it EXPLOITS {cve} and makes the proof "
                    f"appear. Return ONE JSON object only: {{\"command\": \"<better command, may "
                    f"chain curl calls with ; and shell vars to fetch a token first>\", "
                    f"\"assertion\": {_assert_template}}}. No prose.")
