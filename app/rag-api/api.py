@@ -19841,6 +19841,19 @@ def _build_poc_preview(cve, ip, port, eid, product=None, version=None,
     out["reading_hints"] = (_m.reading_hints(vclass) if _m else
                             {"look_for": [], "implies": []})
     out["graded_goals_for_class"] = _m.graded_goals(vclass) if _m else []
+    # CAPEC for THIS CVE: its own CWEs first (most specific), the class's otherwise.
+    try:
+        from etl import capec as _capec
+        _pats = _capec.for_cwes(out["cwe"], limit=5) or _capec.for_class(vclass, limit=5)
+    except Exception:  # noqa: BLE001
+        _pats = []
+    out["capec"] = [{"id": p.get("id"), "name": p.get("name"),
+                     "abstraction": p.get("abstraction"),
+                     "prerequisites": (p.get("prerequisites") or [])[:3],
+                     "steps": [{"phase": st.get("phase"), "step": st.get("step")}
+                               for st in (p.get("execution_flow") or [])[:6]],
+                     "attack": [{"id": t, "name": names.get(t)} for t in (p.get("attack") or [])]}
+                    for p in _pats]
     # scope gate -- the deterministic authorisation decision, evaluated only
     try:
         from etl.scope_gate import check_dispatch, load_dispatch_scope
@@ -20177,6 +20190,14 @@ def _class_reading_hints_block(vclass) -> str:
         out += "  Look for: " + "; ".join(lf) + ".\n"
     if im:
         out += "  This means: " + "; ".join(im) + ".\n"
+    # CAPEC: how this class of weakness is attacked, step by step (MITRE).
+    try:
+        from etl import capec as _capec
+        pats = _capec.for_class(vclass, limit=2)
+    except Exception:  # noqa: BLE001
+        pats = []
+    for pat in pats:
+        out += "  CAPEC " + _capec.brief(pat)[:420] + "\n"
     return out
 
 

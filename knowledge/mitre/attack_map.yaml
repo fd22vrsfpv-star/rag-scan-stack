@@ -55,6 +55,154 @@ techniques:
   T1213:     { name: "Data from Information Repositories", tactic: collection }
   T1071:     { name: "Application Layer Protocol", tactic: command_and_control }
   T1499:     { name: "Endpoint Denial of Service", tactic: impact }
+  # Added 2026-10-18: every ATT&CK v20.0 technique CAPEC (knowledge/mitre/capec.yaml)
+  # maps an attack pattern to, so the CWE -> CAPEC -> ATT&CK chain resolves.
+  "T1001.002": { name: "Steganography", tactic: command_and_control }
+  T1005:       { name: "Data from Local System", tactic: collection }
+  T1007:       { name: "System Service Discovery", tactic: discovery }
+  T1012:       { name: "Query Registry", tactic: discovery }
+  T1014:       { name: "Rootkit", tactic: stealth }
+  T1016:       { name: "System Network Configuration Discovery", tactic: discovery }
+  T1018:       { name: "Remote System Discovery", tactic: discovery }
+  T1027:       { name: "Obfuscated Files or Information", tactic: stealth }
+  "T1027.001": { name: "Binary Padding", tactic: stealth }
+  "T1027.003": { name: "Steganography", tactic: stealth }
+  "T1027.004": { name: "Compile After Delivery", tactic: stealth }
+  "T1027.006": { name: "HTML Smuggling", tactic: stealth }
+  "T1027.009": { name: "Embedded Payloads", tactic: stealth }
+  T1033:       { name: "System Owner/User Discovery", tactic: discovery }
+  T1036:       { name: "Masquerading", tactic: stealth }
+  "T1036.001": { name: "Invalid Code Signature", tactic: stealth }
+  "T1036.003": { name: "Rename Legitimate Utilities", tactic: stealth }
+  "T1036.004": { name: "Masquerade Task or Service", tactic: stealth }
+  "T1036.005": { name: "Match Legitimate Resource Name or Location", tactic: stealth }
+  "T1036.006": { name: "Space after Filename", tactic: stealth }
+  "T1036.007": { name: "Double File Extension", tactic: stealth }
+  T1037:       { name: "Boot or Logon Initialization Scripts", tactic: persistence }
+  T1039:       { name: "Data from Network Shared Drive", tactic: collection }
+  T1040:       { name: "Network Sniffing", tactic: credential_access }
+  T1049:       { name: "System Network Connections Discovery", tactic: discovery }
+  T1052:       { name: "Exfiltration Over Physical Medium", tactic: exfiltration }
+  T1055:       { name: "Process Injection", tactic: stealth }
+  "T1055.003": { name: "Thread Execution Hijacking", tactic: stealth }
+  T1056:       { name: "Input Capture", tactic: collection }
+  "T1056.001": { name: "Keylogging", tactic: collection }
+  "T1056.004": { name: "Credential API Hooking", tactic: collection }
+  T1057:       { name: "Process Discovery", tactic: discovery }
+  T1069:       { name: "Permission Groups Discovery", tactic: discovery }
+  T1070:       { name: "Indicator Removal", tactic: stealth }
+  T1072:       { name: "Software Deployment Tools", tactic: execution }
+  T1080:       { name: "Taint Shared Content", tactic: lateral_movement }
+  T1082:       { name: "System Information Discovery", tactic: discovery }
+  T1083:       { name: "File and Directory Discovery", tactic: discovery }
+  "T1090.001": { name: "Internal Proxy", tactic: command_and_control }
+  "T1090.004": { name: "Domain Fronting", tactic: command_and_control }
+  T1092:       { name: "Communication Through Removable Media", tactic: command_and_control }
+  "T1110.001": { name: "Password Guessing", tactic: credential_access }
+  "T1110.004": { name: "Credential Stuffing", tactic: credential_access }
+  T1111:       { name: "Multi-Factor Authentication Interception", tactic: credential_access }
+  T1112:       { name: "Modify Registry", tactic: defense_impairment }
+  T1113:       { name: "Screen Capture", tactic: collection }
+  "T1114.002": { name: "Remote Email Collection", tactic: collection }
+  T1115:       { name: "Clipboard Data", tactic: collection }
+  T1119:       { name: "Automated Collection", tactic: collection }
+  T1120:       { name: "Peripheral Device Discovery", tactic: discovery }
+  T1123:       { name: "Audio Capture", tactic: collection }
+  T1124:       { name: "System Time Discovery", tactic: discovery }
+  T1125:       { name: "Video Capture", tactic: collection }
+  T1127:       { name: "Trusted Developer Utilities Proxy Execution", tactic: stealth }
+  T1134:       { name: "Access Token Manipulation", tactic: stealth }
+  "T1134.001": { name: "Token Impersonation/Theft", tactic: stealth }
+  "T1134.002": { name: "Create Process with Token", tactic: stealth }
+  "T1134.003": { name: "Make and Impersonate Token", tactic: stealth }
+  T1176:       { name: "Software Extensions", tactic: persistence }
+  T1185:       { name: "Browser Session Hijacking", tactic: collection }
+  T1211:       { name: "Exploitation for Stealth", tactic: stealth }
+  T1217:       { name: "Browser Information Discovery", tactic: discovery }
+  "T1218.001": { name: "Compiled HTML File", tactic: stealth }
+  T1221:       { name: "Template Injection", tactic: stealth }
+  T1491:       { name: "Defacement", tactic: impact }
+  T1495:       { name: "Firmware Corruption", tactic: impact }
+  "T1498.001": { name: "Direct Network Flood", tactic: impact }
+  "T1498.002": { name: "Reflection Amplification", tactic: impact }
+  "T1499.001": { name: "OS Exhaustion Flood", tactic: impact }
+  "T1499.002": { name: "Service Exhaustion Flood", tactic: impact }
+  "T1499.003": { name: "Application Exhaustion Flood", tactic: impact }
+  "T1499.004": { name: "Application or System Exploitation", tactic: impact }
+  "T1505.004": { name: "IIS Components", tactic: persistence }
+  "T1505.005": { name: "Terminal Services DLL", tactic: persistence }
+  "T1518.001": { name: "Security Software Discovery", tactic: discovery }
+  T1528:       { name: "Steal Application Access Token", tactic: credential_access }
+  T1530:       { name: "Data from Cloud Storage", tactic: collection }
+  T1531:       { name: "Account Access Removal", tactic: impact }
+  T1534:       { name: "Internal Spearphishing", tactic: lateral_movement }
+  T1539:       { name: "Steal Web Session Cookie", tactic: credential_access }
+  "T1542.001": { name: "System Firmware", tactic: stealth }
+  "T1542.002": { name: "Component Firmware", tactic: stealth }
+  "T1542.003": { name: "Bootkit", tactic: stealth }
+  T1543:       { name: "Create or Modify System Process", tactic: persistence }
+  "T1543.001": { name: "Launch Agent", tactic: persistence }
+  "T1543.003": { name: "Windows Service", tactic: persistence }
+  "T1543.004": { name: "Launch Daemon", tactic: persistence }
+  "T1546.001": { name: "Change Default File Association", tactic: privilege_escalation }
+  "T1546.004": { name: "Unix Shell Configuration Modification", tactic: privilege_escalation }
+  "T1546.008": { name: "Accessibility Features", tactic: privilege_escalation }
+  "T1546.016": { name: "Installer Packages", tactic: privilege_escalation }
+  T1547:       { name: "Boot or Logon Autostart Execution", tactic: persistence }
+  "T1547.001": { name: "Registry Run Keys / Startup Folder", tactic: persistence }
+  "T1547.004": { name: "Winlogon Helper DLL", tactic: persistence }
+  "T1547.006": { name: "Kernel Modules and Extensions", tactic: persistence }
+  "T1547.009": { name: "Shortcut Modification", tactic: persistence }
+  "T1547.014": { name: "Active Setup", tactic: persistence }
+  T1548:       { name: "Abuse Elevation Control Mechanism", tactic: privilege_escalation }
+  "T1548.004": { name: "Elevated Execution with Prompt", tactic: privilege_escalation }
+  "T1550.001": { name: "Application Access Token", tactic: lateral_movement }
+  "T1550.004": { name: "Web Session Cookie", tactic: lateral_movement }
+  "T1552.001": { name: "Credentials In Files", tactic: credential_access }
+  "T1552.002": { name: "Credentials in Registry", tactic: credential_access }
+  "T1552.003": { name: "Shell History", tactic: credential_access }
+  "T1552.004": { name: "Private Keys", tactic: credential_access }
+  "T1552.006": { name: "Group Policy Preferences", tactic: credential_access }
+  "T1553.002": { name: "Code Signing", tactic: defense_impairment }
+  "T1553.004": { name: "Install Root Certificate", tactic: defense_impairment }
+  T1554:       { name: "Compromise Host Software Binary", tactic: persistence }
+  T1555:       { name: "Credentials from Password Stores", tactic: credential_access }
+  "T1555.001": { name: "Keychain", tactic: credential_access }
+  "T1556.006": { name: "Multi-Factor Authentication", tactic: defense_impairment }
+  "T1557.002": { name: "ARP Cache Poisoning", tactic: credential_access }
+  "T1557.003": { name: "DHCP Spoofing", tactic: credential_access }
+  T1563:       { name: "Remote Service Session Hijacking", tactic: lateral_movement }
+  "T1564.009": { name: "Resource Forking", tactic: stealth }
+  "T1565.002": { name: "Transmitted Data Manipulation", tactic: impact }
+  "T1574.001": { name: "DLL", tactic: stealth }
+  "T1574.004": { name: "Dylib Hijacking", tactic: stealth }
+  "T1574.005": { name: "Executable Installer File Permissions Weakness", tactic: stealth }
+  "T1574.006": { name: "Dynamic Linker Hijacking", tactic: stealth }
+  "T1574.007": { name: "Path Interception by PATH Environment Variable", tactic: stealth }
+  "T1574.008": { name: "Path Interception by Search Order Hijacking", tactic: stealth }
+  "T1574.009": { name: "Path Interception by Unquoted Path", tactic: stealth }
+  "T1574.010": { name: "Services File Permissions Weakness", tactic: stealth }
+  "T1574.011": { name: "Services Registry Permissions Weakness", tactic: stealth }
+  "T1574.013": { name: "KernelCallbackTable", tactic: stealth }
+  "T1584.002": { name: "DNS Server", tactic: resource_development }
+  "T1587.001": { name: "Malware", tactic: resource_development }
+  T1589:       { name: "Gather Victim Identity Information", tactic: reconnaissance }
+  T1592:       { name: "Gather Victim Host Information", tactic: reconnaissance }
+  "T1592.002": { name: "Software", tactic: reconnaissance }
+  T1598:       { name: "Phishing for Information", tactic: reconnaissance }
+  "T1598.001": { name: "Spearphishing Service", tactic: reconnaissance }
+  "T1598.002": { name: "Spearphishing Attachment", tactic: reconnaissance }
+  "T1598.003": { name: "Spearphishing Link", tactic: reconnaissance }
+  T1599:       { name: "Network Boundary Bridging", tactic: defense_impairment }
+  T1600:       { name: "Weaken Encryption", tactic: defense_impairment }
+  T1602:       { name: "Data from Configuration Repository", tactic: collection }
+  T1606:       { name: "Forge Web Credentials", tactic: credential_access }
+  "T1606.001": { name: "Web Cookies", tactic: credential_access }
+  T1611:       { name: "Escape to Host", tactic: privilege_escalation }
+  T1614:       { name: "System Location Discovery", tactic: discovery }
+  T1615:       { name: "Group Policy Discovery", tactic: discovery }
+  T1620:       { name: "Reflective Code Loading", tactic: stealth }
+  T1647:       { name: "Plist File Modification", tactic: defense_impairment }
   # Added 2026-10-18 from ATT&CK v20.0: every Initial Access technique, plus every
   # id referenced elsewhere in knowledge/ (ad_attacks.yaml, vuln_classes.yaml) that
   # this table did not define -- a technique missing here has no tactic, so it adds
@@ -110,6 +258,22 @@ techniques:
   T1649:       { name: "Steal or Forge Authentication Certificates", tactic: credential_access }
   T1659:       { name: "Content Injection", tactic: initial_access }
   T1669:       { name: "Wi-Fi Networks", tactic: initial_access }
+
+# Technique ids that knowledge/ still references but ATT&CK v20.0 no longer
+# defines (revoked, or renumbered -- the Impair Defenses family moved with
+# the v20 Defense Impairment split). Referenced by CAPEC 3.9 mappings. Listed
+# rather than given an invented name or tactic; they carry no risk weight.
+retired_techniques:
+  - "T1513"
+  - "T1562.001"
+  - "T1562.002"
+  - "T1562.003"
+  - "T1562.004"
+  - "T1562.006"
+  - "T1562.007"
+  - "T1562.008"
+  - "T1562.009"
+  - "T1574.002"
 
 # Finding -> technique rules. First matching rules ALL apply (a finding can map
 # to several techniques). Match keys (any present must match; omit to ignore):

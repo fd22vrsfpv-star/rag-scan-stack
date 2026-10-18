@@ -1247,10 +1247,68 @@ def _render_playbook(data: Dict[str, Any], name: str = "") -> List[Doc]:
 # Renderers that apply to EVERY file in a knowledge subdirectory, rather than
 # to one named top-level file. `sync_all` globs the directory and renders each
 # file with the same function, so a new spec or playbook is embedded by being
+def _render_capec(data: Dict[str, Any]) -> List[Doc]:
+    """One document per CAPEC attack pattern (knowledge/mitre/capec.yaml).
+
+    Tagged with the vuln class its CWEs map to in knowledge/vuln_classes.yaml,
+    so a PoC build that holds a class (or a CWE) can retrieve "how is this
+    attacked, step by step" deterministically, not only by similarity. Each
+    body carries the prerequisites, the execution flow with its techniques,
+    the CWEs and the ATT&CK techniques: the CWE -> CAPEC -> ATT&CK chain.
+    """
+    try:
+        from etl import vuln_classes as _vc
+    except Exception:  # noqa: BLE001
+        _vc = None
+    docs: List[Doc] = []
+    for p in (data.get("patterns") or []):
+        if not isinstance(p, dict) or not p.get("id"):
+            continue
+        cwes = [str(c) for c in (p.get("cwes") or [])]
+        classes = []
+        if _vc:
+            for c in cwes:
+                for k in _vc.classes_for_cwe(c):
+                    if k not in classes and k != "unknown":
+                        classes.append(k)
+        body = [str(p.get("description") or "")]
+        if p.get("prerequisites"):
+            body.append("Prerequisites: " + "; ".join(map(str, p["prerequisites"])) + ".")
+        if p.get("skills"):
+            body.append("Skills: " + "; ".join(map(str, p["skills"])) + ".")
+        for st in (p.get("execution_flow") or []):
+            line = f"[{st.get('phase')}] {st.get('step')}: {st.get('detail')}"
+            if st.get("techniques"):
+                line += " Techniques: " + "; ".join(map(str, st["techniques"]))
+            body.append(line)
+        if cwes:
+            body.append("Weaknesses: " + ", ".join(cwes) + ".")
+        if p.get("attack"):
+            body.append("MITRE ATT&CK: " + ", ".join(map(str, p["attack"])) + ".")
+        if classes:
+            body.append("Vulnerability class: " + ", ".join(classes) + ".")
+        docs.append((f"CAPEC attack pattern: {p['id']} {p.get('name')}",
+                     " ".join(" ".join(body).split()),
+                     {"vuln_class": classes[0] if classes else None,
+                      "vuln_classes": classes, "cwes": cwes, "capec": p["id"],
+                      "attack": list(p.get("attack") or []),
+                      "abstraction": p.get("abstraction"), "doc_type": "capec"}))
+    return docs
+
+
+def _render_mitre(data: Dict[str, Any], base: str) -> List[Doc]:
+    """knowledge/mitre/: CAPEC is embedded; attack_map.yaml is a deterministic
+    lookup table and stays declared RAG_LOAD_DEBT, so it renders nothing."""
+    if base in ("capec.yaml", "capec.yml", "capec"):
+        return _render_capec(data)
+    return []
+
+
 # added — no registry edit, which is the point of RAG-first knowledge.
 DIR_RENDERERS = {
     "extractors": _render_extractor_spec,
     "playbooks": _render_playbook,
+    "mitre": _render_mitre,
 }
 
 

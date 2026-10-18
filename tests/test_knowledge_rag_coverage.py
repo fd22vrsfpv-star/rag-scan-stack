@@ -65,6 +65,9 @@ RAG_LOADED_OTHER = {
     # Post-run review criteria: _load_build_poc_review_knowledge embeds each
     # criterion into rag_documents so the review agent can retrieve them.
     "build_poc_review.yaml": "app/rag-api/api.py",
+    # CAPEC attack patterns: DIR_RENDERERS["mitre"] -> _render_capec, one
+    # document per pattern tagged with the vuln class its CWEs map to.
+    "mitre/capec.yaml": "etl/load_knowledge_documents.py",
 }
 
 # YAMLs that ARE embedded into rag_documents, mapped to the loader that does it.

@@ -88,7 +88,8 @@ def _referenced_ids():
 
 
 def test_every_referenced_technique_is_defined_in_the_map():
-    defined = {str(k) for k in _map()["techniques"]}
+    m = _map()
+    defined = {str(k) for k in m["techniques"]} | {str(t) for t in m.get("retired_techniques") or []}
     missing = {t: sorted(fs) for t, fs in _referenced_ids().items() if t not in defined}
     assert not missing, (
         "technique id(s) used in knowledge/ but not defined in attack_map.yaml "
@@ -109,3 +110,13 @@ def test_every_defined_tactic_exists():
     bad = {k: v.get("tactic") for k, v in m["techniques"].items()
            if v.get("tactic") not in tactics}
     assert not bad, "technique(s) with a tactic the map does not define: %s" % bad
+
+
+def test_retired_techniques_are_really_absent_and_still_referenced():
+    """A retired id must not also be defined (pick one), and must still be
+    referenced somewhere -- an unreferenced entry is stale and gets deleted."""
+    m = _map()
+    retired = {str(t) for t in m.get("retired_techniques") or []}
+    assert not retired & {str(k) for k in m["techniques"]}, "retired AND defined"
+    stale = retired - set(_referenced_ids())
+    assert not stale, "retired_techniques no longer referenced (delete them): %s" % sorted(stale)
