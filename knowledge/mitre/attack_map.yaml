@@ -22,7 +22,10 @@ tactics:
   execution:             { id: TA0002, position: 0.65 }
   persistence:           { id: TA0003, position: 0.70 }
   privilege_escalation:  { id: TA0004, position: 0.80 }
-  defense_evasion:       { id: TA0005, position: 0.60 }
+  # ATT&CK v20 renamed TA0005 Defense Evasion -> Stealth and split out
+  # TA0112 Defense Impairment (disabling or tampering with defences).
+  stealth:               { id: TA0005, position: 0.60 }
+  defense_impairment:    { id: TA0112, position: 0.60 }
   credential_access:     { id: TA0006, position: 0.75 }
   discovery:             { id: TA0007, position: 0.30 }
   lateral_movement:      { id: TA0008, position: 0.85 }
@@ -52,6 +55,61 @@ techniques:
   T1213:     { name: "Data from Information Repositories", tactic: collection }
   T1071:     { name: "Application Layer Protocol", tactic: command_and_control }
   T1499:     { name: "Endpoint Denial of Service", tactic: impact }
+  # Added 2026-10-18 from ATT&CK v20.0: every Initial Access technique, plus every
+  # id referenced elsewhere in knowledge/ (ad_attacks.yaml, vuln_classes.yaml) that
+  # this table did not define -- a technique missing here has no tactic, so it adds
+  # nothing to the risk score's tactic_position term.
+  "T1003.001": { name: "LSASS Memory", tactic: credential_access }
+  "T1003.002": { name: "Security Account Manager", tactic: credential_access }
+  "T1003.003": { name: "NTDS", tactic: credential_access }
+  "T1003.006": { name: "DCSync", tactic: credential_access }
+  "T1069.002": { name: "Domain Groups", tactic: discovery }
+  "T1078.001": { name: "Default Accounts", tactic: initial_access }
+  "T1078.002": { name: "Domain Accounts", tactic: initial_access }
+  "T1078.003": { name: "Local Accounts", tactic: initial_access }
+  "T1078.004": { name: "Cloud Accounts", tactic: initial_access }
+  T1087:       { name: "Account Discovery", tactic: discovery }
+  "T1087.002": { name: "Domain Account", tactic: discovery }
+  T1091:       { name: "Replication Through Removable Media", tactic: initial_access }
+  T1098:       { name: "Account Manipulation", tactic: persistence }
+  "T1110.002": { name: "Password Cracking", tactic: credential_access }
+  "T1110.003": { name: "Password Spraying", tactic: credential_access }
+  "T1134.005": { name: "SID-History Injection", tactic: stealth }
+  T1187:       { name: "Forced Authentication", tactic: credential_access }
+  T1189:       { name: "Drive-by Compromise", tactic: initial_access }
+  T1195:       { name: "Supply Chain Compromise", tactic: initial_access }
+  "T1195.001": { name: "Compromise Software Dependencies and Development Tools", tactic: initial_access }
+  "T1195.002": { name: "Compromise Software Supply Chain", tactic: initial_access }
+  "T1195.003": { name: "Compromise Hardware Supply Chain", tactic: initial_access }
+  T1199:       { name: "Trusted Relationship", tactic: initial_access }
+  T1200:       { name: "Hardware Additions", tactic: initial_access }
+  T1207:       { name: "Rogue Domain Controller", tactic: defense_impairment }
+  T1210:       { name: "Exploitation of Remote Services", tactic: lateral_movement }
+  T1222:       { name: "File and Directory Permissions Modification", tactic: defense_impairment }
+  "T1222.001": { name: "Windows Permissions", tactic: defense_impairment }
+  T1482:       { name: "Domain Trust Discovery", tactic: discovery }
+  "T1547.005": { name: "Security Support Provider", tactic: persistence }
+  T1550:       { name: "Use Alternate Authentication Material", tactic: lateral_movement }
+  "T1550.002": { name: "Pass the Hash", tactic: lateral_movement }
+  "T1550.003": { name: "Pass the Ticket", tactic: lateral_movement }
+  T1552:       { name: "Unsecured Credentials", tactic: credential_access }
+  T1556:       { name: "Modify Authentication Process", tactic: defense_impairment }
+  "T1556.001": { name: "Domain Controller Authentication", tactic: defense_impairment }
+  T1557:       { name: "Adversary-in-the-Middle", tactic: credential_access }
+  "T1557.001": { name: "Name Resolution Poisoning and SMB Relay", tactic: credential_access }
+  T1558:       { name: "Steal or Forge Kerberos Tickets", tactic: credential_access }
+  "T1558.001": { name: "Golden Ticket", tactic: credential_access }
+  "T1558.002": { name: "Silver Ticket", tactic: credential_access }
+  "T1558.003": { name: "Kerberoasting", tactic: credential_access }
+  "T1558.004": { name: "AS-REP Roasting", tactic: credential_access }
+  T1566:       { name: "Phishing", tactic: initial_access }
+  "T1566.001": { name: "Spearphishing Attachment", tactic: initial_access }
+  "T1566.002": { name: "Spearphishing Link", tactic: initial_access }
+  "T1566.003": { name: "Spearphishing via Service", tactic: initial_access }
+  "T1566.004": { name: "Spearphishing Voice", tactic: initial_access }
+  T1649:       { name: "Steal or Forge Authentication Certificates", tactic: credential_access }
+  T1659:       { name: "Content Injection", tactic: initial_access }
+  T1669:       { name: "Wi-Fi Networks", tactic: initial_access }
 
 # Finding -> technique rules. First matching rules ALL apply (a finding can map
 # to several techniques). Match keys (any present must match; omit to ignore):
@@ -71,6 +129,7 @@ rules:
   - { keyword: ["lfi", "rfi", "path traversal", "directory traversal", "file inclusion"], cwe: ["CWE-22","CWE-98"], technique: T1190, confidence: 0.8 }
   - { keyword: ["ssrf"], cwe: ["CWE-918"], technique: T1190, confidence: 0.7 }
   - { keyword: ["default login", "default credential", "default password", "weak password", "anonymous"], technique: T1078, confidence: 0.8 }
+  - { keyword: ["default login", "default credential", "default password"], technique: "T1078.001", confidence: 0.85 }
   - { keyword: ["brute", "login", "credential"], source: ["brutus"], technique: T1110, confidence: 0.85 }
   - { keyword: ["hashdump", "dump hash", "kerberoast", "asrep", "ntds"], technique: T1003, confidence: 0.85 }
   - { service: ["ssh"], technique: "T1021.004", confidence: 0.5 }
@@ -81,6 +140,39 @@ rules:
   - { source: ["portscan","nmap","masscan","naabu","httpx","whatweb"], technique: T1046, confidence: 0.4 }
   - { keyword: ["exploit public", "public-facing", "cve-"], technique: T1190, confidence: 0.6 }
   - { keyword: ["denial of service", "dos "], technique: T1499, confidence: 0.5 }
+
+# INITIAL ACCESS COVERAGE (ATT&CK v20.0, TA0001) — one decision per technique and
+# sub-technique, for the PoC workbench. Scoped to Initial Access on 2026-10-18:
+# the workbench builds the FIRST foothold against a target endpoint, so this is
+# the tactic it must answer for today; other tactics are not yet decided here.
+#   covered      — `covered_by` names the class(es) / knowledge file(s) that test it
+#   out_of_scope — `reason` says why a target-endpoint PoC cannot reach it
+#   gap          — in scope, nothing tests it yet (the backlog)
+# tests/test_attack_coverage.py fails if a v20 Initial Access id has no decision
+# or a `covered_by` entry names nothing real.
+initial_access_coverage:
+  T1190:     { status: covered, covered_by: [vuln_classes.yaml#exploitable, craft_guidance.yaml] }
+  T1078:     { status: covered, covered_by: [default_cred_check.yaml, service_access_methods.yaml, credential_spray_policy.yaml] }
+  "T1078.001": { status: covered, covered_by: [default_cred_check.yaml, default_credentials.yaml] }
+  "T1078.002": { status: covered, covered_by: [ad_attacks.yaml], reason: "domain accounts come from the AD playbook, not the web PoC workbench" }
+  "T1078.003": { status: covered, covered_by: [service_access_methods.yaml, credential_spray_policy.yaml] }
+  "T1078.004": { status: out_of_scope, reason: "cloud identity-provider accounts; posture is cloud_scan_rules.yaml's job, not an endpoint PoC" }
+  T1133:     { status: covered, covered_by: [service_access_methods.yaml] }
+  T1189:     { status: out_of_scope, reason: "needs a victim browser visiting attacker content; a graded target has none (same reason xss declares no graded goal)" }
+  T1659:     { status: out_of_scope, reason: "content injection needs an on-path (adversary-in-the-middle) position, not a request to the target" }
+  T1195:     { status: out_of_scope, reason: "supply chain compromise happens upstream of the target, outside the engagement scope" }
+  "T1195.001": { status: out_of_scope, reason: "dependency / dev-tool compromise is upstream of the target" }
+  "T1195.002": { status: out_of_scope, reason: "software supply chain compromise is upstream of the target" }
+  "T1195.003": { status: out_of_scope, reason: "hardware supply chain; physical" }
+  T1199:     { status: out_of_scope, reason: "abuses a third party's trusted access; that party is not in scope" }
+  T1200:     { status: out_of_scope, reason: "physical hardware additions" }
+  T1091:     { status: out_of_scope, reason: "physical removable media" }
+  T1669:     { status: out_of_scope, reason: "wireless proximity access, not a network request to the target" }
+  T1566:     { status: out_of_scope, reason: "social engineering is not automated by this platform" }
+  "T1566.001": { status: out_of_scope, reason: "social engineering (attachment) is not automated" }
+  "T1566.002": { status: out_of_scope, reason: "social engineering (link) is not automated" }
+  "T1566.003": { status: out_of_scope, reason: "social engineering (via service) is not automated" }
+  "T1566.004": { status: out_of_scope, reason: "social engineering (voice) is not automated" }
 
 # Unified risk score weights (Phase B refines; baseline here). Final score is a
 # 0..100 blend of these normalized terms.
