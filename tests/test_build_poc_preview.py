@@ -87,6 +87,8 @@ def test_executed_preview_sends_nothing_to_the_target(monkeypatch):
     monkeypatch.setitem(sys.modules, "requests", _Net("requests"))
 
     class _VC:
+        def names(self): return ["sqli"]
+        def is_exploitable(self, c): return c == "sqli"
         def mitre_for(self, c): return ["T1190"]
         def reading_hints(self, c): return {"look_for": ["x"], "implies": ["y"]}
         def graded_goals(self, c): return ["database_access"]
@@ -108,6 +110,7 @@ def test_executed_preview_sends_nothing_to_the_target(monkeypatch):
             seen.setdefault("profile_probe", probe), {})[1],
         "_benchmark_goal_block": lambda spec: "",
         "_read_description_requirements": lambda *a, **k: {"parameter": "id"},
+        "_resolve_unknown_class": lambda *a, **k: {"class": "unknown"},
         "_class_guidance_block": lambda vc, chain: "GUIDANCE\n",
         "_requirements_block": lambda req: "REQS\n",
         "_llm_for_model": lambda *a, **k: {"response": '{"command": "curl x"}'},

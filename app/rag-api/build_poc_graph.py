@@ -1117,6 +1117,45 @@ def node_precondition_enumeration(state: BuildPocState) -> Dict[str, Any]:
             "recon_metrics": {**state.get("recon_metrics", {}), **metrics}}
 
 
+CLASS_UNRESOLVED = "class_unresolved"
+
+
+def _class_gate(state: BuildPocState) -> Dict[str, Any]:
+    """{} when the class is known or resolved; a readiness block otherwise.
+
+    Applies to a real CVE id only -- a product-only (NOCVE) build has no
+    description to classify from and is steered by the operator's hint.
+    """
+    if (os.environ.get("BUILD_POC_CLASS_GATE", "on") or "on").lower() == "off":
+        return {}
+    cve = str(state.get("cve") or "").upper()
+    if not cve.startswith("CVE-"):
+        return {}
+    from api import (_fetch_cve_details, _vuln_class_from_cve,
+                     _resolve_unknown_class, _poc_trace)
+    try:
+        details = _fetch_cve_details(cve) or {}
+    except Exception:  # noqa: BLE001
+        details = {}
+    if _vuln_class_from_cve(cve, details) != "unknown":
+        return {}
+    research = ""
+    ro = state.get("research_out") or {}
+    if isinstance(ro, dict):
+        an = ro.get("analysis") or {}
+        research = (an.get("summary") if isinstance(an, dict) else "") or ""
+        research = (research + "\n" + str(ro.get("advisory_text") or ""))[:3000]
+    r = _resolve_unknown_class(cve, details, extra_text=research,
+                               model=state.get("model"), run_id=state.get("run_id"))
+    if r.get("class") and r["class"] != "unknown":
+        return {}
+    why = (f"{CLASS_UNRESOLVED}: the vulnerability class of {cve} could not be "
+           f"resolved ({r.get('evidence') or 'no evidence'}); set it with "
+           f"PUT /software/cve-class/{cve} and rebuild")
+    _poc_trace(state.get("run_id"), "class_gate_blocked", response=why)
+    return {"readiness_blocked": True, "readiness_blockers": [why]}
+
+
 def node_readiness_gate(state: BuildPocState) -> Dict[str, Any]:
     """CHALLENGE SKILL — the readiness gate. After preconditions are enumerated
     (and session validated), review whether ALL the pieces are actually in
@@ -1133,6 +1172,16 @@ def node_readiness_gate(state: BuildPocState) -> Dict[str, Any]:
         missing — and records the verdict in metrics + trace.
       - off: skip entirely.
     """
+    # CLASS GATE -- before anything else, and independent of the precondition
+    # gate's mode. An `unknown` class means no class guidance, no reading
+    # hints, no graded-goal preference and no proof template: the exploit
+    # would be a guess. Resolve it (closed vocabulary, stored so every later
+    # re-derivation sees it) or BLOCK the attempt. Operator ask, 2026-10-18:
+    # "in a class unknown, that should be resolved first before trying an
+    # exploit". BUILD_POC_CLASS_GATE=off restores the old behaviour.
+    _cg = _class_gate(state)
+    if _cg:
+        return _cg
     mode = (os.environ.get("BUILD_POC_PRECONDITION_GATE", "warn") or "warn").lower()
     if mode == "off":
         return {}
@@ -1676,9 +1725,12 @@ def node_run_refine(state: BuildPocState) -> Dict[str, Any]:
         blockers = state.get("readiness_blockers") or []
         _poc_trace(state["run_id"], "run_refine_skipped_blocked",
                    extra={"blockers": blockers})
+        _cls = any(str(b).startswith(CLASS_UNRESOLVED) for b in blockers)
         return {"result": {"ok": True, "success": False, "verified": False,
                            "blocked": True, "blockers": blockers,
-                           "reason": "readiness gate: preconditions not met — "
+                           "stop_reason": CLASS_UNRESOLVED if _cls else "readiness_blocked",
+                           "reason": ("class gate: " if _cls else
+                                      "readiness gate: preconditions not met — ")
                                      + "; ".join(blockers),
                            "iterations": 0, "metrics": state.get("built", {}).get("metrics") or {}},
                 "verified": False, "success": False, "iters": 0,

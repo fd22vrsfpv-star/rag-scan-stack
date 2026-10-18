@@ -6841,6 +6841,21 @@ CREATE INDEX IF NOT EXISTS idx_confirmed_provenance
     ON public.confirmed_facts (provenance, status);
 
 -- AGENT-DERIVED CVE EXPLOIT SPECS (auto-derivation pipeline persists verified recipes here)
+-- A CVE's vulnerability class, resolved when the deterministic classifier
+-- (name -> prose -> CWE) answers `unknown`. Written by the build's class gate
+-- (source 'llm', closed vocabulary) or by an operator (source 'operator', which
+-- an llm resolution never overwrites). Read by _vuln_class_from_cve ONLY when its
+-- deterministic answer is unknown, so every re-derivation site sees it.
+-- Knowledge about a CVE, shared across engagements: no engagement_id by design.
+CREATE TABLE IF NOT EXISTS public.cve_class_resolutions (
+    cve          text PRIMARY KEY,
+    vuln_class   text NOT NULL,
+    source       text NOT NULL,              -- 'llm' | 'operator'
+    evidence     text,
+    model        text,
+    resolved_at  timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS public.derived_cve_specs (
     cve           text PRIMARY KEY,
     product       text,

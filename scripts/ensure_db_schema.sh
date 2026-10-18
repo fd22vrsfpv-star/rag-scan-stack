@@ -339,6 +339,7 @@ CRITICAL_TABLES=(
     "build_poc_attempts"
     "recon_cache"
     "build_poc_error_memory"
+    "cve_class_resolutions"
     "build_poc_lessons"
     "learned_postex_overlays"
     "wstg_manual_reviews"

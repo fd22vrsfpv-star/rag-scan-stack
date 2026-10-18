@@ -433,6 +433,38 @@ async def revoke_poc(ip: str, port: int = None):
         return safe_json(resp)
 
 
+@router.get("/api/software/cve-class/{cve}")
+async def get_cve_class(cve: str):
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=60) as c:
+        resp = await c.get(f"{s.rag_api_url}/software/cve-class/{cve}",
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+    if resp.status_code >= 400:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=resp.status_code, detail=resp.text[:500])
+    return safe_json(resp)
+
+
+@router.put("/api/software/cve-class/{cve}")
+async def set_cve_class(cve: str, request: Request):
+    """Operator sets a CVE's vulnerability class (wins over an LLM resolution)."""
+    s = get_settings()
+    body = await request.json()
+    async with httpx.AsyncClient(timeout=30) as c:
+        resp = await c.put(f"{s.rag_api_url}/software/cve-class/{cve}", json=body,
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+    # A 4xx/5xx is a failed write -- never report it as success.
+    if resp.status_code >= 400:
+        from fastapi import HTTPException
+        detail = resp.text[:500]
+        try:
+            detail = resp.json().get("detail", detail)
+        except Exception:  # noqa: BLE001
+            pass
+        raise HTTPException(status_code=resp.status_code, detail=detail)
+    return safe_json(resp)
+
+
 @router.post("/api/software/build-poc/preview")
 async def build_poc_preview(request: Request):
     """Preview a PoC build without sending anything to the target (class, ATT&CK,

@@ -15332,7 +15332,125 @@ def _vuln_class_from_cve(cve: str, details: dict) -> str:
     if _r.get("ambiguous"):
         logging.debug("vuln_class ambiguous for %s: CWE candidates %s and no "
                       "naming prose", cve, _r.get("candidates"))
+    # Last: a class RESOLVED for this CVE earlier (operator, or the build's class
+    # gate). Consulted only after every deterministic signal said nothing, so it
+    # never overrides evidence in the advisory -- and it is what makes a
+    # resolution visible to all the call sites that re-derive the class.
+    _stored = _class_resolution_lookup(cve)
+    if _stored:
+        return _stored
     return "unknown"
+
+
+_CLASS_RES_CACHE: dict = {}
+_CLASS_RES_TTL = 120.0
+
+
+def _class_resolution_lookup(cve):
+    """The stored class for a CVE, or None. Cached briefly; fail-soft (an
+    unreadable table means "no stored class", and the build's class gate then
+    resolves or blocks -- it never reads a DB error as permission to guess)."""
+    key = str(cve or "").upper().strip()
+    if not key:
+        return None
+    hit = _CLASS_RES_CACHE.get(key)
+    if hit and time.time() - hit[1] < _CLASS_RES_TTL:
+        return hit[0]
+    val = None
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("SELECT vuln_class FROM cve_class_resolutions WHERE cve = %s", (key,))
+            row = cur.fetchone()
+        if row and row[0]:
+            c = _vc_canonical(row[0])
+            val = c if c != "unknown" else None
+    except Exception as e:  # noqa: BLE001
+        logging.debug("class resolution lookup failed for %s: %s", key, e)
+        return None          # not cached: a DB blip must not stick for the TTL
+    _CLASS_RES_CACHE[key] = (val, time.time())
+    return val
+
+
+def _store_class_resolution(cve, vuln_class, source, evidence="", model=None):
+    """Upsert a resolution. An 'llm' resolution never overwrites an 'operator'
+    one. Returns True when the row now holds this class."""
+    key = str(cve or "").upper().strip()
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("""INSERT INTO cve_class_resolutions
+                               (cve, vuln_class, source, evidence, model)
+                           VALUES (%s, %s, %s, %s, %s)
+                           ON CONFLICT (cve) DO UPDATE SET
+                               vuln_class = EXCLUDED.vuln_class,
+                               source = EXCLUDED.source,
+                               evidence = EXCLUDED.evidence,
+                               model = EXCLUDED.model,
+                               resolved_at = now()
+                           WHERE cve_class_resolutions.source <> 'operator'
+                              OR EXCLUDED.source = 'operator'
+                           RETURNING vuln_class""",
+                        (key, vuln_class, source, (evidence or "")[:2000], model))
+            ok = cur.fetchone() is not None
+            conn.commit()
+        _CLASS_RES_CACHE.pop(key, None)
+        return ok
+    except Exception as e:  # noqa: BLE001
+        logging.warning("storing class resolution for %s failed: %s", key, e)
+        return False
+
+
+def _resolve_unknown_class(cve, details, extra_text="", model=None, run_id=None,
+                           store=True):
+    """Resolve a CVE whose deterministic class is `unknown`, BEFORE any exploit.
+
+    One LLM call that must answer from the CLOSED vocabulary of exploitable
+    classes in knowledge/vuln_classes.yaml; anything else -- including
+    "unknown" -- is no answer. Returns {"class", "source", "evidence"}, with
+    class "unknown" when unresolved. `store=False` (the preview) resolves
+    without persisting.
+    """
+    out = {"class": "unknown", "source": None, "evidence": ""}
+    _m = _vc()
+    if not _m:
+        out["evidence"] = "class table unavailable"
+        return out
+    vocab = sorted(c for c in _m.names() if _m.is_exploitable(c))
+    desc = ((details or {}).get("description") or "").strip()
+    adv = ((details or {}).get("advisory_poc") or "").strip()
+    if not (desc or adv or extra_text):
+        out["evidence"] = "no description, advisory or research text to classify from"
+        return out
+    prompt = (
+        "Classify this vulnerability into EXACTLY ONE class from this list, or "
+        "answer none if the text does not support one:\n"
+        + ", ".join(vocab) + "\n\n"
+        f"CVE: {cve}\nCWE: {', '.join(map(str, (details or {}).get('cwe') or [])) or '(none)'}\n"
+        f"DESCRIPTION:\n{desc[:2500]}\n"
+        + (f"ADVISORY:\n{adv[:1500]}\n" if adv else "")
+        + (f"RESEARCH:\n{str(extra_text)[:1500]}\n" if extra_text else "")
+        + '\nReturn ONE JSON object: {"class": "<one of the list, or none>", '
+          '"evidence": "<the phrase in the text that decides it>"}')
+    try:
+        res = _llm_for_model(prompt, model=model, caller="cve_class_resolve")
+        text = res.get("response", "") if isinstance(res, dict) else str(res or "")
+        obj = _poc_extract_json(text) or {}
+    except Exception as e:  # noqa: BLE001
+        out["evidence"] = f"resolver call failed: {type(e).__name__}"
+        return out
+    cand = _vc_canonical(str(obj.get("class") or ""))
+    if cand in vocab:
+        out.update({"class": cand, "source": "llm",
+                    "evidence": str(obj.get("evidence") or "")[:500]})
+        if store:
+            _store_class_resolution(cve, cand, "llm", out["evidence"],
+                                    model=(res or {}).get("model") if isinstance(res, dict) else None)
+    else:
+        out["evidence"] = ("resolver answered %r, which is not an exploitable class"
+                           % (obj.get("class"),))
+    if run_id:
+        _poc_trace(run_id, "class_resolution", response=out["class"],
+                   extra={"source": out["source"], "evidence": out["evidence"][:300]})
+    return out
 
 
 _ARTIFACT_FORMAT_HINTS = [
@@ -19703,11 +19821,20 @@ def _build_poc_preview(cve, ip, port, eid, product=None, version=None,
     spec = _extract_target_spec(cve, ip, port, product, version, eid,
                                 canary="POCzPREVIEW00", details=details, probe=False)
     vclass = spec.get("vuln_class") or "unknown"
+    out["class_resolution"] = None
+    if vclass == "unknown":
+        # What the build's class gate would do -- resolved here WITHOUT storing.
+        r = _resolve_unknown_class(cve, details, model=model, store=False)
+        out["class_resolution"] = {**r, "would_block": r["class"] == "unknown"}
+        if r["class"] != "unknown":
+            vclass = r["class"]
     out["vuln_class"] = vclass
     out["vuln_class_chain"] = spec.get("vuln_class_chain") or []
     out["candidate_endpoints"] = spec.get("candidate_endpoints") or []
     out["derived_vector"] = spec.get("derived_vector")
     _m = _vc()
+    out["class_vocabulary"] = (sorted(c for c in _m.names() if _m.is_exploitable(c))
+                               if _m else [])
     names = _attack_technique_names()
     out["attack_techniques"] = [{"id": t, "name": names.get(t)}
                                 for t in ((_m.mitre_for(vclass) if _m else []) or [])]
@@ -37107,31 +37234,6 @@ def _synth_poc_token(ip: str, port, product=None) -> str:
     return f"{base}-{highest + 1:03d}"
 
 
-class BuildPocPreviewBody(BaseModel):
-    cve: str
-    ip: str
-    port: int = 80
-    product: Optional[str] = None
-    version: Optional[str] = None
-    suggest_command: bool = False
-    model: Optional[str] = None
-
-
-@app.post("/software/build-poc/preview", tags=["Assets"])
-def build_poc_preview(body: BuildPocPreviewBody, authorized: bool = Depends(auth)):
-    """Preview a PoC build WITHOUT sending anything to the target: class, ATT&CK
-    techniques, reading hints, the requirements read from the description, the
-    graded goal, the scope verdict, and (optionally) the first command the model
-    would propose -- shown, never run."""
-    cve = (body.cve or "").strip().upper()
-    if not _re_module.match(r"^CVE-\d{4}-\d{4,}$", cve):
-        raise HTTPException(400, "cve must look like CVE-YYYY-NNNN")
-    eid = _resolve_engagement_id()
-    return _build_poc_preview(cve, body.ip.strip(), body.port, eid,
-                              product=body.product, version=body.version,
-                              suggest_command=body.suggest_command, model=body.model)
-
-
 @app.post("/software/build-poc", tags=["Assets"])
 def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     """PoC-builder: research -> synthesize -> run-and-refine. Invoking this authorizes
@@ -37288,6 +37390,72 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
                 "wall_timeout_sec": eff_wall,
             },
             **core}
+
+
+class CveClassBody(BaseModel):
+    vuln_class: str
+    note: Optional[str] = None
+
+
+@app.get("/software/cve-class/{cve}", tags=["Assets"])
+def get_cve_class(cve: str, authorized: bool = Depends(auth)):
+    """The class a build would use for this CVE, and whether it was resolved."""
+    cve = cve.strip().upper()
+    details = _fetch_cve_details(cve) or {}
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT vuln_class, source, evidence, model, resolved_at "
+                    "FROM cve_class_resolutions WHERE cve = %s", (cve,))
+        row = cur.fetchone()
+    return {"cve": cve, "vuln_class": _vuln_class_from_cve(cve, details),
+            "stored": dict(row) if row else None}
+
+
+@app.put("/software/cve-class/{cve}", tags=["Assets"])
+def set_cve_class(cve: str, body: CveClassBody, authorized: bool = Depends(auth)):
+    """Operator sets a CVE's class. Wins over any LLM resolution, and over
+    nothing else: a class named in the advisory still decides first."""
+    cve = cve.strip().upper()
+    if not _re_module.match(r"^CVE-\d{4}-\d{4,}$", cve):
+        raise HTTPException(400, "cve must look like CVE-YYYY-NNNN")
+    _m = _vc()
+    cls = _vc_canonical(body.vuln_class)
+    if not _m or not _m.is_exploitable(cls):
+        raise HTTPException(400, f"{body.vuln_class!r} is not an exploitable class")
+    if not _store_class_resolution(cve, cls, "operator", body.note or "set by operator"):
+        raise HTTPException(500, "could not store the class")
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("cve_class_set", "poc", {"cve": cve, "vuln_class": cls,
+                                              "source": "operator"})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "cve": cve, "vuln_class": cls, "source": "operator"}
+
+
+class BuildPocPreviewBody(BaseModel):
+    cve: str
+    ip: str
+    port: int = 80
+    product: Optional[str] = None
+    version: Optional[str] = None
+    suggest_command: bool = False
+    model: Optional[str] = None
+
+
+@app.post("/software/build-poc/preview", tags=["Assets"])
+def build_poc_preview(body: BuildPocPreviewBody, authorized: bool = Depends(auth)):
+    """Preview a PoC build WITHOUT sending anything to the target: class, ATT&CK
+    techniques, reading hints, the requirements read from the description, the
+    graded goal, the scope verdict, and (optionally) the first command the model
+    would propose -- shown, never run."""
+    cve = (body.cve or "").strip().upper()
+    if not _re_module.match(r"^CVE-\d{4}-\d{4,}$", cve):
+        raise HTTPException(400, "cve must look like CVE-YYYY-NNNN")
+    eid = _resolve_engagement_id()
+    return _build_poc_preview(cve, body.ip.strip(), body.port, eid,
+                              product=body.product, version=body.version,
+                              suggest_command=body.suggest_command, model=body.model)
+
 
 
 class PocGrantBody(BaseModel):
