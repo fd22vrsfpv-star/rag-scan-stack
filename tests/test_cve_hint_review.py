@@ -46,9 +46,21 @@ def test_done_set_makes_a_phase_resumable(tmp_path):
 
 def test_failed_fetch_is_not_recorded_so_it_is_retried():
     """Unreachable is not absent: an errored enrich row must not be written,
-    or the resume logic would skip that CVE forever with no class."""
-    src = SCRIPT.read_text(encoding="utf-8")
-    assert 'if row.get("error"):' in src and "_append(path, row)" in src
+    or the resume logic would skip that CVE forever with no class. The
+    `_append(path, row)` must sit in the ELSE of the `if row.get("error")`."""
+    import ast
+    fn = next(n for n in ast.parse(SCRIPT.read_text(encoding="utf-8")).body
+              if isinstance(n, ast.FunctionDef) and n.name == "phase_enrich")
+    ok = False
+    for n in ast.walk(fn):
+        if isinstance(n, ast.If) and any(isinstance(c, ast.Constant) and c.value == "error"
+                                         for c in ast.walk(n.test)):
+            in_body = any(isinstance(c, ast.Call) and getattr(c.func, "id", "") == "_append"
+                          for c in ast.walk(ast.Module(n.body, [])))
+            in_else = any(isinstance(c, ast.Call) and getattr(c.func, "id", "") == "_append"
+                          for c in ast.walk(ast.Module(n.orelse, [])))
+            ok = ok or (in_else and not in_body)
+    assert ok, "an errored enrich row is appended -- resume would skip it forever"
 
 
 def test_writeups_merge_only_fills_missing_advisories():
@@ -65,6 +77,10 @@ def test_writeups_merge_only_fills_missing_advisories():
 
 def test_enrich_disables_the_web_search():
     """80 of 82 s per CVE was the DuckDuckGo search; enrich must turn it off."""
-    src = SCRIPT.read_text(encoding="utf-8")
-    body = src[src.index("def phase_enrich"):src.index("def phase_writeups")]
-    assert "_BUILD_POC_WEB_SEARCH = False" in body
+    import ast
+    fn = next(n for n in ast.parse(SCRIPT.read_text(encoding="utf-8")).body
+              if isinstance(n, ast.FunctionDef) and n.name == "phase_enrich")
+    assert any(isinstance(n, ast.Assign) and any(getattr(t, "attr", "") == "_BUILD_POC_WEB_SEARCH"
+                                                 for t in n.targets)
+               and isinstance(n.value, ast.Constant) and n.value.value is False
+               for n in ast.walk(fn)), "phase_enrich leaves the web search on"

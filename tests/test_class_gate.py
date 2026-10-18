@@ -91,14 +91,18 @@ def _gate(classify, resolve_to, cve="CVE-2023-9"):
     fake_api._vuln_class_from_cve = lambda c, d: classify
     fake_api._resolve_unknown_class = lambda *a, **k: {"class": resolve_to, "evidence": "e"}
     fake_api._poc_trace = lambda *a, **k: None
-    sys.modules["api"] = fake_api
+    prev = sys.modules.get("api")            # restore, never just pop: later
+    sys.modules["api"] = fake_api            # tests rely on whatever was there
     ns = {"os": os, "CLASS_UNRESOLVED": "class_unresolved", "Dict": dict, "Any": object,
           "BuildPocState": dict}
     exec(compile(ast.Module([_fn(GRAPH, "_class_gate")], []), "graph.py", "exec"), ns)
     try:
         return ns["_class_gate"]({"cve": cve, "run_id": "r", "model": None})
     finally:
-        sys.modules.pop("api", None)
+        if prev is None:
+            sys.modules.pop("api", None)
+        else:
+            sys.modules["api"] = prev
 
 
 def test_a_known_class_passes():
@@ -132,8 +136,11 @@ def test_the_gate_runs_before_the_precondition_gate_can_switch_off():
 
 
 def test_a_blocked_run_reports_class_unresolved():
-    src = ast.get_source_segment(GRAPH.read_text(encoding="utf-8"), _fn(GRAPH, "node_run_refine"))
-    assert "CLASS_UNRESOLVED if _cls" in src
+    """The blocked result's stop_reason must be able to read CLASS_UNRESOLVED."""
+    fn = _fn(GRAPH, "node_run_refine")
+    hit = any(isinstance(n, ast.IfExp) and isinstance(n.body, ast.Name)
+              and n.body.id == "CLASS_UNRESOLVED" for n in ast.walk(fn))
+    assert hit, "node_run_refine never reports stop_reason=class_unresolved"
 
 
 def test_the_classifier_consults_stored_resolutions_last():
@@ -147,9 +154,11 @@ def test_the_classifier_consults_stored_resolutions_last():
 
 
 def test_an_llm_resolution_never_overwrites_an_operator_one():
-    src = ast.get_source_segment(API.read_text(encoding="utf-8"),
-                                 _fn(API, "_store_class_resolution"))
-    assert "WHERE cve_class_resolutions.source <> 'operator'" in src
+    import re
+    sql = " ".join(c.value for c in ast.walk(_fn(API, "_store_class_resolution"))
+                   if isinstance(c, ast.Constant) and isinstance(c.value, str))
+    assert re.search(r"WHERE\s+cve_class_resolutions\.source\s*<>\s*'operator'", sql), (
+        "the upsert lets an llm resolution overwrite an operator's class")
 
 
 def test_set_endpoint_rejects_a_non_exploitable_class():
