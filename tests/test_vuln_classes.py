@@ -571,8 +571,42 @@ class TestResolve:
         r = vc.resolve("local file inclusion via the page parameter",
                        ["CWE-98", "CWE-22"])
         assert r["class"] == "lfi"
-        assert r["basis"] == "name"
+        # `cwe+name`, not `name`: the CWEs WERE consulted — they bound the
+        # candidate set and the advisory's own words picked `lfi` from it.
+        # The old label claimed the taxonomy was ignored, which made a
+        # name-only match indistinguishable from a name that the CWEs
+        # actually supported.
+        assert r["basis"] == "cwe+name"
         assert r["ambiguous"] is False
+
+    def test_the_cwe_bounds_what_the_prose_may_name(self):
+        """A word in prose may not outrank a curated identifier.
+
+        A CWE-918 (SSRF) advisory whose text merely mentions an SQL error was
+        classified `sqli`, so the crafter got the wrong payload family for
+        every iteration. The name may now only pick from classes the CWEs
+        support — and the rejected name is reported, because a silent
+        disagreement cannot be reviewed.
+        """
+        r = vc.resolve("a sql injection error was observed in the response",
+                       ["CWE-918"])
+        assert r["class"] == "ssrf", r
+        assert r["basis"] == "cwe"
+        assert r.get("name_disagreed") == "sqli", r
+
+    def test_a_behaviourally_identical_name_still_wins(self):
+        """NVD files an LFI under CWE-22 routinely.
+
+        `lfi` and `path-traversal` are the same shape — both file_read, both
+        input_field_required, neither needs an OOB sink — so the advisory's
+        own word is better information for crafting and changes no gate.
+        Compared on the properties the gates branch on, not a hand-kept list
+        of related pairs, which would drift as classes are added.
+        """
+        r = vc.resolve("local file inclusion via the page parameter",
+                       ["CWE-22"])          # CWE-22 -> path-traversal only
+        assert r["class"] == "lfi", r
+        assert "name_disagreed" not in r
 
     def test_a_cwe_answers_when_the_text_names_nothing(self):
         r = vc.resolve("the endpoint is vulnerable", ["CWE-918"])

@@ -220,18 +220,61 @@ def test_a_found_login_form_still_blocks():
 def test_the_probe_status_is_captured_from_a_real_response():
     """`ep_probe_status` must come from a status_code, not be inferred."""
     fn = _func("_gather_manifest")
-    assigns = [n for n in ast.walk(fn) if isinstance(n, ast.Assign)
-               and any(isinstance(t, ast.Name) and t.id == "ep_probe_status"
-                       for t in n.targets)]
+    def _binds(node):
+        """Does this Assign bind ep_probe_status, directly or by unpacking?
+
+        The ranking winner arrives as
+        `_, endpoint, ep_source, ep_probe_status = _ranked[0]`, whose single
+        target is a Tuple — so a Name-only scan sees no binding at all and
+        reports the probe site as missing.
+        """
+        for t in node.targets:
+            if isinstance(t, ast.Name) and t.id == "ep_probe_status":
+                return True
+            if isinstance(t, (ast.Tuple, ast.List)):
+                if any(isinstance(e, ast.Name) and e.id == "ep_probe_status"
+                       for e in t.elts):
+                    return True
+        return False
+
+    assigns = [n for n in ast.walk(fn) if isinstance(n, ast.Assign) and _binds(n)]
     assert len(assigns) >= 3, (
         f"expected an init plus both probe sites, found {len(assigns)} "
         "assignments to ep_probe_status")
+    # The status may arrive directly (`ep_probe_status = rp.status_code`) or
+    # be carried through the candidate RANKING, which stores `rp.status_code`
+    # alongside each answering path and unpacks the winner. Both are "observed
+    # from a real response"; pinning only the direct form made this fail when
+    # selection stopped racing candidates and started ranking them, though the
+    # property it guards was never violated.
     from_resp = [a for a in assigns
                  if isinstance(a.value, ast.Attribute)
                  and a.value.attr == "status_code"]
-    assert len(from_resp) >= 2, (
+    # The CANDIDATE TUPLE's status element specifically — not any
+    # `.status_code` in the function. The first version of this check counted
+    # every reference, so replacing the captured status with a literal 200
+    # still passed: there were other `rp.status_code` uses nearby. Fourth
+    # false pass of the same shape today, all from matching something that
+    # merely co-occurs with the thing that matters.
+    ranked_src = []
+    for n in ast.walk(fn):
+        if not (isinstance(n, ast.Call)
+                and getattr(n.func, "attr", None) == "append"):
+            continue
+        for a in n.args:
+            if not isinstance(a, ast.Tuple):
+                continue
+            ranked_src += [e for e in a.elts
+                           if isinstance(e, ast.Attribute)
+                           and e.attr == "status_code"]
+    unpacked = [a for a in assigns
+                if isinstance(a.targets[0], (ast.Tuple, ast.List))]
+    assert len(from_resp) + (1 if unpacked else 0) >= 2, (
         "ep_probe_status is not set from a response status_code at both probe "
         "sites — an unobserved status must stay None, never a default")
+    assert ranked_src, (
+        "the candidate tuple must carry the answering response's real "
+        "status_code; a literal there reports a status nobody observed")
     assert any(isinstance(a.value, ast.Constant) and a.value.value is None
                for a in assigns), (
         "ep_probe_status has no None initialiser: 'not observed' would then be "

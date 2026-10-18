@@ -133,6 +133,25 @@ class TestTheRecallBlockReportsItsSources:
             "the trace must carry structured `extra` naming each source; a "
             "character count cannot say what was recalled")
 
+    def test_all_three_outcomes_are_labelled(self, tree):
+        """hit / empty / not_queried must each carry `outcome`.
+
+        The populated branch originally set no label, so a successful recall
+        read as None and any aggregate over the field counted the hits as
+        unknowns — the measurement problem one level up from the one this
+        whole change was built to fix.
+        """
+        fn = _func(tree, "_synthesize_cve_poc")
+        labels = set()
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Dict):
+                for k, v in zip(n.keys, n.values):
+                    if (isinstance(k, ast.Constant) and k.value == "outcome"
+                            and isinstance(v, ast.Constant)):
+                        labels.add(v.value)
+        assert {"hit", "empty", "not_queried"} <= labels, (
+            f"every recall outcome must be labelled; found {sorted(labels)}")
+
     def test_disabled_is_not_reported_as_empty(self, tree):
         """THREE outcomes at this level too.
 

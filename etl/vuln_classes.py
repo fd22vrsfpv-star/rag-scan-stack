@@ -312,6 +312,62 @@ def class_for_cwe(cwe) -> str:
     return hits[0] if len(hits) == 1 else UNKNOWN
 
 
+_LOCATOR_EXT = re.compile(r"\.[a-z]{2,5}($|[?#])", re.I)
+
+
+def _strip_locators(text: str) -> str:
+    """Remove URLs, paths and filenames before matching a class NAME.
+
+    A locator says WHERE something is; it is not a claim about WHAT the bug
+    is. `\b` treats `/` and `.` as word boundaries, so `\bsql\b` matched
+    inside `/sql/dump.php` and `/phpmyadmin/sql.php` — phpMyAdmin's ordinary
+    query page was classified as SQL injection, and any path with a `sql`
+    segment became a SQLi finding.
+
+    Adjacent LETTERS were already handled (`sqlbackup.php` and `mssql` do not
+    match), but a path separator is not a letter. Rather than widen the
+    boundary — which would break "vulnerable to SQL." at the end of a
+    sentence — drop the tokens that are locators and classify the prose that
+    remains. "The /admin/sql.php endpoint allows SQL injection" still
+    resolves, because the CLAIM survives even when the LOCATOR is removed.
+    """
+    out = []
+    for tok in str(text or "").split():
+        if "://" in tok or tok.startswith("/") or "/" in tok:
+            continue
+        if _LOCATOR_EXT.search(tok):
+            continue
+        out.append(tok)
+    return " ".join(out)
+
+
+def _behaviourally_same(pick: str, cands: List[str]) -> bool:
+    """Is `pick` interchangeable with one of `cands` for every gate we run?
+
+    NVD files an LFI under CWE-22 (path-traversal) routinely, and an advisory
+    that says "local file inclusion" is better information for CRAFTING than
+    the bucket it was filed in. Those two classes are the same shape — both
+    `file_read`, both `input_field_required`, neither needs an OOB sink — so
+    letting the name win changes which payloads are tried and nothing else.
+
+    `sqli` named against a CWE-918 (ssrf) is NOT that: they differ on whether
+    a sink is required and on what counts as proof, so the name winning sends
+    the whole loop at the wrong payload family.
+
+    Compared on the properties the GATES actually branch on, not on a
+    hand-kept list of "related" pairs, which would drift the moment a class
+    is added.
+    """
+    props = ("file_read", "input_field_required", "needs_oob_sink")
+    a = get(pick) or {}
+    want = tuple(bool(a.get(p)) for p in props)
+    for c in cands:
+        b = get(c) or {}
+        if tuple(bool(b.get(p)) for p in props) == want:
+            return True
+    return False
+
+
 def resolve(text=None, cwes=None) -> dict:
     """Decide a class from the COMBINATION of a name and a CWE set.
 
@@ -334,25 +390,53 @@ def resolve(text=None, cwes=None) -> dict:
 
     # 1. An explicit name or alias in the text wins outright. Matched on word
     #    boundaries, longest alias first.
-    named = [(n, cls) for n, rx, cls in tbl.get("alias_res", []) if rx.search(t)]
+    # Match the CLAIM, not the locator: a path segment named `sql` is where
+    # something lives, not a statement that it is injectable.
+    _prose = _strip_locators(t)
+    named = [(n, cls) for n, rx, cls in tbl.get("alias_res", []) if rx.search(_prose)]
+
+    # The CWE-derived candidate set, computed BEFORE the name is accepted:
+    # a CWE id is a curated taxonomy claim, a word in prose is a word. The
+    # name still decides WHICH class — "local file inclusion" with
+    # CWE-98 (lfi, rfi) + CWE-22 (path-traversal) correctly yields lfi —
+    # but it may only pick from what the CWEs actually allow.
+    #
+    # Without this, a description that merely CONTAINS a class name
+    # outranks the identifier: a CWE-918 SSRF whose text mentions an SQL
+    # error was classified sqli, and the crafter was handed the wrong
+    # payload family for every iteration.
+    _cwe_cands: List[str] = []
+    for _cw in (cwes or []):
+        for _c in classes_for_cwe(_cw):
+            if _c not in _cwe_cands:
+                _cwe_cands.append(_c)
+
     if named:
         top = named[0][0]
         tied = {c for n, c in named if n == top}
         if len(tied) == 1:
-            return {"class": named[0][1],
-                    "candidates": sorted({c for _, c in named}),
-                    "basis": "name", "ambiguous": False}
+            _pick = named[0][1]
+            if _cwe_cands and _pick not in _cwe_cands \
+                    and not _behaviourally_same(_pick, _cwe_cands):
+                # The text named a class the CWEs do not support. Fall through
+                # to the CWE path rather than overruling the taxonomy, and say
+                # so, because a silent disagreement is unreviewable.
+                _disagreed = _pick
+            else:
+                return {"class": _pick,
+                        "candidates": sorted({c for _, c in named}),
+                        "basis": "cwe+name" if _cwe_cands else "name",
+                        "ambiguous": False}
 
     # 2. The CWEs give a candidate set.
-    cands: List[str] = []
-    for cw in (cwes or []):
-        for c in classes_for_cwe(cw):
-            if c not in cands:
-                cands.append(c)
-    cands.sort()
+    cands: List[str] = sorted(_cwe_cands)
+    _disagreed = locals().get("_disagreed")
     if len(cands) == 1:
-        return {"class": cands[0], "candidates": cands, "basis": "cwe",
-                "ambiguous": False}
+        out = {"class": cands[0], "candidates": cands, "basis": "cwe",
+               "ambiguous": False}
+        if _disagreed:
+            out["name_disagreed"] = _disagreed
+        return out
 
     # 3. Several CWE candidates — let the text break the tie, but only if it
     #    actually mentions one of them.

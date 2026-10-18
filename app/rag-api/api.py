@@ -22513,7 +22513,13 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None, guida
                            ", ".join(f"{m['source']}={m['rows']}"
                                      for m in _ctx_manifest) or "no sources"),
                        extra={"recall_sources": _ctx_manifest,
-                              "recall_chars": len(_ctx)})
+                              "recall_chars": len(_ctx),
+                              # Label the HIT too. Only the empty and
+                              # not_queried paths carried `outcome`, so a
+                              # populated recall read as None and an
+                              # aggregate over the field silently counted
+                              # the successes as unknowns.
+                              "outcome": "hit"})
         else:
             # THREE outcomes. "No recall block" and "we never looked" produced
             # the same absence of a trace row, and absence is what 669 of 682
