@@ -795,3 +795,17 @@ the round driver's target list.
 **Enforced by:** not enforced.
 *Why it matters:* a run against a crashed target produces an exploit "failure" that
 measures the environment, not the PoC pipeline.
+
+### Six stored timing verdicts fail the corrected scaling rule
+**Found:** 2026-10-18
+**Evidence:** re-scoring every `latency_confirmation` event with `confirmed: true` in
+`/app/poc_logs/*.jsonl` (27) against the rule fixed in `67b3c41f` (scaled run must be
+>= delta − tolerance = 4.5 s slower than the first run): 21 still pass, 6 fail —
+CVE-2023-37999 (23.2 s → 9.7 s), CVE-2024-37849 (28.9 → 24.1), CVE-2024-36779
+(16.9 → 13.3), CVE-2024-3552 twice (12.3 → 13.8; 9.2 → 13.4), CVE-2024-32167
+(10.3 → 14.1). Each was stored as `latency_confirmed`.
+**Where:** rows written for those runs in `security_tests` / `exploit_store` /
+`build_poc_attempts` (verified flag + `verification_method`).
+**Done when:** each of the six is re-verified against its target under the new rule,
+or its stored verdict is downgraded to `latency_unconfirmed`.
+**Enforced by:** not enforced.
