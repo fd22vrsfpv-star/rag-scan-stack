@@ -304,11 +304,34 @@ def test_contract_pattern_is_in_the_knowledge_file():
 # ── gather check (operator ask 2026-10-07: "make sure everything is actually
 #    gathered and ready before creating a payload" — strict) ──────────────────
 
+
+# The class predicates `_gather_decide` now calls. Injected from the REAL
+# `etl/vuln_classes.py` rather than stubbed, so this exercises the shipped
+# table: the gate and the test cannot disagree about what `lfi` is.
+def _vc_predicates():
+    import sys as _sys
+    from pathlib import Path as _P
+    _sys.path.insert(0, str(_P(__file__).resolve().parent.parent))
+    from etl import vuln_classes as _m
+    return {"_vc_needs_input_field": _m.needs_input_field,
+            "_vc_needs_oob_sink": _m.needs_oob_sink,
+            "_vc_path_is_the_field": _m.path_is_the_field,
+            "_vc_canonical": _m.canonical,
+            "_vc_is_file_read": _m.is_file_read,
+            "_vc_cwe_ids_for": _m.cwe_ids_for,
+            "_vc_classes_for_cwe": _m.classes_for_cwe,
+            "_vc_resolve": _m.resolve,
+            "_vc_is_known": lambda n: _m.canonical(n) != "unknown"}
+
+
 def _load_gather():
-    src = API.read_text(); tree = _ast.parse(src); ns = {"os": os}
+    src = API.read_text(); tree = _ast.parse(src)
+    ns = {"os": os, **_vc_predicates()}
     for node in tree.body:
         if isinstance(node, _ast.Assign) and getattr(node.targets[0], "id", "") in (
-                "_GATHER_FIELD_REQUIRED_CLASSES", "_GATHER_OOB_CLASSES", "_GATHER_FOLLOW_UP", "_BUILD_POC_GATHER_CHECK"):
+                # The class SETS are gone — projections of
+                # knowledge/vuln_classes.yaml now, injected above.
+                "_GATHER_FOLLOW_UP", "_BUILD_POC_GATHER_CHECK"):
             exec(_ast.get_source_segment(src, node), ns)
     node = next(x for x in _ast.walk(tree) if isinstance(x, _ast.FunctionDef) and x.name == "_gather_decide")
     exec(_ast.get_source_segment(src, node), ns)

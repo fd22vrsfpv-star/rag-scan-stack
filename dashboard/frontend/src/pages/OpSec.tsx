@@ -3,6 +3,28 @@ import { useOpsecTimeline, useOpsecAlerts, useScheduledScans, useCancelScheduled
 import { ShieldAlert, AlertTriangle, Clock, Trash2, Wifi, Activity } from 'lucide-react'
 import { cn, formatDate } from '@/lib/utils'
 
+// `local` is the one mode that can burn the operator: the packets left from
+// THIS host's own public address, so an external target saw the tester's real
+// IP. It used to render in the same neutral grey as every unremarkable value,
+// which is how a run of them went unnoticed until the target's logs were read
+// back. It is a warning, not a status — the scan itself may well have
+// succeeded, which is exactly why nothing else on the row flags it.
+const EXECUTION_MODE_STYLES: Record<string, string> = {
+  remote: 'text-amber-400',
+  proxied: 'text-green-400',
+  local: 'text-orange-400 font-medium',
+  required_proxy_missing: 'text-red-400 font-medium',
+}
+
+const EXECUTION_MODE_HELP: Record<string, string> = {
+  local: 'Direct egress — this scan left from this host\'s own public IP. '
+    + 'Set the engagement to require a proxy, or select a node, to stop it.',
+  proxied: 'Egress went through the selected SOCKS proxy.',
+  remote: 'Executed on a remote node.',
+  required_proxy_missing: 'Refused: the engagement requires a proxy and none '
+    + 'could be resolved. Nothing was sent.',
+}
+
 const STATUS_COLORS: Record<string, string> = {
   completed: 'text-green-400',
   finished: 'text-green-400',
@@ -222,9 +244,11 @@ function ScanRow({ scan }: { scan: RecentScan }) {
         {scan.duration_s != null ? `${scan.duration_s}s` : ''}
       </td>
       <td className="px-2 py-1.5">
-        <span className={cn('text-[10px]',
-          scan.execution_mode === 'remote' ? 'text-amber-400' : 'text-muted-foreground',
-        )}>
+        <span
+          className={cn('text-[10px]', EXECUTION_MODE_STYLES[scan.execution_mode] ?? 'text-muted-foreground')}
+          title={EXECUTION_MODE_HELP[scan.execution_mode] ?? undefined}
+        >
+          {scan.execution_mode === 'local' && <AlertTriangle className="h-3 w-3 inline mr-0.5 -mt-0.5" />}
           {scan.execution_mode}
           {scan.node_id && <span className="ml-0.5">({scan.node_id.slice(0, 6)})</span>}
         </span>

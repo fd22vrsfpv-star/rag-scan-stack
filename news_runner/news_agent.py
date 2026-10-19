@@ -682,8 +682,25 @@ def fetch_all_sources(run_id: Optional[str] = None,
             sources = cur.fetchall()
 
         for src in sources:
+            # THREE OUTCOMES, NEVER TWO. "fetched and fine", "fetched with
+            # errors" and "still fetching / could not fetch" are three states,
+            # and the one that used to disappear was the one needing attention:
+            # the record was only written AFTER the try/except, so a source
+            # hanging mid-fetch contributed no row at all. It showed up only as
+            # the arithmetic gap between sources_fetched and len(sources),
+            # which no view computes.
+            #
+            # So the row is appended and PERSISTED BEFORE the fetch starts, as
+            # status='fetching', then updated IN PLACE on completion. A hang
+            # now stays visibly in flight. Cost: one extra news_runs UPDATE per
+            # source (bounded by the source count, ~17), each committed on its
+            # own — no transaction is held open across the network fetch.
             src_stats = {"id": str(src["id"]), "name": src["name"],
+                         "status": "fetching",
                          "articles": 0, "new": 0, "updated": 0, "error": None}
+            stats["per_source"].append(src_stats)
+            if run_id:
+                _update_run(conn, run_id, stats)
             try:
                 articles, fetch_error = _fetch_feed(src["url"], src["parser"])
                 if fetch_error:
@@ -692,16 +709,26 @@ def fetch_all_sources(run_id: Optional[str] = None,
                     # in the run record.
                     src_stats["error"] = fetch_error
                     log.warning("[news] source %r: %s", src["name"], fetch_error)
+                src_stats["status"] = "error" if fetch_error else "ok"
                 src_stats["articles"] = len(articles)
                 stats["articles_seen"] += len(articles)
                 stats["sources_fetched"] += 1
 
+                # The stored source status must say what THIS run saw. It used
+                # to be a hardcoded 'ok' on any path that did not raise, so a
+                # feed that soft-failed every run was stored clean — and the
+                # Sources panel (which renders last_status/last_error) then
+                # contradicted the per_source row for the same run.
                 with conn.cursor() as cur:
                     cur.execute(
                         """UPDATE news_sources
-                              SET last_fetched_at = now(), last_status = 'ok', last_error = NULL
+                              SET last_fetched_at = now(),
+                                  last_status = %s,
+                                  last_error = %s
                             WHERE id = %s""",
-                        (src["id"],),
+                        (src_stats["status"],
+                         fetch_error[:500] if fetch_error else None,
+                         src["id"]),
                     )
                     conn.commit()
 
@@ -717,6 +744,7 @@ def fetch_all_sources(run_id: Optional[str] = None,
                         stats["items_updated"] += 1
             except Exception as e:
                 log.warning("[news] source %r failed: %s", src["name"], e)
+                src_stats["status"] = "error"
                 src_stats["error"] = str(e)
                 with conn.cursor() as cur:
                     cur.execute(
@@ -728,7 +756,9 @@ def fetch_all_sources(run_id: Optional[str] = None,
                         (str(e)[:500], src["id"]),
                     )
                     conn.commit()
-            stats["per_source"].append(src_stats)
+            # src_stats is the SAME object already in stats["per_source"], so
+            # this persists the in-place update rather than appending a second
+            # row for the source.
             if run_id:
                 _update_run(conn, run_id, stats)
 
@@ -753,9 +783,14 @@ def fetch_all_sources(run_id: Optional[str] = None,
 
     stats["items_enriched"] = 0
 
+    # A run where 4 of 17 feeds failed used to emit as an unqualified success:
+    # the subscriber saw sources_fetched and nothing about the ones that did
+    # not work. Count the three outcomes the per-source record now carries.
+    _ps = stats["per_source"]
     _emit_webhook("news_ingest_completed", "news_agent", {
         "run_id": run_id,
         "sources_fetched": stats["sources_fetched"],
+        "sources_failed": sum(1 for s in _ps if s.get("status") == "error"),
         "articles_seen": stats["articles_seen"],
         "items_new": stats["items_new"],
         "items_updated": stats["items_updated"],
@@ -1458,23 +1493,34 @@ def _update_run(conn, run_id: str, stats: dict) -> None:
 
 
 def finish_run(run_id: str, stats: dict, error: Optional[str] = None) -> None:
+    """Close the run record. A FAILED run keeps what the loop already wrote.
+
+    `run_full_cycle` calls this with `{}` when the cycle raised, and every
+    column used to be overwritten with a zero — so the run that most needed
+    explaining was the one whose per-source detail (including the source left
+    in flight) got erased on its way out. Each column is now only written when
+    the caller actually has a value for it; otherwise COALESCE keeps the last
+    thing `_update_run` committed.
+    """
     status = "failed" if error else "completed"
+    per_source = stats.get("per_source")
     with _connect() as conn, conn.cursor() as cur:
         cur.execute(
             """UPDATE news_runs
                   SET status = %s,
                       completed_at = now(),
-                      sources_fetched = %s,
-                      articles_seen   = %s,
-                      items_new       = %s,
-                      items_updated   = %s,
-                      items_enriched  = %s,
-                      per_source      = %s::jsonb,
+                      sources_fetched = COALESCE(%s, sources_fetched),
+                      articles_seen   = COALESCE(%s, articles_seen),
+                      items_new       = COALESCE(%s, items_new),
+                      items_updated   = COALESCE(%s, items_updated),
+                      items_enriched  = COALESCE(%s, items_enriched),
+                      per_source      = COALESCE(%s::jsonb, per_source),
                       error           = %s
                 WHERE id = %s::uuid""",
-            (status, stats.get("sources_fetched", 0), stats.get("articles_seen", 0),
-             stats.get("items_new", 0), stats.get("items_updated", 0),
-             stats.get("items_enriched", 0), Json(stats.get("per_source", [])),
+            (status, stats.get("sources_fetched"), stats.get("articles_seen"),
+             stats.get("items_new"), stats.get("items_updated"),
+             stats.get("items_enriched"),
+             Json(per_source) if per_source is not None else None,
              (error or "")[:1000] if error else None, run_id),
         )
         conn.commit()

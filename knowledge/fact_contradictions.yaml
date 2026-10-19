@@ -1,0 +1,233 @@
+# Contradictions visible only when derived facts are read TOGETHER.
+#
+# Every probe in fact_probes.py judges one claim in isolation, and every one of
+# them can be individually right while the set as a whole is nonsense. A real
+# build's ledger held, all at confidence 0.9:
+#
+#   endpoint    /s/{resourceKey}/_/download/resources/...   (a TEMPLATE)
+#   method      OPTIONS accepted on /<other-product>/browse  (wrong product)
+#   input_field 'command' changed the status 200 -> 404      (wrong vuln class)
+#
+# No single probe was in a position to notice. This file is where a reader that
+# sees the whole fact set is told what "does not make sense" looks like.
+#
+# WHAT AN OPERATOR CAN CHANGE HERE: the DATA. Add a product's route markers, a
+# parameter name that belongs to a vuln class, a freshness TTL, a class whose
+# payload lives in the path. Those take effect on reload with no code change.
+# Adding a new KIND of check needs a `check:` implementation in
+# etl/fact_contradictions.py — deliberately, because a free-form expression
+# language in YAML is just code with no tests.
+#
+# severity:
+#   high   — the fact set is self-inconsistent. Acted on before a build spends
+#            itself, and shown to the operator either way.
+#   medium — suspicious, worth reading, not disqualifying on its own.
+#
+# action — what the caller DOES about it. Severity alone is too blunt: one of
+# these contradictions should UNBLOCK a build rather than block it, and a
+# single "high means stop" would have the challenger stall builds it was meant
+# to rescue.
+#   clear      — the value is unusable as it stands; drop it so the gate asks
+#                recon for a real one.
+#   downgrade  — the value may be right but is not evidence; mark it unverified
+#                so it must be re-proven before synthesis relies on it.
+#   relax_auth — the auth precondition is wrong; stop waiting for a session.
+#   warn       — record it, change nothing. The honest answer when the finding
+#                is a hint rather than a proof.
+#
+# Loaded into rag_documents by etl/load_knowledge_documents.py (renderer
+# `fact_contradictions`) so the planner can RECALL why a fact was challenged,
+# and evaluated deterministically by etl/fact_contradictions.py. Retrieval
+# explains; the deterministic pass decides. Never the other way round.
+
+version: 1
+
+rules:
+
+  - id: placeholder_unsubstituted
+    action: clear
+    check: placeholder_in_value
+    severity: high
+    fields: [endpoint, input_field, method, canary]
+    message: >-
+      {item} is still a TEMPLATE, not a value: {value}
+    why: >-
+      Advisories publish routes with placeholders. A probe sent one verbatim and
+      the target answered, so a template was recorded as a verified endpoint. A
+      value containing a brace, an angle bracket or an ellipsis has not been
+      resolved and cannot be attacked or proven.
+    remedy: >-
+      Resolve the placeholder from live recon (a crawl URL that matches the
+      shape), from the app's own self-documentation, or from the advisory's
+      worked example — then re-probe.
+
+  - id: route_belongs_to_another_product
+    action: downgrade
+    check: route_product_mismatch
+    severity: high
+    # path marker -> the product that owns it. Matched case-insensitively as a
+    # path segment, so /bamboo/ matches but /bamboosupport does not.
+    route_markers:
+      bamboo: bamboo
+      confluence: confluence
+      jira: jira
+      bitbucket: bitbucket
+      crowd: crowd
+      wp-admin: wordpress
+      wp-content: wordpress
+      wp-json: wordpress
+      phpmyadmin: phpmyadmin
+      jenkins: jenkins
+      grafana: grafana
+      zabbix: zabbix
+      nagios: nagios
+      solr: solr
+      jolokia: jolokia
+      actuator: spring-boot
+      manager/html: tomcat
+      xmlrpc.php: wordpress
+    message: >-
+      endpoint {value} carries a route marker for '{owner}', but the target was
+      fingerprinted as '{product}'
+    why: >-
+      A build drifted onto another product's route on the same host and the
+      OPTIONS probe confirmed it, because the probe only asks "did this answer".
+      A reverse proxy fronting several apps makes this easy to do and invisible
+      to any single check. Attacking the wrong product's route cannot prove the
+      CVE under test no matter how well it responds.
+    remedy: >-
+      Re-derive the endpoint for the fingerprinted product. If the host really
+      does serve both, the other product is a separate asset and a separate CVE.
+
+  - id: path_class_with_a_query_parameter
+    action: clear
+    check: field_kind_mismatch
+    severity: high
+    # Which classes inject through the URL PATH is answered by the class table
+    # (knowledge/vuln_classes.yaml, `injects_via: [path]`), not restated here.
+    # The copy that used to live here listed `lfi`, which injects through a
+    # parameter, and this rule's action is `clear` — so it deleted the real
+    # injection point on every LFI build.
+    message: >-
+      vuln_class '{vuln_class}' injects through the URL PATH, but input_field is
+      set to the query parameter '{value}'
+    why: >-
+      A traversal has no parameter to find. When the gate reported input_field
+      missing for one, the follow-up sent deep recon to run parameter discovery,
+      which found nothing and could not have. A parameter recorded for a
+      path-based class is either a leftover from another class or a guess.
+    remedy: >-
+      Drop the parameter. Confirm the vulnerable ROUTE and craft the traversal
+      into the path.
+
+  - id: parameter_name_belongs_to_another_class
+    action: warn
+    check: field_name_class_mismatch
+    severity: medium
+    # Parameter names strongly associated with a vuln class. A name on this list
+    # under a DIFFERENT class is a sign the field came from the wrong advisory.
+    class_field_hints:
+      cmdi: [cmd, command, exec, shell, run, ping, host, ip, system]
+      sqli: [id, uid, user_id, order, sort, orderby, query, filter, search]
+      lfi: [file, path, page, doc, document, template, include, view, download]
+      ssrf: [url, uri, target, dest, redirect, next, callback, webhook, feed, proxy]
+      xxe: [xml, data, payload, import, soap]
+      ssti: [template, name, greeting, msg, message]
+      upload: [file, upload, filename, attachment, avatar, image]
+    message: >-
+      input_field '{value}' is a classic '{hint_class}' parameter but vuln_class
+      is '{vuln_class}'
+    why: >-
+      A parameter named `command` was confirmed at 0.9 on a path-traversal CVE
+      because supplying it flipped the status. The name is evidence about which
+      advisory it came from, and that advisory was not this one.
+    remedy: >-
+      Check the advisory for THIS CVE names this parameter. If it does, the hint
+      is a coincidence and the fact stands — this is medium, not disqualifying.
+
+  - id: auth_required_but_answered_unauthenticated
+    action: relax_auth
+    check: auth_contradiction
+    severity: high
+    # Statuses that mean "this did NOT require a session".
+    unauthenticated_ok_statuses: [200, 201, 204, 206, 301, 302, 303, 307, 308]
+    message: >-
+      the gate holds 'authentication required', but {evidence_item} answered
+      HTTP {status} with no session
+    why: >-
+      A pre-authentication CVE is described as "unauthenticated" and the gate's
+      substring matcher read the word "authentication" inside it. The build then
+      blocked waiting for a session it never needed. The target's own answer is
+      better evidence than the wording of a description.
+    remedy: >-
+      Treat the endpoint as pre-auth. If a session is genuinely needed for the
+      exploit but not for the route, record that distinction explicitly.
+
+  - id: fact_survived_no_control
+    # `warn`, NOT `downgrade`. A matched control means "I could not establish
+    # this", which is NOT "this is false" -- and `downgrade` sets the item
+    # unverified, which the gate reads as MISSING and blocks the build.
+    #
+    # Observed live 2026-10-16 on a path-traversal against an Atlassian host:
+    # the app soft-404s, so the control matches EVERY time, so the item was
+    # permanently missing and the run stopped at gather with 0 iterations.
+    # The previous run, without the challenger, reached refine and spent 6.
+    # Blocking forever on an app that answers everything identically makes the
+    # class unbuildable there, which is a worse answer than proceeding with
+    # the fact declared unproven.
+    #
+    # The confidence floor already renders an unproven fact as an ASSUMPTION
+    # in the synth prompt, which is the honest treatment. `downgrade` stays
+    # right for a fact that is WRONG (another product's route), not one that
+    # is merely unestablished.
+    action: warn
+    check: control_matched
+    severity: high
+    message: >-
+      {item} was marked gathered, but its probe reported the target answers a
+      nonsense value identically -- treat it as an ASSUMPTION, not a fact
+    why: >-
+      A probe whose negative control matched did not test anything. Treating its
+      result as a gathered fact reintroduces exactly the blindness the controls
+      were added to remove.
+    remedy: >-
+      Find a value the target distinguishes, or carry the fact as an explicit
+      assumption rather than as evidence.
+
+  - id: endpoint_never_observed_live
+    action: warn
+    check: endpoint_not_observed
+    severity: medium
+    message: >-
+      endpoint {value} came from '{source}' and appears in none of this run's
+      crawl, ZAP, OpenAPI or href recon
+    why: >-
+      An endpoint the model proposed and nothing ever saw is the single most
+      common way a build attacks a URL that does not exist. It is medium rather
+      than high because recon coverage is partial by nature — an unseen path may
+      simply be one nothing crawled.
+    remedy: >-
+      Probe it explicitly, or prefer a candidate the crawl actually returned.
+
+  - id: fact_is_stale
+    action: downgrade
+    check: stale_fact
+    severity: medium
+    # Per-item freshness. Seconds. A fact older than this is a guess wearing a
+    # tick — see fact_provenance's TTL note. 0 disables the check for an item.
+    ttl_seconds:
+      session_valid: 900
+      target_reachable: 3600
+      endpoint: 86400
+      input_field: 86400
+      method: 86400
+    message: >-
+      {item} was last observed {age_seconds}s ago, past its {ttl}s freshness
+      window
+    why: >-
+      Reused recon is cheaper than re-running it and is the right default, but a
+      reused fact must carry its age. A session that was valid an hour ago is not
+      a session, and a route that existed yesterday may have been patched today.
+    remedy: >-
+      Re-probe this single fact (cheap) rather than re-running the whole recon
+      suite, or accept it with the age recorded against the finding.

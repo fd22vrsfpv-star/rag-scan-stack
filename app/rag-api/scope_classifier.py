@@ -55,7 +55,13 @@ class ScopeClassifier:
         db_rules = []
         if cur:
             try:
-                cur.execute("SELECT id, name, scope_name, priority, rule_type, conditions, auto_apply FROM scope_classification_rules WHERE enabled = true ORDER BY priority")
+                # ORDER BY priority ASC, and _check_rules returns on the
+                # FIRST match: the SMALLEST number wins. The column name says
+                # the opposite to anyone authoring a rule — one created at 60
+                # to beat a rule at 50 never fired (2026-10-12). Spelled out
+                # here because this line and the sort below are where the
+                # direction is actually decided.
+                cur.execute("SELECT id, name, scope_name, priority, rule_type, conditions, auto_apply FROM scope_classification_rules WHERE enabled = true ORDER BY priority ASC")
                 for row in cur.fetchall():
                     db_rules.append({
                         "id": str(row["id"]),
@@ -73,6 +79,10 @@ class ScopeClassifier:
         # Merge: DB rules override YAML rules with same id
         db_ids = {r["id"] for r in db_rules}
         merged = db_rules + [r for r in self._yaml_rules if r.get("id") not in db_ids]
+        # Ascending: lower priority is evaluated FIRST (see the query above).
+        # The default of 100 therefore puts an unprioritised rule LAST, which
+        # is the safe end — a rule with no stated opinion must not pre-empt
+        # one that was placed deliberately.
         self._yaml_rules = sorted(merged, key=lambda r: r.get("priority", 100))
         self._loaded = True
         return len(self._yaml_rules)

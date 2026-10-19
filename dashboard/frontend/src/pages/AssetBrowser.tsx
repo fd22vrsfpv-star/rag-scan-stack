@@ -1628,6 +1628,9 @@ export default function AssetBrowser() {
   // render it inline there.
   const resolveExploit = useResolveExploit()
   const [resolveMsg, setResolveMsg] = useState<Record<string, string>>({})
+  // Which CVE the per-software actions act on. Keyed by software row, so
+  // one product's choice does not move another's. Defaults to the newest.
+  const [selCve, setSelCve] = useState<Record<string, string>>({})
   const buildPoc = useBuildPoc()
   const [pocMsg, setPocMsg] = useState<Record<string, string>>({})
   const [selectedProducts, setSelectedProducts] = useState<Set<string>>(new Set())
@@ -2753,79 +2756,103 @@ export default function AssetBrowser() {
                                   {hasCve && (
                                     <div className="col-span-2 mt-1 pt-1 border-t border-border/30 space-y-1 max-w-full overflow-hidden">
                                       <span className="text-red-400 font-medium text-[11px]">CVE/Exploit Flags:</span>
-                                      <div className="flex flex-wrap gap-1 max-w-full overflow-hidden">
-                                        {sw.cve_flags!.slice(0, 10).map((f: any, fi: number) => {
-                                          // Extract CVE IDs from the title
-                                          const cveMatch = (f.title || '').match(/CVE-\d{4}-\d+/g) || []
-                                          const edbMatch = (f.title || '').match(/EDB-\d+/g) || []
-                                          return (
-                                            <div key={fi} className="text-[10px] max-w-full">
-                                              {cveMatch.slice(0, 2).map((cid: string) => (
-                                                <a key={cid} href={`https://nvd.nist.gov/vuln/detail/${cid}`} target="_blank" rel="noopener noreferrer"
-                                                  className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded border border-red-500/40 text-red-400 hover:bg-red-500/10 mr-1 whitespace-nowrap">
-                                                  {cid} <ExternalLink className="h-2 w-2" />
+                                      {(() => {
+                                        // ONE control for the whole row, not a
+                                        // Resolve/Build pair per CVE. The old
+                                        // layout ran two separate .map()s over
+                                        // the same list — chips first, then the
+                                        // button pairs — so with two CVEs you
+                                        // got four buttons in a flat row with
+                                        // nothing tying a button to its CVE.
+                                        const rowKey = `${sw.ip}:${sw.product}:${sw.version || ''}`
+                                        const allCves: string[] = Array.from(new Set(
+                                          (sw.cve_flags || []).flatMap((f: any) =>
+                                            ((f.title || '').match(/CVE-\d{4}-\d+/g) || []) as string[])))
+                                        // Newest first: year desc, then sequence
+                                        // desc. String sort puts CVE-2009 above
+                                        // CVE-2024 once the sequence lengths
+                                        // differ, so compare the parts as numbers.
+                                        allCves.sort((a, b) => {
+                                          const [, ay, an] = a.match(/CVE-(\d{4})-(\d+)/)!
+                                          const [, by, bn] = b.match(/CVE-(\d{4})-(\d+)/)!
+                                          return Number(by) - Number(ay) || Number(bn) - Number(an)
+                                        })
+                                        const allEdb: string[] = Array.from(new Set(
+                                          (sw.cve_flags || []).flatMap((f: any) =>
+                                            ((f.title || '').match(/EDB-\d+/g) || []) as string[])))
+                                        const sel = selCve[rowKey] || allCves[0]
+                                        const rk = `${sw.ip}:${sel}`
+                                        const plain = (sw.cve_flags || []).filter((f: any) =>
+                                          !/CVE-\d{4}-\d+/.test(f.title || '') && !/EDB-\d+/.test(f.title || ''))
+                                        if (!allCves.length && !allEdb.length && !plain.length) return null
+                                        return (
+                                          <div className="flex flex-wrap items-center gap-1.5 max-w-full">
+                                            {allCves.length > 0 && (
+                                              <>
+                                                <select
+                                                  value={sel}
+                                                  onChange={e => setSelCve(m => ({ ...m, [rowKey]: e.target.value }))}
+                                                  title={allCves.length > 1
+                                                    ? `${allCves.length} CVEs on this product — newest first`
+                                                    : sel}
+                                                  className="h-6 px-1 rounded border border-red-500/40 bg-background text-red-400 text-[10px] max-w-[190px]"
+                                                >
+                                                  {allCves.map(cid => (
+                                                    <option key={cid} value={cid}>{cid}</option>
+                                                  ))}
+                                                </select>
+                                                <a href={`https://nvd.nist.gov/vuln/detail/${sel}`}
+                                                   target="_blank" rel="noopener noreferrer"
+                                                   title={`Open ${sel} on NVD`}
+                                                   className="inline-flex items-center px-1 py-0.5 rounded border border-red-500/40 text-red-400 hover:bg-red-500/10">
+                                                  <ExternalLink className="h-2.5 w-2.5" />
                                                 </a>
-                                              ))}
-                                              {cveMatch.slice(0, 2).map((cid: string) => {
-                                                const rk = `${sw.ip}:${cid}`
-                                                return (
-                                                  <span key={`r-${cid}`} className="inline-flex items-center">
-                                                    <button
-                                                      onClick={() => {
-                                                        setResolveMsg(m => ({ ...m, [rk]: 'resolving…' }))
-                                                        resolveExploit.mutate(
-                                                          { cve: cid, ip: sw.ip, port: sw.port ?? undefined, product: sw.product, version: sw.version || undefined },
-                                                          {
-                                                            onSuccess: (r) => setResolveMsg(m => ({ ...m, [rk]: r.method === 'none' ? 'no exploit found' : `→ ${r.method} queued` })),
-                                                            onError: () => setResolveMsg(m => ({ ...m, [rk]: 'failed' })),
-                                                          },
-                                                        )
-                                                      }}
-                                                      className="ml-0.5 mr-1 px-1 py-0.5 rounded border border-primary/40 text-primary hover:bg-primary/10 text-[9px] whitespace-nowrap"
-                                                      title="Resolve a targeted exploit (Metasploit → ExploitDB → synthesize) and queue it for approval"
-                                                    >⚡ Resolve</button>
-                                                    {resolveMsg[rk] && <span className="text-[9px] text-muted-foreground mr-1">{resolveMsg[rk]}</span>}
-                                                    <button
-                                                      onClick={() => {
-                                                        // Navigate into the Exploit Workbench with the Build-PoC
-                                                        // form pre-seeded, instead of fire-and-forget. Operator
-                                                        // reviews + clicks Build inside the Workbench.
-                                                        const qs = new URLSearchParams()
-                                                        qs.set('tab', 'workbench')
-                                                        qs.set('cve', cid)
-                                                        if (sw.product) qs.set('product', sw.product)
-                                                        if (sw.version) qs.set('version', sw.version)
-                                                        if (sw.ip) qs.set('target_url', `http://${sw.ip}${sw.port ? ':' + sw.port : ''}/`)
-                                                        window.open(`/exploits-popout?${qs.toString()}`, '_blank', 'noopener,noreferrer')
-                                                      }}
-                                                      className="ml-0.5 mr-1 px-1 py-0.5 rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 text-[9px] whitespace-nowrap"
-                                                      title="Open this CVE in the Exploit Workbench with the Build-PoC form pre-filled. Review + click Build to kick the loop."
-                                                    >🔨 Build PoC</button>
-                                                    {pocMsg[rk] && <span className="text-[9px] text-muted-foreground mr-1">{pocMsg[rk]}</span>}
-                                                  </span>
-                                                )
-                                              })}
-                                              {edbMatch.slice(0, 1).map((eid: string) => (
-                                                <a key={eid} href={`https://www.exploit-db.com/exploits/${eid.replace('EDB-','')}`} target="_blank" rel="noopener noreferrer"
-                                                  className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded border border-orange-500/40 text-orange-400 hover:bg-orange-500/10 mr-1">
-                                                  {eid} <ExternalLink className="h-2 w-2" />
-                                                </a>
-                                              ))}
-                                              {!cveMatch.length && !edbMatch.length && (
-                                                <span className="text-red-300 truncate max-w-xs" title={f.title}>
-                                                  {f.title?.slice(0, 40)}
-                                                  {(f.title?.length || 0) > 40 && '...'}
-                                                </span>
-                                              )}
-                                            </div>
-                                          )
-                                        })}
-                                        {(sw.cve_flags?.length || 0) > 10 && (
-                                          <span className="text-[10px] text-muted-foreground px-1.5 py-0.5">
-                                            +{(sw.cve_flags?.length || 0) - 10} more
-                                          </span>
-                                        )}
-                                      </div>
+                                                <button
+                                                  onClick={() => {
+                                                    setResolveMsg(m => ({ ...m, [rk]: 'resolving…' }))
+                                                    resolveExploit.mutate(
+                                                      { cve: sel, ip: sw.ip, port: sw.port ?? undefined, product: sw.product, version: sw.version || undefined },
+                                                      {
+                                                        onSuccess: (r) => setResolveMsg(m => ({ ...m, [rk]: r.method === 'none' ? 'no exploit found' : `→ ${r.method} queued` })),
+                                                        onError: () => setResolveMsg(m => ({ ...m, [rk]: 'failed' })),
+                                                      },
+                                                    )
+                                                  }}
+                                                  className="px-1.5 py-0.5 rounded border border-primary/40 text-primary hover:bg-primary/10 text-[10px] whitespace-nowrap"
+                                                  title={`Resolve a targeted exploit for ${sel} (Metasploit → ExploitDB → synthesize) and queue it for approval`}
+                                                >⚡ Resolve</button>
+                                                <button
+                                                  onClick={() => {
+                                                    const qs = new URLSearchParams()
+                                                    qs.set('tab', 'workbench')
+                                                    qs.set('cve', sel)
+                                                    if (sw.product) qs.set('product', sw.product)
+                                                    if (sw.version) qs.set('version', sw.version)
+                                                    if (sw.ip) qs.set('target_url', `http://${sw.ip}${sw.port ? ':' + sw.port : ''}/`)
+                                                    window.open(`/exploits-popout?${qs.toString()}`, '_blank', 'noopener,noreferrer')
+                                                  }}
+                                                  className="px-1.5 py-0.5 rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 text-[10px] whitespace-nowrap"
+                                                  title={`Open the Exploit Workbench with the Build-PoC form pre-filled for ${sel}. It does NOT start a build — review the form and press Build there.`}
+                                                >🔨 Open form</button>
+                                                {resolveMsg[rk] && <span className="text-[10px] text-muted-foreground">{resolveMsg[rk]}</span>}
+                                                {pocMsg[rk] && <span className="text-[10px] text-muted-foreground">{pocMsg[rk]}</span>}
+                                              </>
+                                            )}
+                                            {allEdb.slice(0, 3).map(eid => (
+                                              <a key={eid} href={`https://www.exploit-db.com/exploits/${eid.replace('EDB-', '')}`}
+                                                 target="_blank" rel="noopener noreferrer"
+                                                 className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded border border-orange-500/40 text-orange-400 hover:bg-orange-500/10 text-[10px]">
+                                                {eid} <ExternalLink className="h-2 w-2" />
+                                              </a>
+                                            ))}
+                                            {plain.slice(0, 2).map((f: any, i: number) => (
+                                              <span key={i} className="text-[10px] text-red-300 truncate max-w-xs" title={f.title}>
+                                                {f.title?.slice(0, 40)}{(f.title?.length || 0) > 40 && '…'}
+                                              </span>
+                                            ))}
+                                          </div>
+                                        )
+                                      })()}
                                     </div>
                                   )}
                                 </div>

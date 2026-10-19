@@ -35,6 +35,7 @@ DB_DSN = os.environ.get("DB_DSN", "postgresql://app:app@rag-postgres:5432/scans"
 # These are NOT collected-per-engagement data, so they need no engagement_id and are
 # intentionally kept across a data purge.
 ENG_ATTR_EXEMPT = {
+    "cve_class_resolutions": "a CVE's resolved vulnerability class -- knowledge about the CVE, shared across engagements",
     "burp_followup_queue": "follow-up export queue — an action item, not collected data",
     "port_access_advice": "technique/advice ('what to try on this service') — reusable across engagements",
     "scope_conflicts": "scope-overlap rows that SPAN engagements by design",

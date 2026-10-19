@@ -11,12 +11,14 @@ import { useApiKeys, useUpsertApiKey, useDeleteApiKey } from '@/api/apiKeys'
 import { useMcpServers, useAddMcpServer, useToggleMcpServer, useDeleteMcpServer, useUpdateMcpoConfig } from '@/api/mcpServers'
 import type { McpServer } from '@/api/mcpServers'
 import { useExploitWatcherSettings, useUpdateExploitWatcherSettings, type ExploitWatcherSettings } from '@/api/exploitWatcher'
+import { useExploitModels } from '@/api/exploits'
 import { useReconnectWatcherSettings, useUpdateReconnectWatcherSettings, type ReconnectWatcherSettings } from '@/api/reconnectWatcher'
 import { useNodeAnalysis, useNodeCleanup, type CleanupOptions, type NodeAnalysis } from '@/api/maintenance'
 import { useScanDefaultsStore, type ScanProfile } from '@/stores/scanDefaults'
 import { useUIStore, ALPHA_FEATURES } from '@/stores/ui'
 import { apiFetch } from '@/api/client'
 import { cn } from '@/lib/utils'
+import { readResearchModels, writeResearchModels, RESEARCH_MODELS_MAX } from '@/lib/researchModels'
 import { BUILD_VERSION, SCAN_CATEGORIES, SCAN_FIELDS, TARGET_FIELD_KEYS, TOOL_CLI_OPTIONS } from '@/lib/constants'
 import { Trash2, Download, X, Search, RefreshCw, Eye, EyeOff, Plus, Upload, Loader2, CheckCircle2, XCircle, Database, Wifi, Server, ArrowRightLeft, BarChart3, RotateCcw, ChevronDown, ChevronRight, Zap, Power, PowerOff, Shield, Info } from 'lucide-react'
 
@@ -3907,6 +3909,100 @@ function RateLimitBackoffSection() {
   )
 }
 
+// Exploit-research model fanout (1-3 LLMs, compared at a post-review step).
+// The same selection the Exploit Workbench's inline chip row edits -- both
+// read/write the one localStorage key via lib/researchModels, so this tab is
+// the place to set it and the workbench is the place to tweak it per run.
+//
+// It is BROWSER-LOCAL on purpose and the UI says so: unlike every other
+// control on this page it is not persisted server-side, so it does not apply
+// to other operators, other browsers, or an agent run nobody is watching.
+function ResearchModelsSection() {
+  const [models, setModels] = useState<string[]>(() => readResearchModels())
+  const exploitModels = useExploitModels()
+
+  const update = (next: string[]) => {
+    setModels(next)
+    writeResearchModels(next)
+  }
+  const add = (m: string) => {
+    const t = m.trim()
+    if (!t || models.includes(t) || models.length >= RESEARCH_MODELS_MAX) return
+    update([...models, t])
+  }
+
+  return (
+    <div className="border-t border-border pt-4 space-y-2">
+      <div className="flex items-center gap-2 flex-wrap">
+        <h3 className="text-sm font-semibold">Exploit Research — Compare Models</h3>
+        <span className="text-[10px] px-1.5 py-0.5 rounded border border-amber-500/40 text-amber-300 bg-amber-500/10">
+          Local to this browser
+        </span>
+        <InfoTip text="Runs the SAME exploit-research prompt through up to 3 LLMs and compares them at a post-review step. Empty = one call, the llm_query route decides the model." />
+      </div>
+
+      <div className="text-xs text-muted-foreground space-y-1">
+        <p>
+          <strong>This setting is stored in this browser only</strong> (localStorage key
+          <code className="px-1">workbench.researchModels</code>) — it is not saved to the
+          database, does not apply to other operators or machines, and is lost if you clear
+          site data. Every other setting on this page is stack-wide; this one is not.
+        </p>
+        <p>
+          Applies to <strong>Exploits → Workbench → “Research only”</strong>, where the same
+          picker also appears inline. Leaving it empty keeps single-model behaviour.
+        </p>
+        <p>
+          Picking 3 models runs 3 generations plus a comparison call — on the local 30B+
+          models that routinely exceeds two minutes before results appear.
+        </p>
+      </div>
+
+      <div className="flex items-center gap-1 flex-wrap pt-1">
+        {models.length === 0 && (
+          <span className="text-[11px] text-muted-foreground">none — single call (route decides)</span>
+        )}
+        {models.map(m => (
+          <span key={m} className="h-6 px-1.5 rounded bg-purple-500/15 text-purple-200 text-[11px] inline-flex items-center gap-1">
+            {m}
+            <button className="text-purple-300/70 hover:text-purple-100"
+                    onClick={() => update(models.filter(x => x !== m))}
+                    title={`Remove ${m}`}>×</button>
+          </span>
+        ))}
+        {models.length < RESEARCH_MODELS_MAX && (
+          <select value="" onChange={e => { add(e.target.value); e.currentTarget.value = '' }}
+                  className="h-6 bg-background border border-border rounded text-[11px] px-1">
+            <option value="">+ add model…</option>
+            {(exploitModels.data?.local || []).map(m => (
+              <option key={`l-${m}`} value={m} disabled={models.includes(m)}>local: {m}</option>
+            ))}
+            {exploitModels.data?.cloud_default && !models.includes(exploitModels.data.cloud_default) && (
+              <option value={exploitModels.data.cloud_default}>cloud: {exploitModels.data.cloud_default}</option>
+            )}
+          </select>
+        )}
+        {models.length > 0 && (
+          <button onClick={() => update([])}
+                  className="h-6 px-2 rounded border border-border text-[11px] text-muted-foreground hover:text-foreground">
+            Clear
+          </button>
+        )}
+      </div>
+      {exploitModels.isError && (
+        <div className="text-[11px] text-red-400">
+          Could not list models (/exploit-store/meta/models). Any already-picked models above still apply.
+        </div>
+      )}
+      {!exploitModels.isError && exploitModels.data && !exploitModels.data.has_local && (
+        <div className="text-[11px] text-muted-foreground">
+          No local ollama models are available — only the routed cloud default can be picked.
+        </div>
+      )}
+    </div>
+  )
+}
+
 function LLMTuningTab() {
   const [data, setData] = useState<Record<string, TuningEntry> | null>(null)
   const [draft, setDraft] = useState<Record<string, string>>({})
@@ -3971,6 +4067,8 @@ function LLMTuningTab() {
     <div className="space-y-4">
       {/* Provider / model / API-key selection (moved here from the General tab) */}
       <LlmBackendSection backend={llmBackend} onBackendChange={setLlmBackend} />
+
+      <ResearchModelsSection />
 
       <div className="border-t border-border pt-4">
         <h3 className="text-sm font-semibold mb-1">Generation Parameters</h3>
@@ -5915,6 +6013,14 @@ function SearchResults({ query, onNavigate }: {
     },
 
     // LLM Tuning Tab
+    {
+      tab: 'llm-tuning',
+      tabLabel: 'LLM Tuning',
+      title: 'Exploit Research \u2014 Compare Models (browser-local)',
+      description: 'Pick 1-3 LLMs to run the same exploit-research prompt through and compare. Stored in this browser only, not in the database.',
+      keywords: ['compare', 'models', 'model', 'research', 'exploit', 'workbench', 'fanout',
+                 'three', '3', 'multi', 'llm', 'ollama', 'local', 'browser', 'localstorage']
+    },
     {
       tab: 'llm-tuning',
       tabLabel: 'LLM Tuning',

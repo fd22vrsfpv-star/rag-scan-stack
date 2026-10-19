@@ -70,20 +70,56 @@ def _dict_literal(src: str, name: str):
 
 def test_craft_class_guidance_has_no_duplicate_keys():
     """A duplicate key is silently dropped by Python — only the last survives."""
-    d = _dict_literal(_src(), "_CRAFT_CLASS_GUIDANCE")
-    keys = [k.value for k in d.keys if isinstance(k, ast.Constant)]
-    dupes = {k for k in keys if keys.count(k) > 1}
+    # The guidance is YAML now (knowledge/craft_guidance.yaml). The loader
+    # used here REJECTS duplicate keys — a YAML mapping drops all but the last
+    # just as a dict literal did — so a duplicate raises inside load_guidance.
+    from _craft_guidance import load_guidance
+    try:
+        load_guidance()
+        dupes = set()
+    except ValueError as e:
+        dupes = {str(e)}
     assert not dupes, (
-        f"duplicate key(s) {sorted(dupes)} in _CRAFT_CLASS_GUIDANCE — the "
+        f"duplicate key(s) {sorted(dupes)} in craft_guidance.yaml — the "
         "earlier entry is dead code that silently never applies"
     )
 
 
-def test_cwe_map_has_no_duplicate_keys():
-    d = _dict_literal(_src(), "_CWE_TO_VULN_CLASS")
-    keys = [k.value for k in d.keys if isinstance(k, ast.Constant)]
-    dupes = {k for k in keys if keys.count(k) > 1}
-    assert not dupes, f"duplicate CWE id(s) {sorted(dupes)} in _CWE_TO_VULN_CLASS"
+
+
+def _vc_mod():
+    """The real class table the classifier now reads."""
+    import sys as _sys
+    from pathlib import Path as _P
+    _sys.path.insert(0, str(_P(__file__).resolve().parent.parent))
+    from etl import vuln_classes as _m
+    return _m
+
+
+def _producible_classes(src):
+    """Every class `_vuln_class_from_cve` can actually return.
+
+    That is EVERY exploitable class, not just the regex table plus unique-CWE
+    ones: `resolve()` matches any class name or alias appearing in the
+    advisory text, so any of them can come back.
+
+    Misconfigurations and disclosures are excluded — they have no payload to
+    craft, which is the whole reason `kind` exists.
+    """
+    return _vc_mod().exploitable_classes()
+
+
+def test_no_class_lists_the_same_cwe_twice():
+    """A CWE may be claimed by SEVERAL classes — CWE-78 is cmdi and rce — but
+    listing it twice inside ONE class is a copy-paste, and the candidate list
+    must be deduped either way."""
+    m = _vc_mod()
+    for name in m.names():
+        ids = m.cwe_ids_for(name)
+        assert len(ids) == len(set(ids)), f"{name} repeats a CWE: {ids}"
+    for cwe in m.load()["by_cwe"]:
+        hits = m.classes_for_cwe(cwe)
+        assert len(hits) == len(set(hits)), cwe
 
 
 # ------------------------------------------------------- F3: sqli guidance
@@ -91,12 +127,9 @@ def test_cwe_map_has_no_duplicate_keys():
 
 def test_sqli_guidance_leads_with_a_reflected_canary():
     """Blind timing must be the documented fallback, not the opening move."""
-    d = _dict_literal(_src(), "_CRAFT_CLASS_GUIDANCE")
-    text = None
-    for k, v in zip(d.keys, d.values):
-        if isinstance(k, ast.Constant) and k.value == "sqli":
-            text = ast.literal_eval(v)
-    assert text, "no `sqli` entry in _CRAFT_CLASS_GUIDANCE"
+    from _craft_guidance import load_guidance
+    text = load_guidance().get("sqli")
+    assert text, "no `sqli` entry in craft_guidance.yaml"
     low = text.lower()
     i_union = min([i for i in (low.find("union"), low.find("expect_regex")) if i != -1] or [-1])
     i_blind = min([i for i in (low.find("sleep("), low.find("min_seconds")) if i != -1] or [-1])
@@ -114,11 +147,8 @@ def test_sqli_guidance_leads_with_a_reflected_canary():
 
 
 def test_sqli_guidance_warns_about_the_two_canary_placement_bugs():
-    d = _dict_literal(_src(), "_CRAFT_CLASS_GUIDANCE")
-    text = ""
-    for k, v in zip(d.keys, d.values):
-        if isinstance(k, ast.Constant) and k.value == "sqli":
-            text = ast.literal_eval(v)
+    from _craft_guidance import load_guidance
+    text = load_guidance().get("sqli", "")
     low = text.lower()
     assert "placeholder" in low, "guidance must forbid leaving a {CANARY} placeholder"
     assert "comment" in low, "guidance must forbid placing the canary only in a SQL comment"
@@ -129,54 +159,79 @@ def test_sqli_guidance_warns_about_the_two_canary_placement_bugs():
 
 def test_classifier_consults_cwe():
     fn = _func(_src(), "_vuln_class_from_cve")
-    assert "_cwe_ids_from_details" in fn and "_CWE_TO_VULN_CLASS" in fn, (
+    assert "_cwe_ids_from_details" in fn and "_vc_resolve" in fn, (
         "_vuln_class_from_cve must read CWE — its docstring claimed to for "
         "months while the code only ever matched the description"
     )
 
 
-def test_cwe_outranks_the_description():
-    """The weighting the operator asked for: a known CWE decides."""
+def test_the_name_outranks_the_cwe_and_both_are_consulted():
+    """INVERTED 2026-10-16, deliberately. This used to assert CWE-first.
+
+    A CWE points at SEVERAL classes — CWE-78 is cmdi and rce, CWE-98 is lfi
+    and rfi — so on its own it often cannot pick one, and letting it overrule
+    an advisory that says "local file inclusion" picked the wrong class. The
+    name is primary; the CWE narrows; `resolve()` does the combination.
+    """
+    m = _vc_mod()
     src = _src()
     fn = _func(src, "_vuln_class_from_cve")
-    assert "_CWE_TO_VULN_CLASS" in fn and "checks" in fn, "expected both paths present"
-    assert fn.index("_CWE_TO_VULN_CLASS") < fn.index("checks = ["), (
-        "the CWE lookup must run BEFORE the description regex table, or prose "
-        "still wins over a curated classification"
-    )
+    assert "_vc_resolve" in fn and "checks" in fn, "expected both paths present"
+    assert fn.index("_vc_resolve") < fn.index("checks = ["), (
+        "resolution must run BEFORE the prose regex table")
+    # The name wins over a CWE that points elsewhere.
+    assert m.resolve("local file inclusion via the page parameter",
+                     ["CWE-22"])["class"] == "lfi"
 
 
-def test_cwe_map_covers_the_classes_the_crafter_understands():
-    """A CWE mapping to a class with no guidance would pick an empty prompt."""
+def test_the_regression_cwe_first_was_added_for_still_works():
+    """CVE-2024-36675 carried CWE-918 and classified `unknown`, and was never
+    attempted. With no naming prose at all the CWE is still the last word,
+    because CWE-918 identifies exactly one class."""
+    m = _vc_mod()
+    r = m.resolve("", ["CWE-918"])
+    assert r["class"] == "ssrf" and r["basis"] == "cwe"
+
+
+def test_every_producible_class_has_craft_guidance():
+    """A class the classifier can RETURN but the crafter has no guidance for
+    picks an empty prompt.
+
+    This widened when the CWE map became one-to-many: six classes (idor, csrf,
+    open-redirect, nosql-injection, ldap-injection, prototype-pollution)
+    became reachable from a unique CWE and had no guidance at all. Widening
+    what the classifier can say without widening what the crafter knows is a
+    regression, not a feature.
+    """
     src = _src()
-    cwe_d = _dict_literal(src, "_CWE_TO_VULN_CLASS")
-    guide_d = _dict_literal(src, "_CRAFT_CLASS_GUIDANCE")
-    guide_keys = {k.value for k in guide_d.keys if isinstance(k, ast.Constant)}
-    mapped = {v.value for v in cwe_d.values if isinstance(v, ast.Constant)}
-    unknown = mapped - guide_keys
-    assert not unknown, (
-        f"_CWE_TO_VULN_CLASS maps to class(es) with no _CRAFT_CLASS_GUIDANCE "
-        f"entry: {sorted(unknown)}"
+    from _craft_guidance import load_guidance
+    guide_keys = set(load_guidance())
+    missing = sorted(_producible_classes(src) - guide_keys)
+    assert not missing, (
+        f"class(es) the classifier can return with no _CRAFT_CLASS_GUIDANCE "
+        f"entry: {missing}"
     )
 
 
 def test_the_regression_cves_map_to_the_right_class():
-    """The specific CWEs from the run that motivated this fix."""
-    d = _dict_literal(_src(), "_CWE_TO_VULN_CLASS")
-    m = {k.value: v.value for k, v in zip(d.keys, d.values)
-         if isinstance(k, ast.Constant) and isinstance(v, ast.Constant)}
+    """The specific CWEs from the run that motivated this fix. Containment,
+    not equality: a CWE may legitimately have more than one owner."""
+    m = _vc_mod()
     # CVE-2024-36675 / CVE-2024-32964 — classified `unknown`, never attempted.
-    assert m.get("CWE-918") == "ssrf"
-    # CVE-2023-51483 / CVE-2024-32511 — privesc.
-    assert m.get("CWE-269") == "auth-bypass"
+    assert "ssrf" in m.classes_for_cwe("CWE-918")
+    # CVE-2023-51483 / CVE-2024-32511 / CVE-2023-37999 — privesc. Its own class
+    # since 2026-10-18 (was auth-bypass): the proof is a granted role in USE,
+    # not a check bypassed, and auth-bypass guidance told 37999 to log in as
+    # the attacker and hunt an IDOR.
+    assert "privilege-escalation" in m.classes_for_cwe("CWE-269")
+    assert "auth-bypass" not in m.classes_for_cwe("CWE-269")
     # CVE-2024-3552 / CVE-2024-36412 / CVE-2024-5314.
-    assert m.get("CWE-89") == "sqli"
+    assert "sqli" in m.classes_for_cwe("CWE-89")
 
 
 def test_ambiguous_cwes_are_deliberately_absent():
     """CWE-20 covers everything from SQLi to overflow — it must not decide."""
-    d = _dict_literal(_src(), "_CWE_TO_VULN_CLASS")
-    keys = {k.value for k in d.keys if isinstance(k, ast.Constant)}
+    keys = set(_vc_mod().load()["by_cwe"])
     assert "CWE-20" not in keys, (
         "CWE-20 (Improper Input Validation) is too broad to pick a payload "
         "family — leaving it unmapped lets the description decide. "
@@ -315,7 +370,7 @@ def test_sink_verification_tail_is_still_auto_added():
 
 def test_vuln_classes_returns_every_mapped_class():
     fn = _func(_src(), "_vuln_classes_from_cve")
-    assert "_CWE_TO_VULN_CLASS" in fn and "_cwe_ids_from_details" in fn
+    assert "_vc_classes_for_cwe" in fn and "_cwe_ids_from_details" in fn
     assert "seen" in fn, "must dedupe while preserving NVD order"
 
 

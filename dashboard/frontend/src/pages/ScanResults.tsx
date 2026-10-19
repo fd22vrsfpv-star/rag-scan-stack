@@ -207,7 +207,7 @@ export default function ScanResults() {
                         {/* A PoC build's note is "CVE-YYYY-NNNNN — <verdict>".
                             Without the CVE every build in a 10-CVE run renders
                             as an identical "cve_poc_builder" row. */}
-                        {pocLabel(a) && (
+                        {(pocLabel(a) || workbenchLabel(a)) && (
                           pocWorkbenchHref(a) ? (
                             <a
                               href={pocWorkbenchHref(a) as string}
@@ -217,7 +217,7 @@ export default function ScanResults() {
                               title="Open this build in the Exploit Workbench pop-out — command, assertion and PoC detail. (Click the rest of the row for the raw run output.)"
                               className="text-[11px] font-sans text-orange-300/90 mt-0.5 inline-flex items-center gap-1 underline decoration-dotted underline-offset-2 hover:text-orange-200"
                             >
-                              {pocLabel(a)}
+                              {pocLabel(a) || workbenchLabel(a)}
                               <ExternalLink className="w-3 h-3 shrink-0" />
                             </a>
                           ) : (
@@ -315,7 +315,16 @@ export default function ScanResults() {
  *  Returns null when there is no CVE or no target to aim at, so the label
  *  stays plain text rather than becoming a link to nowhere. */
 function pocWorkbenchHref(a: import('@/api/artifacts').Artifact): string | null {
-  if (a.tool !== 'cve_poc_builder') return null
+  // ANY result that names a CVE and a target can be worked on, not only a
+  // `cve_poc_builder` row. A nuclei hit, a vuln scan or an imported finding
+  // is exactly the moment an operator wants the workbench — and the gate
+  // meant the one artifact that already HAD a PoC was the only one that
+  // offered to open it. Still returns null without a CVE or a target, so a
+  // row never becomes a link to nowhere.
+  //
+  // The note is preferred over the content: a tool's output can mention a CVE
+  // incidentally (a reference list, a changelog), while the note is what this
+  // run was ABOUT.
   const cve = (a.note?.match(/CVE-\d{4}-\d{4,7}/)?.[0]
     || a.content?.match(/CVE-\d{4}-\d{4,7}/)?.[0] || '').toUpperCase()
   // `target` may be "ip" or "ip:port"; the artifact's own port wins when set.
@@ -332,6 +341,17 @@ function pocWorkbenchHref(a: import('@/api/artifacts').Artifact): string | null 
   // build they are about to work on. Matches the existing Pop-out control.
   return `/exploits-popout?${q.toString()}`
 }
+
+/** Label for a NON-PoC result that still names a CVE — the CVE itself.
+ *  `pocLabel` only speaks for `cve_poc_builder` rows; without this a nuclei
+ *  or vuln-scan row would get a workbench link with nothing to click. */
+function workbenchLabel(a: import('@/api/artifacts').Artifact): string | null {
+  if (a.tool === 'cve_poc_builder') return null
+  const cve = a.note?.match(/CVE-\d{4}-\d{4,7}/)?.[0]
+    || a.content?.match(/CVE-\d{4}-\d{4,7}/)?.[0]
+  return cve ? `Build PoC for ${cve.toUpperCase()}` : null
+}
+
 
 function pocLabel(a: import('@/api/artifacts').Artifact): string | null {
   if (a.tool !== 'cve_poc_builder') return null

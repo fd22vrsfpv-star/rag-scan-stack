@@ -78,22 +78,29 @@ class TestLevenshtein:
         assert _levenshtein("abc", "") == 3
 
     def test_examplecorp_pair(self):
-        assert _levenshtein("examplecorp", "blackbacd") == 1
-        assert _levenshtein("examplecorp", "b1ackbaud") == 1
+        # Each mutant is derived FROM "examplecorp": one substitution apiece.
+        # (The originals were derived from a customer name that the history
+        # scrub renamed; only the first argument carried the literal, so the
+        # mutants were left pointing at a word that no longer appears.)
+        assert _levenshtein("examplecorp", "examplecorq") == 1   # p -> q
+        assert _levenshtein("examplecorp", "examp1ecorp") == 1   # l -> 1
 
 
 @pytest.mark.unit
 class TestConfusableCount:
     def test_single_lookalike_pair(self):
         # 'l' -> '1' is in _HOMOGLYPHS["l"]
-        assert _confusable_char_count("examplecorp", "b1ackbaud") == 1
+        assert _confusable_char_count("examplecorp", "examp1ecorp") == 1
 
     def test_cyrillic_a(self):
-        # 'a' -> cyrillic a (U+0430)
-        assert _confusable_char_count("examplecorp", "blаckbaud") == 1
+        # 'a' -> cyrillic a (U+0430); same length, one confusable position
+        assert _confusable_char_count("examplecorp", "ex\u0430mplecorp") == 1
 
     def test_no_confusable(self):
-        assert _confusable_char_count("examplecorp", "redaud") == 0
+        # No position holds a lookalike pair. ("redaud" scored 1 against
+        # "examplecorp" — an accidental collision once the seed changed,
+        # which is why this now uses a word with no shared confusables.)
+        assert _confusable_char_count("examplecorp", "trustnet") == 0
 
 
 @pytest.mark.unit
@@ -134,10 +141,10 @@ class TestGenerator:
         These are the ones a human researcher would notice first."""
         cands = generate_typosquat_candidates("examplecorp.com", max_candidates=1000)
         domains = {c["domain"].lower() for c in cands}
-        # Edit-1 (character insertion)
-        assert "bllackbaud.com" in domains or "blaackbaud.com" in domains
+        # Edit-1 (character insertion) — a doubled letter from the seed itself
+        assert "exampllecorp.com" in domains or "exaamplecorp.com" in domains
         # Homoglyph l->1
-        assert "b1ackbaud.com" in domains
+        assert "examp1ecorp.com" in domains
         # TLD swap
         assert any(d.startswith("examplecorp.") and d != "examplecorp.com"
                    for d in domains)
@@ -164,18 +171,18 @@ class TestScorer:
 
     def test_idn_always_scores_high(self):
         """Sabotage canary: remove the +0.6 IDN bonus and this fails."""
-        c = self._cand("xn--blckbaud-9za.com", "idn")
+        c = self._cand("xn--exmplecorp-9za.com", "idn")
         result = score_typosquat(c, self.SEED, resolution=None)
         assert result["score"] >= 0.6, (
             f"IDN score should always be >= 0.6, got {result['score']}")
 
     def test_homoglyph_scores_above_half(self):
-        c = self._cand("b1ackbaud.com", "homoglyph")
+        c = self._cand("examp1ecorp.com", "homoglyph")
         result = score_typosquat(c, self.SEED, resolution="unregistered")
         assert result["score"] >= 0.5
 
     def test_resolution_boosts_score(self):
-        c = self._cand("blackbacd.com", "edit1")
+        c = self._cand("examplecorq.com", "edit1")
         no_res = score_typosquat(c, self.SEED, resolution="unregistered")
         res = score_typosquat(c, self.SEED, resolution="resolves")
         assert res["score"] > no_res["score"]
@@ -193,12 +200,12 @@ class TestScorer:
             f"auto-block threshold {TYPOSQUAT_AUTO_BLOCK_AT}")
 
     def test_score_bounded_0_1(self):
-        c = self._cand("xn--blckbaud-9za.com", "idn")
+        c = self._cand("xn--exmplecorp-9za.com", "idn")
         result = score_typosquat(c, self.SEED, resolution="resolves")
         assert 0.0 <= result["score"] <= 1.0
 
     def test_reason_populated(self):
-        c = self._cand("b1ackbaud.com", "homoglyph")
+        c = self._cand("examp1ecorp.com", "homoglyph")
         result = score_typosquat(c, self.SEED, resolution="resolves")
         assert result["reason"]
         assert result["reason"] != "(no signal)"

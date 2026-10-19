@@ -63,6 +63,16 @@ def _run_node_save_store(state, final_command=None, verified=False):
     sys.modules["api"] = fake_api
     sys.modules["webhooks"] = fake_webhooks
     try:
+        # Module-level helpers node_save_store calls. Added 2026-10-16 when
+        # "save the best PoC" introduced _preferred_command / _preferred_
+        # assertion: without them the node raised NameError, which the node's
+        # own `except Exception` swallowed into a WARNING and the test saw as
+        # "no store row was written" — a real defect reported as an empty list.
+        for _helper in ("_preferred_command", "_preferred_assertion"):
+            try:
+                exec(_func_src(_helper), ns)
+            except AssertionError:
+                pass            # helper not present in this revision
         exec(_func_src("node_save_store"), ns)
         ns["node_save_store"](state)
     finally:

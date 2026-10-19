@@ -1,0 +1,139 @@
+# feroxbuster — recursive content discovery with link extraction.
+#
+# The same category as gobuster and ffuf, and the same gap: runs landed as
+# generic dumps with no `notable` facts, because there was no spec here.
+#
+# SHAPES, BOTH REAL (tests/fixtures/feroxbuster_results.txt and
+# tests/fixtures/feroxbuster_ndjson_output.jsonl, captured from this stack):
+#
+#   table (default):
+#     200      GET       79l      159w     2246c http://172.18.0.32:9090/index.php
+#     301      GET        9l       29w      358c http://172.18.0.32:9090/custom => http://172.18.0.32:9090/custom/
+#   --json:
+#     {"type":"response","url":"http://127.0.0.1:8765/index.php",...,"status":200,...}
+#
+# THE TRAP the registry parser already documents: the auto-filter notice uses
+# the SAME column layout and then carries prose instead of a URL —
+#
+#     404      GET        9l       32w      315c Auto-filtering found 404-like response ...
+#
+# so every pattern here requires a `http(s)://` URL in the tail. Counting those
+# notices is how a run that found nothing reports five results.
+#
+# Unlike ffuf, the captured stdout carries no ANSI escapes (feroxbuster drops
+# colour when stdout is not a tty), so the table patterns anchor on `^`.
+#
+# "Could not connect to <url>, skipping..." is printed on STDOUT, which is the
+# only stream the spec runner sees. It is worth a finding of its own: a run that
+# never reached the target measured nothing, and silence there is not evidence
+# that the paths are absent.
+tool: feroxbuster
+description: Recursive content discovery — the URLs feroxbuster reached, and whether it reached the target at all.
+enabled: true
+max_chars: 40000
+
+deterministic:
+  # Every discovered URL, from the table (the size column `<n>c ` is what
+  # precedes it) or from --json (`"url":"..."`). One capture group covers both
+  # shapes, so a run in either mode fills the same field.
+  found_urls:
+    pattern: '(?:\d+c\s+|"url"\s*:\s*")(https?://[^"\s]+)'
+    capture: all
+    type: list
+  # A 3xx whose tail is `<url> => <url>` is a directory that exists; the
+  # redirect to a trailing slash is feroxbuster's own evidence for it.
+  redirect_urls:
+    pattern: '^\s*3\d{2}\s+[A-Z]+\s+\d+l\s+\d+w\s+\d+c\s+(https?://\S+)\s+=>'
+    capture: all
+    type: list
+  # Present but refused — the lead a 404 is not.
+  auth_required_urls:
+    pattern: '^\s*(?:401|403)\s+[A-Z]+\s+\d+l\s+\d+w\s+\d+c\s+(https?://\S+)'
+    capture: all
+    type: list
+  # Presence IS the value: no capture group, so run_deterministic records True
+  # when the line is there rather than evaluating the matched sentence.
+  target_unreachable:
+    pattern: '^Could not connect to \S+, skipping'
+    type: boolean
+
+schema:
+  found_urls:
+    type: list
+    description: absolute URLs feroxbuster reached (table or --json output)
+  redirect_urls:
+    type: list
+    description: URLs that answered 3xx with a redirect target — directories that exist
+  auth_required_urls:
+    type: list
+    description: URLs that answered 401 or 403 — present but refused
+  target_unreachable:
+    type: boolean
+    description: true when feroxbuster could not connect to the target at all
+
+prompt: |
+  Extract what `feroxbuster` reached. Each result line is
+  `<status> <METHOD> <n>l <n>w <n>c <url>`, and a 3xx line adds ` => <url>`
+  naming where it redirects. With `--json`, each `{"type":"response"}` record
+  carries `url` and `status`.
+
+  A line in the result layout whose tail is PROSE rather than a URL is the
+  auto-filter notice, not a result — do not count it.
+
+  Also report whether the run could connect at all: a
+  `Could not connect to <url>, skipping...` line means nothing about the target
+  was measured.
+
+examples:
+  - output: |
+      404      GET        9l       32w      315c Auto-filtering found 404-like response and created new filter; toggle off with --dont-filter
+      200      GET       79l      159w     2246c http://192.0.2.10:9090/index.php
+      301      GET        9l       29w      358c http://192.0.2.10:9090/custom => http://192.0.2.10:9090/custom/
+    extract: |
+      {"found_urls": ["http://192.0.2.10:9090/index.php",
+                      "http://192.0.2.10:9090/custom"],
+       "redirect_urls": ["http://192.0.2.10:9090/custom"]}
+  - output: |
+      Could not connect to http://192.0.2.10/, skipping...
+        => error sending request for url (http://192.0.2.10/)
+    extract: |
+      {"found_urls": [], "target_unreachable": true}
+
+notable:
+  - id: feroxbuster_urls_found
+    when: len(found_urls) > 0
+    severity: info
+    title: "{found_urls} URL(s) discovered by feroxbuster"
+    detail: >
+      Each URL is a reachable endpoint the site did not necessarily link.
+      feroxbuster also extracts links and recurses, so this list reaches
+      directories a flat wordlist run never requests — all of them candidates
+      for manual review.
+    params: [found_urls]
+  - id: feroxbuster_directories_found
+    when: len(redirect_urls) > 0
+    severity: info
+    title: "{redirect_urls} director(y/ies) confirmed by redirect"
+    detail: >
+      A 3xx to the same path with a trailing slash is the server confirming a
+      directory exists. Each one is a branch worth recursing into or browsing
+      by hand, and a candidate for a directory-listing check.
+    params: [redirect_urls]
+  - id: feroxbuster_restricted_urls
+    when: len(auth_required_urls) > 0
+    severity: info
+    title: "{auth_required_urls} URL(s) exist but refused access (401/403)"
+    detail: >
+      A 401/403 proves the resource EXISTS while refusing it, which is a
+      different fact from a 404 and a better lead: these are the targets for an
+      authentication or access-control bypass attempt, not for more brute force.
+    params: [auth_required_urls]
+  - id: feroxbuster_target_unreachable
+    when: target_unreachable == true
+    severity: error
+    title: feroxbuster could not connect to the target
+    detail: >
+      The run never reached the target, so it measured nothing — an empty
+      result here is not evidence that the paths are absent. Check that the
+      host, port and scheme are right and that the runner has a route to the
+      target network before reading anything into the result.

@@ -61,12 +61,34 @@ def _func(name: str) -> ast.FunctionDef:
     return fn
 
 
+
+# The class predicates `_gather_decide` now calls. Injected from the REAL
+# `etl/vuln_classes.py` rather than stubbed, so this exercises the shipped
+# table: the gate and the test cannot disagree about what `lfi` is.
+def _vc_predicates():
+    import sys as _sys
+    from pathlib import Path as _P
+    _sys.path.insert(0, str(_P(__file__).resolve().parent.parent))
+    from etl import vuln_classes as _m
+    return {"_vc_needs_input_field": _m.needs_input_field,
+            "_vc_needs_oob_sink": _m.needs_oob_sink,
+            "_vc_path_is_the_field": _m.path_is_the_field,
+            "_vc_canonical": _m.canonical,
+            "_vc_is_file_read": _m.is_file_read,
+            "_vc_cwe_ids_for": _m.cwe_ids_for,
+            "_vc_classes_for_cwe": _m.classes_for_cwe,
+            "_vc_resolve": _m.resolve,
+            "_vc_is_known": lambda n: _m.canonical(n) != "unknown"}
+
+
 def _decide():
     """_gather_decide is documented PURE, so it runs standalone."""
     src = API.read_text(encoding="utf-8")
-    ns = {}
-    needed = ["_GATHER_FIELD_REQUIRED_CLASSES", "_GATHER_OOB_CLASSES",
-              "_GATHER_FOLLOW_UP"]
+    ns = dict(_vc_predicates())
+    # The class SETS are gone — they are projections of
+    # knowledge/vuln_classes.yaml now — so only the follow-up text remains a
+    # module-level dependency of this exec.
+    needed = ["_GATHER_FOLLOW_UP"]
     body = []
     for n in ast.walk(ast.parse(src)):
         if isinstance(n, ast.Assign) and any(
@@ -198,18 +220,61 @@ def test_a_found_login_form_still_blocks():
 def test_the_probe_status_is_captured_from_a_real_response():
     """`ep_probe_status` must come from a status_code, not be inferred."""
     fn = _func("_gather_manifest")
-    assigns = [n for n in ast.walk(fn) if isinstance(n, ast.Assign)
-               and any(isinstance(t, ast.Name) and t.id == "ep_probe_status"
-                       for t in n.targets)]
+    def _binds(node):
+        """Does this Assign bind ep_probe_status, directly or by unpacking?
+
+        The ranking winner arrives as
+        `_, endpoint, ep_source, ep_probe_status = _ranked[0]`, whose single
+        target is a Tuple — so a Name-only scan sees no binding at all and
+        reports the probe site as missing.
+        """
+        for t in node.targets:
+            if isinstance(t, ast.Name) and t.id == "ep_probe_status":
+                return True
+            if isinstance(t, (ast.Tuple, ast.List)):
+                if any(isinstance(e, ast.Name) and e.id == "ep_probe_status"
+                       for e in t.elts):
+                    return True
+        return False
+
+    assigns = [n for n in ast.walk(fn) if isinstance(n, ast.Assign) and _binds(n)]
     assert len(assigns) >= 3, (
         f"expected an init plus both probe sites, found {len(assigns)} "
         "assignments to ep_probe_status")
+    # The status may arrive directly (`ep_probe_status = rp.status_code`) or
+    # be carried through the candidate RANKING, which stores `rp.status_code`
+    # alongside each answering path and unpacks the winner. Both are "observed
+    # from a real response"; pinning only the direct form made this fail when
+    # selection stopped racing candidates and started ranking them, though the
+    # property it guards was never violated.
     from_resp = [a for a in assigns
                  if isinstance(a.value, ast.Attribute)
                  and a.value.attr == "status_code"]
-    assert len(from_resp) >= 2, (
+    # The CANDIDATE TUPLE's status element specifically — not any
+    # `.status_code` in the function. The first version of this check counted
+    # every reference, so replacing the captured status with a literal 200
+    # still passed: there were other `rp.status_code` uses nearby. Fourth
+    # false pass of the same shape today, all from matching something that
+    # merely co-occurs with the thing that matters.
+    ranked_src = []
+    for n in ast.walk(fn):
+        if not (isinstance(n, ast.Call)
+                and getattr(n.func, "attr", None) == "append"):
+            continue
+        for a in n.args:
+            if not isinstance(a, ast.Tuple):
+                continue
+            ranked_src += [e for e in a.elts
+                           if isinstance(e, ast.Attribute)
+                           and e.attr == "status_code"]
+    unpacked = [a for a in assigns
+                if isinstance(a.targets[0], (ast.Tuple, ast.List))]
+    assert len(from_resp) + (1 if unpacked else 0) >= 2, (
         "ep_probe_status is not set from a response status_code at both probe "
         "sites — an unobserved status must stay None, never a default")
+    assert ranked_src, (
+        "the candidate tuple must carry the answering response's real "
+        "status_code; a literal there reports a status nobody observed")
     assert any(isinstance(a.value, ast.Constant) and a.value.value is None
                for a in assigns), (
         "ep_probe_status has no None initialiser: 'not observed' would then be "
@@ -219,26 +284,81 @@ def test_the_probe_status_is_captured_from_a_real_response():
 # -- 8. "pre-auth" contains "auth" ------------------------------------------
 
 def _needs_auth_logic():
-    """Exec just the needs_auth decision from _gather_manifest.
+    """Execute the REAL shared helper, `_auth_requirement`.
 
-    Extracted by source window rather than imported: _gather_manifest is a
-    ~700-line function that probes the network, and the decision under test is
-    a dozen lines of pure string logic inside it.
+    This used to extract a source window out of `_gather_manifest` and exec it,
+    keyed on the literal line `needs_auth = bool(_auth_positive) and not
+    _auth_negated`. That made the test pass only while the logic stayed inlined
+    AND duplicated: `_assess_exploit_readiness` carried its own bare membership
+    test that included the substring "auth", so "pre-authentication" and
+    "unauthenticated" both matched and a pre-auth CVE was blocked for lacking
+    the session it does not need. One definition now, exercised directly.
     """
-    import re as _re
-    src = ast.get_source_segment(API.read_text(encoding="utf-8"),
-                                 _func("_gather_manifest")) or ""
-    i = src.index("_blob = f\"{pre_blob} {desc}\"")
-    j = src.index("needs_auth = bool(_auth_positive) and not _auth_negated")
-    body = src[i:j] + "needs_auth = bool(_auth_positive) and not _auth_negated\n"
-    body = "\n".join(line[4:] if line.startswith("    ") else line
-                     for line in body.split("\n"))
+    import ast as _ast
+    fn = _func("_auth_requirement")
+    ns = {}
+    exec(compile(_ast.Module(body=[fn], type_ignores=[]), "<auth>", "exec"), ns)
+    helper = ns["_auth_requirement"]
 
     def run(pre_blob="", desc=""):
-        ns = {"_re": _re, "pre_blob": pre_blob.lower(), "desc": desc.lower()}
-        exec(compile(body, "<auth>", "exec"), ns)
-        return ns["needs_auth"], ns["_auth_negated"]
+        needs, negated, _why = helper(pre_blob, desc)
+        return needs, negated
     return run
+
+
+def test_both_gates_share_one_auth_definition():
+    """The gather gate and the readiness gate must call the SAME helper.
+
+    They disagreed for weeks: gather got the negation fix, readiness kept a
+    bare `any(k in pre_blob ...)` whose key list contained "auth".
+    """
+    for fname in ("_gather_manifest", "_assess_exploit_readiness"):
+        fn = _func(fname)
+        called = {getattr(n.func, "id", None) or getattr(n.func, "attr", None)
+                  for n in ast.walk(fn) if isinstance(n, ast.Call)}
+        assert "_auth_requirement" in called, (
+            f"{fname} must decide auth through the shared helper, not its own "
+            "copy of the logic")
+    # ...and the old bare membership test must not come back in either.
+    for fname in ("_gather_manifest", "_assess_exploit_readiness"):
+        for node in ast.walk(_func(fname)):
+            if not isinstance(node, ast.Call):
+                continue
+            if getattr(node.func, "id", "") != "any":
+                continue
+            lits = [c.value for c in ast.walk(node)
+                    if isinstance(c, ast.Constant) and isinstance(c.value, str)]
+            assert "auth" not in lits, (
+                f"{fname}: a bare membership test containing the literal "
+                f'"auth" matches "pre-authentication" and "unauthenticated"')
+
+
+def test_the_readiness_gate_lets_a_pre_auth_cve_through():
+    """The regression that motivated the shared helper, end to end.
+
+    Measured before the fix: the bare test said True on 3 of these 6, every
+    one in the blocking direction.
+    """
+    run = _needs_auth_logic()
+    OLD_KEYS = ("auth", "login", "session", "logged", "credential", "cookie",
+                "privilege", "user ", "account")
+    cases = [
+        ("pre-authentication arbitrary file access; allows unauthenticated "
+         "attackers to perform path traversal", False),
+        ("the vulnerability does not require authentication", False),
+        ("requires no credentials", False),
+        ("an authenticated user with admin privileges can trigger this", True),
+        ("the attacker must first obtain a valid session cookie", True),
+    ]
+    wrong_before = 0
+    for text, expect in cases:
+        needs, _neg = run(text, "")
+        assert needs is expect, f"{text[:50]!r}: expected {expect}, got {needs}"
+        if any(k in text.lower() for k in OLD_KEYS) != expect:
+            wrong_before += 1
+    assert wrong_before >= 3, (
+        "the old bare test should be demonstrably worse on this table; if it "
+        "is not, the table no longer covers the regression")
 
 
 PRE_AUTH = [

@@ -2028,11 +2028,26 @@ async def list_scans(
                 (_id, _eid, _cve, _ip, _port, _rid, _verified,
                  _stage, _stop, _model, _start, _end) = r
                 _bpc_run_ids.add(_rid)
-                _status = "completed"
-                if _verified:
-                    _status = "completed"
+                # A build-poc attempt row is now written at the START of a
+                # run (stage_reached='running', stop_reason NULL) so an
+                # in-flight build is visible. Before that change every row
+                # here was terminal, so defaulting to "completed" was safe;
+                # it is not any more, and an in-flight run was being labelled
+                # completed while the running-runs builder below was skipped
+                # by the dedupe — the operator saw "completed" and "running"
+                # on one row.
+                #
+                # stop_reason is the terminal marker: NULL means still going.
+                if not _stop and str(_stage or "").lower() == "running":
+                    _status = "running"
                 elif _stop in ("crash", "error"):
                     _status = "failed"
+                elif not _stop:
+                    # No stop reason and not marked running: we cannot tell.
+                    # Say so rather than claiming either outcome.
+                    _status = "unknown"
+                else:
+                    _status = "completed"
                 jobs.append({
                     "job_id": f"bpc-{_rid}",
                     "type": f"build-poc ({_cve})",
@@ -2067,7 +2082,14 @@ async def list_scans(
             )
             for r in _cur.fetchall():
                 _rid, _resp, _start = r
-                if f"bpc-{_rid}" in {j["job_id"] for j in jobs}:
+                # Dedupe, but let a RUNNING row correct a stale terminal one
+                # rather than being dropped: the attempts table is the richer
+                # source, yet this query is the one that knows the run is
+                # still going.
+                _existing = next((j for j in jobs if j["job_id"] == f"bpc-{_rid}"), None)
+                if _existing is not None:
+                    if _existing.get("status") in ("completed", "unknown"):
+                        _existing["status"] = "running"
                     continue
                 _target = ""
                 if _resp:
@@ -2262,6 +2284,82 @@ async def get_scan(job_id: str):
         except Exception as _e:
             log.debug(f"tool_executions detail lookup failed for {job_id}: {_e}")
 
+        # BUILD-POC runs. The listing above merges them in as `bpc-<run_id>`,
+        # but this detail handler only ever knew about active_jobs, tool
+        # executions and upstream services — so every one of those rows was a
+        # dead link returning "Job not found". The listing offers it; the
+        # detail must be able to open it.
+        if job_id.startswith("bpc-"):
+            _rid = job_id[4:]
+            try:
+                async with httpx.AsyncClient(timeout=15) as _c:
+                    _r = await _c.get(
+                        f"{s.rag_api_url}/build-poc/attempts/{_rid}",
+                        headers={"x-api-key": s.api_key, **engagement_headers()})
+                if _r.status_code < 400:
+                    _a = _r.json() or {}
+                    _row = _a.get("attempt") or _a
+                    _stop = _row.get("stop_reason")
+                    _stage = str(_row.get("stage_reached") or "").lower()
+                    _status = ("running" if (not _stop and _stage == "running")
+                               else "failed" if _stop in ("crash", "error")
+                               else "unknown" if not _stop else "completed")
+                    # The detail page renders `progress.stage` and a JSON view
+                    # of `progress`, so a response without it shows a status
+                    # pill and "No results available yet" — true but useless
+                    # while a 20-minute build is underway. Fill it from the
+                    # run's own trace, which is the only live record there is.
+                    _prog = {"stage": _row.get("stage_reached") or "?"}
+                    try:
+                        async with httpx.AsyncClient(timeout=15) as _c2:
+                            _ar = await _c2.get(
+                                f"{s.rag_api_url}/build-poc/active",
+                                headers={"x-api-key": s.api_key, **engagement_headers()})
+                        if _ar.status_code < 400:
+                            _live = next((x for x in (_ar.json().get("runs") or [])
+                                          if x.get("run_id") == _rid), None)
+                            if _live:
+                                _prog.update(
+                                    stage=_live.get("phase") or _prog["stage"],
+                                    phase=_live.get("phase"),
+                                    trace_rows=_live.get("trace_rows"),
+                                    last_trace_at=_live.get("last_trace_at"),
+                                    trace=_live.get("trace"))
+                    except Exception as _pe:  # noqa: BLE001
+                        # Progress is a nicety; never fail the detail over it,
+                        # but say the live phase is unknown rather than imply
+                        # the stored stage is current.
+                        _prog["live_phase"] = f"unavailable ({type(_pe).__name__})"
+                    for _k in ("missing", "gather_manifest", "failure_analysis",
+                               "llm_model", "poc_log_path", "verified"):
+                        if _row.get(_k) not in (None, "", [], {}):
+                            _prog[_k] = _row[_k]
+                    _summary = (f"{_row.get('cve')} on {_row.get('ip')} — "
+                                + (f"stopped: {_stop}" if _stop
+                                   else f"running, phase {_prog.get('phase') or _prog['stage']}"
+                                        + (f", {_prog.get('trace_rows')} trace rows"
+                                           if _prog.get("trace_rows") else "")))
+                    return {
+                        "job_id": job_id,
+                        "type": f"build-poc ({_row.get('cve') or '?'})",
+                        "kind": "build_poc",
+                        "status": _status,
+                        "target": f"{_row.get('ip') or ''}"
+                                  + (f":{_row.get('port')}" if _row.get("port") else ""),
+                        "created_at": _row.get("created_at"),
+                        "completed_at": _row.get("updated_at") if _stop else None,
+                        "service_url": "rag-api (build-poc)",
+                        "summary": _summary,
+                        "progress": _prog,
+                        "last_data": _row,
+                    }
+            except Exception as _e:  # noqa: BLE001
+                # A lookup that could not run is not a missing job — say which.
+                log.warning("build-poc detail lookup failed for %s: %s", job_id, _e)
+                raise HTTPException(
+                    502, f"could not read build-poc run {_rid}: "
+                         f"{type(_e).__name__}: {_e}")
+
         raise HTTPException(404, "Job not found")
 
     async with httpx.AsyncClient(timeout=15) as c:
@@ -2411,6 +2509,25 @@ async def cloud_import(
                 import logging
                 logging.getLogger("bff").warning("register_job for %s import failed: %s", tool, e)
 
+        return safe_json(resp)
+
+
+@router.get("/api/jobs/recent")
+async def list_recent_jobs(type: Optional[str] = None, status: Optional[str] = None,
+                           limit: int = 10):
+    """Latest N jobs (newest first). Used by the Microburst import status
+    panel; also useful for any dashboard that needs 'is this still running?'
+    without a job id in hand."""
+    s = get_settings()
+    params = {"limit": limit}
+    if type: params["type"] = type
+    if status: params["status"] = status
+    async with httpx.AsyncClient(timeout=15) as c:
+        resp = await c.get(f"{s.rag_api_url}/jobs", params=params,
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        # httpx does not raise on 4xx/5xx -- never report a failed proxy as success.
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text[:500])
         return safe_json(resp)
 
 

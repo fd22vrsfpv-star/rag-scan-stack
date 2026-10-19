@@ -25,11 +25,93 @@ def _load_jsonl(path):
             except json.JSONDecodeError: pass
     return results
 
+# Documented "we could not resolve this hostname" sentinel. A hostname asset
+# still has to carry an inet, and inventing one would make it look scanned.
+UNRESOLVED_IP = "0.0.0.0"
+
+
+def _sanitize_resolved_ip(resolved_ip: str) -> str:
+    """Reject resolver answers that are not a host.
+
+    A bad DNS record can hand back a multicast/broadcast/reserved address, or
+    an all-zeros answer. Storing it makes the address look like a scanned host
+    and, because host views group by ip, collapses every such hostname onto one
+    pseudo-host. Fall back to the documented sentinel instead of inventing a
+    target.
+    """
+    try:
+        _r = ipaddress.ip_address(resolved_ip)
+        if (_r.is_multicast or _r.is_reserved
+                or _r.is_unspecified
+                or resolved_ip == "255.255.255.255"):
+            return UNRESOLVED_IP
+    except ValueError:
+        return UNRESOLVED_IP
+    return resolved_ip
+
+
+def _prefetch_host_ips(records) -> dict:
+    """Resolve every distinct non-IP hostname in the batch, deduplicated.
+
+    Called BEFORE the database connection is opened — see the comment in
+    parse_httpx(). Resolution failures are not an error: they become the
+    UNRESOLVED_IP sentinel exactly as the inline lookup did.
+    """
+    import socket as _socket
+    out: dict = {}
+    for rec in records:
+        host = rec.get("host", "")
+        if not host or host in out:
+            continue
+        try:
+            ipaddress.ip_address(host)
+            continue  # already an IP — nothing to resolve
+        except ValueError:
+            pass
+        try:
+            resolved = _socket.gethostbyname(host)
+        except Exception:
+            # gaierror is the common case, but herror/UnicodeError/timeout are
+            # all "no answer" too, and none of them should abort the batch.
+            resolved = UNRESOLVED_IP
+        out[host] = _sanitize_resolved_ip(resolved)
+    return out
+
+
 def parse_httpx(path: str, profile: str = "upload", job_id: str = None):
     stats = dict(out_of_scope=0, records_seen=0, findings_inserted=0, skipped=0, errors=0, error_examples=[])
     records = _load_jsonl(path); stats["records_seen"] = len(records)
     if not records: return stats
-    conn = psycopg2.connect(DB_DSN)
+
+    # 2026-10-17 — the four-hour-transaction class, in an ingest path.
+    #
+    # Two things used to let ONE batch hold ONE transaction open for an
+    # unbounded time, and both are fixed here:
+    #
+    #  1. DNS. The hostname lookup for an unknown asset ran INSIDE the record
+    #     loop, i.e. inside the open transaction. gethostbyname() goes through
+    #     the C resolver, so it honours neither socket.setdefaulttimeout() nor
+    #     any Postgres setting — a black-holed resolver blocks for the system
+    #     resolver's own timeout (tens of seconds, per hostname) while the
+    #     transaction sits idle holding row locks. Resolving every distinct
+    #     hostname BEFORE the connection is opened was chosen over committing
+    #     around each lookup: a per-record commit does NOT fix this, because
+    #     the lookup happens part-way through a record, after that record's
+    #     statements have already opened the transaction. The only way the
+    #     network call cannot hold a transaction is for there to be no
+    #     transaction while it runs. The cost is resolving hostnames whose
+    #     asset is already in the database; the lookups are deduplicated and
+    #     the OS resolver cache absorbs the repeats.
+    #  2. Batch-wide commit. See the per-record commit at the end of the loop.
+    #
+    # The connection also carries the standard caps (etl/access.py::_connect):
+    # fail the connect fast, and let Postgres kill us if we ever do go idle in
+    # a transaction or queue on a lock.
+    host_ips = _prefetch_host_ips(records)
+    conn = psycopg2.connect(
+        DB_DSN, connect_timeout=5,
+        options="-c idle_in_transaction_session_timeout=120000 -c lock_timeout=5000",
+    )
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             _enforce_scope, _scope_rows = load_ingest_scope(cur)
@@ -82,29 +164,11 @@ def parse_httpx(path: str, profile: str = "upload", job_id: str = None):
                             if row:
                                 asset_id = str(row["id"])
                             else:
-                                # Resolve hostname and create asset
-                                import socket as _socket
-                                try:
-                                    resolved_ip = _socket.gethostbyname(host)
-                                except _socket.gaierror:
-                                    resolved_ip = "0.0.0.0"
-                                # A resolver can hand back something that is not
-                                # a host — a multicast/broadcast address from a
-                                # bad DNS record, or an all-zeros answer. Storing
-                                # it makes the address look like a scanned host
-                                # and, because host views group by ip, collapses
-                                # every such hostname onto one pseudo-host. Fall
-                                # back to the documented 0.0.0.0 "unresolved"
-                                # sentinel instead of inventing a target.
-                                try:
-                                    import ipaddress as _ipa
-                                    _r = _ipa.ip_address(resolved_ip)
-                                    if (_r.is_multicast or _r.is_reserved
-                                            or _r.is_unspecified
-                                            or resolved_ip == "255.255.255.255"):
-                                        resolved_ip = "0.0.0.0"
-                                except ValueError:
-                                    resolved_ip = "0.0.0.0"
+                                # Create the asset from the address resolved in
+                                # the pre-pass. No network call here: a DNS
+                                # lookup inside this transaction is the bug
+                                # this parser is being fixed for.
+                                resolved_ip = host_ips.get(host) or UNRESOLVED_IP
                                 asset_id = str(uuid.uuid4())
                                 cur.execute("""INSERT INTO assets (id, ip, hostname)
                                               VALUES (%s, %s::inet, %s)
@@ -197,7 +261,15 @@ def parse_httpx(path: str, profile: str = "upload", job_id: str = None):
                     cur.execute("ROLLBACK TO SAVEPOINT rec_sp")
                     stats["errors"] += 1
                     if len(stats["error_examples"]) < 5: stats["error_examples"].append(f"{type(e).__name__}: {e}")
-            conn.commit()
+                finally:
+                    # One transaction per RECORD, not one per batch. A 40k-line
+                    # httpx file used to be a single transaction; now the
+                    # longest-lived one is a handful of statements. In a
+                    # `finally` so the `continue` paths (out-of-scope, skipped)
+                    # and the exception path close their transaction too —
+                    # after ROLLBACK TO SAVEPOINT the transaction is still open
+                    # and would otherwise sit idle until the next record.
+                    conn.commit()
     finally:
         conn.close()
     return stats

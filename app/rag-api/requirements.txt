@@ -11,4 +11,13 @@ slowapi
 
 arjun>=2.2.5   # parameter-name discovery on a single URL (recon phase)
 langgraph<2   # StateGraph refactor of _build_poc_core (build_poc_graph.py)
+# Checkpointing for build-poc recovery: a build killed mid-flight (a rag-api
+# restart took out ten in-flight builds on 2026-10-17) resumes from its last
+# completed node. Same mechanism agent sessions already use; thread_id = run_id.
+langgraph-checkpoint-postgres
+# psycopg v3 WITH the binary wheel. langgraph-checkpoint-postgres speaks
+# psycopg3, not psycopg2, and a bare `psycopg` has no libpq — the saver then
+# fails soft and checkpointing is silently inert, which is how it shipped
+# dead the first time. autogen_agents pins the same extra.
+psycopg[binary]
 semgrep>=1.90  # SAST scanning (github/web-source modes)

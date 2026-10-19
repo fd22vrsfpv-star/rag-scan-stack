@@ -1,0 +1,522 @@
+"""One vulnerability-class vocabulary, and one place that normalises into it.
+
+The same concept was spelled differently in eleven places. `_FILE_READ_CLASSES`
+listed `lfi`, `path-traversal` AND `path_traversal` — three names for one idea,
+in one set. Each gate had inlined its own partial alias list (6 non-canonical
+entries in one, 6 in another, 5, 2, 0, 0), so in a single run `path-traversal`
+passed one gate and failed another. That was never eleven vocabularies; it was
+one vocabulary with eleven private, divergent spell-checkers.
+
+Two producers emit a class name:
+
+  * `_vuln_class_from_cve` — deterministic, 10 canonical names.
+  * the LLM fallback — free text, which is where `path-traversal` came from.
+
+`canonical()` is called ONCE at each producer's exit. Downstream code then never
+sees a non-canonical name and never needs an alias list of its own. Every old
+set becomes a projection: `classes_where(file_read=True)`,
+`path_is_the_field(cls)`.
+
+DETERMINISTIC, never fuzzy. A gate asking "is this a file-read class?" must get
+an exact answer; CLAUDE.md's rule is "retrieve, then gate — never retrieve to
+authorize". An unrecognised name resolves to `unknown`, which is a real class
+with defined (conservative) behaviour, not a crash and not a guess.
+
+Pure: no database, no network. `knowledge/vuln_classes.yaml` is bind-mounted, so
+adding a class or an alias takes effect on reload with no code change and no
+image rebuild — which is the whole point, since every one of the eleven sets
+needed a rebuild to extend.
+
+    pytest tests/test_vuln_classes.py
+"""
+from __future__ import annotations
+
+import os
+import re
+import threading
+from typing import Any, Dict, List, Optional, Set, Set
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover
+    yaml = None
+
+UNKNOWN = "unknown"
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_PATHS = (
+    os.path.join(os.environ.get("KNOWLEDGE_DIR", "/knowledge"), "vuln_classes.yaml"),
+    os.path.join(_HERE, "..", "knowledge", "vuln_classes.yaml"),
+)
+
+_lock = threading.Lock()
+_cache: Dict[str, Any] = {}
+
+
+def _squash(s: str) -> str:
+    """`Path Traversal` / `path_traversal` / `PATH-TRAVERSAL` -> `pathtraversal`.
+
+    Only case, separators and surrounding punctuation are normalised away. No
+    stemming, no edit distance: two names that differ by a letter are two
+    different names, because a gate that guesses is not a gate.
+    """
+    return re.sub(r"[^a-z0-9]+", "", str(s or "").lower())
+
+
+def load(path: Optional[str] = None, force: bool = False) -> Dict[str, Any]:
+    """The parsed table, cached. Returns an EMPTY table when unreadable.
+
+    A caller must be able to tell "no such class" from "the table did not
+    load", so `loaded()` reports which happened rather than letting an empty
+    table read as a vocabulary with nothing in it.
+    """
+    global _cache
+    with _lock:
+        if _cache and not force and not path:
+            return _cache
+        data, src = {}, None
+        if yaml is not None:
+            for p in ([path] if path else list(_DEFAULT_PATHS)):
+                if not p or not os.path.isfile(p):
+                    continue
+                try:
+                    with open(p, encoding="utf-8") as fh:
+                        data = yaml.safe_load(fh) or {}
+                    src = p
+                    break
+                except Exception:  # noqa: BLE001
+                    continue
+        by_name, by_alias, by_cwe = {}, {}, {}
+        raw_alias: List[tuple] = []     # (original spelling, class) for prose matching
+        for c in (data.get("classes") or []):
+            if not isinstance(c, dict) or not c.get("name"):
+                continue
+            name = str(c["name"]).strip().lower()
+            by_name[name] = c
+            by_alias[_squash(name)] = name
+            raw_alias.append((name, name))
+            for a in (c.get("aliases") or []):
+                by_alias.setdefault(_squash(a), name)
+                raw_alias.append((str(a), name))
+            for cw in (c.get("cwes") or []):
+                cid = str((cw or {}).get("id") or "").strip().upper()
+                if cid:
+                    # ONE CWE -> MANY classes, by design. CWE-78 is both `cmdi`
+                    # and `rce`; CWE-98 is both `lfi` and `rfi`. Picking one
+                    # would make the lookup lie about the other.
+                    by_cwe.setdefault(cid, [])
+                    if name not in by_cwe[cid]:
+                        by_cwe[cid].append(name)
+        for cid in by_cwe:
+            by_cwe[cid].sort()      # deterministic, never file order
+        # Boundary-aware patterns for matching a class name in PROSE. Squashing
+        # separators is right for `canonical("Path Traversal")` and wrong for
+        # scanning text: `rce` is a substring of "resou(rce)key", so a
+        # substring scan classified a path traversal as remote code execution.
+        # Each alias becomes `\btoken[-_ ]?token\b`, longest first so
+        # `remote file inclusion` is not swallowed by a shorter alias inside it.
+        alias_res = []
+        for spelling, cls in raw_alias:
+            toks = [t for t in re.split(r"[^a-z0-9]+", str(spelling).lower()) if t]
+            if not toks:
+                continue
+            # Separators are flexible so one entry covers `arbitrary-file-read`,
+            # `arbitrary file read` and `arbitrary_file_read` — but the ends are
+            # anchored on word boundaries, because `rce` is a substring of
+            # "resou(rce)key" and a plain substring scan classified a path
+            # traversal as remote code execution.
+            alias_res.append((len(spelling),
+                              re.compile(r"\b" + r"[-_ ]?".join(map(re.escape, toks)) + r"\b",
+                                         re.I),
+                              cls))
+        alias_res.sort(key=lambda x: -x[0])
+        built = {"raw": data, "source": src, "by_name": by_name,
+                 "by_alias": by_alias, "by_cwe": by_cwe,
+                 "alias_res": alias_res, "loaded": bool(by_name)}
+        if not path:
+            _cache = built
+        return built
+
+
+def loaded() -> bool:
+    """Did the table actually load? `False` means every lookup below is
+    answering from an empty vocabulary, which is not the same as 'no match'."""
+    return bool(load().get("loaded"))
+
+
+def canonical(name) -> str:
+    """The canonical class name for any spelling. Unrecognised -> `unknown`.
+
+    This is the ONE normalisation point. Call it where a class name enters the
+    system — the classifier's exit and the LLM fallback's exit — not at each
+    consumer, which is how eleven divergent alias lists happened.
+    """
+    t = load()
+    key = _squash(name)
+    if not key:
+        return UNKNOWN
+    return t["by_alias"].get(key, UNKNOWN)
+
+
+def is_known(name) -> bool:
+    return canonical(name) != UNKNOWN or _squash(name) == UNKNOWN
+
+
+def get(name) -> Optional[dict]:
+    return load()["by_name"].get(canonical(name))
+
+
+def names() -> List[str]:
+    return sorted(load()["by_name"])
+
+
+def aliases_of(name) -> List[str]:
+    return list((get(name) or {}).get("aliases") or [])
+
+
+# ── projections (what the eleven sets used to be) ───────────────────────────
+
+
+def classes_where(**props) -> Set[str]:
+    """Every class whose properties match. A list-valued property matches when
+    the asked-for value is IN it."""
+    out = set()
+    for name, c in load()["by_name"].items():
+        for k, want in props.items():
+            have = c.get(k)
+            if isinstance(have, list):
+                if want not in have:
+                    break
+            elif bool(have) != bool(want) if isinstance(want, bool) else have != want:
+                break
+        else:
+            out.add(name)
+    return out
+
+
+VULNERABILITY = "vulnerability"
+MISCONFIGURATION = "misconfiguration"
+DISCLOSURE = "disclosure"
+UNCLASSIFIED = "unclassified"
+KINDS = (VULNERABILITY, MISCONFIGURATION, DISCLOSURE, UNCLASSIFIED)
+
+
+def kind(name) -> str:
+    """What sort of finding this is.
+
+    A name the table does not know is `unclassified`, NOT a vulnerability:
+    the absence of an answer must not read as a mechanism, or a typo'd class
+    walks into the build-PoC gates.
+    """
+    return str((get(name) or {}).get("kind") or "") or UNCLASSIFIED
+
+
+def is_exploitable(name) -> bool:
+    """Can a PoC be built for this at all?
+
+    A misconfiguration has no injection point, no payload and nothing to
+    assert, so it must never enter the build-PoC gates. This is the filter
+    that keeps a finding out of a pipeline designed for mechanisms.
+    """
+    return kind(name) == VULNERABILITY
+
+
+def leads_to(name) -> List[str]:
+    """Classes this finding ENABLES, for one that is not exploitable itself.
+
+    WebDAV PUT is not exploitable as a misconfiguration; it is exploitable
+    because it hands you an upload. The misconfiguration stays a finding and
+    the class it enables is what goes through the gates — which is how a
+    finding earns its place in this table without pretending to be a
+    mechanism.
+    """
+    return list((get(name) or {}).get("leads_to") or [])
+
+
+def exploitable_classes() -> Set[str]:
+    return classes_where(kind=VULNERABILITY)
+
+
+def injection_points(name) -> List[str]:
+    return list((get(name) or {}).get("injects_via") or [])
+
+
+def path_is_the_field(name) -> bool:
+    """Is the URL PATH the only injection point?
+
+    Deliberately `== ["path"]`, not `"path" in …`. An LFI injects through a
+    parameter and a traversal through the path; `auth-bypass` and `idor` can do
+    either. Treating "can inject via path" as "has no parameter" is the bug
+    this table exists to end — it made the gather gate stop demanding a
+    parameter for every file read.
+    """
+    return is_exploitable(name) and injection_points(name) == ["path"]
+
+
+def needs_input_field(name) -> bool:
+    """Must a parameter / key / field be FOUND before synthesis?
+
+    DECLARED, not inferred from `injects_via`. "Can inject through a parameter"
+    and "requires one" are different questions: auth-bypass can use a parameter
+    and does not need one, because requesting a protected path directly is the
+    whole exploit. Inferring it made the gate demand a parameter for
+    auth-bypass, which the set this replaced deliberately excluded.
+
+    Note `path-traversal` is required AND satisfied by the endpoint — see
+    `path_is_the_field`. Dropping the requirement would let a traversal with no
+    endpoint through the gate with nothing to attack.
+    """
+    if not is_exploitable(name):
+        return False
+    return bool((get(name) or {}).get("input_field_required"))
+
+
+def needs_oob_sink(name) -> bool:
+    return is_exploitable(name) and bool((get(name) or {}).get("needs_oob_sink"))
+
+
+def is_file_read(name) -> bool:
+    """Can this class read a file? Orthogonal to WHERE it injects — XXE reads
+    files through a request body, which is exactly what a single flat set could
+    not express."""
+    return bool((get(name) or {}).get("file_read"))
+
+
+def is_blind_capable(name) -> bool:
+    return bool((get(name) or {}).get("blind_capable"))
+
+
+def proof_kinds(name) -> List[str]:
+    return list((get(name) or {}).get("proof") or [])
+
+
+# ── reference vocabularies ──────────────────────────────────────────────────
+
+
+def classes_for_cwe(cwe) -> List[str]:
+    """EVERY class a CWE points at, sorted. A CWE is a narrowing signal, not an
+    answer: CWE-78 is `cmdi` and `rce`, CWE-98 is `lfi` and `rfi`."""
+    return list(load()["by_cwe"].get(str(cwe or "").strip().upper(), []))
+
+
+def class_for_cwe(cwe) -> str:
+    """The class a CWE identifies ON ITS OWN — which is only meaningful when
+    it points at exactly one.
+
+    Returns `unknown` when the CWE is unmapped AND when it is ambiguous,
+    because "I cannot tell from this alone" is the truthful answer and
+    returning the alphabetically-first class would be a fabricated certainty.
+    Callers with more to go on should use `resolve()`.
+    """
+    hits = classes_for_cwe(cwe)
+    return hits[0] if len(hits) == 1 else UNKNOWN
+
+
+_LOCATOR_EXT = re.compile(r"\.[a-z]{2,5}($|[?#])", re.I)
+
+
+def _strip_locators(text: str) -> str:
+    """Remove URLs, paths and filenames before matching a class NAME.
+
+    A locator says WHERE something is; it is not a claim about WHAT the bug
+    is. `\b` treats `/` and `.` as word boundaries, so `\bsql\b` matched
+    inside `/sql/dump.php` and `/phpmyadmin/sql.php` — phpMyAdmin's ordinary
+    query page was classified as SQL injection, and any path with a `sql`
+    segment became a SQLi finding.
+
+    Adjacent LETTERS were already handled (`sqlbackup.php` and `mssql` do not
+    match), but a path separator is not a letter. Rather than widen the
+    boundary — which would break "vulnerable to SQL." at the end of a
+    sentence — drop the tokens that are locators and classify the prose that
+    remains. "The /admin/sql.php endpoint allows SQL injection" still
+    resolves, because the CLAIM survives even when the LOCATOR is removed.
+    """
+    out = []
+    for tok in str(text or "").split():
+        if "://" in tok or tok.startswith("/") or "/" in tok:
+            continue
+        if _LOCATOR_EXT.search(tok):
+            continue
+        out.append(tok)
+    return " ".join(out)
+
+
+def _behaviourally_same(pick: str, cands: List[str]) -> bool:
+    """Is `pick` interchangeable with one of `cands` for every gate we run?
+
+    NVD files an LFI under CWE-22 (path-traversal) routinely, and an advisory
+    that says "local file inclusion" is better information for CRAFTING than
+    the bucket it was filed in. Those two classes are the same shape — both
+    `file_read`, both `input_field_required`, neither needs an OOB sink — so
+    letting the name win changes which payloads are tried and nothing else.
+
+    `sqli` named against a CWE-918 (ssrf) is NOT that: they differ on whether
+    a sink is required and on what counts as proof, so the name winning sends
+    the whole loop at the wrong payload family.
+
+    Compared on the properties the GATES actually branch on, not on a
+    hand-kept list of "related" pairs, which would drift the moment a class
+    is added.
+    """
+    props = ("file_read", "input_field_required", "needs_oob_sink")
+    a = get(pick) or {}
+    want = tuple(bool(a.get(p)) for p in props)
+    for c in cands:
+        b = get(c) or {}
+        if tuple(bool(b.get(p)) for p in props) == want:
+            return True
+    return False
+
+
+def resolve(text=None, cwes=None) -> dict:
+    """Decide a class from the COMBINATION of a name and a CWE set.
+
+    The class NAME is primary: an advisory that says "path traversal" has told
+    us the class, and no CWE should overrule it. The CWEs narrow when the text
+    does not name a class, and where they disagree the ambiguity is reported
+    rather than resolved by file order.
+
+    Returns {class, candidates, basis, ambiguous}:
+        basis = "name"      a class name or alias appeared in the text
+                "cwe"       the CWEs pointed at exactly one class
+                "cwe+name"  several CWE candidates, the text picked one
+                "none"      nothing to go on -> class is `unknown`
+    `ambiguous` is True when several candidates survived; `class` is then
+    `unknown` and `candidates` carries them, so a caller can ask for more
+    evidence instead of acting on a guess.
+    """
+    t = str(text or "")
+    tbl = load()
+
+    # 1. An explicit name or alias in the text wins outright. Matched on word
+    #    boundaries, longest alias first.
+    # Match the CLAIM, not the locator: a path segment named `sql` is where
+    # something lives, not a statement that it is injectable.
+    _prose = _strip_locators(t)
+    named = [(n, cls) for n, rx, cls in tbl.get("alias_res", []) if rx.search(_prose)]
+
+    # The CWE-derived candidate set, computed BEFORE the name is accepted:
+    # a CWE id is a curated taxonomy claim, a word in prose is a word. The
+    # name still decides WHICH class — "local file inclusion" with
+    # CWE-98 (lfi, rfi) + CWE-22 (path-traversal) correctly yields lfi —
+    # but it may only pick from what the CWEs actually allow.
+    #
+    # Without this, a description that merely CONTAINS a class name
+    # outranks the identifier: a CWE-918 SSRF whose text mentions an SQL
+    # error was classified sqli, and the crafter was handed the wrong
+    # payload family for every iteration.
+    _cwe_cands: List[str] = []
+    for _cw in (cwes or []):
+        for _c in classes_for_cwe(_cw):
+            if _c not in _cwe_cands:
+                _cwe_cands.append(_c)
+
+    if named:
+        top = named[0][0]
+        tied = {c for n, c in named if n == top}
+        if len(tied) == 1:
+            _pick = named[0][1]
+            if _cwe_cands and _pick not in _cwe_cands \
+                    and not _behaviourally_same(_pick, _cwe_cands):
+                # The text named a class the CWEs do not support.
+                # A MECHANISM named in the text (sqli, cmdi, lfi...) wins over
+                # CWE candidates that are only CONSEQUENCES (privilege-
+                # escalation, auth-bypass, idor): the CWE catalogue often marks
+                # the IMPACT (CWE-269) when the WEAKNESS is actually the sqli
+                # that enables it, and steering the build at the consequence
+                # loses the mechanism's exploit path. CVE-2023-51483 verified
+                # by SQLi in round 8 but was steered at unauthorized_admin_login
+                # in round 9 and never landed.
+                _pick_role = role(_pick)
+                _cwe_roles = {role(c) for c in _cwe_cands}
+                if _pick_role == "mechanism" and _cwe_roles == {"consequence"}:
+                    return {"class": _pick,
+                            "candidates": sorted({c for _, c in named}),
+                            "basis": "name_over_consequence",
+                            "cwe_consequence_candidates": sorted(_cwe_cands),
+                            "ambiguous": False}
+                # Otherwise fall through to the CWE path rather than overruling
+                # the taxonomy, and say so, because a silent disagreement is
+                # unreviewable.
+                _disagreed = _pick
+            else:
+                return {"class": _pick,
+                        "candidates": sorted({c for _, c in named}),
+                        "basis": "cwe+name" if _cwe_cands else "name",
+                        "ambiguous": False}
+
+    # 2. The CWEs give a candidate set.
+    cands: List[str] = sorted(_cwe_cands)
+    _disagreed = locals().get("_disagreed")
+    if len(cands) == 1:
+        out = {"class": cands[0], "candidates": cands, "basis": "cwe",
+               "ambiguous": False}
+        if _disagreed:
+            out["name_disagreed"] = _disagreed
+        return out
+
+    # 3. Several CWE candidates — let the text break the tie, but only if it
+    #    actually mentions one of them.
+    if len(cands) > 1:
+        mentioned = [cls for _, rx, cls in tbl.get("alias_res", [])
+                     if cls in cands and rx.search(t)]
+        if len(set(mentioned)) == 1:
+            return {"class": mentioned[0], "candidates": cands,
+                    "basis": "cwe+name", "ambiguous": False}
+        return {"class": UNKNOWN, "candidates": cands, "basis": "cwe",
+                "ambiguous": True}
+
+    return {"class": UNKNOWN, "candidates": [], "basis": "none",
+            "ambiguous": False}
+
+
+def cwes_for(name) -> List[dict]:
+    return list((get(name) or {}).get("cwes") or [])
+
+
+def cwe_ids_for(name) -> List[str]:
+    return [str(c.get("id")) for c in cwes_for(name) if c.get("id")]
+
+
+def owasp_for(name) -> Optional[str]:
+    return (get(name) or {}).get("owasp")
+
+
+def wstg_for(name) -> List[str]:
+    return list((get(name) or {}).get("wstg") or [])
+
+
+def mitre_for(name) -> List[str]:
+    return list((get(name) or {}).get("mitre") or [])
+
+
+def role(name) -> str:
+    """`mechanism` (HOW the attack works) or `consequence` (WHAT it achieves).
+    Default `mechanism` for an unknown or untagged class -- the safer side:
+    overriding a mechanism with a mechanism needs more evidence than text, and
+    this is the pre-existing behaviour."""
+    r = (get(name) or {}).get("role")
+    return str(r) if r == "consequence" else "mechanism"
+
+
+def graded_goals(name) -> List[str]:
+    """Graded-benchmark goals this class reaches, best first; [] = no preference."""
+    return list((get(name) or {}).get("graded_goals") or [])
+
+
+def reading_hints(name) -> Dict[str, List[str]]:
+    """{"look_for": [...], "implies": [...]} for reading a description of this
+    class; both lists empty for an unknown or unhinted class."""
+    rh = (get(name) or {}).get("reading_hints") or {}
+    return {"look_for": [str(x) for x in (rh.get("look_for") or [])],
+            "implies": [str(x) for x in (rh.get("implies") or [])]}
+
+
+def references(name) -> dict:
+    """Everything a report needs to name this finding in the reader's own
+    vocabulary — CWE, OWASP Top 10, WSTG and ATT&CK in one call."""
+    c = get(name) or {}
+    return {"class": canonical(name), "title": c.get("title"),
+            "kind": kind(name), "leads_to": leads_to(name),
+            "cwes": cwes_for(name), "owasp": c.get("owasp"),
+            "wstg": wstg_for(name), "mitre": mitre_for(name)}

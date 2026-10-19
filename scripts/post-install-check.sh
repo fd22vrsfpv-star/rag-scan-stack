@@ -113,7 +113,7 @@ EXPECTED_TABLES=(
   checkpoints checkpoint_blobs checkpoint_writes checkpoint_migrations
   # TIER 8: Exploit management
   pending_exploits exploit_results exploit_chunks
-  lateral_movement credential_spray_attempts credential_spray_approvals password_policies platform_control security_tests security_test_runs custom_vuln_skills poc_synthesis_log poc_grants exploit_store exploit_store_versions build_poc_attempts build_poc_error_memory build_poc_reviews build_poc_lessons learned_postex_overlays
+  lateral_movement credential_spray_attempts credential_spray_approvals password_policies platform_control security_tests security_test_runs custom_vuln_skills poc_synthesis_log poc_grants exploit_store exploit_store_versions build_poc_attempts build_poc_error_memory cve_class_resolutions build_poc_reviews build_poc_lessons learned_postex_overlays recon_cache
   exploit_approval_rules
   msf_modules active_listeners exploit_callbacks tool_executions
   # TIER 9: Webhooks
@@ -274,6 +274,33 @@ else
   warn "scan_recommendations.target_kind check skipped (no DB connection helper available)"
 fi
 
+# discovered_params.engagement_id — half of uq_discovered_params_identity.
+# url_pattern carries only scheme://netloc/path, so without the engagement two
+# engagements pointed at the same address shared one row and the second crawl
+# UPDATEd the first's counters. Missing column => the ON CONFLICT in
+# etl/parse_katana.py and playwright_scanner/param_extractor.py matches no
+# index and EVERY discovered param insert raises instead of storing.
+HAS_DP_ENG=$(_run_sql "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='discovered_params' AND column_name='engagement_id')")
+if [[ "$HAS_DP_ENG" == "t" ]]; then
+  pass "discovered_params.engagement_id column present"
+elif [[ "$HAS_DP_ENG" == "f" ]]; then
+  fail "discovered_params.engagement_id missing — run ./scripts/ensure_db_schema.sh (every param upsert will raise 'no unique or exclusion constraint matching the ON CONFLICT specification')"
+else
+  warn "discovered_params.engagement_id check skipped (no DB connection helper available)"
+fi
+
+# The index itself: the column alone is not the key. COALESCE, not a partial
+# index — a NULL in an indexed column makes rows non-equal in Postgres, so an
+# unresolved engagement would be unconstrained rather than deduped.
+HAS_DP_IDX=$(_run_sql "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE tablename='discovered_params' AND indexname='uq_discovered_params_identity')")
+if [[ "$HAS_DP_IDX" == "t" ]]; then
+  pass "uq_discovered_params_identity present (engagement-scoped param dedup)"
+elif [[ "$HAS_DP_IDX" == "f" ]]; then
+  fail "uq_discovered_params_identity missing — run ./scripts/ensure_db_schema.sh (discovered param upserts cannot match their ON CONFLICT target)"
+else
+  warn "uq_discovered_params_identity check skipped (no DB connection helper available)"
+fi
+
 # Asset identity: a hostname equal to the IP is not a virtual host, it is
 # "hostname unknown" written wrongly — and ix_assets_ip_hostname(ip,
 # COALESCE(hostname,'')) counts it as a DIFFERENT row from hostname=NULL. Ports
@@ -365,6 +392,20 @@ elif [[ "$HAS_NSJ_ENG" == "f" ]]; then
   fail "node_scan_jobs.engagement_id missing — run ./scripts/ensure_db_schema.sh"
 else
   warn "node_scan_jobs.engagement_id check skipped (no DB connection helper available)"
+fi
+
+# engagements.require_proxy — the per-engagement egress policy the OSINT
+# runner reads before every scan. The column being ABSENT is the one state
+# that is safe (no engagement can have opted in, so nothing changes); the
+# column being absent on a stack where an operator THINKS they enabled it is
+# the dangerous one, which is why this is asserted rather than assumed.
+HAS_ENG_RP=$(_run_sql "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='engagements' AND column_name='require_proxy')")
+if [[ "$HAS_ENG_RP" == "t" ]]; then
+  pass "engagements.require_proxy column present"
+elif [[ "$HAS_ENG_RP" == "f" ]]; then
+  fail "engagements.require_proxy missing — run ./scripts/ensure_db_schema.sh (OSINT scans cannot be forced through a proxy without it)"
+else
+  warn "engagements.require_proxy check skipped (no DB connection helper available)"
 fi
 
 HAS_NSJ_UQ=$(_run_sql "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE tablename='node_scan_jobs' AND indexname='uq_node_scan_jobs_job_id')")

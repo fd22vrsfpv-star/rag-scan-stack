@@ -23,6 +23,7 @@ under two minutes:
 Route shadowing is the one worth a permanent guard: it produces endpoints that
 exist in the source, appear in the OpenAPI schema, and can never be called.
 """
+import ast
 import os
 import re
 
@@ -118,3 +119,91 @@ def test_endpoint_count_is_reported_not_asserted():
     total = sum(len(_routes(p)) for p in _router_files())
     assert total > 0, "no routes found — has the BFF layout changed?"
     print(f"\n  BFF declares {total} route decorators")
+
+
+# ---------------------------------------------------------------------------
+# A route decorator must decorate its HANDLER
+# ---------------------------------------------------------------------------
+# Inserting a helper function directly above an existing handler puts it
+# BETWEEN the decorator and the function, so the decorator silently registers
+# the helper as the endpoint. FastAPI then derives the route's query
+# parameters from the helper's signature and every call 422s:
+#
+#   {"detail":[{"type":"missing","loc":["query","vec"], ...}]}
+#
+# Observed 2026-10-17 on POST /rag/knowledge/search, which registered
+# `_rag_log_retrieval` and demanded `vec`, `rows` and `source` as query
+# params. ast.parse passed, the container was healthy, and the real handler
+# was simply unreachable.
+
+ROUTE_DECORATORS = ("get", "post", "put", "patch", "delete", "head", "options")
+
+
+def _route_source_files():
+    """api.py plus every BFF router — the files that declare HTTP routes."""
+    files = [os.path.join(REPO, "app", "rag-api", "api.py")]
+    files += _router_files()
+    return [f for f in files if os.path.exists(f)]
+
+
+def _decorated_routes(path):
+    """(decorator_path, handler_name, lineno) for every HTTP route in a file."""
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        tree = ast.parse(fh.read())
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for dec in node.decorator_list:
+            if not isinstance(dec, ast.Call):
+                continue
+            f = dec.func
+            if not isinstance(f, ast.Attribute) or f.attr not in ROUTE_DECORATORS:
+                continue
+            route = None
+            if dec.args and isinstance(dec.args[0], ast.Constant):
+                route = dec.args[0].value
+            if isinstance(route, str) and route.startswith("/"):
+                out.append((route, node.name, node.lineno))
+    return out
+
+
+def test_no_route_is_registered_on_a_private_helper():
+    """A handler named `_foo` means a decorator lost its function.
+
+    Public handlers are the convention everywhere in this codebase, so a
+    leading underscore is a reliable signal that a helper was spliced in
+    between the decorator and the real handler.
+    """
+    offenders = []
+    for path in _route_source_files():
+        for route, name, lineno in _decorated_routes(path):
+            if name.startswith("_"):
+                offenders.append(
+                    f"{os.path.basename(path)}:{lineno} {route} -> {name}()")
+    assert not offenders, (
+        "a route decorator is attached to a private helper, so the real "
+        "handler is unreachable and the route takes the helper's signature "
+        "as its parameters:\n  " + "\n  ".join(offenders))
+
+
+def test_the_private_handler_detector_would_catch_a_planted_case(tmp_path):
+    """Sabotage-proof: the detector must flag the exact shape of the bug."""
+    f = tmp_path / "planted.py"
+    f.write_text(
+        "import fastapi\n"
+        "app = fastapi.FastAPI()\n"
+        "\n"
+        '@app.post("/x/y")\n'
+        "def _helper(query, vec, rows, *, source):\n"
+        "    return None\n"
+        "\n"
+        "def real_handler(body):\n"
+        "    return {}\n", encoding="utf-8")
+    found = _decorated_routes(str(f))
+    assert len(found) == 1, found
+    route, name, lineno = found[0]
+    assert (route, name) == ("/x/y", "_helper"), found
+    assert name.startswith("_"), "the detector must see the private name"
+    # the real handler is present but unreachable — exactly the live symptom
+    assert "real_handler" not in [n for _, n, _ in found]

