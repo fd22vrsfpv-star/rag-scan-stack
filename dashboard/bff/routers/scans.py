@@ -2512,6 +2512,25 @@ async def cloud_import(
         return safe_json(resp)
 
 
+@router.get("/api/jobs/recent")
+async def list_recent_jobs(type: Optional[str] = None, status: Optional[str] = None,
+                           limit: int = 10):
+    """Latest N jobs (newest first). Used by the Microburst import status
+    panel; also useful for any dashboard that needs 'is this still running?'
+    without a job id in hand."""
+    s = get_settings()
+    params = {"limit": limit}
+    if type: params["type"] = type
+    if status: params["status"] = status
+    async with httpx.AsyncClient(timeout=15) as c:
+        resp = await c.get(f"{s.rag_api_url}/jobs", params=params,
+                           headers={"x-api-key": s.api_key, **engagement_headers()})
+        # httpx does not raise on 4xx/5xx -- never report a failed proxy as success.
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, resp.text[:500])
+        return safe_json(resp)
+
+
 @router.get("/api/import/status/{job_id}")
 async def cloud_import_status(job_id: str):
     """Poll the status of an async cloud-import job (e.g. MicroBurst).

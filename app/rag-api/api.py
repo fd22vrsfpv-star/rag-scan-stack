@@ -7774,6 +7774,54 @@ class Job(BaseModel):
 class JobListResponse(BaseModel):
     jobs: List[Job]
 
+@app.get("/jobs", tags=["Jobs"])
+def list_jobs(type: Optional[str] = None, status: Optional[str] = None,
+              limit: int = 10, authorized: bool = Depends(auth)):
+    """Recent jobs, newest first. For dashboards that need "is X still running?"
+    without a job id in hand (operator ask, 2026-10-18 — the MicroBurst import
+    panel). Returns [{id, type, status, started_at, finished_at, created_at,
+    progress, error, elapsed_s}]."""
+    limit = max(1, min(int(limit or 10), 100))
+    where, args = [], []
+    if type:
+        where.append("type = %s"); args.append(type)
+    if status:
+        where.append("status = %s"); args.append(status)
+    sql = ("SELECT id::text, type, status, started_at, finished_at, created_at, "
+           "progress, error FROM jobs"
+           + (" WHERE " + " AND ".join(where) if where else "")
+           + " ORDER BY created_at DESC LIMIT %s")
+    args.append(limit)
+    try:
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, args)
+            rows = cur.fetchall()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"job listing failed: {e}")
+
+    def _iso(x): return x.isoformat() if x else None
+    def _elapsed(st, fn):
+        import datetime as _dt
+        if not st:
+            return None
+        end = fn or _dt.datetime.now(_dt.timezone.utc)
+        try:
+            return int((end - st).total_seconds())
+        except Exception:  # noqa: BLE001
+            return None
+    out = []
+    for r in rows:
+        out.append({
+            "id": r["id"], "type": r["type"], "status": r["status"],
+            "created_at": _iso(r["created_at"]),
+            "started_at": _iso(r["started_at"]),
+            "finished_at": _iso(r["finished_at"]),
+            "elapsed_s": _elapsed(r["started_at"], r["finished_at"]),
+            "progress": r["progress"], "error": r["error"],
+        })
+    return {"jobs": out, "count": len(out)}
+
+
 @app.get("/jobs/{job_id}")
 def get_job_results(job_id: str, authorized: bool = Depends(auth)):
     # Check in-memory DDG jobs first (non-UUID IDs like ai-check-*)

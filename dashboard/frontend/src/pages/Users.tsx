@@ -21,6 +21,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Loader2,
+  Clock
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -341,6 +342,15 @@ export default function Users() {
         {tile('Service Principals', summary.service_principals, 'bg-cyan-500/15 text-cyan-400', Cloud)}
         {tile('Providers', summary.providers, 'bg-zinc-500/15 text-zinc-400', Cloud)}
       </div>
+
+      {/* MicroBurst ingest status panel.
+          Shows the LATEST microburst-ingest job: whether it is running, when it
+          started, elapsed time, totals from `progress`, and any error. Operator
+          ask (2026-10-18): "I can't tell if it is still running" -- previously
+          the only way to know was to query `jobs` directly.
+          Hidden when there has never been a MicroBurst ingest on this
+          installation (no row returned). */}
+      <MicroburstJobCard />
 
       {/* Filter bar */}
       <div className="bg-card border border-border rounded-lg p-3 flex flex-wrap items-center gap-3">
@@ -825,6 +835,124 @@ function GroupCombobox({
             </div>
           </div>
         </>
+      )}
+    </div>
+  )
+}
+
+
+interface JobRow {
+  id: string
+  type: string
+  status: string
+  created_at?: string | null
+  started_at?: string | null
+  finished_at?: string | null
+  elapsed_s?: number | null
+  progress?: {
+    records_seen?: number
+    findings_inserted?: number
+    identities_upserted?: number
+    assets_created?: number
+    files_processed?: number
+    errors?: number
+    by_type?: Record<string, number>
+    phase?: string
+  } | null
+  error?: string | null
+}
+
+/** Latest microburst-ingest job's status (newest first). Auto-refetches on a
+ *  10-second cadence while the job is running, 60 s when idle; both are
+ *  fail-soft -- a failed poll leaves the last state up rather than clearing it,
+ *  so a brief rag-api hiccup does not read as "the import stopped". */
+function MicroburstJobCard() {
+  const q = useQuery({
+    queryKey: ['jobs-recent', 'microburst-ingest'],
+    queryFn: () => apiFetch<{ jobs: JobRow[]; count: number }>(
+      '/jobs/recent?type=microburst-ingest&limit=1'),
+    refetchInterval: (query) => {
+      // Running? Poll fast. Otherwise poll slowly.
+      const d = (query.state.data as { jobs?: JobRow[] } | undefined)
+      const run = (d?.jobs?.[0]?.status === 'running'
+                   || d?.jobs?.[0]?.status === 'queued')
+      return run ? 10_000 : 60_000
+    },
+    staleTime: 5_000,
+  })
+  const job = q.data?.jobs?.[0]
+  if (q.isLoading && !job) return null  // first paint; stay out of the way
+  if (!job) return null                 // never ingested here
+
+  const running = job.status === 'running' || job.status === 'queued'
+  const pg = job.progress || {}
+  const fmtDur = (s?: number | null) => {
+    if (s == null) return '-'
+    const h = Math.floor(s / 3600); const m = Math.floor((s % 3600) / 60); const ss = s % 60
+    return h ? `${h}h ${m}m` : (m ? `${m}m ${ss}s` : `${ss}s`)
+  }
+  const n = (x?: number) => (x ?? 0).toLocaleString()
+  const started = job.started_at ? new Date(job.started_at) : null
+  const finished = job.finished_at ? new Date(job.finished_at) : null
+  const statusTone =
+    running   ? 'bg-blue-500/15 text-blue-300 border-blue-500/40' :
+    job.status === 'finished' ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40' :
+    job.status === 'failed'   ? 'bg-red-500/15 text-red-300 border-red-500/40' :
+                                'bg-zinc-500/15 text-zinc-300 border-zinc-500/40'
+
+  return (
+    <div className="bg-card border border-border rounded-lg p-3">
+      <div className="flex items-center gap-2 mb-2 text-sm">
+        <Cloud className="h-4 w-4 text-cyan-400" />
+        <span className="font-medium">MicroBurst ingest</span>
+        <span className={cn('text-[11px] px-2 py-0.5 rounded border inline-flex items-center gap-1', statusTone)}>
+          {running && <Loader2 className="h-3 w-3 animate-spin" />}
+          {job.status}
+        </span>
+        <span className="text-[11px] text-muted-foreground font-mono ml-1">{job.id.slice(0, 8)}</span>
+        <button
+          onClick={() => q.refetch()}
+          className="ml-auto px-2 py-1 text-xs rounded border border-border hover:bg-muted inline-flex items-center gap-1 text-muted-foreground hover:text-foreground"
+          title="Re-check the job status now"
+        >
+          <RefreshCw className={cn('h-3 w-3', q.isFetching && 'animate-spin')} /> Refresh
+        </button>
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-2 text-[11px]">
+        <div><div className="text-muted-foreground">Started</div>
+          <div className="font-mono" title={started?.toISOString()}>
+            {started ? started.toLocaleString() : '-'}
+          </div></div>
+        <div><div className="text-muted-foreground">{running ? 'Running for' : 'Elapsed'}</div>
+          <div className="font-mono inline-flex items-center gap-1">
+            <Clock className="h-3 w-3" /> {fmtDur(job.elapsed_s)}
+          </div></div>
+        <div><div className="text-muted-foreground">Files</div>
+          <div className="font-mono">{n(pg.files_processed)}</div></div>
+        <div><div className="text-muted-foreground">Records</div>
+          <div className="font-mono">{n(pg.records_seen)}</div></div>
+        <div><div className="text-muted-foreground">Identities</div>
+          <div className="font-mono">{n(pg.identities_upserted)}</div></div>
+        <div><div className="text-muted-foreground">Assets</div>
+          <div className="font-mono">{n(pg.assets_created)}</div></div>
+      </div>
+      {pg.by_type && Object.keys(pg.by_type).length > 0 && (
+        <div className="mt-2 text-[11px] text-muted-foreground">
+          {Object.entries(pg.by_type).map(([k, v]) => (
+            <span key={k} className="mr-3 font-mono">{k}: {n(v)}</span>
+          ))}
+        </div>
+      )}
+      {(pg.errors ?? 0) > 0 && (
+        <div className="mt-2 text-[11px] text-amber-300 font-mono">errors in progress: {pg.errors}</div>
+      )}
+      {job.status === 'failed' && job.error && (
+        <div className="mt-2 text-[11px] text-red-300 font-mono break-all">error: {job.error}</div>
+      )}
+      {finished && !running && (
+        <div className="mt-2 text-[11px] text-muted-foreground">
+          Finished {finished.toLocaleString()}
+        </div>
       )}
     </div>
   )
