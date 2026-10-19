@@ -229,11 +229,23 @@ def test_engagement_predicate_keeps_global_rows():
           if isinstance(n, _ast.FunctionDef) and n.name == "_scope_engagement_predicate"]
     assert fn, "_scope_engagement_predicate gone — the two clauses would drift"
     src = _ast.get_source_segment(_read(API), fn[0]) or ""
-    assert "st.engagement_id = %s" in src and "st.engagement_id IS NULL" in src, (
+    # Whitespace-insensitive: the shape is what matters, not the spacing.
+    import re as _re
+    assert _re.search(r"st\.engagement_id\s*=\s*%s", src) and \
+           _re.search(r"st\.engagement_id\s+IS\s+NULL", src), (
         "the predicate must be `= %s OR IS NULL`; equality alone drops the "
         "global deny-list and the legacy pre-attribution rows")
-    # No engagement -> no predicate, so an explicit all-engagements view still works.
-    assert 'return "", []' in src, "None must append nothing, not match nothing"
+    # No engagement -> no predicate, so an explicit all-engagements view still
+    # works. Checked structurally: SOME return hands back an empty fragment and
+    # an empty param list, whatever the literal spelling.
+    empties = [n for n in _ast.walk(fn[0])
+               if isinstance(n, _ast.Return) and isinstance(n.value, _ast.Tuple)
+               and len(n.value.elts) == 2
+               and isinstance(n.value.elts[0], _ast.Constant)
+               and n.value.elts[0].value == ""
+               and isinstance(n.value.elts[1], _ast.List)
+               and not n.value.elts[1].elts]
+    assert empties, "None must append nothing, not match nothing"
 
 
 def test_all_followup_callsites_pass_the_engagement():

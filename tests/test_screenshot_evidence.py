@@ -86,7 +86,7 @@ def test_no_host_means_no_screenshots():
     m = re.search(r"const matchingScreenshots = (.*?)\n\n", page, re.S)
     assert m, "matchingScreenshots is gone from FindingsExplorer"
     block = m.group(1)
-    assert "if (!screenshotSearch) return []" in block, (
+    assert re.search(r"if\s*\(\s*!screenshotSearch\s*\)\s*return\s*\[\s*\]", block), (
         "with no hostname/ip/url the panel falls back to every screenshot on "
         "the box and shows another host's pages as this finding's evidence")
 
