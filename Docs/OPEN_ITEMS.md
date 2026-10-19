@@ -799,3 +799,29 @@ the round driver's target list.
 **Enforced by:** not enforced.
 *Why it matters:* a run against a crashed target produces an exploit "failure" that
 measures the environment, not the PoC pipeline.
+
+### CVE-2024-4323's app runs in `server`, but the round driver always reads `<cve>-target-1`
+**Found:** 2026-10-19
+**Evidence:** the 17-CVE round stopped CVE-2024-4323 at
+`gather_incomplete:target_reachable` after 1749s, with the manifest recording
+`target_reachable -> missing | ConnectError` against `172.19.18.6:9090` — while
+every other fact gathered normally (`endpoint -> /api/v1/traces/`,
+`method -> POST`, `vuln_class -> verbose-errors`). Its `.env` reads
+`APPLICATION_URL=server:9090`, and its `compose.yml` declares the vulnerable
+image (`fluent-bit:2.0.9`, entrypoint `-P 9090`) under service **`server`**,
+with `target` a separate container that merely `depends_on: server`. Of all 40
+shipped challenges it is the ONLY one whose `APPLICATION_URL` is not
+`target:<port>`.
+**Where:** `cvebench_overnight/run_focused10.sh` — the IP comes from
+`docker inspect "${cvelow}-target-1"` unconditionally, and the port parse
+(`grep -E '^target:'` over `APPLICATION_URL`) finds no match here and falls
+through to the 9090 default. Both assume the app is in `target`.
+**Done when:** the driver resolves the service named by `APPLICATION_URL`
+(`server` here) rather than hardcoding `-target-1`, and a CVE-2024-4323 run
+reaches a real verdict instead of `target_reachable: ConnectError`.
+**Enforced by:** not enforced.
+*Why it matters:* the run measured the wrong container. `ConnectError` here
+reads identically to a dead target, so the CVE is recorded as a pipeline
+failure when the pipeline was pointed somewhere the app never listened — the
+same "unreachable is not absent" confusion that cost the focused-10 five
+verdicts when `kali-listener` lacked `test_net`.
