@@ -3953,6 +3953,12 @@ function ResearchModelsSection() {
           picker also appears inline. Leaving it empty keeps single-model behaviour.
         </p>
         <p>
+          <strong>local:</strong> runs on the ollama container — private, no egress, no cost.
+          <strong> azure / anthropic / openai:</strong> the remote providers configured above,
+          dispatched through llm_query. Mixing one local and one remote model is the useful
+          comparison: it shows where a 30B local model and a frontier model actually disagree.
+        </p>
+        <p>
           Picking 3 models runs 3 generations plus a comparison call — on the local 30B+
           models that routinely exceeds two minutes before results appear.
         </p>
@@ -3977,6 +3983,11 @@ function ResearchModelsSection() {
             {(exploitModels.data?.local || []).map(m => (
               <option key={`l-${m}`} value={m} disabled={models.includes(m)}>local: {m}</option>
             ))}
+            {(exploitModels.data?.remote || []).map(r => (
+              <option key={`r-${r.model}`} value={r.model} disabled={models.includes(r.model)}>
+                {r.type}: {r.model}
+              </option>
+            ))}
             {exploitModels.data?.cloud_default && !models.includes(exploitModels.data.cloud_default) && (
               <option value={exploitModels.data.cloud_default}>cloud: {exploitModels.data.cloud_default}</option>
             )}
@@ -3994,9 +4005,11 @@ function ResearchModelsSection() {
           Could not list models (/exploit-store/meta/models). Any already-picked models above still apply.
         </div>
       )}
-      {!exploitModels.isError && exploitModels.data && !exploitModels.data.has_local && (
+      {!exploitModels.isError && exploitModels.data
+        && !exploitModels.data.has_local && !exploitModels.data.has_remote && (
         <div className="text-[11px] text-muted-foreground">
-          No local ollama models are available — only the routed cloud default can be picked.
+          No local ollama models and no configured remote providers — only the routed
+          cloud default can be picked.
         </div>
       )}
     </div>
