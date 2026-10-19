@@ -42399,14 +42399,57 @@ class ResearchExploitBody(BaseModel):
     models: Optional[List[str]] = None
 
 
+def _remote_models():
+    """Configured REMOTE models, one row per distinct model name.
+
+    Built from the same provider config llm_query dispatches on
+    (`common.llm_settings.get_providers()`), so what the picker offers is what
+    the router can actually serve. Ollama-type providers are excluded -- those
+    are the `local` list, and offering one in both places invites picking the
+    same model twice in a 3-way comparison.
+
+    `model` is the BARE model name, which is what the dispatch path wants:
+    `_llm_for_model` sends any non-local model to `llm_generate(model=...)` ->
+    llm_query, verified answering for `gpt-5-mini` and `DeepSeek-V4-Pro`. The
+    router's `<provider_id>:<model>` alias form also resolves, but the bare
+    name is what the operator recognises and what comes back in `llm_model`.
+
+    Never raises: a malformed provider config must shrink the picker, not 500
+    the page that lists local models too.
+    """
+    try:
+        from common.llm_settings import get_providers
+    except Exception:  # noqa: BLE001
+        return []
+    out, seen = [], set()
+    try:
+        for p in (get_providers() or []):
+            ptype = (p.get("type") or "").strip().lower()
+            model = (p.get("default_model") or "").strip()
+            # vllm ships with no default_model until one is configured; a blank
+            # entry would render as an unpickable empty option.
+            if not model or ptype == "ollama":
+                continue
+            if model in seen:
+                continue
+            seen.add(model)
+            out.append({"id": p.get("id") or ptype, "type": ptype, "model": model})
+    except Exception:  # noqa: BLE001
+        return out
+    return out
+
+
 @app.get("/exploit-store/meta/models", tags=["Exploit Store"])
 def list_exploit_models(authorized: bool = Depends(auth)):
     """Models available for research/synth/bake-off: local ollama models (run locally,
-    private, unguarded) + the cloud default (routed). Used by the model picker/bake-off.
+    private, unguarded), the configured REMOTE models, and the routed cloud default.
+    Used by the model picker/bake-off.
     (Path is /meta/models to avoid shadowing by /exploit-store/{id}.)"""
     local = _ollama_tags()
-    return {"local": local, "cloud_default": "routed (llm_query task routing)",
-            "has_local": bool(local)}
+    remote = _remote_models()
+    return {"local": local, "remote": remote,
+            "cloud_default": "routed (llm_query task routing)",
+            "has_local": bool(local), "has_remote": bool(remote)}
 
 
 @app.post("/exploit-store/research", tags=["Exploit Store"])
