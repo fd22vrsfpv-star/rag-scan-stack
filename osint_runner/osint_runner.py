@@ -4921,6 +4921,68 @@ def run_wafw00f(req: Wafw00fReq, background_tasks: BackgroundTasks):
             "status_url": f"/jobs/{job_id}", "no_ingest": req.no_ingest}
 
 
+# GoWitness writes one JSONL record per probe (url, final_url, response_code,
+# title) alongside the PNGs it names after the URL. That record is the
+# AUTHORITATIVE status for a screenshot -- the same tool produced both -- so the
+# status shown under a thumbnail comes from here rather than from a join against
+# web_findings, whose URLs for the same host often omit the :port the filename
+# carries.
+#
+# The filename encoding is `://` -> `---`, then `:` and `/` -> `-`. Measured
+# against the live corpus (1814 records, 1598 files): that exact form matches
+# 1227 files, also trying the trailing-slash-stripped URL reaches 1332, and
+# additionally sanitising everything outside [A-Za-z0-9.-_] reaches 1374 (86%).
+# The remaining 14% have no surviving record, and they get NO status rather than
+# a guessed one.
+_GW_STATUS_CACHE = {"t": 0.0, "index": {}}
+
+
+def _gowitness_name_variants(url: str):
+    """Candidate screenshot filenames GoWitness may have written for `url`."""
+    import re as _re
+    out = []
+    for u in (url, url.rstrip("/")):
+        base = u.replace("://", "---").replace(":", "-").replace("/", "-")
+        out.append(base + ".png")
+        out.append(_re.sub(r"[^A-Za-z0-9.\-_]", "-", base) + ".png")
+    # dict.fromkeys keeps order and drops the duplicates the two passes produce
+    return list(dict.fromkeys(out))
+
+
+def _gowitness_status_index(max_age: float = 60.0):
+    """{filename: {"status_code": int, "title": str}} built from the GoWitness
+    JSONL reports. Cached for `max_age` seconds; never raises -- a missing or
+    half-written report must cost the status badge, not the whole listing."""
+    import time as _t
+    if _GW_STATUS_CACHE["index"] and _t.time() - _GW_STATUS_CACHE["t"] < max_age:
+        return _GW_STATUS_CACHE["index"]
+    index = {}
+    try:
+        for rep in sorted(REPORT_DIR.glob("gowitness_*.jsonl")):
+            try:
+                with rep.open(errors="ignore") as fh:
+                    for line in fh:
+                        try:
+                            d = json.loads(line)
+                        except Exception:  # noqa: BLE001 -- a truncated line
+                            continue
+                        code = d.get("response_code")
+                        if not code:
+                            continue
+                        meta = {"status_code": int(code), "title": d.get("title") or ""}
+                        for u in (d.get("url"), d.get("final_url")):
+                            if not u:
+                                continue
+                            for name in _gowitness_name_variants(u):
+                                index.setdefault(name, meta)
+            except Exception:  # noqa: BLE001 -- one unreadable report
+                continue
+    except Exception:  # noqa: BLE001
+        return _GW_STATUS_CACHE["index"]
+    _GW_STATUS_CACHE.update(t=_t.time(), index=index)
+    return index
+
+
 @app.get("/screenshots/list")
 def list_screenshots(search: Optional[str] = None):
     """List all screenshot files across all screenshot directories."""
@@ -4928,6 +4990,7 @@ def list_screenshots(search: Optional[str] = None):
     results = []
     if not screenshots_root.exists():
         return {"screenshots": results, "total": 0}
+    status_index = _gowitness_status_index()
     for dir_entry in sorted(screenshots_root.iterdir()):
         if not dir_entry.is_dir():
             continue
@@ -4942,12 +5005,18 @@ def list_screenshots(search: Optional[str] = None):
                     search_dashed = search_lower.replace(".", "-").replace("://", "---")
                     if search_lower not in fname_lower and search_dashed not in fname_lower:
                         continue
-                results.append({
+                row = {
                     "path": rel_path,
                     "filename": f.name,
                     "directory": dir_entry.name,
                     "size": f.stat().st_size,
-                })
+                }
+                meta = status_index.get(f.name)
+                if meta:
+                    row["status_code"] = meta["status_code"]
+                    if meta.get("title"):
+                        row["title"] = meta["title"]
+                results.append(row)
     return {"screenshots": results, "total": len(results)}
 
 

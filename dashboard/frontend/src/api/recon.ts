@@ -344,6 +344,12 @@ export interface ScreenshotEntry {
   filename: string
   directory: string
   size: number
+  /** GoWitness `response_code` for this capture. OPTIONAL: ~14% of the
+   *  screenshots on disk have no surviving JSONL record, and those render no
+   *  status rather than borrowing another page's. */
+  status_code?: number
+  /** GoWitness page `title`, when recorded. */
+  title?: string
 }
 
 export interface ScreenshotsResponse {
