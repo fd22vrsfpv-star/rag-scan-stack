@@ -1010,7 +1010,26 @@ def _resolve_engagement_id(explicit: Optional[str] = None) -> Optional[str]:
 HOST_EXPR_FOLLOWUP = "followup_target_host(follow_up_items.target)"
 
 
-def _scope_exclusion_clause(host_expr: str, exclude_scope: Optional[str]):
+def _scope_engagement_predicate(engagement_id: Optional[str]):
+    """(sql_fragment, params) narrowing a `scope_targets st` subquery to one
+    engagement's lists plus the global (NULL-engagement) ones.
+
+    A scope NAME is not unique: `unknown_scope` exists under five engagements
+    and `not_in_scope` under two, so matching on the name alone consults every
+    engagement's list at once. NULL-engagement rows stay in deliberately --
+    `not_in_scope` is the cross-engagement deny-list by design, and legacy rows
+    predate attribution.
+
+    Returns ("", []) for None so a caller that genuinely wants every
+    engagement's list (an explicit all-engagements view) appends nothing.
+    """
+    if not engagement_id:
+        return "", []
+    return " AND (st.engagement_id = %s::uuid OR st.engagement_id IS NULL)", [engagement_id]
+
+
+def _scope_exclusion_clause(host_expr: str, exclude_scope: Optional[str],
+                            engagement_id: Optional[str] = None):
     """(sql_fragment, params) dropping rows whose host sits in a named scope list.
 
     WHY: `customer_scope` holds customer-hosted sites that the mark-customer-sites
@@ -1025,18 +1044,29 @@ def _scope_exclusion_clause(host_expr: str, exclude_scope: Optional[str]):
     the blank-target guard elsewhere: a matcher that is too generous silently
     removes the operator's real work.
 
+    SCOPE NAMES ARE PER-ENGAGEMENT, so `engagement_id` narrows which list of
+    that name is consulted: the engagement's own rows, plus the NULL-engagement
+    rows which are global by design (`not_in_scope` is the cross-engagement
+    deny-list, and pre-attribution rows are intentionally visible everywhere --
+    the same `= %s OR IS NULL` pattern the listing endpoints use). Without it,
+    `unknown_scope` exists under FIVE engagements and they all answer at once.
+    Passing None keeps the old name-only behaviour, which is what an explicit
+    all-engagements view wants.
+
     Returns ("", []) when nothing is excluded, so callers can append
     unconditionally.
     """
     names = [n.strip() for n in (exclude_scope or "").split(",") if n.strip()]
     if not names:
         return "", []
+    eng_sql, eng_params = _scope_engagement_predicate(engagement_id)
     return (f"NOT EXISTS (SELECT 1 FROM scope_targets st "
-            f"WHERE st.name = ANY(%s) AND st.target <> '' "
-            f"AND lower(st.target) = {host_expr})"), [names]
+            f"WHERE st.name = ANY(%s) AND st.target <> ''{eng_sql} "
+            f"AND lower(st.target) = {host_expr})"), [names, *eng_params]
 
 
-def _scope_inclusion_clause(host_expr: str, scope_name: Optional[str]):
+def _scope_inclusion_clause(host_expr: str, scope_name: Optional[str],
+                            engagement_id: Optional[str] = None):
     """(sql_fragment, params) keeping ONLY rows whose host sits in a named scope.
 
     The inverse of _scope_exclusion_clause, and the one that was missing. The
@@ -1054,16 +1084,24 @@ def _scope_inclusion_clause(host_expr: str, scope_name: Optional[str]):
     filter is a VIEW, not an authorization boundary (etl/scope_gate.py is that,
     and it fails closed).
 
+    SCOPE NAMES COLLIDE ACROSS ENGAGEMENTS -- `unknown_scope` exists under five
+    of them on the live database -- so `engagement_id` picks whose list to read
+    (that engagement's rows plus the global NULL-engagement ones). Measured
+    2026-10-19: filtering follow-ups by `unknown_scope` returned 11 rows, and
+    10 of them matched ONLY because another engagement owns a list of the same
+    name.
+
     Returns ("", []) when no scope is selected, so callers can append
     unconditionally.
     """
     name = (scope_name or "").strip()
     if not name:
         return "", []
+    eng_sql, eng_params = _scope_engagement_predicate(engagement_id)
     return (f"EXISTS (SELECT 1 FROM scope_targets st "
-            f"WHERE st.name = %s AND st.target <> '' "
+            f"WHERE st.name = %s AND st.target <> ''{eng_sql} "
             f"AND ({host_expr} = lower(st.target) "
-            f"     OR {host_expr} LIKE '%%.' || lower(st.target)))"), [name]
+            f"     OR {host_expr} LIKE '%%.' || lower(st.target)))"), [name, *eng_params]
 
 
 def _validate_engagement_uuid(eid: Optional[str]) -> Optional[str]:
@@ -53946,13 +53984,13 @@ def follow_up_stats(
     if engagement_id:
         stat_clauses.append("engagement_id = %s::uuid")
         params.append(engagement_id)
-    _ex, _exp = _scope_exclusion_clause(HOST_EXPR_FOLLOWUP, exclude_scope)
+    _ex, _exp = _scope_exclusion_clause(HOST_EXPR_FOLLOWUP, exclude_scope, engagement_id)
     if _ex:
         stat_clauses.append(_ex)
         params.extend(_exp)
     # Keep ONLY the selected scope. A header counting the whole engagement
     # under a scope's name is the same lie as a table showing it.
-    _in, _inp = _scope_inclusion_clause(HOST_EXPR_FOLLOWUP, scope_name)
+    _in, _inp = _scope_inclusion_clause(HOST_EXPR_FOLLOWUP, scope_name, engagement_id)
     if _in:
         stat_clauses.append(_in)
         params.extend(_inp)
@@ -54036,13 +54074,13 @@ def follow_ups_grouped(
         if engagement_id:
             where_clauses.append("engagement_id = %s::uuid")
             params.append(engagement_id)
-        _ex, _exp = _scope_exclusion_clause(HOST_EXPR_FOLLOWUP, exclude_scope)
+        _ex, _exp = _scope_exclusion_clause(HOST_EXPR_FOLLOWUP, exclude_scope, engagement_id)
         if _ex:
             where_clauses.append(_ex)
             params.extend(_exp)
         # The grouped view renders host_samples — unfiltered, those are the
         # out-of-scope IPs the operator reported seeing under a scope header.
-        _in, _inp = _scope_inclusion_clause(HOST_EXPR_FOLLOWUP, scope_name)
+        _in, _inp = _scope_inclusion_clause(HOST_EXPR_FOLLOWUP, scope_name, engagement_id)
         if _in:
             where_clauses.append(_in)
             params.extend(_inp)
@@ -54164,13 +54202,13 @@ def list_follow_ups(
     if search:
         clauses.append("(title ILIKE %s OR target ILIKE %s OR reason ILIKE %s OR rule_id ILIKE %s)")
         params.extend([f"%{search}%", f"%{search}%", f"%{search}%", f"%{search}%"])
-    _ex, _exp = _scope_exclusion_clause(HOST_EXPR_FOLLOWUP, exclude_scope)
+    _ex, _exp = _scope_exclusion_clause(HOST_EXPR_FOLLOWUP, exclude_scope, engagement_id)
     if _ex:
         clauses.append(_ex)
         params.extend(_exp)
     # Server-side too, not only the client filter: the client one cannot fix
     # the counts, and pagination over an unfiltered set hides in-scope rows.
-    _in, _inp = _scope_inclusion_clause(HOST_EXPR_FOLLOWUP, scope_name)
+    _in, _inp = _scope_inclusion_clause(HOST_EXPR_FOLLOWUP, scope_name, engagement_id)
     if _in:
         clauses.append(_in)
         params.extend(_inp)
