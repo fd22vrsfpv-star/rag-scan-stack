@@ -30158,7 +30158,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                     recon_source_used=None, arjun_discovered=None,
                     focused_urls_from_body=None, resolved_ids=None, gather_facts=None,
                     prior_cmd_signatures=None, vuln_class_override=None,
-                    tried_classes=None):
+                    tried_classes=None, plan=None):
     """Increment 2: run the PoC against the target; on failure, refine via the LLM,
     re-run — up to max_iters. Verbose trail -> filesystem.
 
@@ -30616,7 +30616,13 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             except (Exception, StopIteration):  # noqa: BLE001
                 pass
             try:
-                _probe = _prerun_payload_probe(ip, port, command, timeout=5)
+                # `plan` is the structured request behind the FIRST command.
+                # Once refine rewrites the command by hand the plan no longer
+                # describes it, so it is only trusted on iteration 1 — a stale
+                # declared target would be worse than inferring one.
+                _probe = _prerun_payload_probe(
+                    ip, port, command, timeout=5,
+                    plan=(plan if it == 1 else None))
             except Exception as _pbe:  # noqa: BLE001 — probe never breaks dispatch
                 _probe = {"ok": True, "skipped": True, "reason": f"probe raised {type(_pbe).__name__}"}
             _poc_trace(run_id, "prerun_probe", iteration=it,
@@ -36858,7 +36864,8 @@ def _curl_target_url(command: str):
     return method, url
 
 
-def _prerun_payload_probe(ip, port, command: str, timeout: int = 5) -> dict:
+def _prerun_payload_probe(ip, port, command: str, timeout: int = 5,
+                          plan=None) -> dict:
     """Lightweight method-aware endpoint probe before executing the real exploit.
 
     Extracts the first HTTP method + URL from a curl-ish command and sends a
@@ -36887,9 +36894,21 @@ def _prerun_payload_probe(ip, port, command: str, timeout: int = 5) -> dict:
     # perfectly good `CANARY=POCz...; curl ".../$CANARY"` was probed with the
     # literal `$CANARY` in the path and refused on the resulting 404.
     command = _expand_simple_assignments(command)
-    # The URL curl will REQUEST — not the first URL in the string, which for
-    # an SSRF or OOB command is the payload's callback destination.
-    method, url = _curl_target_url(command)
+    # A structured plan DECLARES its target, so there is nothing to infer.
+    # Extraction from the rendered command is the fallback for the string
+    # path, and every bug this probe has had was in that inference.
+    method = url = None
+    if plan:
+        try:
+            from etl.http_request import target_of as _tgt
+            method, url = _tgt(plan)
+        except Exception as _pe:  # noqa: BLE001 — fall back, never refuse
+            logging.debug("probe: plan target lookup failed: %s", _pe)
+            method = url = None
+    if not url:
+        # The URL curl will REQUEST — not the first URL in the string, which
+        # for an SSRF or OOB command is the payload's callback destination.
+        method, url = _curl_target_url(command)
     if not url:
         return {"ok": True, "skipped": True, "reason": "no HTTP URL in command — not an HTTP exploit"}
     url = _re.sub(r"[\"'`;&|]+$", "", url).rstrip()
