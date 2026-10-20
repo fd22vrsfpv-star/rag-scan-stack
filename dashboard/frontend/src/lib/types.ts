@@ -136,6 +136,17 @@ export interface ScanJob {
   scope_name?: string | null
   target?: string | null
   targets?: string[] | null
+  // Kali tool executions (`kind: "tool"`) have no scanner-service `result`
+  // object — `/api/scans/{job_id}` returns their captured stdout and metadata
+  // at the top level instead. Declared here so the detail page can read the
+  // raw output it was previously unable to see.
+  output?: string
+  command?: string
+  exit_code?: number | string | null
+  port?: number | string | null
+  service?: string | null
+  summary?: string
+  parsed_results?: unknown
 }
 
 export interface Exploit {

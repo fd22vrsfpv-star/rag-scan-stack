@@ -364,13 +364,14 @@ function ExploitWorkbenchOperationsTab({ product, version, collectedCves, embedd
   }) as Array<{ data?: { exploits: Array<{ id: string; cve: string; verified: boolean; target_host: string | null; target_port: number | null; built_at: string | null }> } }>
   const matchedExploits = useMemo(() => {
     const seen = new Set<string>()
-    const rows: Array<{ id: string; cve: string; verified: boolean; target: string }> = []
+    const rows: Array<{ id: string; cve: string; verified: boolean; target: string; host: string; port: number | null }> = []
     for (const q of cveQueries) {
       for (const ex of (q.data?.exploits || [])) {
         if (seen.has(ex.id)) continue
         seen.add(ex.id)
         rows.push({
           id: ex.id, cve: ex.cve, verified: ex.verified,
+          host: ex.target_host || '?', port: ex.target_port ?? null,
           target: `${ex.target_host || '?'}${ex.target_port ? ':' + ex.target_port : ''}`,
         })
       }
@@ -378,6 +379,32 @@ function ExploitWorkbenchOperationsTab({ product, version, collectedCves, embedd
     rows.sort((a, b) => (a.verified === b.verified ? 0 : a.verified ? -1 : 1))
     return rows
   }, [cveQueries])
+
+  // Group by host:port. One product's CVE set can carry PoCs built against
+  // several hosts and ports, and a flat list sorted only by verified-ness
+  // interleaved them — the operator could not see which target a run of
+  // entries belonged to, or that a host had any verified PoC at all without
+  // reading every row. Verified targets sort first, then by host:port, so the
+  // target worth attacking is at the top.
+  const exploitsByTarget = useMemo(() => {
+    const groups = new Map<string, {
+      target: string; host: string; port: number | null
+      rows: typeof matchedExploits; verified: number
+    }>()
+    for (const ex of matchedExploits) {
+      const key = ex.target
+      let g = groups.get(key)
+      if (!g) {
+        g = { target: ex.target, host: ex.host, port: ex.port, rows: [], verified: 0 }
+        groups.set(key, g)
+      }
+      g.rows.push(ex)
+      if (ex.verified) g.verified += 1
+    }
+    return [...groups.values()].sort((a, b) =>
+      (b.verified > 0 ? 1 : 0) - (a.verified > 0 ? 1 : 0)
+      || a.target.localeCompare(b.target, undefined, { numeric: true }))
+  }, [matchedExploits])
   const buildPoc = useBuildPoc()
   const [buildMsg, setBuildMsg] = useState<string>('')
   const firstCve = collectedCves[0]
@@ -420,29 +447,45 @@ function ExploitWorkbenchOperationsTab({ product, version, collectedCves, embedd
             No stored exploits yet for any of the collected CVEs. Click Build PoC below to generate one.
           </div>
         ) : (
-          <div className="space-y-1 max-h-72 overflow-y-auto">
-            {matchedExploits.slice(0, 25).map(ex => (
-              <div key={ex.id} className="flex items-center gap-2 px-2 py-1 rounded border border-border bg-muted/20 text-xs">
-                <span className={cn('h-5 px-1.5 rounded text-[9px] inline-flex items-center font-semibold uppercase',
-                  ex.verified ? 'bg-emerald-500/20 text-emerald-300' : 'bg-amber-500/20 text-amber-300')}>
-                  {ex.verified ? '✓ verified' : 'unverified'}
-                </span>
-                <span className="font-mono text-amber-400">{ex.cve}</span>
-                <span className="text-muted-foreground">on {ex.target}</span>
-                <div className="flex-1" />
-                {/* ?open= was read by nothing anywhere in the app — the link
-                    opened an unfiltered Exploits page. Target the host, which
-                    the PoC Store list now filters on. */}
-                <a href={`/exploits?tab=workbench&ip=${encodeURIComponent(ex.target || '')}`}
-                  target="_blank" rel="noopener"
-                  className="text-[10px] px-2 py-0.5 rounded border border-border hover:bg-muted">
-                  Open in /exploits
-                </a>
+          <div className="space-y-2 max-h-72 overflow-y-auto">
+            {exploitsByTarget.map(g => (
+              <div key={g.target} className="border border-border rounded">
+                {/* Target header — the host:port every PoC under it was built
+                    against, with its verified count so a target carrying a
+                    working PoC is visible without reading each row. */}
+                <div className="flex items-center gap-2 px-2 py-1 bg-muted/40 text-xs border-b border-border">
+                  <Server className="h-3 w-3 text-muted-foreground shrink-0" />
+                  <span className="font-mono">{g.host}</span>
+                  {g.port != null && <span className="font-mono text-muted-foreground">:{g.port}</span>}
+                  <span className="text-[10px] text-muted-foreground">
+                    {g.rows.length} PoC{g.rows.length === 1 ? '' : 's'}
+                    {g.verified > 0 && <span className="text-emerald-300"> · {g.verified} verified</span>}
+                  </span>
+                  <div className="flex-1" />
+                  {/* ?open= was read by nothing anywhere in the app — the link
+                      opened an unfiltered Exploits page. Target the host, which
+                      the PoC Store list now filters on. One link per target
+                      rather than one per row: they were all identical within a
+                      group. */}
+                  <a href={`/exploits?tab=workbench&ip=${encodeURIComponent(g.host)}`}
+                    target="_blank" rel="noopener"
+                    className="text-[10px] px-2 py-0.5 rounded border border-border hover:bg-muted">
+                    Open in /exploits
+                  </a>
+                </div>
+                <div className="divide-y divide-border/50">
+                  {g.rows.map(ex => (
+                    <div key={ex.id} className="flex items-center gap-2 px-2 py-1 text-xs">
+                      <span className={cn('h-5 px-1.5 rounded text-[9px] inline-flex items-center font-semibold uppercase',
+                        ex.verified ? 'bg-emerald-500/20 text-emerald-300' : 'bg-amber-500/20 text-amber-300')}>
+                        {ex.verified ? '✓ verified' : 'unverified'}
+                      </span>
+                      <span className="font-mono text-amber-400">{ex.cve}</span>
+                    </div>
+                  ))}
+                </div>
               </div>
             ))}
-            {matchedExploits.length > 25 && (
-              <div className="text-[10px] text-muted-foreground">+ {matchedExploits.length - 25} more…</div>
-            )}
           </div>
         )}
       </div>
