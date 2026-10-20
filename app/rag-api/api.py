@@ -20277,11 +20277,21 @@ def _assert_template_for(vuln_class, canary) -> str:
     could never satisfy.
     """
     kinds = _vc_proof_kinds(vuln_class) or []
-    for k in kinds:
-        t = _PROOF_KIND_ASSERT_TMPL.get(k)
-        if t:
-            return t.replace("CANARY", str(canary or ""))
-    return "<the assertion matching the proof kind above>"
+    if not kinds:
+        return "<the assertion matching the proof kind above>"
+    # The FIRST kind, and ONLY the first. Falling through to a later kind is
+    # how `lfi` (['file_content', 'echo']) got handed a canary template on
+    # 2026-10-20: there is no file_content template, so the loop skipped to
+    # echo. For a file read the canary is a REFUTATION — if it comes back, the
+    # app echoed your input instead of disclosing a file. Offering that shape
+    # is the exact mistake this selector replaced.
+    #
+    # No template for the cheapest kind means we have nothing honest to
+    # suggest, so the guidance stands on its own.
+    t = _PROOF_KIND_ASSERT_TMPL.get(kinds[0])
+    if not t:
+        return "<the assertion matching the proof kind above>"
+    return t.replace("CANARY", str(canary or ""))
 
 
 def _proof_expectation_block(vuln_class, canary, os=None, runtime=None) -> str:

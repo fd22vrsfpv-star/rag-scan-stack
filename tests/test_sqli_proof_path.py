@@ -590,6 +590,29 @@ def test_an_unknown_class_gets_no_invented_shape():
     assert "matching the proof kind" in tmpl
 
 
+def test_a_file_read_is_never_offered_a_canary():
+    """`lfi` declares ['file_content', 'echo']. There is no file_content
+    template, and an earlier version of this selector FELL THROUGH to echo and
+    handed back a canary — the exact mistake it replaced.
+
+    CLAUDE.md: for a file read a returning canary is a REFUTATION, not a near
+    miss. The app echoed your input instead of disclosing a file."""
+    fn = _assert_template_for()
+    for cls in ("lfi", "file-read", "path-traversal"):
+        tmpl = fn(cls, CANARY)
+        assert CANARY not in tmpl, (
+            f"{cls} was offered a canary template ({tmpl!r}) — a canary there "
+            "REFUTES the proof")
+
+
+def test_no_fall_through_past_the_cheapest_kind():
+    """A class whose first kind has no template gets the generic fallback, not
+    a later kind's shape. Suggesting the wrong proof's shape is worse than
+    suggesting none."""
+    fn = _assert_template_for()
+    assert "matching the proof kind" in fn("lfi", CANARY)
+
+
 def test_the_template_follows_the_declared_order():
     """Every class's template must be the one for its FIRST kind — the list is
     ordered cheapest-first and the template is what the model actually obeys."""
@@ -608,7 +631,8 @@ def test_the_template_follows_the_declared_order():
     for c in classes:
         if not isinstance(c, dict):
             continue
-        first = next((k for k in (c.get("proof") or []) if k in tbl), None)
+        kinds = c.get("proof") or []
+        first = kinds[0] if kinds and kinds[0] in tbl else None
         if not first:
             continue
         got = fn(c["name"], CANARY)
