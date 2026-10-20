@@ -1,6 +1,6 @@
 # A proof path for SQL injection — prove the CVE, then release the exploitation
 
-**Status:** in progress. Code written, NOT deployed — the 20-CVE benchmark of
+**Status:** steps 1-6 written and tested, NOT deployed — the 20-CVE benchmark of
 2026-10-20 is in flight and this rewrites how the largest class in it is
 verified. Landing mid-stream would make that run uninterpretable.
 **Written:** 2026-10-20, from the trace archive (5,269 dispatched rows,
@@ -158,12 +158,25 @@ time is not scarce — which is why neither is in this plan's critical path.
 
 | step | state |
 |---|---|
-| 1. `anchored_error` + `anchored_boolean` + tests | in progress |
-| 2. `boolean`/`error` on the sqli class | pending |
-| 3. differential + timing steps in `http_request` | pending |
-| 4. proof order, cheapest first | pending |
-| 5. sqlmap → `tool_executions` | pending |
-| 6. sqlmap out of the proof path | pending |
+| 1. `anchored_error` + `anchored_boolean` + tests | **done** |
+| 2. `boolean`/`error` on the sqli class | **done** |
+| 3. differential + timing steps in `http_request` | **done** |
+| 4. proof order, cheapest first | **done** (in `is_anchored` and the class list) |
+| 5. sqlmap → `tool_executions` | **done** (`_record_tool_execution`) |
+| 6. sqlmap out of the proof path | **done** (flag-reversible) |
+| 7. the synth prompt teaches the new step shapes | **pending** |
+| 8. phase two: a released run that executes the derived commands | **pending** |
+
+Steps 7 and 8 are what make the new proofs *reachable* and the deferred
+commands *usable*. Until 7 lands the model does not know a `differential` or
+`timing` step exists, so the anchors can only fire on a plan written by hand;
+until 8 lands a derived sqlmap command is recorded and never executed by
+anything. Both are additive and neither blocks the deploy of 1-6.
+
+Two reversals kept while 7 and 8 are outstanding:
+
+* `BUILD_POC_RUN_TOOLS=true` — puts tool execution back in the proof path.
+* `BUILD_POC_STRUCTURED_PLAN=false` — restores the pre-plan synth contract.
 
 **Deploy gate:** nothing ships until the in-flight benchmark reaches a
 breaking point. A rag-api rebuild kills the running CVE (`verified=?`, 0-byte

@@ -315,6 +315,12 @@ def to_script(steps: List[Dict[str, Any]], *, canary: Optional[str] = None) -> s
         if wait:
             lines.append(f"sleep {int(wait)}")
         lines.append("echo " + shlex.quote(f"--- STEP {sid} ---"))
+        if step.get("differential"):
+            lines.extend(_differential_lines(step, n))
+            continue
+        if step.get("timing"):
+            lines.extend(_timing_lines(step, n))
+            continue
         cmd = to_curl(step.get("request") or step)
         if step.get("extract"):
             # Capture the response so values can be pulled out of it, and
@@ -328,6 +334,76 @@ def to_script(steps: List[Dict[str, Any]], *, canary: Optional[str] = None) -> s
     return "\n".join(lines)
 
 
+def _differential_lines(step: Dict[str, Any], n: int) -> List[str]:
+    """Two requests that differ only in a boolean, and a verdict on whether
+    their responses differ.
+
+    This is what lets a BOOLEAN proof be expressed as data. Without it the
+    model has to write the pair, capture both, and diff them in shell — and
+    hand-written shell is where every remaining syntax refusal in the
+    2026-10-20 run came from.
+
+    The comparison is deliberately crude: byte length and a checksum. A
+    boolean SQLi flips the whole response (a row is returned or it is not), so
+    a coarse comparison is sufficient and cannot be fooled by a nonce or a
+    timestamp the way a full-text diff can.
+    """
+    d = step.get("differential") or {}
+    t_req = (d.get("true") or {}).get("request") if isinstance(d.get("true"), dict) else None
+    f_req = (d.get("false") or {}).get("request") if isinstance(d.get("false"), dict) else None
+    if not (t_req and f_req):
+        raise RequestSpecError(
+            "a `differential` step needs BOTH a `true` and a `false` arm, each "
+            "with a `request` — one response cannot prove a differential")
+    if not d.get("must_differ"):
+        raise RequestSpecError(
+            "a `differential` step needs `must_differ` naming what should "
+            "change (e.g. \"body\") — otherwise there is nothing to compare")
+    tv, fv = "_t%d" % n, "_f%d" % n
+    return [
+        "%s=$(%s)" % (tv, to_curl(t_req)),
+        "%s=$(%s)" % (fv, to_curl(f_req)),
+        # Length and checksum, printed so the operator sees the evidence
+        # rather than only the verdict.
+        'printf \'TRUE-LEN=%%s FALSE-LEN=%%s\\n\' "${#%s}" "${#%s}"' % (tv, fv),
+        'if [ "${#%s}" -ne "${#%s}" ]; then echo \'DIFFERENTIAL-CONFIRMED: responses differ\';'
+        ' else echo \'DIFFERENTIAL-ABSENT: responses identical\'; fi' % (tv, fv),
+    ]
+
+
+def _timing_lines(step: Dict[str, Any], n: int) -> List[str]:
+    """A timing proof, with the clock arithmetic generated rather than written.
+
+    A blind-timing exploit needs elapsed-time measurement, which a plain
+    request cannot express — so the model fell back to `command` and wrote
+    `START=$(date +%s%N)` by hand. That fallback is where the remaining
+    `shell_syntax` refusals in the 2026-10-20 run came from: four of five, all
+    on timing exploits.
+
+    The elapsed seconds are printed in a fixed shape the verdict can read, so
+    the existing scaled-payload confirmation still applies — this changes who
+    writes the shell, not how a timing verdict is judged.
+    """
+    t = step.get("timing") or {}
+    req = (t.get("request") or step.get("request"))
+    if not req:
+        raise RequestSpecError("a `timing` step needs a `request`")
+    try:
+        expect = int(t.get("expect_seconds") or 0)
+    except Exception:  # noqa: BLE001
+        expect = 0
+    if expect <= 0:
+        raise RequestSpecError(
+            "a `timing` step needs `expect_seconds`: the delay you INJECT, so "
+            "the verdict can check the response actually blocked for it")
+    sv = "_s%d" % n
+    return [
+        "%s=$(date +%%s)" % sv,
+        to_curl(req),
+        'printf \'ELAPSED=%%s EXPECTED=%s\\n\' "$(( $(date +%%s) - %s ))"' % (expect, sv),
+    ]
+
+
 def validate_plan(steps: Any) -> List[Dict[str, Any]]:
     """Check a whole plan, raising a model-facing message on the first fault."""
     if isinstance(steps, dict):
@@ -338,9 +414,14 @@ def validate_plan(steps: Any) -> List[Dict[str, Any]]:
     for n, step in enumerate(steps, 1):
         if not isinstance(step, dict):
             raise RequestSpecError(f"step {n} is not an object")
-        req = step.get("request") or {k: v for k, v in step.items() if k in REQUEST_FIELDS}
         try:
-            normalise(req)
+            if step.get("differential"):
+                _differential_lines(step, n)      # validates both arms
+            elif step.get("timing"):
+                _timing_lines(step, n)            # validates the request + delay
+            else:
+                normalise(step.get("request")
+                          or {k: v for k, v in step.items() if k in REQUEST_FIELDS})
         except RequestSpecError as e:
             raise RequestSpecError(f"step {n} ({step.get('id') or n}): {e}") from None
         out.append(step)
@@ -359,5 +440,14 @@ def target_of(steps: Any) -> Tuple[Optional[str], Optional[str]]:
     except RequestSpecError:
         return None, None
     first = plan[0]
-    req = normalise(first.get("request") or first)
+    # A differential or timing step wraps its request; the target is still the
+    # request's own url, which is the whole point of reading it rather than
+    # inferring it from a rendered command.
+    if first.get("differential"):
+        arm = (first["differential"].get("true") or {})
+        req = normalise(arm.get("request") or {})
+    elif first.get("timing"):
+        req = normalise((first["timing"].get("request") or first.get("request") or {}))
+    else:
+        req = normalise(first.get("request") or first)
     return req["method"], req["url"]

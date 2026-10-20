@@ -36942,6 +36942,44 @@ def _curl_target_url(command: str):
     return method, url
 
 
+def _record_tool_execution(*, tool, command, target, port=None, service=None,
+                           status="completed", exit_code=None, output="",
+                           error=None, scan_id=None):
+    """Write one `tool_executions` row for a tool this platform ran.
+
+    Why: the build-PoC tool handoff dispatches sqlmap (and tplmap, commix)
+    DIRECTLY rather than through the recorded dispatch route, so 173 sqlmap
+    runs existed only inside trace JSONL — invisible to scan history, the
+    scan monitor, and every audit view. An operator asking "what have we run
+    against this host?" got an answer that was missing all of them.
+
+    `output` is CAPPED. An uncapped text column is a latent outage here: 127 MB
+    of captured stderr once emptied two dashboard pages, and a verbose sqlmap
+    run is exactly the shape that produces it.
+
+    Best-effort by contract — the caller treats a failure as nothing. Recording
+    that a scan happened must never be able to fail the scan.
+    """
+    _OUT_CAP = 100_000
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO tool_executions
+                     (tool, command, target, port, service, status, exit_code,
+                      output, error, scan_id, started_at, completed_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())""",
+                (str(tool)[:100], str(command or "")[:20000], str(target or "")[:255],
+                 int(port) if port else None, str(service)[:100] if service else None,
+                 str(status)[:40], int(exit_code) if exit_code is not None else None,
+                 str(output or "")[:_OUT_CAP], str(error)[:4000] if error else None,
+                 scan_id))
+            conn.commit()
+        return True
+    except Exception as e:  # noqa: BLE001
+        logging.debug("_record_tool_execution(%s) failed: %s", tool, e)
+        return False
+
+
 def _prerun_payload_probe(ip, port, command: str, timeout: int = 5,
                           plan=None) -> dict:
     """Lightweight method-aware endpoint probe before executing the real exploit.

@@ -2337,11 +2337,41 @@ def node_tool_handoff(state: BuildPocState) -> Dict[str, Any]:
         return {}
     if not tools:
         return {}
+    # ── PROOF vs RELEASE ───────────────────────────────────────────────────
+    #
+    # Proving a CVE and exploiting it are different jobs. Proof needs the
+    # cheapest deterministic evidence that the vulnerability exists; sqlmap's
+    # job is enumeration and extraction, which belongs to a run the operator
+    # has RELEASED.
+    #
+    # Measured before splitting them: sqlmap ran 173 times in the proof path
+    # and confirmed 7 (4%) — and all 7 are simple form POSTs with a named
+    # parameter. Elsewhere it was handed a crippled technique set
+    # (`--technique=T` on 136 of 175, time-based only) or a broken request
+    # (42 of 175 carry an unexpanded $VAR such as `sid=$CSRF_TOKEN`, so the
+    # app rejects it before any injection test). It was spending build time
+    # on a question the proof path can now answer in one or two requests —
+    # see `anchored_error` / `anchored_boolean`.
+    #
+    # The DERIVED commands are still recorded, because they are what a
+    # released run executes. Only the execution moves.
+    #
+    # BUILD_POC_RUN_TOOLS=true restores the old behaviour. Phase two is not
+    # wired yet, so this is reversible without a rebuild while that lands.
+    _run_tools = os.environ.get("BUILD_POC_RUN_TOOLS", "false").strip().lower() \
+        in ("1", "true", "yes", "on")
     tested = []
     for te in tools:
         entry = {"tool": te["tool"], "class": te["class"],
                  "command": te.get("command"), "available": None,
                  "ran": False, "confirmed": False}
+        if te.get("command") and not _run_tools:
+            entry["refusal"] = ("not run in the proof path — sqlmap and friends "
+                                "belong to a released exploitation run; the "
+                                "command is recorded for it")
+            entry["deferred_to_release"] = True
+            tested.append(entry)
+            break
         if te.get("command"):
             try:
                 v = _run_tool_validation(state["ip"], state["port"], te,
@@ -2352,6 +2382,26 @@ def node_tool_handoff(state: BuildPocState) -> Dict[str, Any]:
                               "command": v.get("command")})
             except Exception as e:  # noqa: BLE001
                 entry["refusal"] = f"validation error: {e}"
+            # RECORD IT AS A SCAN. sqlmap has run 173 times through this path
+            # and `tool_executions` held zero rows for it, because the handoff
+            # dispatches the tool directly rather than through the recorded
+            # route. Every one of those runs was invisible to scan history,
+            # the monitor and any audit view — so "any sqlmap run should be
+            # tracked in the scans" was simply not true.
+            #
+            # Fire-and-forget: a bookkeeping failure must never cost a build.
+            try:
+                from api import _record_tool_execution as _rte
+                _rte(tool=entry["tool"], command=entry.get("command") or "",
+                     target=state["ip"], port=state.get("port"),
+                     service=entry.get("class"),
+                     status=("completed" if entry.get("ran") else "skipped"),
+                     exit_code=(0 if entry.get("confirmed") else 1),
+                     output=(entry.get("refusal") or
+                             ("confirmed" if entry.get("confirmed") else "not confirmed")))
+            except Exception as _rex:  # noqa: BLE001
+                logging.debug("tool_executions record failed for %s: %s",
+                              entry["tool"], _rex)
             tested.append(entry)
             break  # bounded: test ONE tool per build
         tested.append(entry)

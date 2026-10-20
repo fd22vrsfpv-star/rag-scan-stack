@@ -90,7 +90,11 @@ injection_points: [path, parameter, body, header, cookie, multipart, none]
 # through the gate with nothing to attack.
 
 # proof vocabulary — what counts as evidence the class actually fired.
-proof_kinds: [echo, oob, timing, file_content, status_change, side_effect]
+# `error` and `boolean` added 2026-10-20 — see Docs/plans/SQLI_PROOF_PATH.md.
+# Ordered cheapest-and-most-certain first, which is also the order
+# `etl/proof_anchor.is_anchored` tries them: a one-request parser error or a
+# two-request differential beats a clock that 1,215 archived attempts got wrong.
+proof_kinds: [error, boolean, echo, oob, file_content, status_change, side_effect, timing]
 # OPTIONAL per-class `graded_goals`: on a graded benchmark target, the goals this
 # class's primitive naturally reaches, best first (ids from _BENCH_GOAL_LADDER in
 # app/rag-api/api.py). Absent = keep the ladder's cost order. Without it every
@@ -113,7 +117,16 @@ classes:
     file_read: false
     needs_oob_sink: false
     blind_capable: true
-    proof: [echo, timing, oob]
+    # Cheapest and most certain FIRST. `error` is one request and `boolean` is
+    # two, and neither depends on how fast the target answers — which is what
+    # makes a timing verdict unreliable against a slow target or a WAF with a
+    # fixed delay. Measured on the trace archive before adding them: 1,215
+    # timing attempts went wrong against 305 that landed, dominated by 920
+    # `latency_too_fast` (a SLEEP(5) that returned instantly, i.e. the payload
+    # never reached the SQL parser). `timing` stays LAST — still valid, still
+    # gated by its scaled-payload confirmation, but no longer the only route a
+    # blind SQLi has. See Docs/plans/SQLI_PROOF_PATH.md.
+    proof: [error, boolean, echo, oob, timing]
     graded_goals: [database_access, database_modification]
     reading_hints:
       look_for:
@@ -558,7 +571,13 @@ classes:
     file_read: false
     needs_oob_sink: false
     blind_capable: true
-    proof: [echo, timing, status_change]
+    # `boolean` added 2026-10-20: a NoSQL auth bypass is PROVEN by a
+    # differential — `{"$ne": null}` against `{"$eq": "<nonexistent>"}` giving
+    # different answers shows the operator was evaluated. `status_change` has
+    # no anchor function at all (one of 17 such declarations, see
+    # Docs/plans/SQLI_PROOF_PATH.md), so this class had `echo` and `timing`
+    # in practice. A differential is both cheaper and more certain than either.
+    proof: [boolean, echo, oob, timing, status_change]
     graded_goals: [database_access, unauthorized_admin_login, database_modification]
     reading_hints:
       look_for:
