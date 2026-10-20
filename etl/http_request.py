@@ -65,6 +65,11 @@ from typing import Any, Dict, List, Optional, Tuple
 #: comparison, a human) sees the literal text instead.
 CANARY_TOKEN = "{{CANARY}}"
 
+#: Marks a captured value inside a string that is about to be shell-quoted.
+#: `\x00` cannot appear in a shell command or an HTTP body, so it cannot
+#: collide with payload text — which `"$name"` could.
+CAPTURE_SENTINEL = "\x00CAP:%s\x00"
+
 #: What a step may contain. Kept small on purpose — every field here is one
 #: the model must choose correctly, and the 444 syntax failures came from
 #: giving it a field with infinite freedom.
@@ -156,6 +161,30 @@ def normalise(req: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def interpolate_captures(obj: Any) -> Any:
+    """Turn `{{name}}` references into shell `"$name"` for captured values.
+
+    The model writes `{{csrf}}` in a later step's body; the renderer turns it
+    into the shell variable the extraction above assigned. The model still
+    never writes a shell variable or decides any quoting — `to_curl` quotes
+    the whole value, and a `$name` inside a double-quoted argument expands.
+    """
+    import re as _re
+    if isinstance(obj, str):
+        # A SENTINEL, not shell text. Emitting `"$name"` here would be swallowed
+        # by shlex.quote — it wraps the whole value in single quotes, where a
+        # variable does not expand — and a payload containing the literal text
+        # `"$foo"` would become an expansion. The sentinel is converted after
+        # quoting, so only real capture references escape the quotes.
+        return _re.sub(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}",
+                       lambda m: CAPTURE_SENTINEL % m.group(1), obj)
+    if isinstance(obj, list):
+        return [interpolate_captures(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: interpolate_captures(v) for k, v in obj.items()}
+    return obj
+
+
 def substitute(obj: Any, canary: Optional[str]) -> Any:
     """Replace `{{CANARY}}` throughout a plan. Recursive over dict/list/str.
 
@@ -175,6 +204,20 @@ def substitute(obj: Any, canary: Optional[str]) -> Any:
 
 
 # ── rendering ───────────────────────────────────────────────────────────────
+
+def _q(value: str) -> str:
+    """shlex.quote, then let capture references out of the quotes.
+
+    shlex.quote wraps a value in single quotes, where `$name` is literal. A
+    capture has to step outside them: `'a='"$csrf"'&b=1'`. Done after quoting
+    and only for the sentinel, so a payload containing the characters `$csrf`
+    stays data.
+    """
+    import re as _re
+    out = shlex.quote(value)
+    return _re.sub(r"\x00CAP:([A-Za-z_][A-Za-z0-9_]*)\x00",
+                   lambda m: "'\"$%s\"'" % m.group(1), out)
+
 
 def to_curl(req: Dict[str, Any], *, silent: bool = True,
             include_headers: bool = True) -> str:
@@ -199,23 +242,58 @@ def to_curl(req: Dict[str, Any], *, silent: bool = True,
     if r["method"] != "GET" or r["body"] is not None:
         parts += ["-X", r["method"]]
     for k, v in r["headers"].items():
-        parts += ["-H", shlex.quote(f"{k}: {v}")]
+        parts += ["-H", _q(f"{k}: {v}")]
     if r["cookies"]:
         jar = "; ".join(f"{k}={v}" for k, v in r["cookies"].items())
-        parts += ["-b", shlex.quote(jar)]
+        parts += ["-b", _q(jar)]
     if r["auth"]:
         parts += ["-u", shlex.quote(f"{r['auth'][0]}:{r['auth'][1]}")]
     if r["body"] is not None:
         # --data-raw, never -d: -d strips newlines and @ means "read a file",
         # so a body starting with @ would silently become a file read.
-        parts += ["--data-raw", shlex.quote(r["body"])]
+        parts += ["--data-raw", _q(r["body"])]
     url = r["url"]
     if r["query"]:
         from urllib.parse import urlencode
         sep = "&" if "?" in url else "?"
         url = url + sep + urlencode(r["query"])
-    parts.append(shlex.quote(url))
+    parts.append(_q(url))
     return " ".join(parts)
+
+
+def _extract_lines(step: Dict[str, Any], var: str) -> List[str]:
+    """Shell that pulls named values out of a step's response.
+
+    The one thing shell-chaining genuinely gave the model: a CSRF token or
+    session id fetched in one request and used in the next. A plan with no way
+    to express that would force `csrf_token=REPLACE_WITH_CSRF` into the body —
+    observed on the very first live plan this prompt produced.
+
+    So the model supplies the PATTERN and we generate the plumbing. That keeps
+    the property that matters: the model never writes shell quoting. The
+    archive's nastiest commands were exactly this idiom (a grep -oP with a
+    nested-quoted character class) and 15 of them were refused for unbalanced
+    quotes. The pattern is a PCRE using ``\\K``, so the match IS the value and
+    there are no capture groups to address.
+    """
+    out: List[str] = []
+    for name, spec in (step.get("extract") or {}).items():
+        if not str(name).isidentifier():
+            raise RequestSpecError(
+                "extract name %r must be a plain identifier — it becomes a "
+                "{{%s}} token later steps reference" % (name, name))
+        pat = spec.get("grep_p") if isinstance(spec, dict) else spec
+        if not pat:
+            raise RequestSpecError(
+                "extract %r needs `grep_p`: a PCRE whose \\K marks where the "
+                "value starts, e.g. name=\"csrf\"\\s+value=\"\\K[^\"]+" % (name,))
+        out.append("%s=$(printf '%%s' \"$%s\" | grep -oP %s | head -1)"
+                   % (name, var, shlex.quote(str(pat))))
+        # An empty capture is a silent wrong answer: the next request goes out
+        # with the parameter blank and the failure looks like the exploit, not
+        # the extraction.
+        out.append("[ -n \"$%s\" ] || echo 'EXTRACT-FAILED: %s'" % (name, name))
+    return out
 
 
 def to_script(steps: List[Dict[str, Any]], *, canary: Optional[str] = None) -> str:
@@ -226,7 +304,10 @@ def to_script(steps: List[Dict[str, Any]], *, canary: Optional[str] = None) -> s
     which step produced what. A chained one-liner cannot do that, which is why
     "iteration 3 FAILED" never said which part failed.
     """
-    plan = substitute(steps, canary)
+    # Canary first (a literal value), then capture references (which become
+    # shell variables) — order matters only in that both must happen before
+    # rendering, and a canary is never a capture name.
+    plan = interpolate_captures(substitute(steps, canary))
     lines: List[str] = []
     for n, step in enumerate(plan, 1):
         sid = str(step.get("id") or f"step{n}")
@@ -234,7 +315,16 @@ def to_script(steps: List[Dict[str, Any]], *, canary: Optional[str] = None) -> s
         if wait:
             lines.append(f"sleep {int(wait)}")
         lines.append("echo " + shlex.quote(f"--- STEP {sid} ---"))
-        lines.append(to_curl(step.get("request") or step))
+        cmd = to_curl(step.get("request") or step)
+        if step.get("extract"):
+            # Capture the response so values can be pulled out of it, and
+            # still print it — the verdict reads the combined output.
+            var = "_r%d" % n
+            lines.append("%s=$(%s)" % (var, cmd))
+            lines.append("printf '%%s\\n' \"$%s\"" % var)
+            lines.extend(_extract_lines(step, var))
+        else:
+            lines.append(cmd)
     return "\n".join(lines)
 
 

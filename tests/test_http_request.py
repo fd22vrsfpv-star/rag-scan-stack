@@ -238,3 +238,155 @@ def test_the_plan_is_only_trusted_on_the_first_iteration():
     call = src[src.index("_prerun_payload_probe("):]
     call = call[:call.index(")") + 1]
     assert "it == 1" in call, "the plan must not be reused after the first iteration"
+
+
+# ── the synth contract ──────────────────────────────────────────────────────
+
+@pytest.mark.skipif(not API.exists(), reason="rag-api source not present")
+def test_plan_is_bound_before_the_return_reads_it():
+    """`plan` is assigned only inside a branch that depends on what the model
+    returned, and the return reads it unconditionally. That is the
+    use-before-assignment shape that took `_summarize_build_trace` down on
+    2026-10-20 (three suite failures, NameError on every trace summary).
+    pyflakes does not flag conditional binding, so the initialiser is the
+    guard and this is what holds it there."""
+    import ast
+    fn = _func(_ast(API), "_synthesize_cve_poc")
+    assert fn is not None
+    # An unconditional `plan = ...` at function-body level, before any return.
+    top_level_init = None
+    for i, node in enumerate(fn.body):
+        if (isinstance(node, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "plan" for t in node.targets)):
+            top_level_init = i
+            break
+    assert top_level_init is not None, (
+        "`plan` has no unconditional initialiser — it will be unbound whenever "
+        "the model returns no plan")
+
+
+@pytest.mark.skipif(not API.exists(), reason="rag-api source not present")
+def test_the_structured_contract_is_the_default_and_chaining_is_the_fallback():
+    """The old prompt actively taught the shape that breaks — "chain curl
+    calls with ; and shell vars" — and that instruction produced the commands
+    behind 444 shell_syntax refusals.
+
+    Structural, on the if/else that selects the contract. A substring search
+    would be satisfied by the COMMENT that quotes the old hint to explain why
+    it moved, which is how the first version of this test passed for the
+    wrong reason.
+    """
+    import ast
+    fn = _func(_ast(API), "_synthesize_cve_poc")
+    branch = None
+    for node in ast.walk(fn):
+        if (isinstance(node, ast.If)
+                and any(isinstance(n, ast.Name) and n.id == "_structured"
+                        for n in ast.walk(node.test))):
+            branch = node
+            break
+    assert branch is not None, "no branch selects the prompt contract"
+
+    def _strings(body):
+        return " ".join(c.value for n in body for c in ast.walk(ast.Module(body=[n], type_ignores=[]))
+                        if isinstance(c, ast.Constant) and isinstance(c.value, str))
+
+    on, off = _strings(branch.body), _strings(branch.orelse)
+    assert "PREFER `plan` over `command`" in on, "the default must ask for a plan"
+    assert "{{CANARY}}" in on, "the default must name the canary token"
+    assert "chain curl calls with ; and shell vars" not in on, (
+        "the default contract still teaches shell chaining")
+    assert "chain curl calls with ; and shell vars" in off, (
+        "the legacy contract must be preserved verbatim behind the kill switch")
+
+
+@pytest.mark.skipif(not API.exists(), reason="rag-api source not present")
+def test_the_contract_change_has_a_kill_switch():
+    """A prompt change alters what the model produces on EVERY build, so it
+    has to be revertible without a rebuild — the LITELLM_ROUTER_ENABLED
+    pattern."""
+    import ast
+    src = API.read_text(encoding="utf-8")
+    seg = ast.get_source_segment(src, _func(_ast(API), "_synthesize_cve_poc")) or ""
+    assert "BUILD_POC_STRUCTURED_PLAN" in seg
+
+
+@pytest.mark.skipif(not API.exists(), reason="rag-api source not present")
+def test_a_malformed_plan_falls_back_rather_than_failing_the_build():
+    import ast
+    src = API.read_text(encoding="utf-8")
+    seg = ast.get_source_segment(src, _func(_ast(API), "_synthesize_cve_poc")) or ""
+    assert "synth_plan_invalid" in seg, "an unrenderable plan must say so in the trace"
+    i_plan = seg.index('obj.get("plan")')
+    i_cmd = seg.index('obj.get("command")')
+    assert i_plan < i_cmd, (
+        "the plan must be read before the command — when the model sends "
+        "both, the structured one is the one whose quoting we can guarantee")
+
+
+# ── carrying a value between steps ──────────────────────────────────────────
+#
+# The one thing shell-chaining genuinely gave the model: a CSRF token fetched
+# in one request and used in the next. Without it, the very first live plan
+# this prompt produced wrote `csrf_token=REPLACE_WITH_CSRF` into the body —
+# so every CSRF-gated exploit would have produced an unusable plan and the
+# benchmark would have looked worse for the wrong reason.
+
+EXTRACT_PLAN = [
+    {"id": "fetch", "request": {"url": "http://t:9090/login.php"},
+     "extract": {"csrf": {"grep_p": 'name="csrf_token"\\s+value="\\K[^"]+'}}},
+    {"id": "use", "request": {"method": "POST", "url": "http://t:9090/login.php",
+                              "body": "t={{csrf}}&q=' OR 1=1-- "}},
+]
+
+
+def test_a_capture_reference_expands_outside_the_quotes():
+    """shlex.quote wraps a value in single quotes, where `$name` is literal.
+    A capture has to step outside them, or the next request goes out with the
+    parameter empty and the failure looks like the exploit."""
+    script = to_script(EXTRACT_PLAN)
+    # The capture leaves the single-quoted run and re-enters it:  't='"$csrf"'&...'
+    assert '\'"$csrf"\'' in script, "the capture does not escape the quotes"
+    # ...and the payload's own quote is still intact.
+    assert "OR 1=1--" in script
+
+
+def test_a_literal_dollar_in_a_payload_is_not_an_expansion():
+    """A body containing the characters `$csrf` is DATA. Pattern-matching for
+    `"$name"` after quoting would have turned it into a shell expansion."""
+    body = "note=the var $csrf is literal"
+    script = to_script([{"id": "x", "request": {
+        "method": "POST", "url": "http://t:9090/a", "body": body}}])
+    # Parsed back rather than matched as text: what matters is that the body
+    # curl receives is byte-identical to the one the model supplied.
+    parse = _real_parser()
+    curl_line = [l for l in script.splitlines() if l.startswith("curl")][0]
+    assert parse(curl_line)["body"] == body
+
+
+def test_an_empty_capture_announces_itself():
+    """A blank token produces a request that fails for a reason that looks
+    like the exploit. The extraction has to say it failed."""
+    assert "EXTRACT-FAILED: csrf" in to_script(EXTRACT_PLAN)
+
+
+def test_extract_requires_a_pattern_and_a_usable_name():
+    with pytest.raises(RequestSpecError) as e:
+        to_script([{"id": "a", "request": {"url": "http://t/a"}, "extract": {"x": {}}}])
+    assert "grep_p" in str(e.value)
+    with pytest.raises(RequestSpecError) as e:
+        to_script([{"id": "a", "request": {"url": "http://t/a"},
+                    "extract": {"not a name": {"grep_p": "x"}}}])
+    assert "identifier" in str(e.value)
+
+
+def test_the_generated_script_is_valid_shell():
+    """Generated shell that does not parse would be the original problem with
+    extra steps. `bash -n` reads it without executing a word."""
+    import shutil
+    import subprocess
+    if not shutil.which("bash"):
+        pytest.skip("bash not available")
+    script = to_script(EXTRACT_PLAN, canary="POCzTEST")
+    r = subprocess.run(["bash", "-n", "-c", script], capture_output=True, text=True, timeout=10)
+    assert r.returncode == 0, f"generated script does not parse: {r.stderr.strip()[:200]}"

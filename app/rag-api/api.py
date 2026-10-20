@@ -23385,6 +23385,12 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None,
     # effect of the exploit, so "success" proves the CVE's real effect (an admin the
     # exploit CREATED, a value it WROTE/REFLECTED) — not a pre-existing/adjacent state.
     canary = _poc_canary()
+    # Bound BEFORE the response loop. `plan` is assigned only inside a
+    # branch that depends on what the model returned, while the return
+    # reads it unconditionally — the use-before-assignment shape that took
+    # the trace summariser down this morning. pyflakes does not flag
+    # conditional binding, so this initialiser is the guard.
+    plan = None
     # What this class can REALISTICALLY prove. The prompt used to mandate
     # inject-and-reflect for every class and pre-fill a canary assertion; for a
     # file read, an out-of-band class or an IDOR that is an instruction the
@@ -23455,6 +23461,59 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None,
         logging.debug("description read failed for %s: %s", cve, _rde)
         _req = {}
     _class_block = (_class_block or "") + _requirements_block(_req)
+    # ── STRUCTURED REQUEST PLAN ────────────────────────────────────────────
+    #
+    # Asking for a shell STRING is upstream of most pre-dispatch failures:
+    # 444 shell_syntax refusals in the trace archive are a quoting decision
+    # made inside a JSON field, and the old prompt actively taught the shape
+    # that causes them ("chain curl calls with ; and shell vars"). A plan is
+    # data: the model says WHAT to send and etl/http_request.py decides how to
+    # spell it, so quoting stops being a decision anyone makes.
+    #
+    # `command` stays in the contract and stays accepted. Plenty of exploits
+    # are not a sequence of HTTP requests — sqlmap, nc, a python one-liner —
+    # and a plan cannot express those. The model picks.
+    #
+    # Kill switch: BUILD_POC_STRUCTURED_PLAN=false restores the old contract
+    # verbatim, including the chaining hint. Same reasoning as
+    # LITELLM_ROUTER_ENABLED — a prompt change alters what the model produces
+    # on EVERY build, so it has to be revertible without a rebuild.
+    _structured = os.environ.get("BUILD_POC_STRUCTURED_PLAN", "true").strip().lower() \
+        in ("1", "true", "yes", "on")
+    if _structured:
+        _plan_field = ('"plan": [{"id": "<short name>", "request": {"method": "POST", '
+                       '"url": "<absolute url>", "headers": {}, "body": "<raw body>" '
+                       'OR "json": {}, "cookies": {}}, '
+                       '"extract": {"<name>": {"grep_p": "<PCRE with \\\\K>"}}}], ')
+        _plan_block = (
+            "PREFER `plan` over `command`. A plan is a list of HTTP steps as DATA — "
+            "you describe the request, the platform renders it. Do NOT escape "
+            "quotes, do NOT build a shell string, do NOT use shell variables: put "
+            "the literal payload in `body` and it is quoted correctly for you. "
+            f'Write this run\'s canary as the literal token {{{{CANARY}}}} — it is '
+            "substituted before the request is sent. Use one step per request; a "
+            "later step may carry \"wait_seconds\": N. Each step reports its own "
+            "result, so a failure names the step that failed. "
+            "To carry a CSRF token or session id from one step to the next, give "
+            "the earlier step an `extract`: a name plus `grep_p`, a PCRE whose "
+            "\\K marks where the value starts (e.g. "
+            "name=\"csrf_token\"\\s+value=\"\\K[^\"]+). Reference it in a later "
+            "step as {{<name>}} — the platform wires it up. Do NOT write "
+            "$VARIABLES or $(...) yourself. "
+            "Use `command` INSTEAD of `plan` only when the exploit is not a "
+            "sequence of HTTP requests (sqlmap, nc, a python one-liner). "
+            "Never send both.\n")
+        _chain_hint = ("If the vuln needs a CSRF nonce/token or session, make it a "
+                       "SEPARATE EARLIER STEP with an `extract`, and reference the "
+                       "value as {{name}} — never chain shell commands or write "
+                       "$(curl ...). ")
+    else:
+        _plan_field = ""
+        _plan_block = ""
+        _chain_hint = ("If the vuln needs a CSRF nonce/token or session, FETCH it inline "
+                       "first (GET the page, extract the token with grep/sed, keep the "
+                       "cookie) then use it — chain curl calls with ; and shell vars. ")
+
     prompt = (f"AUTHORIZED lab pentest. Build a proof-of-concept for {cve} on {tgt} "
               f"({product or ''} {version or ''}).\n"
               f"CVE description: {details.get('description') or '(none)'}\n"
@@ -23466,13 +23525,12 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None,
               f"{_proof_block}"
               f"STAY ON {cve}'s specific vulnerability — do not pivot to an easier/adjacent "
               f"finding (e.g. generic user enumeration).\n"
-              f"Return ONE JSON object only: {{\"command\": \"<single shell command, prefer "
+              f"{_plan_block}"
+              f"Return ONE JSON object only: {{{_plan_field}\"command\": \"<single shell command, prefer "
               f"curl, that EXPLOITS {cve} against {tgt} and produces the proof described above>\", "
               f"\"assertion\": {_assert_tmpl}, "
               f"\"rationale\": \"<why this proves {cve}, and what the proof actually is>\"}}. "
-              f"If the vuln needs a CSRF nonce/token or session, FETCH it inline first (GET the "
-              f"page, extract the token with grep/sed, keep the cookie) then use it — chain curl "
-              f"calls with ; and shell vars. "
+              f"{_chain_hint}"
               f"TIMING-BASED EXPLOITS (blind time-based SQLi with SLEEP/pg_sleep/WAITFOR DELAY, "
               f"timing side-channels, slow-loris) often cannot inject a visible marker. For those, "
               f"set assertion to {{\"min_seconds\": N, \"max_seconds\": M, \"canary\": \"{canary}\"}} "
@@ -23516,6 +23574,22 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None,
                    extra={"model_requested": model, "ok": bool(last_res and last_res.get("ok")),
                           "error": last_err})
         obj = _poc_extract_json(text)
+        # A plan is accepted BEFORE a command: when the model sends both, the
+        # structured one is the one whose quoting we can guarantee. It is
+        # validated here so a malformed plan falls back to `command` in the
+        # same response rather than failing the build.
+        if obj and obj.get("plan"):
+            try:
+                from etl.http_request import validate_plan as _vp
+                plan = _vp(obj["plan"])
+                _poc_trace(run_id, "synth_plan_accepted",
+                           extra={"steps": len(plan),
+                                  "ids": [str(x.get("id") or i) for i, x in enumerate(plan, 1)],
+                                  "also_sent_command": bool(obj.get("command"))})
+            except Exception as _pe:  # noqa: BLE001
+                plan = None
+                _poc_trace(run_id, "synth_plan_invalid", response=str(_pe)[:400],
+                           extra={"falling_back_to": "command" if obj.get("command") else "nothing"})
         if obj and obj.get("command"):
             command = str(obj["command"]).strip()
             # Keep the anchor unless the LLM's own assertion also requires the canary.
@@ -23581,6 +23655,10 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None,
                             "augmented command with sink-verification tail and broadened assertion",
                    extra={"sink_url": sink_url})
     return {"command": command, "assertion": assertion, "rationale": rationale,
+            # The structured plan, when the model sent a renderable one.
+            # node_synth renders it into the command; the probe reads its
+            # declared target. None keeps every path exactly as it was.
+            "plan": plan,
             "synth_kind": synth_kind, "run_id": run_id, "canary": canary,
             "origin_family": _poc_target_family(command), "llm_model": llm_model,
             "metrics": metrics,
