@@ -39573,6 +39573,120 @@ def regenerate_exploit_artifacts(exploit_id: str, authorized: bool = Depends(aut
     return dict(out)
 
 
+class ReleasedToolRunBody(BaseModel):
+    #: Which derived tool to run. None = the first one recorded.
+    tool: Optional[str] = None
+    #: Operator override of the derived command, for a one-off tweak. The
+    #: scope gate still applies to it — an override changes the command, never
+    #: the authorization.
+    command: Optional[str] = None
+
+
+@app.post("/exploit-store/{exploit_id}/released-run", tags=["Exploit Store"])
+def run_released_tool(exploit_id: str, body: ReleasedToolRunBody = None,
+                      authorized: bool = Depends(auth)):
+    """Execute a tool command the PROOF path derived but deliberately did not run.
+
+    Phase two of Docs/plans/SQLI_PROOF_PATH.md. Proving a CVE and exploiting it
+    are different jobs: proof needs the cheapest deterministic evidence that the
+    vulnerability exists, while sqlmap's job is enumeration and extraction. The
+    handoff derives the command and records it with `deferred_to_release`; this
+    is where an operator runs it, once there is a PoC worth exploiting.
+
+    Four conditions, and each exists for a reason:
+
+    * **The PoC must be VERIFIED.** Running an enumeration tool against a
+      vulnerability we have not proven is a scan, not an exploitation, and it
+      belongs in the recon phase where it is already available.
+    * **The scope gate.** Unconditional and fail-closed, exactly as for any
+      other dispatch. An operator-supplied `command` override is still gated —
+      CLAUDE.md: an override overrules the platform's SUPPRESSION judgement,
+      never the operator's AUTHORIZATION.
+    * **MAX_CONCURRENT_SCANS.** This initiates a scan, so it takes a slot and
+      sheds with 429 rather than queueing.
+    * **It is recorded as a scan.** `tool_executions`, like every other tool
+      this platform runs — the whole point of step 5.
+    """
+    import time as _t
+    _ensure_exploit_store()
+    body = body or ReleasedToolRunBody()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM exploit_store WHERE id = %s", (exploit_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "exploit not found")
+
+    # 1. A PoC, not a hunch.
+    if not row.get("verified"):
+        raise HTTPException(
+            409, "this PoC is not verified — a released exploitation run needs a "
+                 "proven vulnerability. Prove it first, or use the recon phase.")
+
+    # 2. Which command.
+    md = row.get("metadata") or {}
+    handoff = (md.get("tool_handoff") or {}) if isinstance(md, dict) else {}
+    derived = [d for d in (handoff.get("derived") or []) if d.get("command")]
+    chosen = None
+    if body.command:
+        chosen = {"tool": body.tool or "operator", "command": body.command,
+                  "class": "operator-supplied"}
+    elif body.tool:
+        chosen = next((d for d in derived if d.get("tool") == body.tool), None)
+    elif derived:
+        chosen = derived[0]
+    if not chosen:
+        return {"ok": False, "reason": ("no derived tool command on this exploit"
+                                        if not body.tool else
+                                        f"no derived command for tool {body.tool!r}"),
+                "available": [d.get("tool") for d in derived]}
+
+    target = str(row.get("target_host") or "")
+    port = row.get("target_port") or 80
+
+    # 3. Scope gate — unconditional, fail-closed, and it covers an override.
+    _enforce_scan_scope([target], chosen["command"])
+
+    # 4. A slot, or shed fast.
+    if not _api_scan_slots.acquire(blocking=False):
+        raise HTTPException(
+            429, f"{_MAX_CONCURRENT_SCANS} concurrent scans already in flight "
+                 "(MAX_CONCURRENT_SCANS) — nothing was dispatched, retry shortly")
+    listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    vt = int(os.environ.get("RELEASED_TOOL_TIMEOUT", "900"))
+    t0 = _t.time()
+    output, exit_code = "", None
+    try:
+        lr = _listener_vectors_run(listener, chosen["command"], target, port, vt,
+                                   eid=row.get("engagement_id"))
+        d = lr.json() if lr.status_code < 400 else {}
+        output = (d.get("output", "") if isinstance(d, dict) else "") or lr.text
+        exit_code = d.get("exit_code") if isinstance(d, dict) else None
+    except Exception as e:  # noqa: BLE001
+        output, exit_code = f"listener error: {e}", None
+    finally:
+        _api_scan_slots.release()
+    seconds = round(_t.time() - t0, 2)
+
+    # 5. It happened, so it is a scan.
+    _record_tool_execution(tool=chosen.get("tool") or "unknown",
+                           command=chosen["command"], target=target, port=port,
+                           service=chosen.get("class"),
+                           status=("completed" if exit_code == 0 else "failed"),
+                           exit_code=exit_code, output=output)
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("released_tool_run", "exploit_store", {
+            "exploit_store_id": exploit_id, "cve": row.get("cve"),
+            "tool": chosen.get("tool"), "target": target, "port": port,
+            "exit_code": exit_code, "seconds": seconds,
+            "engagement_id": str(row.get("engagement_id") or "") or None})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "tool": chosen.get("tool"), "command": chosen["command"],
+            "target": f"{target}:{port}", "exit_code": exit_code,
+            "seconds": seconds, "output": (output or "")[:20000]}
+
+
 @app.post("/exploit-store/{exploit_id}/run", tags=["Exploit Store"])
 def run_exploit(exploit_id: str, authorized: bool = Depends(auth)):
     """Run the stored PoC's shell command through the listener and return the output.

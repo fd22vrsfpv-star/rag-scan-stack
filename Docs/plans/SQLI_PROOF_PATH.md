@@ -165,11 +165,31 @@ time is not scarce — which is why neither is in this plan's critical path.
 | 5. sqlmap → `tool_executions` | **done** (`_record_tool_execution`) |
 | 6. sqlmap out of the proof path | **done** (flag-reversible) |
 | 7. the synth prompt teaches the new step shapes | **done** — verified live against the model |
-| 8. phase two: a released run that executes the derived commands | **pending** |
+| 8. phase two: a released run that executes the derived commands | **done** |
 
-Step 8 is what makes the deferred commands *usable*: until it lands, a derived
-sqlmap command is recorded and executed by nothing. Additive, and it does not
-block the deploy of 1-7.
+All eight steps are written and tested. Nothing is deployed.
+
+### Step 8: `POST /exploit-store/{id}/released-run`
+
+Where an operator runs a command the proof path derived and deliberately did
+not. Four conditions, each load-bearing:
+
+* **409 on an unverified PoC.** Running an enumeration tool against a
+  vulnerability nobody has proven is a scan, not an exploitation, and it is
+  already available in the recon phase.
+* **The scope gate**, unconditional and fail-closed — *including* over an
+  operator-supplied `command` override, which is applied BEFORE the gate so it
+  cannot slip past it. CLAUDE.md: an override overrules the platform's
+  suppression judgement, never the operator's authorization.
+* **`MAX_CONCURRENT_SCANS`.** This initiates a scan, so it takes a slot and
+  sheds with 429 rather than queueing.
+* **`tool_executions`.** A tool this platform ran is a scan.
+
+The BFF proxy checks the upstream status rather than assuming it: httpx does
+not raise on 4xx/5xx, and this endpoint's refusals ARE the safety story —
+returning a 409 as success would report a refused exploitation as a completed
+one. All three refusal paths are executed in the test, not asserted
+structurally.
 
 ### What step 7 cost, and what it found
 

@@ -443,3 +443,64 @@ def test_a_reference_to_a_step_that_does_not_exist_is_refused():
                                         "must_differ": "body"}}]
     with pytest.raises(_ReqErr):
         validate_plan(bad)
+
+
+# ── step 8: the released run, and its gates ────────────────────────────────
+#
+# Executing this handler needs a live DB and listener. Its REFUSALS are what
+# matter, so they are pinned on the handler's structure — and the generic
+# dispatch-invariant guards (test_dispatch_invariants) already assert that any
+# new dispatcher is scope-gated and slot-bounded, which is what makes these
+# cheap checks sufficient rather than the only line of defence.
+
+
+
+def _handler_src():
+    import ast
+    if not API_SRC.exists():
+        pytest.skip("rag-api source not present")
+    src = API_SRC.read_text(encoding="utf-8")
+    for n in ast.walk(ast.parse(src)):
+        if isinstance(n, ast.FunctionDef) and n.name == "run_released_tool":
+            return ast.get_source_segment(src, n) or ""
+    pytest.fail("run_released_tool not defined")
+
+
+def test_the_scope_gate_runs_before_the_dispatch():
+    seg = _handler_src()
+    assert "_enforce_scan_scope" in seg, "a dispatcher with no scope gate"
+    assert seg.index("_enforce_scan_scope") < seg.index("_listener_vectors_run"), \
+        "the gate must precede the dispatch, or it is decoration"
+
+
+def test_an_operator_command_override_is_still_scope_gated():
+    """An override changes the command, never the authorization."""
+    seg = _handler_src()
+    assert seg.index("body.command") < seg.index("_enforce_scan_scope"), \
+        "the override is applied after the gate, so it bypasses it"
+
+
+def test_it_takes_a_concurrency_slot_and_sheds():
+    seg = _handler_src()
+    assert "_api_scan_slots.acquire(blocking=False)" in seg, \
+        "a scan initiator that does not bound itself by MAX_CONCURRENT_SCANS"
+    assert "429" in seg, "must shed rather than queue"
+    assert "_api_scan_slots.release()" in seg, "a slot that is never released"
+
+
+def test_an_unverified_poc_is_refused():
+    seg = _handler_src()
+    assert '"verified"' in seg and "409" in seg
+
+
+def test_the_run_is_recorded_as_a_scan():
+    seg = _handler_src()
+    assert "_record_tool_execution" in seg, (
+        "a tool this platform ran must land in tool_executions — the gap that "
+        "left 173 sqlmap runs invisible")
+
+
+def test_it_emits_a_webhook():
+    """CLAUDE.md: any feature that performs an action emits a webhook event."""
+    seg = _handler_src()
+    assert "released_tool_run" in seg
