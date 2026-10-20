@@ -120,6 +120,122 @@ def anchored_oob(assertion, canary) -> bool:
     return canary in rx or _declared(assertion, canary)
 
 
+#: DB error fragments that only a database emits. A page can contain the words
+#: "error" or "syntax"; it cannot contain MySQL's own parser message unless a
+#: database produced it. Keyed by engine so the proof names which one answered.
+#:
+#: Deliberately conservative and literal: a loose pattern here would let a
+#: generic 500 page anchor a SQLi proof, which is the failure mode this whole
+#: file exists to prevent.
+DB_ERROR_SIGNATURES = {
+    "mysql": (
+        "You have an error in your SQL syntax",
+        "check the manual that corresponds to your MySQL server version",
+        "supplied argument is not a valid MySQL result",
+        "mysql_fetch_array()",
+        "MySQLSyntaxErrorException",
+    ),
+    "postgres": (
+        "PG::SyntaxError",
+        "unterminated quoted string at or near",
+        "syntax error at or near",
+        "PSQLException",
+    ),
+    "mssql": (
+        "Unclosed quotation mark after the character string",
+        "Incorrect syntax near",
+        "System.Data.SqlClient.SqlException",
+    ),
+    "oracle": (
+        "ORA-00933",
+        "ORA-01756",
+        "quoted string not properly terminated",
+    ),
+    "sqlite": (
+        "SQLite3::SQLException",
+        "sqlite3.OperationalError",
+        "unrecognized token:",
+    ),
+}
+
+
+def db_error_engine(text) -> Optional[str]:
+    """Which engine emitted this, or None. Used by the anchor and reportable."""
+    t = str(text or "")
+    if not t:
+        return None
+    for engine, sigs in DB_ERROR_SIGNATURES.items():
+        for sig in sigs:
+            if sig.lower() in t.lower():
+                return engine
+    return None
+
+
+def anchored_error(assertion, command, canary=None) -> bool:
+    """The assertion requires a DB parser error that the command provoked.
+
+    The cheapest certain SQLi proof: one request. A database syntax error
+    naming the engine proves attacker input reached the SQL parser — nothing
+    but a database emits `You have an error in your SQL syntax`.
+
+    Two halves, same reasoning as `anchored_file_content`: the assertion must
+    require the signature, AND the command must carry something that would
+    provoke it. A page that happens to contain the words is not proof, and a
+    broken-quote payload with no assertion on the result proves nothing was
+    observed.
+
+    Why this matters here: the sqli class could only prove by `timing`, and
+    the archive has 920 `latency_too_fast` rows — a SLEEP that returned
+    instantly, i.e. the payload never reached the parser. An error-based proof
+    answers the SAME question (did the input reach the parser?) in one request
+    and with no dependence on how fast the target answers.
+    """
+    rx = _regex_of(assertion)
+    if not rx:
+        return False
+    if db_error_engine(rx) is None:
+        return False
+    # The command has to contain a syntax-breaking payload. An unbalanced
+    # quote or comment introducer is what provokes the parser; without one the
+    # error was already there and is pre-existing state, not this exploit's
+    # effect.
+    cmd = str(command or "")
+    if not cmd:
+        return False
+    provokers = ("'", '"', "--", "/*", ";", "%27", "%22")
+    return any(p in cmd for p in provokers)
+
+
+def anchored_boolean(assertion, command, canary=None) -> bool:
+    """The assertion requires two responses to DIFFER.
+
+    A boolean proof is a differential: `' AND 1=1--` and `' AND 1=2--` give
+    different answers only if the database EVALUATED the expression. Two
+    requests, deterministic, and — unlike timing — immune to a slow target or
+    a WAF with a fixed delay, which are the two things that make a latency
+    verdict unreliable and that TIMING_CONFIRM_DELTA_SEC exists to work
+    around.
+
+    Anchored on the DIFFERENTIAL, never on a single response. "The page
+    rendered" is not evidence; "these two requests, differing only in a
+    boolean, produced different output" is. So the assertion must declare
+    both arms — a lone regex cannot anchor this kind, by construction.
+    """
+    a = assertion or {}
+    diff = a.get("differential")
+    if not isinstance(diff, dict):
+        return False
+    true_arm = diff.get("true")
+    false_arm = diff.get("false")
+    if not (true_arm and false_arm):
+        return False
+    # The arms must actually be different payloads: asserting that identical
+    # requests differ is either a flake or a fabricated proof.
+    if str(true_arm).strip() == str(false_arm).strip():
+        return False
+    return bool(diff.get("must_differ"))
+
+
 def anchored_timing(assertion, verdict_method) -> bool:
     """Confirmed by the scaled-payload re-run, never by a single elapsed.
 
@@ -223,6 +339,15 @@ def is_anchored(assertion, canary, *, proof_kinds=None, command=None,
         return ok, ("canary in the assertion" if ok
                     else "no proof kind known and no canary in the assertion")
 
+    # Cheapest and most certain first. An error or boolean proof answers the
+    # same question timing does — did the input reach the SQL parser? — in one
+    # or two requests, with no dependence on how fast the target answers.
+    if "error" in kinds and anchored_error(assertion, command, canary):
+        return True, ("error: the assertion requires a %s parser error the "
+                      "command provokes" % (db_error_engine(_regex_of(assertion)),))
+    if "boolean" in kinds and anchored_boolean(assertion, command, canary):
+        return True, ("boolean: the proof is a differential — two requests "
+                      "differing only in a boolean produced different output")
     if "echo" in kinds and anchored_echo(assertion, canary):
         return True, "echo: the injected canary is required by the assertion"
     if "oob" in kinds and anchored_oob(assertion, canary):
