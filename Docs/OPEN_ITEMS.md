@@ -27,6 +27,27 @@ named tests exist).
 
 ## Known gaps carried from earlier sessions
 
+### The News "Asset matches" panel can never fire — `vulns.cve` is empty on 97% of rows
+**Found:** 2026-10-19
+**Evidence:** `_match_assets` (`news_runner/news_agent.py`) joins
+`news_items.all_cves` → `vulns.cve` → `vulns.asset_id` → `assets`. Of **299**
+`vulns` rows only **10** carry any CVE (`count(*) filter (where cve is not null
+and cardinality(cve)>0)`), and the overlap with the 2,631 news items' CVEs is
+**0** distinct CVEs / **0** joinable rows. 46 news items have `asset_matched_at`
+set; `count(*) filter (where jsonb_array_length(asset_matches) > 0)` is **0** —
+the matcher has never produced a single hit. The panel renders "none yet — click
+*Match assets*" forever, which reads as a broken button rather than an empty
+join. (The separate per-engagement matcher stored in
+`metadata.engagement_match` is unaffected and does work: 1,058 items carry one.)
+**Where:** `news_runner/news_agent.py::_match_assets`; the producers that should
+populate `vulns.cve` (nuclei/nessus/nmap-script ingest paths).
+**Done when:** either `vulns.cve` is populated by the ingest paths that know a
+CVE, so the join can hit — or `_match_assets` additionally pivots through
+`detected_software` / `software_cves` (which do carry CVEs) and the panel stops
+claiming a capability that has no data behind it.
+**Enforced by:** not enforced
+
+
 ### `vuln_class` is not in the graph state, so phases re-derive it — one branch never ran
 **Found:** 2026-10-17
 **Evidence:** `vuln_class` is derived at 12 call sites by 3 functions
