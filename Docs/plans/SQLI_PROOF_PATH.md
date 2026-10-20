@@ -146,6 +146,42 @@ only, the slowest and least certain of the five) or a broken request (**42 of
 rejects it before any injection test). Both only matter in phase two, where
 time is not scarce — which is why neither is in this plan's critical path.
 
+## Step 9 (found 2026-10-20 mid-run): the prompt overrides its own guidance
+
+Steps 1-8 deployed and the new anchors fired **zero** times. The capability is
+live and unreachable, for a reason the isolated prompt test could not show.
+
+`_assert_tmpl` is computed independently of the proof-kind list:
+
+```python
+elif "echo" in _vc_proof_kinds(_listener_vc):
+    _assert_tmpl = '{"expect_regex": "%s"}' % canary
+```
+
+`sqli` declares `echo` among its kinds, so every sqli build is handed a
+hard-coded CANARY assertion template — sitting in the return-shape instruction,
+right beside guidance telling the model to prefer an error or boolean proof.
+The template is concrete and the guidance is prose further up. The model
+follows the template.
+
+Evidence from the run: every assertion is `['cve_anchored', 'expect_regex']`,
+including on all three builds that resolved as `sqli`. The proof-kind guidance
+reached the prompt correctly (6 of 12 synth calls carry it — exactly the 3
+sqli builds × 2 calls each); the model simply had no template for anything but
+echo.
+
+This is also why the isolated test on 2026-10-20 showed the opposite: that
+prompt carried no `_assert_tmpl`, so the guidance was the only instruction
+present and the model reached straight for error-based.
+
+**Fix:** `_assert_tmpl` follows the FIRST declared proof kind rather than
+jumping to `echo` whenever it appears anywhere in the list. The list is
+ordered cheapest-first, which was the point of ordering it.
+
+**What the deployed run still proved:** `latency_too_fast` went from 920
+lifetime to **0**. Removing timing as the class default worked. The proofs
+meant to replace it are a separate, still-unverified claim.
+
 ## What this does NOT change
 
 * The scope gate and `MAX_CONCURRENT_SCANS`. Proof methods decide what counts

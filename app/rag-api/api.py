@@ -20244,6 +20244,46 @@ def _target_shape_from_guidance(text):
             None if r.upper().startswith("UNKNOWN") else r)
 
 
+#: The assertion TEMPLATE for each proof kind — the concrete shape the model
+#: is told to return. It must agree with the per-kind guidance, because when
+#: they disagree the model follows the template: it sits in the return-shape
+#: instruction while the guidance is prose further up.
+#:
+#: That disagreement is why the error and boolean anchors fired ZERO times
+#: after they shipped (2026-10-20). `_assert_tmpl` jumped to the canary shape
+#: whenever `echo` appeared ANYWHERE in a class's kinds, and sqli declares
+#: echo — so every sqli build was handed a canary template beside guidance
+#: asking for an error proof. Every assertion in that run came back
+#: `{cve_anchored, expect_regex}`.
+_PROOF_KIND_ASSERT_TMPL = {
+    "error":   '{"expect_regex": "You have an error in your SQL syntax"}',
+    "boolean": '(no assertion — the `differential` STEP carries the proof)',
+    "echo":    '{"expect_regex": "CANARY"}',
+    "oob":     '{"expect_regex": "SINK-VERIFIED"}',
+    "timing":  '{"min_seconds": 5, "max_seconds": 30, "canary": "CANARY"}',
+}
+
+
+def _assert_template_for(vuln_class, canary) -> str:
+    """The template for the class's FIRST (cheapest) declared proof kind.
+
+    The kind list is ordered cheapest-and-most-certain first, which is the
+    whole point of ordering it — so the template follows that order rather
+    than preferring whichever kind happens to be mentioned.
+
+    Unknown class, or no template for its first kind: fall back to naming the
+    guidance instead of inventing a shape. Offering a canary template to a
+    class that cannot echo is how a file read ended up with an assertion it
+    could never satisfy.
+    """
+    kinds = _vc_proof_kinds(vuln_class) or []
+    for k in kinds:
+        t = _PROOF_KIND_ASSERT_TMPL.get(k)
+        if t:
+            return t.replace("CANARY", str(canary or ""))
+    return "<the assertion matching the proof kind above>"
+
+
 def _proof_expectation_block(vuln_class, canary, os=None, runtime=None) -> str:
     """What this class can realistically prove, and how to assert it.
 
@@ -23442,12 +23482,12 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None,
             f"reflect it), then read it back so it shows in the output. Do NOT "
             f"match a value that could already exist.\n")
         _assert_tmpl = '{"expect_regex": "%s"}' % canary
-    elif "echo" in _vc_proof_kinds(_listener_vc):
-        _assert_tmpl = '{"expect_regex": "%s"}' % canary
     else:
-        # No canary template for a class that cannot echo — offering one is how
-        # a file read ended up with an assertion it could never satisfy.
-        _assert_tmpl = "<the assertion matching the proof kind above>"
+        # Follow the class's FIRST declared proof kind, not whichever kind is
+        # merely present. `echo` appears in most classes' lists, so preferring
+        # it made the template contradict the guidance for every class whose
+        # cheapest proof is something else — see _assert_template_for.
+        _assert_tmpl = _assert_template_for(_listener_vc, canary)
     # Shape improvement #2: when the GHSA advisory included a verbatim PoC
     # snippet, hand it to synth as a KNOWN_GOOD_SHAPE block. The LLM should
     # mimic the shape (method/path/body-key/content-type) and only vary the

@@ -481,11 +481,29 @@ def test_an_operator_command_override_is_still_scope_gated():
 
 
 def test_it_takes_a_concurrency_slot_and_sheds():
-    seg = _handler_src()
-    assert "_api_scan_slots.acquire(blocking=False)" in seg, \
-        "a scan initiator that does not bound itself by MAX_CONCURRENT_SCANS"
-    assert "429" in seg, "must shed rather than queue"
-    assert "_api_scan_slots.release()" in seg, "a slot that is never released"
+    """Structural: a non-blocking acquire, a 429, and a release. Matched on the
+    AST so a reformat or a rename of the semaphore does not read as the bound
+    disappearing."""
+    import ast
+    src = API_SRC.read_text(encoding="utf-8")
+    fn = [n for n in ast.walk(ast.parse(src))
+          if isinstance(n, ast.FunctionDef) and n.name == "run_released_tool"][0]
+    acquires = releases = False
+    for call in ast.walk(fn):
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)):
+            continue
+        if call.func.attr == "acquire":
+            # NON-blocking: a blocking acquire queues, and CLAUDE.md says shed.
+            assert any(k.arg == "blocking"
+                       and isinstance(k.value, ast.Constant) and k.value.value is False
+                       for k in call.keywords), "a blocking acquire queues instead of shedding"
+            acquires = True
+        if call.func.attr == "release":
+            releases = True
+    assert acquires, "a scan initiator that does not bound itself by MAX_CONCURRENT_SCANS"
+    assert releases, "a slot that is never released"
+    assert any(isinstance(n, ast.Constant) and n.value == 429 for n in ast.walk(fn)), \
+        "must shed with 429 rather than queue"
 
 
 def test_an_unverified_poc_is_refused():
@@ -504,3 +522,134 @@ def test_it_emits_a_webhook():
     """CLAUDE.md: any feature that performs an action emits a webhook event."""
     seg = _handler_src()
     assert "released_tool_run" in seg
+
+
+# ── step 9: the template must agree with the guidance ──────────────────────
+#
+# Steps 1-8 deployed and the new anchors fired ZERO times. The capability was
+# live and unreachable: `_assert_tmpl` jumped to the canary shape whenever
+# `echo` appeared ANYWHERE in a class's kinds, and sqli declares echo — so
+# every sqli build got a canary template sitting in the return-shape
+# instruction, beside guidance asking for an error proof. The model follows
+# the template; every assertion in that run came back
+# {cve_anchored, expect_regex}.
+#
+# The isolated prompt test could not have caught this: it carried no
+# `_assert_tmpl` at all, so the guidance was the only instruction present.
+
+def _assert_template_for():
+    """Execute the real selector against the real class table."""
+    import ast
+    src = API_SRC.read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    pieces = []
+    for n in ast.walk(tree):
+        if (isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "_PROOF_KIND_ASSERT_TMPL"
+                        for t in n.targets)):
+            pieces.append(ast.get_source_segment(src, n))
+        if isinstance(n, ast.FunctionDef) and n.name == "_assert_template_for":
+            pieces.append(ast.get_source_segment(src, n))
+    if len(pieces) < 2:
+        pytest.fail("_PROOF_KIND_ASSERT_TMPL or _assert_template_for missing")
+    import yaml
+    classes = yaml.safe_load((REPO / "knowledge" / "vuln_classes.yaml")
+                             .read_text(encoding="utf-8")).get("classes") or []
+    kinds = {c["name"]: (c.get("proof") or []) for c in classes if isinstance(c, dict)}
+    ns = {"_vc_proof_kinds": lambda vc: kinds.get(vc, [])}
+    exec(compile("\n".join(pieces), "<tmpl>", "exec"), ns)  # noqa: S102
+    return ns["_assert_template_for"]
+
+
+def test_sqli_is_offered_the_error_template_not_the_canary_one():
+    """The regression. sqli's cheapest kind is `error`, so that is the shape
+    the model is shown — not the canary shape it was shown before."""
+    tmpl = _assert_template_for()("sqli", CANARY)
+    assert "SQL syntax" in tmpl, f"sqli still offered {tmpl!r}"
+    assert CANARY not in tmpl, "the canary template is back for sqli"
+
+
+def test_a_class_whose_cheapest_proof_is_echo_still_gets_the_canary():
+    """This must not swing the other way: for XSS the canary IS the proof."""
+    tmpl = _assert_template_for()("xss", CANARY)
+    assert CANARY in tmpl, f"xss lost its canary template: {tmpl!r}"
+
+
+def test_nosql_is_offered_the_differential_not_a_regex():
+    """nosql-injection's cheapest kind is `boolean`, whose proof lives in the
+    STEP. Offering a regex template there would invite an assertion that
+    cannot express a differential."""
+    tmpl = _assert_template_for()("nosql-injection", CANARY)
+    assert "differential" in tmpl.lower()
+
+
+def test_an_unknown_class_gets_no_invented_shape():
+    """Offering a canary template to a class that cannot echo is how a file
+    read ended up with an assertion it could never satisfy."""
+    tmpl = _assert_template_for()("not-a-real-class", CANARY)
+    assert "matching the proof kind" in tmpl
+
+
+def test_the_template_follows_the_declared_order():
+    """Every class's template must be the one for its FIRST kind — the list is
+    ordered cheapest-first and the template is what the model actually obeys."""
+    import yaml
+    fn = _assert_template_for()
+    classes = yaml.safe_load((REPO / "knowledge" / "vuln_classes.yaml")
+                             .read_text(encoding="utf-8")).get("classes") or []
+    import ast
+    src = API_SRC.read_text(encoding="utf-8")
+    tbl = {}
+    for n in ast.walk(ast.parse(src)):
+        if (isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "_PROOF_KIND_ASSERT_TMPL"
+                        for t in n.targets)):
+            tbl = {k.value: v.value for k, v in zip(n.value.keys, n.value.values)}
+    for c in classes:
+        if not isinstance(c, dict):
+            continue
+        first = next((k for k in (c.get("proof") or []) if k in tbl), None)
+        if not first:
+            continue
+        got = fn(c["name"], CANARY)
+        assert got == tbl[first].replace("CANARY", CANARY), (
+            f"{c['name']}: template is for a later kind than {first!r}")
+
+
+def test_the_call_site_actually_uses_the_selector():
+    """The tests above exercise `_assert_template_for` in isolation. That is
+    not enough: sabotaging the CALL SITE back to the echo-preferring form left
+    every one of them green, because none of them could see it.
+
+    A guard that cannot fail is worse than none — it is mistaken for coverage.
+    This one pins the branch that actually builds the prompt.
+    """
+    import ast
+    src = API_SRC.read_text(encoding="utf-8")
+    fn = [n for n in ast.walk(ast.parse(src))
+          if isinstance(n, ast.FunctionDef) and n.name == "_synthesize_cve_poc"][0]
+
+    assigns = [n for n in ast.walk(fn)
+               if isinstance(n, ast.Assign)
+               and any(isinstance(t, ast.Name) and t.id == "_assert_tmpl"
+                       for t in n.targets)]
+    assert assigns, "_assert_tmpl is never assigned"
+
+    # Exactly one assignment may hard-code the canary shape: the fallback for a
+    # class the table does not know, where there is no kind list to follow.
+    via_selector = any(
+        isinstance(a.value, ast.Call)
+        and isinstance(a.value.func, ast.Name)
+        and a.value.func.id == "_assert_template_for"
+        for a in assigns)
+    assert via_selector, (
+        "_assert_tmpl is built without consulting _assert_template_for, so the "
+        "template can contradict the proof guidance again")
+
+    # And no assignment may branch on `echo` being merely PRESENT — that is the
+    # exact shape of the bug: echo appears in most classes' kinds, so it won. 
+    for a in assigns:
+        dumped = ast.dump(a)
+        assert not ("'echo'" in dumped and "_vc_proof_kinds" in dumped), (
+            "an _assert_tmpl branch keys on `echo` being present in the kind "
+            "list; the template must follow the FIRST kind, not any kind")
