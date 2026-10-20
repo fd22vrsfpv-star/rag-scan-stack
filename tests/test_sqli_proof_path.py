@@ -677,3 +677,88 @@ def test_the_call_site_actually_uses_the_selector():
         assert not ("'echo'" in dumped and "_vc_proof_kinds" in dumped), (
             "an _assert_tmpl branch keys on `echo` being present in the kind "
             "list; the template must follow the FIRST kind, not any kind")
+
+
+# ── the 17 declarations that had no anchor ─────────────────────────────────
+#
+# Across 36 classes the YAML declared six proof kinds; proof_anchor.py
+# implemented four. `status_change` (9 classes) and `side_effect` (8) had NO
+# anchor function, so they fell through to the generic self-declaration — which
+# means `cve_anchored: true` was their ENTIRE verification. That is the same
+# unfounded-declaration shape that let a model's refusal be stored as a
+# verified PoC on 2026-10-20, sitting unnoticed across 17 declarations.
+
+def _anchors():
+    from etl.proof_anchor import (anchored_side_effect, anchored_status_change,
+                                  is_anchored)
+    return anchored_status_change, anchored_side_effect, is_anchored
+
+
+TWO_REQ = (f"curl -s -X POST -d 'x={CANARY}' http://t/a ; "
+           f"curl -s http://t/list")
+
+
+def test_status_change_anchors_on_a_differential():
+    """Its own guidance says it: 'a 200 alone proves nothing, because the
+    honest request returns 200 too.'"""
+    sc, _, _ = _anchors()
+    assert sc(GOOD_DIFF, TWO_REQ) is True
+    assert sc({"expect_regex": "200 OK"}, TWO_REQ) is False
+
+
+def test_side_effect_needs_the_canary_and_a_read_back():
+    _, se, _ = _anchors()
+    # Both halves present.
+    assert se({"expect_regex": CANARY}, TWO_REQ, CANARY) is True
+    # Named, but never read back — the causing request returns an ordinary 200.
+    assert se({"expect_regex": CANARY},
+              f"curl -s -X POST -d 'x={CANARY}' http://t/a", CANARY) is False
+    # Read back, but asserting on something that could already have been there.
+    assert se({"expect_regex": "success"}, TWO_REQ, CANARY) is False
+
+
+@pytest.mark.parametrize("cls,kind", [
+    ("auth-bypass", "status_change"), ("idor", "status_change"),
+    ("csrf", "status_change"), ("upload", "side_effect"),
+    ("prototype-pollution", "side_effect"), ("deserialization", "side_effect"),
+])
+def test_every_class_that_declares_one_can_now_use_it(cls, kind):
+    """The declarations were not wrong — there was simply nothing behind them."""
+    import yaml
+    _, _, is_anchored = _anchors()
+    classes = yaml.safe_load((REPO / "knowledge" / "vuln_classes.yaml")
+                             .read_text(encoding="utf-8")).get("classes") or []
+    kinds = next((c.get("proof") or [] for c in classes
+                  if isinstance(c, dict) and c.get("name") == cls), [])
+    assert kind in kinds, f"{cls} no longer declares {kind}"
+    assertion = GOOD_DIFF if kind == "status_change" else {"expect_regex": CANARY}
+    ok, why = is_anchored(assertion, CANARY, proof_kinds=[kind], command=TWO_REQ)
+    assert ok is True, f"{cls}/{kind} still cannot anchor: {why}"
+
+
+def test_the_new_anchors_still_obey_the_target_contact_rule():
+    _, _, is_anchored = _anchors()
+    ok, why = is_anchored({"expect_regex": CANARY}, CANARY,
+                          proof_kinds=["side_effect"],
+                          command=f"echo '{CANARY}' ; echo '{CANARY}'")
+    assert ok is False and "never contacts the target" in why
+
+
+def test_no_declared_kind_is_left_without_an_anchor():
+    """The ratchet. A new proof kind in the YAML with no anchor behind it is
+    a class whose verification silently becomes `cve_anchored: true`."""
+    import ast
+    import yaml
+    src = (REPO / "etl" / "proof_anchor.py").read_text(encoding="utf-8")
+    implemented = {n.name.replace("anchored_", "")
+                   for n in ast.walk(ast.parse(src))
+                   if isinstance(n, ast.FunctionDef) and n.name.startswith("anchored_")}
+    declared = set()
+    for c in (yaml.safe_load((REPO / "knowledge" / "vuln_classes.yaml")
+                             .read_text(encoding="utf-8")).get("classes") or []):
+        if isinstance(c, dict):
+            declared |= set(c.get("proof") or [])
+    missing = sorted(declared - implemented)
+    assert not missing, (
+        f"proof kinds declared in vuln_classes.yaml with no anchored_* function: "
+        f"{missing} — those classes verify on a self-declaration alone")

@@ -25283,7 +25283,20 @@ def _poc_shell_syntax_check(command, canary=None, assertion=None):
     # payload, so nothing the exploit did could ever reflect it. Catch the
     # token in both raw and percent-encoded form, before dispatch.
     import re as _re_ph
-    _ph = _re_ph.search(r"(?:\{|%7[Bb])\s*(CANARY|canary)[^}]*?(?:\}|%7[Dd])", command)
+    # Substitute the PLAN token first. `{{CANARY}}` is what the plan contract
+    # teaches (etl/http_request.CANARY_TOKEN), and a model that learned it
+    # there uses it in a plain `command` too — where nothing substitutes it,
+    # so the check below refused a command whose only fault was using the
+    # token we taught it.
+    if canary:
+        command = command.replace("{{CANARY}}", str(canary)).replace("{{canary}}", str(canary))
+    # A SHELL VARIABLE IS NOT A PLACEHOLDER. `${CANARY}` contains the
+    # characters `{CANARY}`, so this check fired on commands that correctly
+    # set `CANARY='POCz…'` and referenced it — 11 refusals on 2026-10-20
+    # alone, every one of them valid shell the shell would have expanded.
+    # A refusal of correct work reads as the model failing.
+    _ph = _re_ph.search(r"(?<!\$)(?:\{|%7[Bb])\s*(CANARY|canary)[^}]*?(?:\}|%7[Dd])",
+                        command)
     if _ph:
         return (False, f"unsubstituted canary placeholder {_ph.group(0)!r} in the "
                        "command — substitute the real canary string into the payload")

@@ -75,10 +75,22 @@ implements four:
 | timing | 7 | `anchored_timing` |
 | file_content | 4 | `anchored_file_content` |
 
-17 class-declarations name a proof kind with no anchor behind it. They fall
+17 class-declarations named a proof kind with no anchor behind it. They fell
 through to the generic self-declaration path, which means for those classes
-`cve_anchored: true` is the entire verification. Pre-existing, out of scope
-here, recorded so it is not rediscovered — see `Docs/OPEN_ITEMS.md`.
+`cve_anchored: true` was the entire verification.
+
+**Closed 2026-10-20.** Both turned out to be mechanisms already built:
+
+* `status_change` IS a differential — its own guidance says "a 200 alone
+  proves nothing, because the honest request returns 200 too". It anchors on
+  the same declared pair `boolean` does.
+* `side_effect` needs the canary in the assertion AND a read-back in the
+  command. "State changed" is only provable if we can name what it changed to,
+  and the request causing the effect "usually returns a perfectly ordinary
+  200" — so without a second request nothing observed the change.
+
+A ratchet now fails if any kind declared in `vuln_classes.yaml` has no
+`anchored_*` function, so the gap cannot silently reopen.
 
 ## The change
 

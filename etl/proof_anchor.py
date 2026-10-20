@@ -236,6 +236,56 @@ def anchored_boolean(assertion, command, canary=None) -> bool:
     return bool(diff.get("must_differ"))
 
 
+def anchored_status_change(assertion, command, canary=None) -> bool:
+    """A DIFFERENCE between two requests — the same shape as `boolean`.
+
+    The guidance for this kind already says it: "send the honest value and the
+    attack value and assert on what differs; a 200 alone proves nothing,
+    because the honest request returns 200 too." That is a differential, so it
+    anchors on one.
+
+    9 classes declared `status_change` with NO anchor function behind it
+    (auth-bypass, idor, csrf, ldap-injection, open-redirect, xpath-injection,
+    hpp, privilege-escalation, nosql-injection). They fell through to the
+    self-declaration path, which means `cve_anchored: true` was their entire
+    verification — the same unfounded-declaration shape that let a model's
+    refusal be stored as a verified PoC on 2026-10-20.
+    """
+    return anchored_boolean(assertion, command, canary)
+
+
+def anchored_side_effect(assertion, command, canary=None) -> bool:
+    """State that CHANGED, observed by a FOLLOW-UP READ.
+
+    Two halves, and both are necessary:
+
+    * The assertion must require THIS run's canary. "State changed" is only
+      provable if we can name what it changed to; a generic success string
+      could describe state that was already there. The canary is how the
+      exploit names its own effect.
+    * The command must actually READ BACK. A single request that returns 200
+      proves nothing — the guidance says so directly: "The request causing the
+      effect usually returns a perfectly ordinary 200." Without a second
+      request there is nothing that observed the change.
+
+    8 classes declared `side_effect` with no anchor (upload, deserialization,
+    privilege-escalation, csrf, prototype-pollution, host-header-injection,
+    smtp-injection, format-string).
+    """
+    if not canary:
+        return False
+    if canary not in _regex_of(assertion):
+        return False
+    cmd = str(command or "")
+    if not cmd:
+        return False
+    # A follow-up read: a second request-issuing invocation, or a plan with
+    # more than one step. Counting the tool is cruder than parsing and cannot
+    # be fooled the other way — one request can never look like two.
+    reads = sum(cmd.lower().count(t) for t in ("curl ", "wget ", "http "))
+    return reads >= 2
+
+
 def anchored_timing(assertion, verdict_method) -> bool:
     """Confirmed by the scaled-payload re-run, never by a single elapsed.
 
@@ -348,6 +398,12 @@ def is_anchored(assertion, canary, *, proof_kinds=None, command=None,
     if "boolean" in kinds and anchored_boolean(assertion, command, canary):
         return True, ("boolean: the proof is a differential — two requests "
                       "differing only in a boolean produced different output")
+    if "status_change" in kinds and anchored_status_change(assertion, command, canary):
+        return True, ("status_change: the proof is a differential — two requests "
+                      "differing only in the attack value produced different output")
+    if "side_effect" in kinds and anchored_side_effect(assertion, command, canary):
+        return True, ("side_effect: the assertion requires this run's canary and "
+                      "the command reads the state back")
     if "echo" in kinds and anchored_echo(assertion, canary):
         return True, "echo: the injected canary is required by the assertion"
     if "oob" in kinds and anchored_oob(assertion, canary):
@@ -369,7 +425,11 @@ def is_anchored(assertion, canary, *, proof_kinds=None, command=None,
     # is not, so the declaration is claiming an anchor it does not have —
     # which is how `{"canary": "...", "cve_anchored": true,
     # "expect_regex": "REFUSED"}` came to be stored as a verified PoC.
-    _reflection = any(k in kinds for k in ("echo", "oob"))
+    # Kinds where the canary is SUPPOSED to be in the regex, so a declaration
+    # that matches on something else is unfounded. status_change and
+    # side_effect now have their own anchors above, so reaching the generic
+    # declaration with either on the table means that anchor already said no.
+    _reflection = any(k in kinds for k in ("echo", "oob", "side_effect"))
     if _declared(assertion, canary):
         if _reflection and _regex_of(assertion):
             return False, ("the assertion declares itself anchored with this "
