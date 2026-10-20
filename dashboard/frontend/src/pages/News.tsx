@@ -3,7 +3,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import {
   Newspaper, Search, RefreshCw, Loader2, X, ExternalLink, Github, Server,
   Trash2, CheckSquare, Square, Eye, Settings as SettingsIcon, Wand2,
-  HelpCircle, Globe, ShieldAlert, Plus, Sparkles, CalendarClock, Target,
+  HelpCircle, Globe, ShieldAlert, Plus, Sparkles, CalendarClock, Target, RotateCcw,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import PageHelp from '@/components/PageHelp'
@@ -16,6 +16,9 @@ import {
 } from '@/api/news'
 import type { NewsSort } from '@/api/news'
 import type { NewsItem, NewsStatus, NewsSource } from '@/lib/types'
+import {
+  NEWS_FILTER_DEFAULTS, loadNewsFilters, saveNewsFilters, newsFiltersAreDefault,
+} from '@/lib/newsFilters'
 
 const STATUS_TABS: { id: NewsStatus; label: string }[] = [
   { id: 'new',       label: 'NEW' },
@@ -55,21 +58,55 @@ function FlagPill({ value, label, kind }: { value: boolean | null; label: string
 
 export default function News() {
   const qc = useQueryClient()
-  const [activeStatus, setActiveStatus] = useState<NewsStatus | 'all'>('new')
-  const [search, setSearch] = useState('')
-  const [cveFilter, setCveFilter] = useState('')
-  const [kevOnly, setKevOnly] = useState(false)
-  const [rceOnly, setRceOnly] = useState(false)
-  const [redTeamOnly, setRedTeamOnly] = useState(true)
+  // Read once on mount — a lazy initialiser, so a blocked localStorage costs
+  // one try/catch rather than one per render.
+  const [persisted] = useState(loadNewsFilters)
+  const [activeStatus, setActiveStatus] = useState<NewsStatus | 'all'>(persisted.activeStatus)
+  const [search, setSearch] = useState(persisted.search)
+  const [cveFilter, setCveFilter] = useState(persisted.cveFilter)
+  const [kevOnly, setKevOnly] = useState(persisted.kevOnly)
+  const [rceOnly, setRceOnly] = useState(persisted.rceOnly)
+  const [redTeamOnly, setRedTeamOnly] = useState(persisted.redTeamOnly)
   // Engagement-match filter: show only items the backend has tagged as
   // affecting this engagement. strong_only narrows to confidence='strong'
   // (CVE-confirmed hits), muting the weak product-mention tier.
-  const [affectsEngagement, setAffectsEngagement] = useState(false)
-  const [strongOnly, setStrongOnly] = useState(false)
-  const [hideStatuses, setHideStatuses] = useState<Set<NewsStatus>>(new Set(['deleted']))
-  const [maxAgeDays, setMaxAgeDays] = useState<number | null>(30)
-  const [sort, setSort] = useState<NewsSort>('relevance')
+  const [affectsEngagement, setAffectsEngagement] = useState(persisted.affectsEngagement)
+  const [strongOnly, setStrongOnly] = useState(persisted.strongOnly)
+  const [hideStatuses, setHideStatuses] = useState<Set<NewsStatus>>(new Set(persisted.hideStatuses))
+  const [maxAgeDays, setMaxAgeDays] = useState<number | null>(persisted.maxAgeDays)
+  const [sort, setSort] = useState<NewsSort>(persisted.sort)
   const [hideDeleted] = useState(true)
+
+  // One object holding the whole remembered toolbar — it feeds both the
+  // write-back and the "is anything narrowed?" check, so the two can't drift.
+  const liveFilters = useMemo(() => ({
+    activeStatus, search, cveFilter, kevOnly, rceOnly, redTeamOnly,
+    affectsEngagement, strongOnly, hideStatuses: [...hideStatuses],
+    maxAgeDays, sort,
+  }), [activeStatus, search, cveFilter, kevOnly, rceOnly, redTeamOnly,
+       affectsEngagement, strongOnly, hideStatuses, maxAgeDays, sort])
+
+  // Write the toolbar back on every change; saveNewsFilters is fail-soft, so
+  // unavailable storage costs the memory of the view and nothing else.
+  useEffect(() => { saveNewsFilters(liveFilters) }, [liveFilters])
+
+  // The toolbar is remembered now, so a narrowed feed can outlive the session
+  // that narrowed it. Surface one escape hatch, and only when it is needed.
+  const filtersAreDefault = newsFiltersAreDefault(liveFilters)
+
+  const resetFilters = () => {
+    setActiveStatus(NEWS_FILTER_DEFAULTS.activeStatus)
+    setSearch(NEWS_FILTER_DEFAULTS.search)
+    setCveFilter(NEWS_FILTER_DEFAULTS.cveFilter)
+    setKevOnly(NEWS_FILTER_DEFAULTS.kevOnly)
+    setRceOnly(NEWS_FILTER_DEFAULTS.rceOnly)
+    setRedTeamOnly(NEWS_FILTER_DEFAULTS.redTeamOnly)
+    setAffectsEngagement(NEWS_FILTER_DEFAULTS.affectsEngagement)
+    setStrongOnly(NEWS_FILTER_DEFAULTS.strongOnly)
+    setHideStatuses(new Set(NEWS_FILTER_DEFAULTS.hideStatuses))
+    setMaxAgeDays(NEWS_FILTER_DEFAULTS.maxAgeDays)
+    setSort(NEWS_FILTER_DEFAULTS.sort)
+  }
 
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [openItemId, setOpenItemId] = useState<string | null>(null)
@@ -121,7 +158,8 @@ export default function News() {
       limit: 200,
       offset: 0,
     }
-  }, [activeStatus, hideStatuses, maxAgeDays, cveFilter, kevOnly, rceOnly, redTeamOnly, search, sort])
+  }, [activeStatus, hideStatuses, maxAgeDays, cveFilter, kevOnly, rceOnly, redTeamOnly,
+      affectsEngagement, strongOnly, search, sort])
 
   const itemsQ = useNewsItems(filters)
   const statsQ = useNewsStats()
@@ -500,6 +538,16 @@ export default function News() {
             <option value="last_seen">Last seen</option>
           </select>
         </label>
+        {!filtersAreDefault && (
+          <button
+            onClick={resetFilters}
+            className="px-2 py-1 rounded text-xs border border-border hover:bg-muted flex items-center gap-1"
+            title="Clear every filter on this page and forget the remembered view"
+          >
+            <RotateCcw className="h-3 w-3" />
+            Reset filters
+          </button>
+        )}
         <span className="ml-auto text-xs text-muted-foreground">
           {itemsQ.isFetching ? 'loading…' : `${(itemsQ.data?.total ?? 0).toLocaleString()} matching`}
         </span>
