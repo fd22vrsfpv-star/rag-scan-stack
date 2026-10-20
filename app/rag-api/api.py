@@ -36456,9 +36456,13 @@ def _summarize_build_trace(entries):
             # it, so fall back to the refusal markers the pre-dispatch branches
             # write into `output` — each is a fixed prefix emitted by exactly
             # one branch, never produced by a target.
+            # 800, not 400: this is the only place the operator sees what the
+            # target actually answered, and the first 400 characters of a curl
+            # run are headers. Read BEFORE the dispatched check, which needs it.
+            out = str(e.get("run_output") or "")[:800]
             _disp = e.get("dispatched")
             if _disp is None:
-                _disp = not any(str(out).startswith(mk) for mk in _PRE_DISPATCH_MARKERS)
+                _disp = not any(out.startswith(mk) for mk in _PRE_DISPATCH_MARKERS)
             if not _disp:
                 s["pre_dispatch_refusals"].append({
                     "iter": it,
@@ -36468,10 +36472,6 @@ def _summarize_build_trace(entries):
                     "command": str(extra.get("command") or "")[:500],
                 })
                 continue
-            # 800, not 400: this is the only place the operator sees what the
-            # target actually answered, and the first 400 characters of a curl
-            # run are headers.
-            out = str(e.get("run_output") or "")[:800]
             passed = bool(e.get("assertion_passed"))
             status = "PASSED" if passed else "FAILED"
             if "404 Not Found" in out or "\"404 Not Found\"" in out:
