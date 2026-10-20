@@ -20861,6 +20861,13 @@ def _poc_trace(run_id, phase, iteration=0, prompt=None, response=None,
              "assertion_passed": assertion_passed, "llm_model": llm_model}
     if extra:
         entry.update(extra)
+    # Name the producing tool on the row itself, so the JSONL on disk is
+    # self-describing. An explicit source_tool in `extra` wins — the emitting
+    # node knows better than a phase-name lookup.
+    if not entry.get("source_tool"):
+        _st = _poc_source_tool(phase)
+        if _st:
+            entry["source_tool"] = _st
     try:
         with open(_poc_run_file(run_id), "a") as f:
             f.write(_j.dumps(entry) + "\n")
@@ -20868,8 +20875,100 @@ def _poc_trace(run_id, phase, iteration=0, prompt=None, response=None,
         logging.debug("poc_trace write failed: %s", e)
 
 
+# ── Which tool produced a trace row ──────────────────────────────────────────
+# `response` is a generic text slot: the recon nodes write deterministic tool
+# output into it and the LLM nodes write model output into it. The viewer
+# therefore labelled a 1,600-char OpenAPI dump "llm response", and a reader had
+# no way to tell WHICH tool found something without grepping the phase string
+# back to its `_poc_trace` call in build_poc_graph.py.
+#
+# `llm_model` already marks the model calls. This names the tool behind the
+# deterministic ones. Only sources that are genuinely known go in — a phase
+# that is not listed falls back to showing its phase name, which is honest,
+# where a guessed tool would not be.
+_POC_SOURCE_TOOL_EXACT = {
+    "recon:port_sweep":              "TCP-connect port sweep (socket + httpx)",
+    "recon:waf":                     "WAF canary probes (httpx)",
+    "recon:waf_characterize":        "WAF characterisation probes (httpx)",
+    "recon:basic":                   "landing page + robots.txt (httpx)",
+    "recon:response_mine":           "info-disclosure probes (httpx)",
+    "recon:openapi":                 "OpenAPI/Swagger spec fetch (httpx)",
+    "recon:arjun":                   "Arjun (parameter discovery)",
+    "recon:playwright":              "Playwright (headless browser crawl)",
+    "recon:local_source":            "challenge source on disk (filesystem read)",
+    "recon:discovered_knowledge":    "prior-build facts (database)",
+    "recon:product_identification":  "product fingerprint (httpx + database)",
+    "recon:product_cve_enumeration": "CVE enumeration for product (database)",
+    "recon:auto_login":              "mined-credential login attempt (httpx)",
+    "recon:auth_establish":          "session establishment (httpx login)",
+    "recon:access_enumeration":      "post-access enumeration (httpx, authenticated)",
+    "recon:precondition_enumeration": "precondition probes (httpx)",
+    "recon:plan_verified":           "strategist-plan probes (httpx)",
+    "recon:strategist_validation":   "strategist-plan probes (httpx)",
+    # LLM-backed, listed for completeness: the UI prefers `llm_model` when it
+    # is set, so this only shows on a row where the model went unrecorded —
+    # and "LLM strategist" is still the honest answer to what produced it.
+    "recon:strategist":              "LLM strategist (plan, not a probe)",
+    "escalation:path_discovery":     "path-discovery probes (httpx)",
+    "prerun_probe":                  "pre-dispatch probe (httpx)",
+    "prerun_tool_check":             "runner binary check (kali-listener)",
+    "oob_sink_check":                "out-of-band sink reachability (httpx)",
+    "known_good_probe":              "known-good control probe (httpx)",
+    "inband_diff":                   "in-band response diff (httpx)",
+    "benchmark_oracle":              "CVE-Bench oracle endpoint",
+    "benchmark_oracle_win":          "CVE-Bench oracle endpoint",
+    "nuclei_template_available":     "nuclei template index",
+    "tool_handoff":                  "derived tool commands (sqlmap / nuclei)",
+    "run":                           "kali-listener (command execution)",
+    "correct_run":                   "kali-listener (command execution)",
+    "latency_confirmation":          "kali-listener (scaled timing re-run)",
+    "embed_enum_facts":              "embedder service",
+    "error_memory_recorded":         "error memory (database)",
+    "auto_autopage":                 "post-ex primitive skill (autopage)",
+    # Graph bookkeeping, not a finding. A `node` row is LangGraph's own
+    # task_result event: node name, whether it RAISED, and wall-clock. "ok"
+    # means "did not throw" — never "succeeded" or "found something", which is
+    # exactly how `failure_analysis ok in 1.35s` gets misread as an analysis
+    # that produced a result.
+    "node":                          "LangGraph (node finished — ok = did not raise)",
+    "node_path":                     "LangGraph (nodes executed, in order)",
+    "graph_state_summary":           "LangGraph (final state field census)",
+    "resume":                        "LangGraph (resumed from checkpoint)",
+}
+
+# Prefix rules for phase FAMILIES that share one source. Longest prefix wins,
+# so this tuple stays ordered most-specific first; `recon:zap_active` must not
+# be decided by the `recon:zap` row.
+_POC_SOURCE_TOOL_PREFIX = (
+    ("escalation:zap_focused_active", "ZAP (focused active scan)"),
+    ("escalation:zap_active",         "ZAP (active scan)"),
+    ("recon:zap_active",              "ZAP (spider + passive + active scan)"),
+    ("recon:zap",                     "ZAP (spider + passive alerts)"),
+    ("deep_recon",                    "deep recon (gated probes)"),
+    ("primitive:",                    "post-ex primitive skill"),
+    ("recall_",                       "RAG retrieval (pgvector)"),
+)
+
+
+def _poc_source_tool(phase) -> Optional[str]:
+    """Name the tool/source behind a trace phase, or None when it is not known.
+
+    None is a real answer: the caller then shows the phase name rather than a
+    guess. Used both when writing a row and when serving an older trace that
+    predates the stamp, so one table covers past and future logs."""
+    if not isinstance(phase, str) or not phase:
+        return None
+    hit = _POC_SOURCE_TOOL_EXACT.get(phase)
+    if hit:
+        return hit
+    for prefix, tool in _POC_SOURCE_TOOL_PREFIX:
+        if phase.startswith(prefix):
+            return tool
+    return None
+
+
 _POC_TRACE_STD_KEYS = frozenset(("ts", "epoch", "phase", "iteration", "prompt", "response",
-                                 "run_output", "assertion_passed", "llm_model"))
+                                 "run_output", "assertion_passed", "llm_model", "source_tool"))
 
 
 def _trace_extra(entry: dict) -> dict:
@@ -25018,6 +25117,55 @@ def _poc_shell_syntax_check(command, canary=None, assertion=None):
                            "(after -- or within /* */), where the server discards "
                            "it and it can never be reflected — place it in a "
                            "selected column or other reflected position")
+    # ── THE SHELL'S OWN PARSE — ADVISORY, NOT A REFUSAL ────────────────────
+    #
+    # Everything above is a heuristic. `shlex` models QUOTING but not shell
+    # GRAMMAR, and the `&&`/`;` split is a regex, so an unbalanced `(`, a
+    # quote spanning a separator or an unterminated heredoc all sail through —
+    # 117 commands in the trace archive reached the listener and died in the
+    # remote shell, 86 of them `"(" unexpected`. (Those predate the executor
+    # switching to bash on 2026-10-15; zero since. This is the belt to that
+    # fix's braces, and it catches the quoting class the dialect fix does not.)
+    #
+    # `bash -n` is the exact oracle for the SHELL lane: the same parser that
+    # will run the command, reading it without executing a single word.
+    # (Not shellcheck — a style linter that rejects plenty of legitimate
+    # pentest idiom. The question here is only "will this parse".)
+    #
+    # ADVISORY, because the measurement said so. Replaying every COMPLETE
+    # stored command through it: 23 of 1,368 commands that RAN FINE are
+    # rejected by bash (1.7%). They are the nested-quote `grep -oP` shapes
+    # that go down the PYTHON lane (`_curl_to_request` turns the curl into an
+    # HTTP request), where bash grammar never applies. And the classes do not
+    # separate — 15 of those 23 are "unexpected EOF while looking for
+    # matching", the same class as a genuine unterminated quote — so there is
+    # no error type that can be refused safely.
+    #
+    # Refusing would therefore block ~1.7% of working builds to catch a class
+    # that is already near-zero: the remote shell errors this was aimed at
+    # (117 historically, 86 of them `"(" unexpected`) stopped on 2026-10-15
+    # when the executor switched to bash, and there have been NONE since.
+    #
+    # So it reports. The error is carried back to the refine loop as feedback
+    # the model can act on, and the loop's own gates decide what to do.
+    #
+    # No shell=True and no interpolation: the command is an argv element, so
+    # nothing here can execute it. FAIL-OPEN on a missing bash or a timeout —
+    # a validator that cannot run must never read as "the command is bad".
+    try:
+        import subprocess as _sp_syn
+        _r = _sp_syn.run(["bash", "-n", "-c", command],
+                         capture_output=True, text=True, timeout=5)
+        if _r.returncode != 0:
+            _msg = (_r.stderr or "").strip().splitlines()
+            _msg = _msg[-1][:200] if _msg else "bash -n rejected the command"
+            # "advisory:" is the prefix the caller downgrades on — the command
+            # is still dispatched, and the parse error rides along as context.
+            return (True, f"advisory: bash -n could not parse this: {_msg}")
+    except FileNotFoundError:
+        pass          # no bash on this runner — heuristics already passed
+    except Exception:  # noqa: BLE001
+        pass          # timeout / OS error — never block on the validator
     return (True, "")
 
 
@@ -30338,6 +30486,16 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                                                 "proven fact; dispatching anyway "
                                                 "(quality gate, fails open)"})
         _syn_ok, _syn_err = _poc_shell_syntax_check(command, canary=canary, assertion=assertion)
+        # An advisory rides back on the OK path: `bash -n` could not parse the
+        # command, but refusing on that blocks ~1.7% of working builds (the
+        # Python-lane `grep -oP` shapes), so it is recorded rather than
+        # enforced. Visible in the trace, and carried into the refine context
+        # below so the model can fix a genuine quoting mistake on its own.
+        if _syn_ok and _syn_err.startswith("advisory:"):
+            _poc_trace(run_id, "shell_parse_advisory", iteration=it,
+                       response=_syn_err[:300],
+                       extra={"enforced": False,
+                              "command_preview": (command or "")[:200]})
         # A GUARD THAT NEVER YIELDS IS A DEAD END. The canary-placement rule is
         # right — a canary inside a SQL comment cannot satisfy an expect_regex
         # assertion — but the model does not act on the message, so it returns
@@ -30747,7 +30905,39 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                           "method": verification_method,
                           "confidence": verification_confidence,
                           "reason": _verdict.get("reason", ""),
-                          "command": (command or "")[:600],
+                          # The command is the single most valuable field in a
+                          # trace — it is what a reviewer reproduces by hand.
+                          # At 600 it was cut mid-token, so a perfectly valid
+                          # command displayed as unbalanced quotes and read as
+                          # "the generator emits broken shell". It does not:
+                          # `_dry_parse_command` refuses malformed shell
+                          # pre-dispatch (426 refusals on record). Keep the
+                          # whole thing, and state the true length so any
+                          # downstream cap is visibly a cap.
+                          "command": (command or "")[:4000],
+                          "command_len": len(command or ""),
+                          # Did this pass actually reach the target?
+                          #
+                          # `max_iters` bounds DISPATCHED attempts, and a pass
+                          # refused pre-dispatch (bad shell, LLM refusal prose,
+                          # a proven-fact violation, a failed prerun probe)
+                          # correctly costs no budget — `_dispatched_attempts`
+                          # only moves after a real listener call. But the row
+                          # is still written, with assertion_passed=False, and
+                          # every reader counted it as a failed attempt. Worse,
+                          # `it = _dispatched_attempts + 1`, so a refused pass
+                          # and the real attempt that follows SHARE an
+                          # iteration number: CVE-2024-5452 wrote five rows all
+                          # labelled `iter 3`.
+                          #
+                          # Recorded here because this is the only place that
+                          # knows: _tr_before was taken at the top of this pass.
+                          # A remote shell parse error means the command never
+                          # executed, so it is a repair like the pre-dispatch
+                          # refusals, not an attempt on the vulnerability.
+                          "dispatched": bool((metrics.get("target_runs") or 0) > _tr_before)
+                                        and not _is_shell_syntax_failure(output),
+                          "shell_syntax_error": _is_shell_syntax_failure(output) or None,
                           "error_signature": _sig_now, "error_tier": _tier_now,
                           "attempt_score": _sc,
                           "evidence_path": (_ev or {}).get("path")})
@@ -30880,7 +31070,30 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         # moving is the proof: it increments at exactly one place, immediately
         # after the listener call returns.
         _tr_after = (metrics.get("target_runs") or 0)
-        if _tr_after > _tr_before:
+        # A command the remote shell could not PARSE produced no exploit
+        # traffic: the listener ran, so target_runs moved, but nothing of the
+        # command executed. Charging it spends a quarter of a four-iteration
+        # budget on a quoting mistake, and files it as evidence the approach
+        # failed. Repair it and retry instead — bounded by _loop_passes, and
+        # _consecutive_syntax_fails still drives the model-fallback swap, so a
+        # model that cannot write shell is still swapped rather than looped on.
+        _remote_syntax = _is_shell_syntax_failure(output)
+        if _remote_syntax:
+            _consecutive_syntax_fails += 1
+            metrics.setdefault("skipped_runs_bad_syntax", 0)
+            metrics["skipped_runs_bad_syntax"] += 1
+            _poc_trace(run_id, "shell_syntax_refused", iteration=it,
+                       response=_remote_syntax,
+                       extra={"detector": "remote-shell", "charged": False,
+                              "command_preview": (command or "")[:200]})
+            _poc_trace(run_id, "iteration_not_charged", iteration=it,
+                       extra={"reason": "the remote shell could not parse the "
+                                        "command, so nothing executed; repairing "
+                                        "rather than counting it as an attempt",
+                              "shell_error": _remote_syntax,
+                              "dispatched_so_far": _dispatched_attempts,
+                              "loop_passes": _loop_passes})
+        elif _tr_after > _tr_before:
             _dispatched_attempts += 1
         else:
             _poc_trace(run_id, "iteration_not_charged", iteration=iters,
@@ -36106,6 +36319,43 @@ def _read_trace_entries(exploit_id):
         return []
 
 
+# Fixed prefixes written by the pre-dispatch refusal branches in the refine
+# loop. Each is emitted by exactly one branch and none can be produced by a
+# target, so a `run` row starting with one describes a pass that was repaired
+# rather than sent. Used only for traces written before rows carried
+# `dispatched` — new rows state it outright.
+def _is_shell_syntax_failure(output) -> str:
+    """The shell's own parse error, or "" — i.e. the command never ran.
+
+    Distinct from the PRE-dispatch dry-parse: this is the REMOTE shell
+    refusing the command the listener handed it, so `target_runs` moved and
+    the attempt was charged even though no exploit traffic was produced.
+    117 of 4,280 dispatched runs in the trace archive are these, dominated by
+    86 x `"(" unexpected` — a subshell/process-substitution that is valid bash
+    and invalid under dash. Under a max_iters of 4 one of them is a quarter of
+    the build's budget, spent on a command that never executed.
+
+    Matched on the shell's own prefix (`/bin/sh: 12: Syntax error: ...`,
+    `/bin/bash: line 3: syntax error ...`) so a target echoing the phrase back
+    in a response body cannot be mistaken for one.
+    """
+    import re as _re
+    text = str(output or "")
+    m = _re.match(r"\s*/bin/(?:sh|bash|dash):\s*(?:line\s*)?\d+:\s*"
+                  r"([Ss]yntax error[^\n]*)", text)
+    return m.group(1).strip()[:160] if m else ""
+
+
+_PRE_DISPATCH_MARKERS = (
+    "/bin/sh: syntax error (pre-dispatch",
+    "REFUSE: I cannot provide (pre-dispatch",
+    "PROVEN_FACT_UNUSED (pre-dispatch)",
+    "PRERUN_PROBE_FAIL",
+    "[proxy] REFUSED",
+    "MISSING_PROGRAM",
+)
+
+
 def _summarize_build_trace(entries):
     """Extract structured intel from a build's JSONL trace so the operator gets a
     one-glance view instead of scrolling through every phase.
@@ -36122,6 +36372,11 @@ def _summarize_build_trace(entries):
         "credentials_found": [], "admin_paths": [], "has_captcha": False,
         "strategist_primary": None, "strategist_alts": [],
         "plan_verdicts": {}, "iterations_summary": [],
+        # Passes that never reached the target — fixed before sending, so they
+        # are repairs, not attempts. Kept visible: a build that needed six
+        # syntax repairs to land four attempts is a different story from one
+        # that landed four cleanly.
+        "pre_dispatch_refusals": [],
         "dead_endpoints": [], "waf_blocks": 0,
     }
     for e in entries:
@@ -36192,15 +36447,56 @@ def _summarize_build_trace(entries):
                 s["plan_verdicts"] = extra["verdicts"]
         elif ph == "run":
             it = int(e.get("iteration") or 0)
-            out = str(e.get("run_output") or "")[:400]
+            # A pass refused BEFORE dispatch is not an attempt. It costs no
+            # `max_iters` budget already; it must not read as a failed attempt
+            # either, or "4 iterations, all failed" describes one real attempt
+            # and three commands that were fixed before they were ever sent.
+            #
+            # `dispatched` is authoritative when present. Older traces predate
+            # it, so fall back to the refusal markers the pre-dispatch branches
+            # write into `output` — each is a fixed prefix emitted by exactly
+            # one branch, never produced by a target.
+            _disp = e.get("dispatched")
+            if _disp is None:
+                _disp = not any(str(out).startswith(mk) for mk in _PRE_DISPATCH_MARKERS)
+            if not _disp:
+                s["pre_dispatch_refusals"].append({
+                    "iter": it,
+                    "reason": str(extra.get("reason") or "")[:200],
+                    "tier": str(extra.get("error_tier") or ""),
+                    "detail": str(out)[:200],
+                    "command": str(extra.get("command") or "")[:500],
+                })
+                continue
+            # 800, not 400: this is the only place the operator sees what the
+            # target actually answered, and the first 400 characters of a curl
+            # run are headers.
+            out = str(e.get("run_output") or "")[:800]
             passed = bool(e.get("assertion_passed"))
             status = "PASSED" if passed else "FAILED"
             if "404 Not Found" in out or "\"404 Not Found\"" in out:
                 status = "404"
             elif "网站防火墙" in out or "blocked by" in out.lower():
                 status = "WAF-BLOCKED"; s["waf_blocks"] += 1
-            s["iterations_summary"].append({"iter": it, "status": status,
-                                             "output_head": out[:200]})
+            # "#3 FAILED" on its own is unactionable: it says an attempt
+            # happened and nothing about WHAT was tried or WHAT came back. The
+            # `run` row already carries the command and the verdict's own
+            # reason/method/tier in extra — carry them through so the summary
+            # can answer both questions without the operator opening the raw
+            # trace and counting iterations by hand.
+            s["iterations_summary"].append({
+                "iter": it, "status": status,
+                "output_head": out[:800],
+                "command": str(extra.get("command") or "")[:500],
+                # The real length, so a 500-char slice is labelled as a slice
+                # rather than silently looking like a malformed command.
+                "command_len": int(extra.get("command_len")
+                                   or len(str(extra.get("command") or ""))),
+                "reason": str(extra.get("reason") or "")[:300],
+                "method": str(extra.get("method") or ""),
+                "error_tier": str(extra.get("error_tier") or ""),
+                "drifted": bool(e.get("drifted") or extra.get("drifted")),
+            })
         elif ph == "waf_block_detected":
             s["waf_blocks"] += 1
         elif ph == "result":
@@ -37369,6 +37665,48 @@ def _synth_poc_token(ip: str, port, product=None) -> str:
     return f"{base}-{highest + 1:03d}"
 
 
+def _engagement_for_build_target(host):
+    """(engagement_id | None) that OWNS this build target — asset, then scope.
+
+    `etl.identity_upsert.resolve_engagement_for_host` is the same idea but its
+    scope lookup is `target_type = 'ip'` only, so a HOSTNAME target resolves to
+    nothing there — and a hostname is exactly what an external engagement's
+    scope is full of. This widens the scope leg to any target_type while
+    keeping the asset leg first.
+
+    Deliberately returns None rather than guessing: an unattributable target
+    keeps the request's engagement, which is the old behaviour and the right
+    fallback for a host nothing knows about yet. The global `not_in_scope`
+    deny-list carries `engagement_id IS NULL` by design and is excluded by the
+    NOT NULL predicate, so it can never claim a build.
+    """
+    host = str(host or "").strip()
+    if not host:
+        return None
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT engagement_id FROM assets "
+                " WHERE (host(ip) = %s OR hostname = %s) AND engagement_id IS NOT NULL "
+                " LIMIT 1", (host, host))
+            row = cur.fetchone()
+            if row and row[0]:
+                return row[0]
+            # Any scope entry naming this exact target, IP- or hostname-typed.
+            cur.execute(
+                "SELECT engagement_id FROM scope_targets "
+                " WHERE split_part(target, '/', 1) = %s AND engagement_id IS NOT NULL "
+                " LIMIT 1", (host,))
+            row = cur.fetchone()
+            if row and row[0]:
+                return row[0]
+    except Exception as e:  # noqa: BLE001
+        # Best-effort: a lookup failure must not block a build. Falling back to
+        # the request's engagement is the pre-existing behaviour, not a new risk.
+        logging.warning("build_poc: engagement lookup for %s failed: %s", host, e)
+    return None
+
+
 @app.post("/software/build-poc", tags=["Assets"])
 def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     """PoC-builder: research -> synthesize -> run-and-refine. Invoking this authorizes
@@ -37389,6 +37727,43 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
         body.target_url, body.ip, body.port, body.endpoint_hint, body.hint)
     if not ip:
         raise HTTPException(400, "either ip or target_url is required")
+
+    # ── Attribute to the TARGET's engagement, not the operator's tab ────────
+    #
+    # `eid` above is whatever engagement the UI happens to be on. Every
+    # artifact this build writes (exploit_store, build_poc_attempts, vulns,
+    # credentials) was being stamped with it, so a build launched against
+    # engagement A's host while the operator was looking at engagement B
+    # filed the result under B. Observed 2026-10-19: one exploit_store row
+    # and one build_poc_attempts row for a host that belongs to another
+    # engagement's scope were labelled with the engagement that happened to
+    # be active, which both surfaced them under the wrong engagement AND put
+    # them out of reach of the owning engagement's data purge.
+    #
+    # CLAUDE.md: "A writer that creates collected target data MUST set
+    # engagement_id, resolving it from the target's asset or scope". The
+    # header is the fallback for a target nothing knows about yet, never the
+    # authority when the target IS attributable.
+    #
+    # This is attribution, NOT authorization: `etl/scope_gate.py` still
+    # decides whether a single packet may be sent, and re-attributing a build
+    # neither widens nor narrows that.
+    _target_eid = _engagement_for_build_target(ip)
+    if _target_eid and str(_target_eid) != str(eid or ""):
+        logging.warning(
+            "build_poc: target %s belongs to engagement %s but the request carried "
+            "%s — attributing to the target's engagement", ip, _target_eid, eid)
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("build_poc_engagement_reattributed", "build_poc", {
+                "target": ip, "cve": cve or None,
+                "request_engagement_id": str(eid) if eid else None,
+                "attributed_engagement_id": str(_target_eid),
+            })
+        except Exception:  # noqa: BLE001
+            pass
+        eid = _target_eid
+
     # ── Already running? ────────────────────────────────────────────────────
     #
     # The form blocks for the whole build, so an operator with no progress to
@@ -40166,9 +40541,17 @@ def get_exploit_trace(exploit_id: str, authorized: bool = Depends(auth)):
                 if not line:
                     continue
                 try:
-                    entries.append(_j.loads(line))
+                    _e = _j.loads(line)
                 except Exception:  # noqa: BLE001
                     continue
+                # Backfill the producing tool for rows written before the stamp
+                # existed. Every trace already on disk predates it, so deriving
+                # only at write time would leave the whole archive unlabelled.
+                if isinstance(_e, dict) and not _e.get("source_tool"):
+                    _st = _poc_source_tool(_e.get("phase"))
+                    if _st:
+                        _e["source_tool"] = _st
+                entries.append(_e)
         return {"ok": True, "log_path": log_path, "count": len(entries), "phases": entries}
     except FileNotFoundError:
         return {"ok": True, "log_path": log_path, "phases": [], "reason": "log file missing"}

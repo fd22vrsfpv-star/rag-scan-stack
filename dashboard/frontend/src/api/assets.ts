@@ -1137,7 +1137,32 @@ export interface ExploitSummary {
   strategist_primary: { class: string; endpoint: string; param: string; method: string } | null
   strategist_alts: Array<{ label: string; class: string; endpoint: string; param: string }>
   plan_verdicts: Record<string, string>
-  iterations_summary: Array<{ iter: number; status: string; output_head: string }>
+  /** Passes that never reached the target — refused pre-dispatch, or rejected
+   *  by the remote shell before anything executed. Repairs, not attempts:
+   *  they cost no `max_iters` budget and must not read as failed attempts. */
+  pre_dispatch_refusals?: Array<{
+    iter: number; reason?: string; tier?: string; detail?: string; command?: string
+  }>
+  iterations_summary: Array<{
+    iter: number
+    status: string
+    /** First 800 chars of what the target actually answered. */
+    output_head: string
+    /** The command that was dispatched — "what was tried". May be a prefix;
+     *  compare against `command_len` before reading it as complete shell. */
+    command?: string
+    /** True length of the dispatched command. When it exceeds `command.length`
+     *  the UI MUST say so: a silently-cut command shows unbalanced quotes and
+     *  reads as a generator bug rather than a display cap. */
+    command_len?: number
+    /** The verdict's own words, e.g. "canary not in output — regex-authoritative failure". */
+    reason?: string
+    /** Verdict method: regex / regex_missed / latency_confirmed / probe / … */
+    method?: string
+    /** Which axis the outcome killed: endpoint / auth / carrier / parameter. */
+    error_tier?: string
+    drifted?: boolean
+  }>
   dead_endpoints: string[]
   waf_blocks: number
   final_verdict?: { verified: boolean; reason: string }
