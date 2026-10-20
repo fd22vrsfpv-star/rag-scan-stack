@@ -43,14 +43,29 @@ def _func_src(name: str) -> str | None:
 def test_prerun_payload_probe_defined():
     body = _func_src("_prerun_payload_probe")
     assert body, "_prerun_payload_probe missing"
-    # Extracts method; defaults to GET.
-    assert '"GET"' in body or "'GET'" in body, (
-        "probe must default to GET when curl has no explicit -X"
-    )
-    # Honors `-X METHOD` from the command.
-    assert "-X" in body and re.search(r"-X\\s", body) is not None, (
-        "probe must parse the exploit's explicit -X METHOD"
-    )
+    # Method extraction moved into `_curl_target_url` (2026-10-20) when the
+    # probe stopped taking the first URL in the command and started reading
+    # curl's real target. Test the BEHAVIOUR where it now lives rather than
+    # the literal where it used to be.
+    extract = _func_src("_curl_target_url")
+    assert extract, "_curl_target_url missing — the probe has no way to read the target"
+    # It reads the module-level flag table, so that has to come along.
+    import ast as _a2
+    _src_all = API.read_text(encoding="utf-8")
+    _flags = None
+    for _n in _a2.walk(_a2.parse(_src_all)):
+        if (isinstance(_n, _a2.Assign)
+                and any(isinstance(t, _a2.Name) and t.id == "_CURL_VALUE_FLAGS"
+                        for t in _n.targets)):
+            _flags = _a2.get_source_segment(_src_all, _n)
+    assert _flags, "_CURL_VALUE_FLAGS missing — the probe cannot tell payload from target"
+    ns = {}
+    exec(compile(_flags + "\n" + extract, "<extract>", "exec"), ns)  # noqa: S102
+    target = ns["_curl_target_url"]
+    assert target("curl 'http://t:9090/a'")[0] == "GET", (
+        "probe must default to GET when curl has no explicit -X")
+    assert target("curl -X PUT 'http://t:9090/a'")[0] == "PUT", (
+        "probe must parse the exploit's explicit -X METHOD")
     # Uses httpx.request so any method is first-class (not .post/.get).
     assert "httpx" in body or "_hx" in body, "probe must use httpx for method-agnostic request"
     assert ".request" in body, "probe must call .request(method, ...) not .post/.get"

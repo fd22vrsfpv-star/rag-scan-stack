@@ -781,7 +781,7 @@ def test_unsourced_credential_detector():
     r3 = f("curl -u admin:admin http://t/x", known_values=[])
     assert r3["kinds"] == ["basic"] and r3["unsourced"]
     body = _func_src("_run_refine_poc")
-    assert '"credential_unsourced"' in body and body.find("_command_credential_unsourced(command") < body.find("_prerun_payload_probe(ip, port, command")
+    assert '"credential_unsourced"' in body and body.find("_command_credential_unsourced(command") < body.find("_prerun_payload_probe(")
 
 
 # ── round-9 fixes: the login path the deep pass depends on ────────────────

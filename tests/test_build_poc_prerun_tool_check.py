@@ -109,7 +109,7 @@ def test_prerun_tool_check_short_circuits_only_on_a_confirmed_missing_program(ns
 def test_loop_runs_the_tool_check_in_the_prerun_block_and_skips_the_listener():
     loop = _func_src("_run_refine_poc")
     assert loop
-    i_probe = loop.index("_prerun_payload_probe(ip, port, command")
+    i_probe = loop.index("_prerun_payload_probe(")
     i_oob = loop.index("_prerun_oob_check(ip, port, command")
     i_tool = loop.index("_prerun_tool_check(ip, port, command")
     i_trace = loop.index('"prerun_tool_check"')

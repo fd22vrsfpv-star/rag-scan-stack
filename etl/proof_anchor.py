@@ -232,19 +232,26 @@ def is_anchored(assertion, canary, *, proof_kinds=None, command=None,
     if "file_content" in kinds and anchored_file_content(assertion, command, signatures):
         return True, ("file_content: the assertion is a known content signature "
                       "and the command requested that file")
-    # The generic self-declaration, and the same caveat as the echo and oob
-    # paths: it only stands when there is no regex to contradict it. An
-    # assertion that CARRIES the canary while matching on something unrelated
-    # has declared an anchor it does not have — that is how
-    # `{"canary": "...", "cve_anchored": true, "expect_regex": "REFUSED"}`
-    # came to be stored as a verified PoC on 2026-10-20.
-    if _declared(assertion, canary) and not _regex_of(assertion):
-        return True, "the assertion declares itself anchored with this run's canary"
+    # The generic self-declaration. It is the DESIGNED route for the proof
+    # kinds where the canary cannot appear in the regex: a file read asserts
+    # on content only the real file has (CLAUDE.md: a returning canary there
+    # is a REFUTATION), and a blind-timing proof has nothing to reflect into.
+    # For those, a content signature plus a declared canary is the correct
+    # shape and must keep anchoring.
+    #
+    # For a REFLECTION kind it is not. If `echo` or `oob` is on the table and
+    # neither anchor matched, the canary was supposed to be in the regex and
+    # is not, so the declaration is claiming an anchor it does not have —
+    # which is how `{"canary": "...", "cve_anchored": true,
+    # "expect_regex": "REFUSED"}` came to be stored as a verified PoC.
+    _reflection = any(k in kinds for k in ("echo", "oob"))
     if _declared(assertion, canary):
-        return False, ("the assertion declares itself anchored with this run's "
-                       "canary but matches on %r, which does not contain it — "
-                       "a declaration cannot anchor a proof the regex does not "
-                       "require" % (_regex_of(assertion)[:60],))
+        if _reflection and _regex_of(assertion):
+            return False, ("the assertion declares itself anchored with this "
+                           "run's canary but matches on %r, which does not "
+                           "contain it — for a reflection proof the canary IS "
+                           "the proof" % (_regex_of(assertion)[:60],))
+        return True, "the assertion declares itself anchored with this run's canary"
 
     # Say which kind was expected — "not anchored" with no reason is what made
     # this impossible to diagnose from a run's trace.
