@@ -364,3 +364,82 @@ def test_the_split_is_reversible_without_a_rebuild():
     fn = [n for n in ast.walk(ast.parse(src))
           if isinstance(n, ast.FunctionDef) and n.name == "node_tool_handoff"][0]
     assert "BUILD_POC_RUN_TOOLS" in (ast.get_source_segment(src, fn) or "")
+
+
+# ── step 7: the model can actually reach these proofs ───────────────────────
+#
+# Capability is not reachability. Verified against the real model
+# (DeepSeek-V4-Pro) rather than assumed, and three defects came out of that:
+#
+#  1. Told the vuln was BLIND, it chose ERROR-based — one request, a broken
+#     quote, asserting on MySQL's parser message. Before this change a blind
+#     SQLi had only `timing`, so it would have written a SLEEP and joined the
+#     920 `latency_too_fast` rows.
+#  2. It sent `"data"` instead of `"body"`, and normalise SILENTLY DROPPED it:
+#     both arms of a boolean proof rendered as bare POSTs with no payload.
+#  3. It referenced arms BY STEP ID rather than inlining them — a better shape
+#     than the one designed — and as written that would have issued four
+#     requests for a two-request proof.
+
+@pytestmark_steps
+def test_an_unknown_request_field_is_refused_not_dropped():
+    """The model sent `data`; normalise kept only keys it knew and the payload
+    vanished with nothing said. That is the unreachable-is-not-absent shape
+    this repo keeps hitting: a proof that could not possibly fire, and no
+    reason recorded anywhere."""
+    from etl.http_request import normalise
+    with pytest.raises(_ReqErr) as e:
+        normalise({"url": "http://t/a", "bodyy": "typo"})
+    assert "unknown request field" in str(e.value)
+    assert "bodyy" in str(e.value)
+    # ...and the message names what IS supported, so it is actionable.
+    assert "body" in str(e.value)
+
+
+@pytestmark_steps
+@pytest.mark.parametrize("alias,canonical", [
+    ("data", "body"), ("payload", "body"), ("params", "query"),
+    ("cookie", "cookies"), ("header", "headers"),
+])
+def test_the_names_the_model_reaches_for_are_accepted(alias, canonical):
+    from etl.http_request import normalise
+    val = {"body": "x=1", "query": {"a": "b"}, "cookies": {"s": "1"},
+           "headers": {"H": "v"}}[canonical]
+    assert normalise({"url": "http://t/a", alias: val})[canonical] == \
+        normalise({"url": "http://t/a", canonical: val})[canonical]
+
+
+# The plan the model actually produced, verbatim in shape.
+REF_PLAN = [
+    {"id": "bool-true", "request": {"method": "POST", "url": "http://t:9090/login.php",
+                                    "data": "u=x' AND 1=1-- "}},
+    {"id": "bool-false", "request": {"method": "POST", "url": "http://t:9090/login.php",
+                                     "data": "u=x' AND 1=2-- "}},
+    {"id": "bool-diff", "differential": {"true": "bool-true", "false": "bool-false",
+                                         "must_differ": "body"}},
+]
+
+
+@pytestmark_steps
+def test_a_differential_arm_may_be_a_step_reference():
+    validate_plan(REF_PLAN)
+    assert target_of(REF_PLAN) == ("POST", "http://t:9090/login.php")
+
+
+@pytestmark_steps
+def test_a_referenced_arm_is_not_issued_twice():
+    """The model declares the pair as steps AND references them. Emitting both
+    the steps and the differential would send four requests for a two-request
+    proof — and double the traffic of every boolean proof."""
+    script = to_script(REF_PLAN, canary=CANARY)
+    assert script.count("curl ") == 2, (
+        f"issued {script.count('curl ')} requests for a two-request differential")
+    assert "AND 1=1" in script and "AND 1=2" in script, "an arm lost its payload"
+
+
+@pytestmark_steps
+def test_a_reference_to_a_step_that_does_not_exist_is_refused():
+    bad = [{"id": "d", "differential": {"true": "nope", "false": "also-nope",
+                                        "must_differ": "body"}}]
+    with pytest.raises(_ReqErr):
+        validate_plan(bad)

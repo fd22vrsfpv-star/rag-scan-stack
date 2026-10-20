@@ -164,14 +164,37 @@ time is not scarce — which is why neither is in this plan's critical path.
 | 4. proof order, cheapest first | **done** (in `is_anchored` and the class list) |
 | 5. sqlmap → `tool_executions` | **done** (`_record_tool_execution`) |
 | 6. sqlmap out of the proof path | **done** (flag-reversible) |
-| 7. the synth prompt teaches the new step shapes | **pending** |
+| 7. the synth prompt teaches the new step shapes | **done** — verified live against the model |
 | 8. phase two: a released run that executes the derived commands | **pending** |
 
-Steps 7 and 8 are what make the new proofs *reachable* and the deferred
-commands *usable*. Until 7 lands the model does not know a `differential` or
-`timing` step exists, so the anchors can only fire on a plan written by hand;
-until 8 lands a derived sqlmap command is recorded and never executed by
-anything. Both are additive and neither blocks the deploy of 1-6.
+Step 8 is what makes the deferred commands *usable*: until it lands, a derived
+sqlmap command is recorded and executed by nothing. Additive, and it does not
+block the deploy of 1-7.
+
+### What step 7 cost, and what it found
+
+Capability is not reachability, so the prompt change was verified against the
+real model rather than assumed. Three defects came out of that, none of which
+a unit test would have found:
+
+1. Told the vuln was BLIND, the model chose **error-based** — one request, a
+   broken quote, asserting on MySQL's own parser message. That is the intended
+   outcome: before this, a blind SQLi had only `timing` and would have written
+   a SLEEP.
+2. It sent `"data"` instead of `"body"`, and `normalise` **silently dropped
+   it** — both arms of a boolean proof rendered as bare POSTs with no payload.
+   A proof that could not fire, with no reason recorded anywhere; the same
+   unreachable-is-not-absent shape this repo keeps hitting. Aliases are
+   accepted now (`data`, `payload`, `params`, `header`, `cookie`, …) and an
+   unrecognised field is REFUSED with a message naming what is supported.
+3. It referenced the arms **by step id** rather than inlining them — a better
+   shape than the one designed, because it avoids repeating a request and the
+   arms stay self-describing in the trace. As written it would have issued
+   FOUR requests for a two-request proof; a referenced step is now consumed by
+   the differential and not issued again.
+
+The format moved toward what the model actually produces, which is the right
+direction of travel for a contract it has to satisfy on every build.
 
 Two reversals kept while 7 and 8 are outstanding:
 

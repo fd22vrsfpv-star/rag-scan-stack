@@ -78,6 +78,22 @@ REQUEST_FIELDS = (
     "auth", "verify", "timeout", "follow_redirects",
 )
 
+#: Names the model reaches for that mean something we DO support. Being
+#: liberal here is free; being silent is not — see `normalise`.
+FIELD_ALIASES = {
+    "data": "body",            # curl's flag name, and requests' kwarg
+    "payload": "body",
+    "post_data": "body",
+    "params": "query",
+    "querystring": "query",
+    "query_params": "query",
+    "header": "headers",
+    "cookie": "cookies",
+    "verify_ssl": "verify",
+    "allow_redirects": "follow_redirects",
+    "redirects": "follow_redirects",
+}
+
 _DEFAULTS: Dict[str, Any] = {
     "method": "GET",
     "url": "",
@@ -111,9 +127,28 @@ def normalise(req: Dict[str, Any]) -> Dict[str, Any]:
     out["headers"] = {}
     out["query"] = {}
     out["cookies"] = {}
+    unknown = []
     for k, v in req.items():
-        if k in REQUEST_FIELDS:
-            out[k] = v
+        key = k if k in REQUEST_FIELDS else FIELD_ALIASES.get(k)
+        if key:
+            out[key] = v
+        elif k not in ("id", "request", "extract", "wait_seconds",
+                       "differential", "timing", "note", "rationale"):
+            unknown.append(k)
+    # A field we do not recognise is REJECTED, never dropped.
+    #
+    # Observed 2026-10-20: the model sent `"data": "username=x' AND 1=1--"`,
+    # `normalise` kept only the keys it knew, and BOTH arms of a boolean proof
+    # rendered as bare POSTs with no payload at all. The proof could not
+    # possibly fire and nothing anywhere said why — the same
+    # unreachable-is-not-absent shape this repo keeps hitting. `data` is an
+    # alias now; the next unknown name has to fail loudly instead.
+    if unknown:
+        raise RequestSpecError(
+            "unknown request field(s) %s. Supported: %s. (Aliases accepted: %s.)"
+            % (", ".join(repr(u) for u in sorted(unknown)),
+               ", ".join(sorted(REQUEST_FIELDS)),
+               ", ".join(sorted(FIELD_ALIASES))))
 
     url = str(out.get("url") or "").strip()
     if not url:
@@ -308,15 +343,22 @@ def to_script(steps: List[Dict[str, Any]], *, canary: Optional[str] = None) -> s
     # shell variables) — order matters only in that both must happen before
     # rendering, and a canary is never a capture name.
     plan = interpolate_captures(substitute(steps, canary))
+    # Steps referenced as differential arms are issued BY the differential, so
+    # emitting them on their own as well would double every request in the
+    # proof — four for a two-request differential.
+    consumed = {sid for st in plan if isinstance(st, dict)
+                for sid in _differential_arm_ids(st)}
     lines: List[str] = []
     for n, step in enumerate(plan, 1):
+        if str(step.get("id")) in consumed and not step.get("differential"):
+            continue
         sid = str(step.get("id") or f"step{n}")
         wait = step.get("wait_seconds")
         if wait:
             lines.append(f"sleep {int(wait)}")
         lines.append("echo " + shlex.quote(f"--- STEP {sid} ---"))
         if step.get("differential"):
-            lines.extend(_differential_lines(step, n))
+            lines.extend(_differential_lines(step, n, plan))
             continue
         if step.get("timing"):
             lines.extend(_timing_lines(step, n))
@@ -334,7 +376,37 @@ def to_script(steps: List[Dict[str, Any]], *, canary: Optional[str] = None) -> s
     return "\n".join(lines)
 
 
-def _differential_lines(step: Dict[str, Any], n: int) -> List[str]:
+def _resolve_arm(arm: Any, plan: Optional[List[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
+    """An arm is either an inline `{"request": {...}}` or a STEP ID.
+
+    The reference form is what the model actually reaches for: it declares
+    `bool-true` and `bool-false` as steps and then writes
+    `{"true": "bool-true", "false": "bool-false"}`. That is a better shape than
+    nesting — it avoids repeating a request, and the steps are self-describing
+    in the trace.
+
+    It also fixes a real defect in the inline-only reading: the model emitted
+    the pair as steps AND a differential referencing them, which would have
+    issued FOUR requests for a two-request proof. A referenced step is
+    consumed by the differential and not issued again.
+    """
+    if isinstance(arm, dict):
+        return arm.get("request") or (arm if arm.get("url") else None)
+    if isinstance(arm, str) and plan:
+        for st in plan:
+            if str(st.get("id")) == arm:
+                return st.get("request") or (st if st.get("url") else None)
+    return None
+
+
+def _differential_arm_ids(step: Dict[str, Any]) -> List[str]:
+    """Step ids this differential consumes, so they are not issued twice."""
+    d = step.get("differential") or {}
+    return [str(d[k]) for k in ("true", "false") if isinstance(d.get(k), str)]
+
+
+def _differential_lines(step: Dict[str, Any], n: int,
+                        plan: Optional[List[Dict[str, Any]]] = None) -> List[str]:
     """Two requests that differ only in a boolean, and a verdict on whether
     their responses differ.
 
@@ -349,12 +421,13 @@ def _differential_lines(step: Dict[str, Any], n: int) -> List[str]:
     timestamp the way a full-text diff can.
     """
     d = step.get("differential") or {}
-    t_req = (d.get("true") or {}).get("request") if isinstance(d.get("true"), dict) else None
-    f_req = (d.get("false") or {}).get("request") if isinstance(d.get("false"), dict) else None
+    t_req = _resolve_arm(d.get("true"), plan)
+    f_req = _resolve_arm(d.get("false"), plan)
     if not (t_req and f_req):
         raise RequestSpecError(
-            "a `differential` step needs BOTH a `true` and a `false` arm, each "
-            "with a `request` — one response cannot prove a differential")
+            "a `differential` step needs BOTH a `true` and a `false` arm. Each "
+            "is either an inline {\"request\": {...}} or the id of another step "
+            "in this plan — one response cannot prove a differential")
     if not d.get("must_differ"):
         raise RequestSpecError(
             "a `differential` step needs `must_differ` naming what should "
@@ -416,7 +489,7 @@ def validate_plan(steps: Any) -> List[Dict[str, Any]]:
             raise RequestSpecError(f"step {n} is not an object")
         try:
             if step.get("differential"):
-                _differential_lines(step, n)      # validates both arms
+                _differential_lines(step, n, steps)  # validates both arms
             elif step.get("timing"):
                 _timing_lines(step, n)            # validates the request + delay
             else:
@@ -444,8 +517,7 @@ def target_of(steps: Any) -> Tuple[Optional[str], Optional[str]]:
     # request's own url, which is the whole point of reading it rather than
     # inferring it from a rendered command.
     if first.get("differential"):
-        arm = (first["differential"].get("true") or {})
-        req = normalise(arm.get("request") or {})
+        req = normalise(_resolve_arm(first["differential"].get("true"), plan) or {})
     elif first.get("timing"):
         req = normalise((first["timing"].get("request") or first.get("request") or {}))
     else:

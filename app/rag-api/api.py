@@ -20146,6 +20146,35 @@ except Exception as _cge:  # noqa: BLE001
 # of assumed, and the canary paragraph is emitted only for classes that can
 # actually echo.
 _PROOF_KIND_INSTRUCTION = {
+    # Cheapest and most certain FIRST — this dict's order is the order the
+    # guidance lists them, and the model takes the first one it can satisfy.
+    # Added 2026-10-20 for sqli/nosql; see Docs/plans/SQLI_PROOF_PATH.md. The
+    # archive had 1,215 timing attempts go wrong against 305 that landed, so
+    # timing being the FIRST thing a blind SQLi was offered was the problem.
+    "error": [
+        "DB ERROR - the cheapest certain proof, and it needs ONE request. Break",
+        "the quoting (a stray ' or \") so the database's own parser complains.",
+        "Nothing but a database emits its parser error, so the error IS the",
+        "proof that your input reached the SQL parser. Assert on the engine's",
+        "message, not on the word 'error' - a 500 page is not a database.",
+        '  assertion: {"expect_regex": "You have an error in your SQL syntax"}',
+        "  (or the Postgres / MSSQL / Oracle / SQLite equivalent)",
+    ],
+    "boolean": [
+        "BOOLEAN - two requests differing ONLY in a true/false condition. If the",
+        "database evaluated your expression the responses differ; if it did not,",
+        "they are identical. No clock, so a slow target or a WAF delay cannot",
+        "fake it - which is exactly what makes timing unreliable.",
+        "  Use a `differential` STEP in the plan, which issues both and compares",
+        "  them for you:",
+        '    {"id": "bool", "differential": {',
+        '       "true":  {"request": {... AND 1=1 ...}},',
+        '       "false": {"request": {... AND 1=2 ...}},',
+        '       "must_differ": "body"}}',
+        "  Pick a condition whose TRUE arm returns a row and whose FALSE arm",
+        "  returns none - `AND 1=1` / `AND 1=2` on an existing record is the",
+        "  standard pair. Do NOT write the pair as shell.",
+    ],
     "echo": [
         "ECHO - this class CAN reflect an injected marker, so anchor the proof",
         "to it: make the exploit cause the exact marker CANARY to appear as a",
@@ -20175,7 +20204,14 @@ _PROOF_KIND_INSTRUCTION = {
         "elapsed to scale. So the command MUST carry a real delay payload",
         "(SLEEP / pg_sleep / WAITFOR / BENCHMARK); a min_seconds assertion over",
         "a command with no payload is rewritten before dispatch.",
+        "  Use a `timing` STEP so the clock arithmetic is generated for you -",
+        "  writing `START=$(date +%s)` by hand is where timing exploits lose",
+        "  their quoting:",
+        '    {"id": "blind", "timing": {"expect_seconds": 5,',
+        '       "request": {... OR SLEEP(5) ...}}}',
         '  assertion: {"min_seconds": 5}',
+        "  TRY error and boolean FIRST. Timing is the last resort: it is the",
+        "  only proof whose verdict depends on how fast the target answers.",
     ],
     "status_change": [
         "STATUS CHANGE - the proof is a DIFFERENCE between two requests, not a",
@@ -23485,6 +23521,15 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None,
                        '"url": "<absolute url>", "headers": {}, "body": "<raw body>" '
                        'OR "json": {}, "cookies": {}}, '
                        '"extract": {"<name>": {"grep_p": "<PCRE with \\\\K>"}}}], ')
+        # The two step shapes that exist so a proof need not be hand-written
+        # shell. A boolean proof is two requests and a comparison; a timing
+        # proof is clock arithmetic. Neither fits a plain request, which is why
+        # they were falling back to `command` and losing their quoting there.
+        _plan_field += ('// a step may instead be '
+                        '{"id":"x","differential":{"true":{"request":{...}},'
+                        '"false":{"request":{...}},"must_differ":"body"}} '
+                        'or {"id":"x","timing":{"expect_seconds":5,'
+                        '"request":{...}}} ')
         _plan_block = (
             "PREFER `plan` over `command`. A plan is a list of HTTP steps as DATA — "
             "you describe the request, the platform renders it. Do NOT escape "
@@ -23500,6 +23545,14 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None,
             "name=\"csrf_token\"\\s+value=\"\\K[^\"]+). Reference it in a later "
             "step as {{<name>}} — the platform wires it up. Do NOT write "
             "$VARIABLES or $(...) yourself. "
+            "For a BOOLEAN proof the `differential` goes INSIDE A STEP of the "
+            "plan, NOT in `assertion` — the step issues both requests and "
+            "compares them, so there is nothing left for an assertion to say. "
+            "For a BLIND TIMING proof use a `timing` step the same way (the "
+            "clock arithmetic is generated). Writing either as shell is where "
+            "those proofs lose their quoting. "
+            "Put the payload in `body` (`data` is accepted); an unrecognised "
+            "field is REFUSED, not ignored. "
             "Use `command` INSTEAD of `plan` only when the exploit is not a "
             "sequence of HTTP requests (sqlmap, nc, a python one-liner). "
             "Never send both.\n")
