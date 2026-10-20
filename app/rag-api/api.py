@@ -23637,6 +23637,10 @@ _LLM_REFUSAL_MARKERS = (
     "i will not", "i won't provide", "i'm sorry, but i cannot", "i am sorry, but i cannot",
     "cannot assist with", "cannot generate exploit", "refuse to generate",
     "unable to provide exploit", "as an ai", "i cannot write exploit",
+    # Bare forms. The list above all required a leading "i", so the model
+    # saying "REFUSED: cannot provide exploit PoC" matched nothing.
+    "cannot provide exploit", "cannot provide a poc", "refuse to provide",
+    "refused: cannot", "will not provide exploit", "cannot comply",
 )
 
 
@@ -23655,6 +23659,24 @@ def _poc_detect_llm_refusal(command):
     first_tok = (first[0] if first else "").rstrip(":,.").lower()
     if first_tok in ("refuse", "sorry", "unfortunately", "apologies"):
         return (True, command[:200])
+
+    # A refusal WRAPPED in a valid command. `echo 'REFUSED: cannot provide
+    # exploit PoC'` is syntactically fine shell whose first token is `echo`,
+    # so neither the first-token check above nor the dry-parse saw anything
+    # wrong — and an assertion built from that text matched it perfectly. It
+    # was stored as a verified PoC for CVE-2024-34070 on 2026-10-20.
+    #
+    # Only when the ENTIRE command is that echo: a conditional
+    # `curl ... && echo 'SINK: $CANARY'` is a legitimate and common shape, and
+    # refusing it would break every out-of-band proof.
+    _stripped = command.strip()
+    _m = _re_module.fullmatch(r"""(?:echo|printf)\s+(?:-[eEn]+\s+)?(['"])(.*)\1\s*""",
+                              _stripped, _re_module.S)
+    if _m:
+        _inner = _m.group(2).lower()
+        if any(mk in _inner for mk in _LLM_REFUSAL_MARKERS) or _inner.startswith("refused"):
+            return (True, _stripped[:200])
+
     lc = command.lower()
     for m in _LLM_REFUSAL_MARKERS:
         if m in lc:

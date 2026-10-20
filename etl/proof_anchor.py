@@ -70,10 +70,34 @@ def _declared(assertion, canary) -> bool:
 
 
 def anchored_echo(assertion, canary) -> bool:
-    """The original rule: the assertion requires the canary we injected."""
+    """The original rule: the assertion requires the canary we injected.
+
+    For an ECHO proof the canary IS the proof, so `_declared` alone does not
+    stand here: an assertion may CARRY the canary as metadata while matching
+    on something else entirely, and then the declaration is unfounded.
+
+    Observed 2026-10-20 on CVE-2024-34070, stored as a verified PoC:
+
+        command   = echo 'REFUSED: cannot provide exploit PoC'
+        assertion = {"canary": "POCz2c556557da", "cve_anchored": true,
+                     "expect_regex": "REFUSED"}
+
+    The model declined to write an exploit, the refusal text became the
+    command, an assertion was built that matches that text, and because the
+    canary rode along in a sibling field `_declared` said "anchored". The run
+    proved only that `echo` works.
+
+    So: a non-empty regex that does not mention the canary REFUTES the
+    declaration for this kind. An empty regex leaves nothing to contradict it
+    (timing and file_content proofs legitimately carry no canary regex, and
+    they are handled by their own anchors anyway).
+    """
     if not canary:
         return False
-    return _declared(assertion, canary) or canary in _regex_of(assertion)
+    rx = _regex_of(assertion)
+    if canary in rx:
+        return True
+    return _declared(assertion, canary) and not rx
 
 
 def anchored_oob(assertion, canary) -> bool:
@@ -86,7 +110,13 @@ def anchored_oob(assertion, canary) -> bool:
         return False
     rx = _regex_of(assertion)
     if not any(m in rx for m in _OOB_MARKERS):
-        return _declared(assertion, canary)
+        # No sink marker in the regex, so the declaration is all there is —
+        # and it only stands when there is no regex to contradict it. An
+        # assertion matching on something unrelated while CARRYING the canary
+        # in a sibling field is the same unfounded self-declaration that let
+        # `echo 'REFUSED: ...'` be stored as a verified PoC (see
+        # anchored_echo). Same rule, same reason.
+        return _declared(assertion, canary) and not rx
     return canary in rx or _declared(assertion, canary)
 
 
@@ -135,6 +165,40 @@ def anchored_file_content(assertion, command, signatures) -> bool:
     return False
 
 
+#: Tools that actually reach the target. A command built only from shell
+#: builtins contacts nothing, so whatever it "proves" came from this host.
+_TARGET_CONTACT = (
+    "curl", "wget", "nc ", "ncat", "netcat", "socat", "openssl s_client",
+    "python", "python3", "perl", "ruby", "php", "java", "nmap", "masscan",
+    "nuclei", "sqlmap", "ffuf", "gobuster", "feroxbuster", "katana", "httpx",
+    "hydra", "medusa", "msfconsole", "msfvenom", "ssh ", "ftp ", "telnet",
+    "smbclient", "redis-cli", "mysql", "psql", "mongo", "ldapsearch", "dig",
+    "host ", "nslookup", "wfuzz", "arjun", "whatweb", "nikto", "zap-cli",
+)
+
+
+def proof_requires_target(command) -> bool:
+    """Could this command have learned anything from the target?
+
+    A PoC whose command never contacts the target cannot prove a
+    vulnerability in it, whatever its assertion matches. `echo 'REFUSED: ...'`
+    satisfies `expect_regex: "REFUSED"` perfectly and demonstrates nothing —
+    it was stored as a verified PoC on 2026-10-20.
+
+    Deliberately a WHITELIST of contacting tools rather than a blacklist of
+    builtins: a new builtin would silently pass a blacklist, where a new tool
+    missing from this list only costs a refusal the operator can see and fix.
+    Fail-SAFE, not fail-open, because the output of this decides whether
+    something is recorded as a proven exploit.
+
+    Empty or unparseable command -> False: nothing is not a proof.
+    """
+    c = str(command or "").lower()
+    if not c.strip():
+        return False
+    return any(t in c for t in _TARGET_CONTACT)
+
+
 def is_anchored(assertion, canary, *, proof_kinds=None, command=None,
                 verdict_method=None, signatures=None) -> tuple:
     """(anchored, why).
@@ -143,6 +207,16 @@ def is_anchored(assertion, canary, *, proof_kinds=None, command=None,
     original canary rule exactly, so an unknown class cannot become verifiable
     by accident.
     """
+    # No contact with the target, no proof about the target. Checked FIRST and
+    # for every proof kind: an assertion cannot earn an anchor that the
+    # command's own reach makes impossible. `command` is optional on this
+    # signature, so an absent one skips the check rather than refusing — the
+    # callers that decide "verified" all pass it.
+    if command is not None and not proof_requires_target(command):
+        return False, ("the command never contacts the target "
+                       "(no request-issuing tool in it), so nothing it "
+                       "matched can be evidence about the target")
+
     kinds = [str(k) for k in (proof_kinds or [])]
     if not kinds:
         ok = anchored_echo(assertion, canary)
@@ -158,8 +232,19 @@ def is_anchored(assertion, canary, *, proof_kinds=None, command=None,
     if "file_content" in kinds and anchored_file_content(assertion, command, signatures):
         return True, ("file_content: the assertion is a known content signature "
                       "and the command requested that file")
-    if _declared(assertion, canary):
+    # The generic self-declaration, and the same caveat as the echo and oob
+    # paths: it only stands when there is no regex to contradict it. An
+    # assertion that CARRIES the canary while matching on something unrelated
+    # has declared an anchor it does not have — that is how
+    # `{"canary": "...", "cve_anchored": true, "expect_regex": "REFUSED"}`
+    # came to be stored as a verified PoC on 2026-10-20.
+    if _declared(assertion, canary) and not _regex_of(assertion):
         return True, "the assertion declares itself anchored with this run's canary"
+    if _declared(assertion, canary):
+        return False, ("the assertion declares itself anchored with this run's "
+                       "canary but matches on %r, which does not contain it — "
+                       "a declaration cannot anchor a proof the regex does not "
+                       "require" % (_regex_of(assertion)[:60],))
 
     # Say which kind was expected — "not anchored" with no reason is what made
     # this impossible to diagnose from a run's trace.
