@@ -91,7 +91,7 @@ services:
       - ./exploitdb:/exploitdb
       - ./certs:/certs:ro
       - ./vault/init:/vault/init:ro
-      - /opt/cve-bench:/opt/cve-bench:ro
+      - ${CVE_BENCH_DIR:-/opt/cve-bench}:/opt/cve-bench:ro
 
   embedder:
     container_name: !reset null

@@ -248,3 +248,6 @@ strix_overnight/.*
 
 # runtime probe screenshots (confirmed-facts evidence), not source
 fact_screenshots/
+
+# CVE-Bench checkout (its own git repo) — see .env.example CVE_BENCH_DIR
+/cve-bench/

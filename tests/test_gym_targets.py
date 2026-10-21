@@ -68,9 +68,10 @@ class TestDeterministicIp:
         assert _ip_for(cve) == expect
 
     def test_the_shipped_arithmetic_matches(self):
-        """Pin the formula in the script, not just this file's copy of it."""
-        assert "cve_num / 254" in SRC and "cve_num % 254" in SRC
-        assert "172.19." in SRC
+        """Run the script's own _static_ip on a legacy /16 test_net."""
+        for cve in ("CVE-2024-4443", "CVE-2024-22120"):
+            n = int(re.search(r"(\d+)$", cve).group(1))
+            assert _shipped_ip(n, "172.19.0.0/16") == _ip_for(cve)
 
     def test_the_focused_ten_do_not_collide(self):
         ips = [_ip_for(c) for c in FOCUSED_10]
@@ -90,6 +91,71 @@ class TestDeterministicIp:
         claim targets "never" share an IP without saying when they can."""
         a, b = "CVE-2024-1000", "CVE-2024-%d" % (1000 + 254 * 254)
         assert _ip_for(a) == _ip_for(b), "the period is not 254*254 any more"
+
+
+def _shipped_ip(n: int, subnet: str, used=(), tgt="cve-x-target-1") -> str:
+    """Execute gym.sh's _static_ip with a fake `docker` that reports `subnet`
+    and the `used` addresses, so the test pins the shipped shell, not a copy."""
+    m = re.search(r"^_static_ip\(\) \{.*?^\}", SRC, re.S | re.M)
+    if not m:
+        pytest.fail("_static_ip() not found in scripts/gym.sh")
+    members = " ".join("c%d=%s/24" % (i, ip) for i, ip in enumerate(used))
+    fake = ('docker() { case "$*" in *Subnet*) echo "%s";; *Containers*) echo "%s";; esac; }'
+            % (subnet, members))
+    script = "NET=test_net\n%s\n%s\n_static_ip %d %s\n" % (fake, m.group(0), n, tgt)
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip()
+
+
+@pytest.mark.unit
+class TestSlash24Network:
+    """test_net is a /24 (setup.sh TEST_NET_SUBNET, default 172.30.30.0/24):
+    platform services get .1-.62 from --ip-range, targets a static .64-.254."""
+    NET = "172.30.30.0/24"
+
+    def test_observed_address(self):
+        # live: `gym.sh up CVE-2024-2624` -> "assigned static IP 172.30.30.205"
+        assert _shipped_ip(2624, self.NET) == "172.30.30.205"
+
+    def test_targets_stay_out_of_the_platform_range(self):
+        for c in FOCUSED_10 + ["CVE-2024-0001", "CVE-2024-190"]:
+            n = int(re.search(r"(\d+)$", c).group(1))
+            last = int(_shipped_ip(n, self.NET).rsplit(".", 1)[1])
+            assert 64 <= last <= 254, (c, last)
+
+    def test_a_used_address_is_skipped(self):
+        assert _shipped_ip(2624, self.NET, used=["172.30.30.205"]) == "172.30.30.206"
+
+    def test_the_wrap_stays_in_range(self):
+        # 190 % 191 = 190 -> .254; occupied -> wraps to .64, not .255
+        assert _shipped_ip(190, self.NET, used=["172.30.30.254"]) == "172.30.30.64"
+
+    def test_the_target_own_address_is_reusable(self):
+        """Re-running `up` must not move a target off the IP it already holds."""
+        assert _shipped_ip(2624, self.NET, used=["172.30.30.205"],
+                           tgt="c0") == "172.30.30.205"
+
+    def test_the_focused_ten_do_not_collide(self):
+        used, ips = [], []
+        for c in FOCUSED_10:
+            n = int(re.search(r"(\d+)$", c).group(1))
+            ip = _shipped_ip(n, self.NET, used=used)
+            used.append(ip); ips.append(ip)
+        assert len(set(ips)) == len(ips), ips
+
+
+@pytest.mark.unit
+class TestMacosPortability:
+    def test_no_bash4_lowercase(self):
+        code = [l.split(" #", 1)[0] for l in SRC.splitlines() if not l.lstrip().startswith("#")]
+        assert not [l for l in code if ",,}" in l], "bash 3.2 (macOS) has no ${x,,}"
+
+    def test_cvebench_dir_follows_compose_knob(self):
+        assert "CVE_BENCH_DIR" in SRC and 'CVEBENCH_DIR="/opt/cve-bench"' not in SRC
+
+    def test_cvebench_run_goes_through_the_wrapper(self):
+        assert not re.search(r"^\s+\./run ", SRC, re.M), "call ./run via _run (bash>=4 + GNU timeout)"
 
 
 @pytest.mark.unit

@@ -1,5 +1,33 @@
 # OS Changes for Migration
 
+## 2026-10-21 — CVE-Bench gym on macOS / Apple Silicon
+
+### Files Changed
+`scripts/gym.sh`, `scripts/setup.sh`, `docker-compose.rehearsal.yml`. Detail in Docs/CHANGES_MADE.md.
+
+### Platforms Affected
+**macOS — fixed. Linux — unchanged behaviour (falls through every guard). Windows/WSL — bash ≥ 4 and GNU timeout already present.**
+
+1. **bash 3.2** has no `${x,,}`: gym.sh uses `tr`; CVE-Bench's own `./run` still needs bash ≥ 4 → `brew install bash`, gym.sh finds `/opt/homebrew/bin/bash`.
+2. **GNU `timeout -v`** (used by `./run up`) is missing → `brew install coreutils`; gym.sh prepends coreutils' gnubin for `./run` only.
+3. **amd64-only images** on arm64 → `DOCKER_DEFAULT_PLATFORM=linux/amd64` + per-image `docker pull --platform` (a multi-arch base already present as arm64 is otherwise skipped, then rejected at `up`).
+4. **Container IPs are not routable from the macOS host** → reach targets via `scripts/socks-attach.sh` (`SOCKS_PORT=1081` here; 1080 is `ssh-tunnel`).
+5. **test_net subnet** → `TEST_NET_SUBNET` (default `172.30.30.0/24`); the old fixed `172.19.0.0/16` can overlap another Docker network.
+
+## 2026-10-21 — `/opt/cve-bench` bind mount must stay overridable on macOS
+
+### Files Changed
+`docker-compose.yml` (rag-api volumes). Detail in Docs/CHANGES_MADE.md (2026-10-21).
+
+### Platforms Affected
+**macOS — fixed. Linux — unchanged (default `/opt/cve-bench`). Windows — same class applies.**
+
+Docker Desktop does not share `/opt`, so the mount is refused and rag-api never
+starts. Old: `/opt/cve-bench:/opt/cve-bench:ro`. New:
+`${CVE_BENCH_DIR:-/opt/cve-bench}:/opt/cve-bench:ro`, with `CVE_BENCH_DIR=./cve-bench`
+in the machine-local `.env`. Also: `test_net`'s fixed `172.19.0.0/16` subnet can
+overlap an existing network; create it without `--subnet` when that happens.
+
 ## 2026-09-09 — Rehearsal isolation: one ordering rule to mirror
 
 ### Files Changed

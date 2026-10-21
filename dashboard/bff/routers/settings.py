@@ -825,6 +825,7 @@ _LLM_KEYS = [
     "llm.backend", "llm.openai_api_key", "llm.openai_model", "llm.openai_base_url",
     "llm.anthropic_api_key", "llm.anthropic_model",
     "llm.azure_api_key", "llm.azure_endpoint", "llm.azure_model",
+    "llm.ollama_url", "llm.ollama_model",
 ]
 _MASKED_KEYS = {"llm.openai_api_key", "llm.anthropic_api_key", "llm.azure_api_key"}
 
@@ -861,6 +862,41 @@ class LlmSettingsBody(BaseModel):
     azure_api_key: Optional[str] = None
     azure_endpoint: Optional[str] = None
     azure_model: Optional[str] = None
+    # Blank = this machine (the llm_query OLLAMA_URL env, host.docker.internal);
+    # a URL = an Ollama elsewhere on the network ("Ollama (network)" in the UI).
+    ollama_url: Optional[str] = None
+    ollama_model: Optional[str] = None
+
+
+def _normalise_ollama_url(raw: str) -> str:
+    """Validate an Ollama base URL; "" means "use this machine's Ollama".
+
+    `localhost` / `127.0.0.1` are rewritten to host.docker.internal: the URL is
+    dialled from inside the llm_query container, where localhost is the
+    container itself and an operator typing "localhost" means their machine.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+    v = (raw or "").strip()
+    if not v:
+        return ""
+    if "://" not in v:
+        v = "http://" + v
+    parts = urlsplit(v)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise HTTPException(400, f"ollama_url must be http(s)://host[:port], got {raw!r}")
+    if parts.path not in ("", "/") or parts.query or parts.fragment:
+        raise HTTPException(400, "ollama_url must be the bare server URL, e.g. "
+                                 "http://192.168.1.50:11434 (no /api path)")
+    try:
+        port = parts.port or 11434
+    except ValueError:
+        raise HTTPException(400, f"ollama_url has an invalid port: {raw!r}")
+    host = parts.hostname
+    if host in ("localhost", "127.0.0.1", "::1"):
+        host = "host.docker.internal"
+    if ":" in host:
+        host = f"[{host}]"
+    return urlunsplit((parts.scheme, f"{host}:{port}", "", "", ""))
 
 
 @router.put("/api/settings/llm")
@@ -874,7 +910,10 @@ async def save_llm_settings(body: LlmSettingsBody):
         ("anthropic_api_key", "llm.anthropic_api_key"),
         ("anthropic_model", "llm.anthropic_model"), ("azure_api_key", "llm.azure_api_key"),
         ("azure_endpoint", "llm.azure_endpoint"), ("azure_model", "llm.azure_model"),
+        ("ollama_url", "llm.ollama_url"), ("ollama_model", "llm.ollama_model"),
     ]
+    if body.ollama_url is not None:
+        body.ollama_url = _normalise_ollama_url(body.ollama_url)
     async with httpx.AsyncClient(timeout=10) as c:
         for field, key in mapping:
             val = getattr(body, field, None)

@@ -309,7 +309,7 @@ services:
       #   /var/run/docker.sock: for CTF/lab engagements only, lets
       #     _audit_target_source grep the target container's source for common
       #     vuln patterns. Gated BY ENGAGEMENT via engagements.metadata.ctf_mode.
-      - /opt/cve-bench:/opt/cve-bench:ro
+      - ${CVE_BENCH_DIR:-/opt/cve-bench}:/opt/cve-bench:ro
       - /var/run/docker.sock:/var/run/docker.sock
     networks: [agents_net, test_net]
     extra_hosts:

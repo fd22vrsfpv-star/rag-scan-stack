@@ -1525,8 +1525,23 @@ if [ "$REHEARSAL" = true ]; then
 elif docker network inspect test_net &>/dev/null; then
     log_skip "Docker network 'test_net' already exists"
 else
-    docker network create --subnet 172.19.0.0/16 --gateway 172.19.0.1 test_net
-    log_ok "Docker network 'test_net' created"
+    # A /24: platform services take .1-.62 (--ip-range), CVE-Bench targets get
+    # static .64-.254 from scripts/gym.sh. TEST_NET_SUBNET overrides it; a
+    # subnet that overlaps another Docker network ("Pool overlaps") is fatal
+    # here rather than silently falling back, because gym.sh scopes targets
+    # by their test_net address.
+    _tn_subnet="${TEST_NET_SUBNET:-$(grep -E '^TEST_NET_SUBNET=' "$PROJECT_ROOT/.env" 2>/dev/null | tail -1 | cut -d= -f2-)}"
+    _tn_subnet="${_tn_subnet:-172.30.30.0/24}"
+    _tn_net="${_tn_subnet%/*}"
+    if [ "${_tn_subnet#*/}" = "24" ]; then
+        docker network create --subnet "$_tn_subnet" --ip-range "${_tn_net%.*}.0/26" \
+            --gateway "${_tn_net%.*}.1" test_net \
+            || { log_err "Could not create test_net on $_tn_subnet — set TEST_NET_SUBNET in .env to a free /24"; exit 1; }
+    else
+        docker network create --subnet "$_tn_subnet" test_net \
+            || { log_err "Could not create test_net on $_tn_subnet — set TEST_NET_SUBNET in .env"; exit 1; }
+    fi
+    log_ok "Docker network 'test_net' created ($_tn_subnet)"
 fi
 
 # Required directories
