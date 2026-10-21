@@ -21792,7 +21792,13 @@ def _poc_target_family(command):
     CVE's endpoint onto an easier/adjacent finding can be detected. Best-effort: reads the
     first URL in the shell string. Returns (host, seg) or ('', '')."""
     import re as _re
-    m = _re.search(r"https?://([^/\s'\"]+)(/[^\s'\"?]*)?", command or "")
+    # The path stops at shell metacharacters as well as whitespace/quotes/`?`.
+    # Without `)` `;` and a backtick, a URL that ends a command substitution —
+    # `_r1=$(curl ... https://host/)` — parses as path "/)", which never equals
+    # the CVE endpoint "/", so the drift gate refused every such command before
+    # dispatch. The structured-plan renderer emits exactly that shape, so the
+    # platform was rejecting its own commands.
+    m = _re.search(r"https?://([^/\s'\"?);`&|<>]+)(/[^\s'\"?);`&|<>]*)?", command or "")
     if not m:
         return ("", "")
     host = (m.group(1) or "").lower()

@@ -921,3 +921,35 @@ produce the same answer — the repo's recurring unreachable-is-not-absent rule.
 **Enforced by:** not enforced. `tests/test_build_poc_research_gate.py` now
 `importorskip`s rather than failing, which keeps the suite honest but does not
 cover the production path.
+
+### `_poc_target_family` reads shell metacharacters as part of the URL path
+**Found:** 2026-10-21
+**Evidence:** the path group in `_poc_target_family`'s regex
+(`(/[^\s'\"?]*)?`) excludes whitespace, quotes and `?` but not `)`, `;` or a
+backtick, so a URL that ends a command substitution is parsed with the closing
+delimiter inside the path. Run against the real function:
+
+| command | extracted |
+|---------|-----------|
+| `curl -s https://example-corp.com/download?f=x` | `('example-corp.com', '/download')` |
+| `_r1=$(curl -s https://example-corp.com:443/)` | `('example-corp.com:443', '`/)`')` |
+| `_r1=$(curl -s https://example-corp.com:443/); echo done` | `('example-corp.com:443', '`/);`')` |
+| ``x=`curl -s https://example-corp.com:443/` `` | ``('example-corp.com:443', '/`')`` |
+
+The drift gate then compares `/)` against the CVE endpoint `/`, declares drift,
+and `fact_predispatch_refused` refuses the command before dispatch. Observed on a
+live build (run `…_1792609927`): drift fired on **every** refine iteration
+(15:30:23, 15:31:34, 15:31:44) and the final verdict carried `drifted=True`,
+against commands whose URL was correct. The platform's own
+`synth_plan_rendered` emits this shape — `_r1=$(curl … )` — so the renderer
+produces commands the drift gate rejects.
+**Scope of the bite:** only when the URL's FIRST path segment is also the last
+token before the metacharacter — i.e. a root path `/` or a single-segment path.
+`…/plugins/servlet)` is parsed correctly (`/plugins`) because the paren lands in
+a later segment that is discarded.
+**Where:** `app/rag-api/api.py::_poc_target_family` (~line 21790).
+**Done when:** the path group stops at shell metacharacters (`)`, `;`, `` ` ``,
+`&`, `|`, `<`, `>`) as well, and a test pins the four cases above — including
+that a legitimate drift onto a genuinely different endpoint is still caught, so
+the fix cannot be a blanket "strip trailing punctuation".
+**Enforced by:** not enforced.
