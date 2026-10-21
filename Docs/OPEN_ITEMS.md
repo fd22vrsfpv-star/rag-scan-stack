@@ -846,3 +846,41 @@ reads identically to a dead target, so the CVE is recorded as a pipeline
 failure when the pipeline was pointed somewhere the app never listened — the
 same "unreachable is not absent" confusion that cost the focused-10 five
 verdicts when `kali-listener` lacked `test_net`.
+
+### The boolean/differential proof path is offered to the model and never used
+**Found:** 2026-10-21
+**Evidence:** three consecutive CVE-2024-4443 builds (trace epochs 1792586866 /
+1792589064 / 1792590041) each carried the `DIFFERENTIAL-CONFIRMED` guidance in
+the synth prompt — the literal string appears 8 / 5 / 4 times per trace — and
+the model emitted **zero** differential plans in all three: `"differential"` as
+a rendered step shape is `0` in every round, while `min_seconds` appears 21 /
+53 / 49 times. The isolated prompt test added with the 2026.10.21.0815 change
+*does* produce `step shapes : ['request', 'differential']` against the same
+model, so the guidance is reachable in principle; something in the live synth
+path (the full `_proof_block` ordering, the class resolution for this CVE, or a
+research signal naming the CVE as blind-time-based) steers it back to timing
+every time.
+**Where:** `app/rag-api/api.py` `_assert_template_for` / `_PROOF_KIND_ASSERT_TMPL`
+and the synth prompt assembly; `etl/proof_anchor.py::anchored_boolean`;
+`knowledge/vuln_classes.yaml` (sqli `proof:` order).
+**Done when:** a live build against a target whose DB errors are suppressed
+emits at least one rendered `differential` step, observed in the trace — not
+only in a reconstructed prompt.
+**Enforced by:** not enforced. The existing `tests/test_sqli_proof_path.py`
+covers the helper and the isolated prompt, neither of which failed while the
+live path emitted timing 123 times across three builds.
+
+### The failure-analysis hint has not been shown to break a solver stall
+**Found:** 2026-10-21
+**Evidence:** `_derive_auto_hint` now emits 1,232 characters of failure analysis
+where it previously emitted 135 of recon (`CONTEXT: framework=WordPress`), and
+`tests/test_auto_hint_failure_analysis.py` pins the content against the real
+round-3 rows. But the three rounds that stalled ran on the OLD hint; no solver
+round has yet consumed the new one. The claim "this unsticks the loop" is
+currently reasoning, not an observation.
+**Where:** `app/rag-api/api.py::_failure_analysis_lines`, `scripts/solve_cve.sh`.
+**Done when:** a `solve_cve.sh` run on CVE-2024-4443 shows round N+1 choosing a
+different proof mechanism from round N — concretely, `min_seconds` occurrences
+falling and a non-timing verdict method appearing — or the loop is shown to
+stall for a different, named reason.
+**Enforced by:** not enforced (requires a live build).

@@ -36740,6 +36740,82 @@ def _summarize_build_trace(entries):
     return s
 
 
+# Verdict methods that each mean "the timing proof did not land". A build that
+# spent its budget on these has empirically shown the sleep payload never
+# executed, so the next build must not re-propose a `min_seconds` assertion.
+_TIMING_FAIL_METHODS = ("latency_too_fast", "latency_unconfirmed",
+                        "latency_unconfirmable")
+
+
+def _failure_analysis_lines(summary):
+    """Lines derived from HOW the prior build failed, not from what recon saw.
+
+    `_derive_auto_hint` read only the recon half of the summary, so a target
+    whose recon found a single fact produced a near-identical hint every round.
+    Feeding a build back its own recon tells it nothing it did not already know,
+    and the solver loop stalls on three identical outcomes while the hint
+    "updates" each round. The actionable half is the attempt record: which proof
+    mechanism was tried, what the target answered, and which commands were
+    refused. Those are what the next build must do DIFFERENTLY.
+
+    Returns [] when the build never attempted anything (empty recon-only run).
+    """
+    from collections import Counter
+    lines = []
+    iters = summary.get("iterations_summary") or []
+    refusals = summary.get("pre_dispatch_refusals") or []
+    if not iters and not refusals:
+        return lines
+
+    passed = [i for i in iters if i.get("status") == "PASSED"]
+    if iters:
+        lines.append(f"PRIOR BUILD: {len(iters)} attempt(s) reached the target, "
+                     f"{len(passed)} passed. Do not repeat what follows.")
+
+    methods = Counter(str(i.get("method") or "") for i in iters if i.get("method"))
+
+    # Timing is the mechanism that fails while looking healthy: the command
+    # runs, the target answers 200, and only the clock says nothing executed.
+    timing_hit = sorted(m for m in methods if m in _TIMING_FAIL_METHODS)
+    timing_n = sum(methods[m] for m in timing_hit)
+    if timing_n:
+        lines.append(
+            f"TIMING PROOF FAILED {timing_n}x ({', '.join(timing_hit)}): the "
+            "request was sent and the response did NOT slow down, so the sleep "
+            "payload never executed. DO NOT propose another `min_seconds` "
+            "assertion against this target - the mechanism is what is failing, "
+            "not the payload. Use a non-timing proof: error-based, "
+            "boolean/differential, or a reflected canary.")
+
+    regex_n = methods.get("regex_missed", 0)
+    if regex_n:
+        lines.append(
+            f"REGEX PROOF MISSED {regex_n}x: the response arrived but did not "
+            "contain the asserted string - either the injection did not land, "
+            "or the assertion asserts something this response would never carry.")
+
+    # A repeated outcome is the strongest "this axis is dead" signal a build
+    # produces: whatever changed never reached the vulnerable code.
+    sigs = Counter(str(i.get("reason") or "")[:120] for i in iters if i.get("reason"))
+    for sig, n in sigs.most_common(3):
+        if n >= 2 and sig:
+            lines.append(f"REPEATED OUTCOME ({n}x, zero information): {sig}")
+
+    # Pre-dispatch refusals are the build's own gate rejecting its command.
+    # They cost no iteration, but they say the emitted command was malformed in
+    # a way the next build can simply not repeat.
+    if refusals:
+        rtiers = Counter(str(r.get("tier") or "?") for r in refusals)
+        details = sorted({str(r.get("detail") or r.get("reason") or "")[:150]
+                          for r in refusals if (r.get("detail") or r.get("reason"))})
+        line = ("REFUSED BEFORE DISPATCH " + str(len(refusals)) + "x ("
+                + ", ".join(f"{t} x{n}" for t, n in rtiers.most_common()) + ")")
+        if details:
+            line += ": " + "; ".join(details[:2])
+        lines.append(line)
+    return lines
+
+
 def _derive_auto_hint(summary):
     """Turn a build summary into an operator-hint string. Highest-signal items first
     so a synth agent reading this immediately sees the strongest attack surface.
@@ -36798,10 +36874,14 @@ def _derive_auto_hint(summary):
     if summary.get("waf_blocks", 0) > 0:
         lines.append(f"WAF blocks previously hit: {summary['waf_blocks']} times. "
                      "Use only empirical proven-passable variants (see CONTEXT above).")
-    if not lines:
+    # Failure analysis leads: on a rebuild, "stop doing X" changes behaviour
+    # where a restatement of recon the build already performed does not.
+    fail_lines = _failure_analysis_lines(summary)
+    if not lines and not fail_lines:
         return ""
-    return ("AUTO-HINT (derived from prior build's recon — the pipeline already saw "
-            "these signals live on this target): " + " | ".join(lines))
+    return ("AUTO-HINT (derived from the prior build - what it saw live on this "
+            "target AND how its attempts failed): "
+            + " | ".join(fail_lines + lines))
 
 
 def _auto_save_recon_hint(cve, ip, port, hint_text, engagement_id=None):
