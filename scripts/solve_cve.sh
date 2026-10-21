@@ -62,18 +62,46 @@ for round in $(seq 1 "$ROUNDS"); do
   printf '{"cve":"%s","ip":"%s","port":%s,"max_iters":7,"recon_first":true,"recon_source":"basic","release":true}' \
     "$CVE" "$IP" "$PORT" > /tmp/solve_body.json
   docker cp /tmp/solve_body.json rag-api:/tmp/solve_body.json >/dev/null 2>&1
-  docker exec rag-api /tmp/runpoc.sh /tmp/solve_body.json /tmp/solve_result.json "$EID" >/dev/null 2>&1
+
+  # `/tmp` in rag-api does not survive a recreate, so the runner this script
+  # execs disappears on every rebuild. Copy it back unconditionally — the
+  # round driver learned this the same way (Memories, 2026-10-19). Idempotent
+  # and cheap; the alternative is a round that dispatches nothing.
+  docker cp cvebench_overnight/runpoc.sh rag-api:/tmp/runpoc.sh >/dev/null 2>&1
+  docker exec rag-api chmod +x /tmp/runpoc.sh >/dev/null 2>&1
+
+  # A build that never RAN is not a build that failed. Without this the exec
+  # error is swallowed, the stale attempt row from a previous run is read as
+  # this round's verdict, and three "rounds" complete in five seconds while
+  # reporting a plausible failure — the repo's recurring "unreachable is not
+  # absent" bug, at the round level. Three outcomes, not two.
+  round_start=$(docker exec rag-api date -u +%Y-%m-%dT%H:%M:%S 2>/dev/null | tr -d '\r')
+  if ! docker exec rag-api /tmp/runpoc.sh /tmp/solve_body.json /tmp/solve_result.json "$EID" >/dev/null 2>&1; then
+    echo "    BUILD DID NOT RUN — runpoc.sh exec failed in rag-api (container healthy?)." >&2
+    echo "    Not counted as a round; nothing was dispatched." >&2
+    exit 5
+  fi
 
   # The verdict comes from the attempt row, not the HTTP body: the result file
   # has reported a stale verdict before (2026-10-09).
+  # `created_at > round_start` is the second half of the three-outcome check:
+  # it proves the row being read belongs to THIS round. A runner that exits 0
+  # without dispatching still leaves the previous round's row newest.
   read -r VERIFIED STAGE STOP SID < <(docker exec rag-api python3 -c "
 import psycopg2
 c=psycopg2.connect('postgresql://app:app@172.203.226.44:5432/scans?sslmode=require').cursor()
 c.execute('select verified, stage_reached, stop_reason, exploit_store_id from build_poc_attempts '
-          'where cve=%s order by created_at desc limit 1', ('$CVE',))
-r=c.fetchone() or (None,'?','?',None)
-print(r[0], r[1] or '?', r[2] or '?', r[3] or '')
+          'where cve=%s and created_at >= %s order by created_at desc limit 1',
+          ('$CVE', '$round_start'))
+r=c.fetchone()
+print(r[0], r[1] or '?', r[2] or '?', r[3] or '') if r else print('NOROW','?','?','')
 " 2>/dev/null | tr -d '\r')
+
+  if [ "${VERIFIED:-NOROW}" = "NOROW" ]; then
+    echo "    BUILD LEFT NO ATTEMPT ROW since $round_start — it did not run." >&2
+    echo "    Not counted as a round; the previous verdict is NOT this one's." >&2
+    exit 5
+  fi
 
   echo "    verified=$VERIFIED stage=$STAGE stop=$STOP"
   if [ "$VERIFIED" = "True" ]; then

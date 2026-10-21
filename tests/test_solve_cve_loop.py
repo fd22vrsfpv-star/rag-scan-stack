@@ -123,3 +123,60 @@ def test_it_refuses_a_target_it_cannot_resolve():
     s = _src()
     assert "no known target for" in s
     assert re.search(r'\[ -n "\$\{IP:-\}" \] \|\|.*exit', s), "a missing target does not stop it"
+
+
+# --- 2026-10-21: a build that never ran is a third outcome ---------------------
+#
+# The first solver run after a rag-api rebuild completed three "rounds" in five
+# seconds and reported `verified=False stage=refine stop=max_iters` for each.
+# None of them dispatched anything: `/tmp/runpoc.sh` does not survive a container
+# recreate, the `docker exec` failed into `>/dev/null 2>&1`, its status was never
+# checked, and the loop then read the PREVIOUS run's attempt row as this round's
+# verdict. A plausible failure report, entirely fabricated.
+#
+# This is the repo's recurring "unreachable is not absent" bug at the round
+# level, so the loop needs three outcomes: solved, failed, and did-not-run.
+
+
+def test_the_runner_is_recopied_before_every_round():
+    """`/tmp` in rag-api is wiped by a recreate; copy the runner back each round."""
+    c = _code()
+    assert "docker cp cvebench_overnight/runpoc.sh rag-api:/tmp/runpoc.sh" in c, \
+        "runpoc.sh is not re-copied — a rebuild silently stops the loop dispatching"
+    # Inside the per-round loop, not once at the top: a rebuild mid-run is the case.
+    loop_body = c.split("for round in", 1)[1]
+    assert "docker cp cvebench_overnight/runpoc.sh" in loop_body, \
+        "the re-copy must be inside the round loop"
+
+
+def test_a_failed_exec_is_not_a_failed_round():
+    """The runner's exit status is checked and aborts, rather than falling
+    through to read a stale verdict."""
+    c = _code()
+    assert re.search(r"if ! docker exec rag-api /tmp/runpoc\.sh", c), \
+        "runpoc.sh exit status is still unchecked"
+    m = re.search(r"if ! docker exec rag-api /tmp/runpoc\.sh.*?fi", c, re.S)
+    assert m and "exit 5" in m.group(0), \
+        "a build that could not start must abort, not count as a round"
+
+
+def test_the_verdict_row_must_belong_to_this_round():
+    """Status 0 is not proof of dispatch. The attempt row is required to be
+    newer than the round's start, or the loop refuses to read it."""
+    c = _code()
+    assert "round_start=" in c, "no round start timestamp is captured"
+    assert "created_at >= %s" in c, \
+        "the attempt-row query does not bound by this round's start time"
+    assert "NOROW" in c, "no distinct did-not-run outcome"
+    m = re.search(r'if \[ "\$\{VERIFIED:-NOROW\}" = "NOROW" \]; then.*?fi', c, re.S)
+    assert m and "exit 5" in m.group(0), \
+        "a missing attempt row must abort rather than report the previous verdict"
+
+
+def test_did_not_run_is_distinct_from_not_solved():
+    """Exit codes: 0 solved, 1 not solved, 5 never ran. A caller that cannot
+    tell them apart repeats the same mistake one level up."""
+    c = _code()
+    assert "exit 5" in c
+    # The stall and exhausted paths keep their own code.
+    assert re.search(r"STALLED after.*?exit 1", c, re.S), "stall must still exit 1"
