@@ -180,3 +180,149 @@ def test_call_site_is_present_in_source():
              if isinstance(n, _ast.FunctionDef) and n.name == "_derive_auto_hint"))
     assert _aa.calls(src, "_failure_analysis_lines"), \
         "_derive_auto_hint no longer calls _failure_analysis_lines"
+
+
+# --- 2026-10-21: a warning that erases itself when heeded is not a memory -----
+#
+# Four solver rounds on CVE-2024-4443 after the failure-analysis hint shipped:
+#
+#   round 1  min_seconds 53, latency_too_fast 6  -> hint says TIMING PROOF FAILED
+#   round 2  min_seconds 13, latency_too_fast 0  -> obeyed; hint DROPS the warning
+#   round 3  min_seconds  9, latency_too_fast 0  -> still obeying, still no warning
+#   round 4  min_seconds 52, latency_too_fast 8  -> no memory it was ever dead
+#
+# The hint is derived from one build, so the moment the warning worked it
+# vanished. A mechanism proven dead on a target has to stay dead across rounds.
+
+STICKY = "TIMING PROOF FAILED"
+
+
+def _sticky_ns(prior_hints):
+    """Load the carry-forward helpers with a stubbed hint history."""
+    src = API.read_text()
+    tree = _ast.parse(src)
+    want = {"_sticky_lines", "_carry_forward_sticky_lines"}
+    chunks = [_ast.get_source_segment(src, n) for n in tree.body
+              if isinstance(n, _ast.FunctionDef) and n.name in want]
+    consts = [_ast.get_source_segment(src, n) for n in tree.body
+              if isinstance(n, _ast.Assign) and any(
+                  isinstance(t, _ast.Name) and t.id == "_STICKY_HINT_PREFIXES"
+                  for t in n.targets)]
+    assert len(chunks) == 2, f"helpers missing from api.py: {want}"
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, *a, **k): pass
+        def fetchall(self): return [{"hint": h} for h in prior_hints]
+
+    class _Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def cursor(self, **k): return _Cur()
+
+    ns = {"get_db": lambda: _Conn(), "RealDictCursor": None}
+    exec("\n\n".join(consts + chunks), ns)  # noqa: S102 - our own source
+    return ns
+
+
+def test_a_reproved_warning_is_not_duplicated():
+    """When this build hit the failure again, there is nothing to carry."""
+    ns = _sticky_ns([f"AUTO-HINT: | {STICKY} 6x (latency_too_fast): old"])
+    fresh = f"AUTO-HINT: | {STICKY} 8x (latency_too_fast): new"
+    out = ns["_carry_forward_sticky_lines"]("CVE-2024-4443", "10.0.0.1", 9090, fresh)
+    assert out == fresh, "a re-proved verdict must not be duplicated from history"
+    assert out.count(STICKY) == 1
+
+
+def test_the_warning_survives_the_round_that_heeded_it():
+    """The actual regression: round 2 obeyed and produced no timing failure, so
+    its hint carried none — round 4 then went straight back to min_seconds."""
+    prior = [f"AUTO-HINT: | {STICKY} 6x (latency_too_fast): the request was sent "
+             f"and the response did NOT slow down"]
+    round2_hint = "AUTO-HINT: | REGEX PROOF MISSED 5x: ... | CONTEXT: framework=WordPress"
+    out = ns_ = _sticky_ns(prior)["_carry_forward_sticky_lines"](
+        "CVE-2024-4443", "10.0.0.1", 9090, round2_hint)
+    assert STICKY in out, "the timing verdict vanished the moment it was obeyed"
+    assert "carried forward" in out, "a carried verdict must be labelled as carried"
+    assert "has not been disproved" in out, \
+        "the label must say why it still stands, or it reads as this build's finding"
+
+
+def test_a_carried_verdict_outranks_the_rest_of_the_report():
+    ns = _sticky_ns([f"AUTO-HINT: | {STICKY} 6x: old"])
+    out = ns["_carry_forward_sticky_lines"](
+        "CVE-2024-4443", "10.0.0.1", 9090,
+        "AUTO-HINT (preamble): | REGEX PROOF MISSED 5x | CONTEXT: x")
+    parts = out.split(" | ")
+    assert parts[0].startswith("AUTO-HINT"), "the preamble must stay first"
+    assert parts[1].startswith(STICKY), f"verdict must precede the report: {parts}"
+
+
+def test_carry_forward_does_not_stack_duplicates():
+    """Eight rounds of history must not yield eight copies of one verdict."""
+    ns = _sticky_ns([f"AUTO-HINT: | {STICKY} {n}x (latency_too_fast): r{n}"
+                     for n in (6, 7, 8, 5)])
+    out = ns["_carry_forward_sticky_lines"](
+        "CVE-2024-4443", "10.0.0.1", 9090, "AUTO-HINT: | CONTEXT: x")
+    assert out.count(STICKY) == 1, f"stacked duplicates: {out}"
+
+
+def test_an_unavailable_history_does_not_block_the_save():
+    """Fails soft: a DB error must return the hint unchanged, not raise."""
+    src = API.read_text()
+    tree = _ast.parse(src)
+    want = {"_sticky_lines", "_carry_forward_sticky_lines"}
+    chunks = [_ast.get_source_segment(src, n) for n in tree.body
+              if isinstance(n, _ast.FunctionDef) and n.name in want]
+    consts = [_ast.get_source_segment(src, n) for n in tree.body
+              if isinstance(n, _ast.Assign) and any(
+                  isinstance(t, _ast.Name) and t.id == "_STICKY_HINT_PREFIXES"
+                  for t in n.targets)]
+
+    def _boom():
+        raise RuntimeError("database is unavailable")
+
+    ns = {"get_db": _boom, "RealDictCursor": None}
+    exec("\n\n".join(consts + chunks), ns)  # noqa: S102
+    fresh = "AUTO-HINT: | CONTEXT: x"
+    assert ns["_carry_forward_sticky_lines"]("C", "h", 1, fresh) == fresh
+
+
+def test_the_save_path_actually_carries_forward():
+    """Sabotage guard: the call site in _auto_save_recon_hint, not just the helper."""
+    src = _ast.get_source_segment(
+        API.read_text(),
+        next(n for n in _ast.parse(API.read_text()).body
+             if isinstance(n, _ast.FunctionDef) and n.name == "_auto_save_recon_hint"))
+    assert _aa.calls(src, "_carry_forward_sticky_lines"), \
+        "_auto_save_recon_hint persists a hint without carrying prior verdicts forward"
+
+
+def test_the_save_helper_returns_what_it_stored():
+    """The carry-forward happens inside the save, so the caller's string is not
+    the stored string. Both callers report length / echo the hint to the
+    operator; returning the pre-carry text tells them about a hint they do not
+    have. Pinned structurally at both call sites.
+    """
+    src = API.read_text()
+    tree = _ast.parse(src)
+    fn = next(n for n in tree.body if isinstance(n, _ast.FunctionDef)
+              and n.name == "_auto_save_recon_hint")
+    returns = [n for n in _ast.walk(fn) if isinstance(n, _ast.Return)]
+    assert returns, "_auto_save_recon_hint has no return"
+    assert all(isinstance(r.value, _ast.Tuple) and len(r.value.elts) == 2
+               for r in returns), \
+        "every return must be (id, stored_text) — a bare id drops the carry-forward"
+
+    graph = _ast.parse((REPO / "app" / "rag-api" / "build_poc_graph.py").read_text())
+    unpacks = [n for n in _ast.walk(graph)
+               if isinstance(n, _ast.Assign)
+               and isinstance(n.value, _ast.Call)
+               and isinstance(n.value.func, _ast.Name)
+               and n.value.func.id == "_auto_save_recon_hint"]
+    assert unpacks, "the graph no longer calls _auto_save_recon_hint"
+    for a in unpacks:
+        tgt = a.targets[0]
+        assert isinstance(tgt, _ast.Tuple) and len(tgt.elts) == 2, \
+            "the graph binds a single value and will report the pre-carry hint"

@@ -165,7 +165,7 @@ def test_the_verdict_row_must_belong_to_this_round():
     newer than the round's start, or the loop refuses to read it."""
     c = _code()
     assert "round_start=" in c, "no round start timestamp is captured"
-    assert "created_at >= %s" in c, \
+    assert re.search(r"created_at\s*>=\s*%s", c), \
         "the attempt-row query does not bound by this round's start time"
     assert "NOROW" in c, "no distinct did-not-run outcome"
     m = re.search(r'if \[ "\$\{VERIFIED:-NOROW\}" = "NOROW" \]; then.*?fi', c, re.S)

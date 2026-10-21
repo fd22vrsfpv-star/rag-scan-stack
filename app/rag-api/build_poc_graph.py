@@ -2302,13 +2302,19 @@ def node_save_store(state: BuildPocState) -> Dict[str, Any]:
             summary = _summarize_build_trace(entries)
             hint_text = _derive_auto_hint(summary)
             if hint_text:
-                hid = _auto_save_recon_hint(state["cve"], state["ip"], state["port"],
-                                             hint_text, state.get("eid"))
+                # The stored text can differ from the derived text: the save path
+                # carries forward mechanism verdicts proven on earlier builds
+                # against this target. Trace what was STORED.
+                hid, stored = _auto_save_recon_hint(state["cve"], state["ip"],
+                                                    state["port"], hint_text,
+                                                    state.get("eid"))
                 if hid:
                     _poc_trace(state["run_id"], "auto_hint_saved",
                                response=f"persisted auto-hint {hid} for next rebuild "
-                                        f"({len(hint_text)} chars from prior recon)",
-                               extra={"hint_id": str(hid), "hint_len": len(hint_text)})
+                                        f"({len(stored)} chars; {len(hint_text)} derived "
+                                        f"from this build)",
+                               extra={"hint_id": str(hid), "hint_len": len(stored),
+                                      "derived_len": len(hint_text)})
         except Exception:  # noqa: BLE001
             pass
     return {"exploit_store_id": store_id}

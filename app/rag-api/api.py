@@ -36884,12 +36884,82 @@ def _derive_auto_hint(summary):
             + " | ".join(fail_lines + lines))
 
 
+# A mechanism proven dead on a target stays dead. These prefixes mark hint lines
+# that are a verdict about the TARGET rather than a report on the last build, so
+# they must survive into the next hint even when the build that heeded them
+# produced no such failure.
+_STICKY_HINT_PREFIXES = ("TIMING PROOF FAILED",)
+
+
+def _sticky_lines(hint_text):
+    """The subset of a hint's lines that are verdicts about the target."""
+    return [ln for ln in str(hint_text or "").split(" | ")
+            if ln.strip().startswith(_STICKY_HINT_PREFIXES)]
+
+
+def _carry_forward_sticky_lines(cve, ip, port, hint_text):
+    """Merge mechanism verdicts from earlier auto-hints for the same target.
+
+    `_derive_auto_hint` reads ONE build, so a warning erases itself the moment it
+    is heeded. Observed across four solver rounds on CVE-2024-4443:
+
+      round 1  min_seconds 53, latency_too_fast 6  -> hint says TIMING PROOF FAILED
+      round 2  min_seconds 13, latency_too_fast 0  -> obeyed; hint drops the warning
+      round 3  min_seconds  9, latency_too_fast 0  -> still obeying, still no warning
+      round 4  min_seconds 52, latency_too_fast 8  -> no memory it was ever dead
+
+    A lesson that exists only while the mistake is still being made is an echo,
+    not a memory. Carried-forward lines are labelled as such so the synth agent
+    can tell "this build saw it" from "an earlier build against this same target
+    proved it" - both are evidence, but they are not the same claim.
+
+    Fails soft: an unavailable hint history must not block saving the new hint.
+    """
+    try:
+        if any(_sticky_lines(hint_text)):
+            return hint_text  # this build re-proved it; nothing to carry
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""SELECT hint FROM poc_hints
+                            WHERE cve=%s AND target_host=%s
+                              AND (target_port = %s OR (%s IS NULL AND target_port IS NULL))
+                              AND created_by = 'auto_from_recon'
+                            ORDER BY created_at DESC LIMIT 8""",
+                        (cve, ip, port, port))
+            prior = [r["hint"] for r in (cur.fetchall() or [])]
+    except Exception:  # noqa: BLE001
+        return hint_text
+    # Deduped by CATEGORY, not by line: the same verdict from three rounds
+    # differs only in its count ("FAILED 6x" / "7x"), and three near-identical
+    # copies of one finding is how a hint stops being read.
+    carried, seen = [], set()
+    for text in prior:
+        for ln in _sticky_lines(text):
+            cat = next((p for p in _STICKY_HINT_PREFIXES if ln.strip().startswith(p)), None)
+            if cat is None or cat in seen:
+                continue
+            seen.add(cat)
+            base = ln.split(" (carried forward", 1)[0].strip()
+            carried.append(base + " (carried forward from an earlier build "
+                                  "against this target - it was not retried, "
+                                  "so it has not been disproved)")
+    if not carried:
+        return hint_text
+    parts = str(hint_text or "").split(" | ")
+    # After the preamble, before the rest: a verdict outranks a report.
+    return " | ".join(parts[:1] + carried + parts[1:]) if parts else " | ".join(carried)
+
+
 def _auto_save_recon_hint(cve, ip, port, hint_text, engagement_id=None):
     """Persist an auto-derived hint tagged `auto_from_recon` so the next build against
     the same (cve, host, port) picks it up. Dedupes: replaces any prior auto-hint
     for the same target rather than accumulating."""
     if not hint_text:
-        return None
+        return None, ""
+    # Carry-forward happens HERE, which is the only place that knows the target,
+    # so the stored text differs from the text the caller offered. Return what
+    # was stored: a caller that reports the pre-carry string tells the operator
+    # a hint they do not have.
+    hint_text = _carry_forward_sticky_lines(cve, ip, port, hint_text)
     _ensure_poc_hints_table()
     try:
         with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -36904,9 +36974,9 @@ def _auto_save_recon_hint(cve, ip, port, hint_text, engagement_id=None):
                            VALUES (%s,%s,%s,%s,%s,'auto_from_recon') RETURNING id""",
                         (cve, ip, port, hint_text, engagement_id))
             new_id = cur.fetchone()["id"]; conn.commit()
-        return new_id
+        return new_id, hint_text
     except Exception:  # noqa: BLE001
-        return None
+        return None, hint_text
 
 
 @app.get("/exploit-store/{exploit_id}/summary", tags=["Exploit Store"])
@@ -36962,10 +37032,11 @@ def derive_and_save_hint(exploit_id: str, authorized: bool = Depends(auth)):
     hint_text = _derive_auto_hint(summary)
     if not hint_text:
         return {"ok": False, "reason": "no hint-worthy signals in this build's trace"}
-    hint_id = _auto_save_recon_hint(row["cve"], row["target_host"], row["target_port"],
-                                      hint_text, row.get("engagement_id"))
+    hint_id, stored_text = _auto_save_recon_hint(
+        row["cve"], row["target_host"], row["target_port"],
+        hint_text, row.get("engagement_id"))
     return {"ok": bool(hint_id), "hint_id": str(hint_id) if hint_id else None,
-            "hint_text": hint_text}
+            "hint_text": stored_text}
 
 
 @app.post("/software/poc-hints", tags=["Assets"])

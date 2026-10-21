@@ -870,17 +870,54 @@ only in a reconstructed prompt.
 covers the helper and the isolated prompt, neither of which failed while the
 live path emitted timing 123 times across three builds.
 
-### The failure-analysis hint has not been shown to break a solver stall
+### The sticky carry-forward has not been proven across a live solver run
 **Found:** 2026-10-21
-**Evidence:** `_derive_auto_hint` now emits 1,232 characters of failure analysis
-where it previously emitted 135 of recon (`CONTEXT: framework=WordPress`), and
-`tests/test_auto_hint_failure_analysis.py` pins the content against the real
-round-3 rows. But the three rounds that stalled ran on the OLD hint; no solver
-round has yet consumed the new one. The claim "this unsticks the loop" is
-currently reasoning, not an observation.
-**Where:** `app/rag-api/api.py::_failure_analysis_lines`, `scripts/solve_cve.sh`.
-**Done when:** a `solve_cve.sh` run on CVE-2024-4443 shows round N+1 choosing a
-different proof mechanism from round N — concretely, `min_seconds` occurrences
-falling and a non-timing verdict method appearing — or the loop is shown to
-stall for a different, named reason.
-**Enforced by:** not enforced (requires a live build).
+**Evidence:** the failure-analysis hint demonstrably works for one round and then
+erases itself. Four rounds on CVE-2024-4443 (traces 1792592186 / 1792593519 /
+1792594293 / 1792595168):
+
+| round | `min_seconds` | `latency_too_fast` | `regex` verdict | hint carried the timing warning |
+|-------|---------------|--------------------|-----------------|---------------------------------|
+| 1     | 53            | 6                  | 0               | yes (derived from round 1)       |
+| 2     | 13            | 0                  | 1               | **no** — round 2 had no timing failure to report |
+| 3     | 9             | 0                  | 1               | **no**                           |
+| 4     | 52            | 8                  | 0               | yes (re-derived the hard way)    |
+
+Round 2 obeyed the warning, so the hint derived *from* round 2 no longer
+contained it, and by round 4 nothing remembered timing was dead.
+`_carry_forward_sticky_lines` now re-attaches a mechanism verdict from earlier
+auto-hints for the same target, deduped by category and labelled "carried
+forward ... not retried, so it has not been disproved". Verified stored
+correctly on the real round-3 build; **not** yet observed to hold a mechanism
+dead across a full solver run.
+**Where:** `app/rag-api/api.py::_carry_forward_sticky_lines`,
+`_STICKY_HINT_PREFIXES`, `_auto_save_recon_hint`.
+**Done when:** a solver run of 4+ rounds shows `latency_too_fast` at 0 for every
+round after the first that hit it — i.e. no round-4-style relapse — or a
+different named reason for the relapse is established.
+**Enforced by:** `tests/test_auto_hint_failure_analysis.py` covers the carry
+rules (re-proved verdicts not duplicated, survives the round that heeded it,
+deduped by category, fails soft). The cross-round behaviour itself is not
+enforced — it requires a live build.
+
+### `etl/vuln_classes.py` answers "no requirements" when it cannot read its knowledge file
+**Found:** 2026-10-21
+**Evidence:** the module does `try: import yaml / except ImportError: yaml = None`
+and then skips the file load entirely (`if yaml is not None:`), leaving an empty
+class table. Every predicate then answers False. Observed in a dependency-free
+test container: `needs_oob_sink("ssrf")` returned `False`, so
+`_gather_decide(oob_sink="missing", "ssrf")["missing"]` was `[]` instead of
+`["oob_sink"]` — the gather gate declares a blind-class build ready with no
+callback sink. Same shape for the other eight predicates. With PyYAML installed
+the identical call is correct, so the failure is invisible wherever the
+dependency happens to be present.
+**Where:** `etl/vuln_classes.py` lines ~40-90 (`yaml = None`, `_load()`), and the
+three `_PATHS` candidates — a missing/unreadable `knowledge/vuln_classes.yaml`
+degrades the same way even with PyYAML installed.
+**Done when:** an unreadable or unparseable class table raises (or sets a hard
+`_DEGRADED` flag the predicates refuse to answer under) rather than returning an
+empty table. "Could not read the knowledge" and "the knowledge says no" must not
+produce the same answer — the repo's recurring unreachable-is-not-absent rule.
+**Enforced by:** not enforced. `tests/test_build_poc_research_gate.py` now
+`importorskip`s rather than failing, which keeps the suite honest but does not
+cover the production path.
