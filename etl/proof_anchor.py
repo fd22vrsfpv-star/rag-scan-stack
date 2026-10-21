@@ -206,6 +206,19 @@ def anchored_error(assertion, command, canary=None) -> bool:
     return any(p in cmd for p in provokers)
 
 
+#: What a rendered `differential` step prints. BOTH branches are emitted by
+#: `etl/http_request._differential_lines` and nothing else writes the pair, so
+#: a command containing both really does compare two responses — an
+#: `echo 'DIFFERENTIAL-CONFIRMED'` carries only one and cannot fake it.
+DIFFERENTIAL_MARKERS = ("DIFFERENTIAL-CONFIRMED", "DIFFERENTIAL-ABSENT")
+
+
+def _command_runs_a_differential(command) -> bool:
+    """Did this command actually issue and compare a pair?"""
+    c = str(command or "")
+    return all(m in c for m in DIFFERENTIAL_MARKERS)
+
+
 def anchored_boolean(assertion, command, canary=None) -> bool:
     """The assertion requires two responses to DIFFER.
 
@@ -222,6 +235,27 @@ def anchored_boolean(assertion, command, canary=None) -> bool:
     both arms — a lone regex cannot anchor this kind, by construction.
     """
     a = assertion or {}
+
+    # FORM 1: assert on the marker the differential step prints.
+    #
+    # This exists because the first form was unreachable in practice. Synth
+    # asks for an `assertion`, and boolean's template said "(no assertion —
+    # the differential STEP carries the proof)" — which gives a model thinking
+    # in assertions nothing to return. Timing was then the only blind-capable
+    # kind WITH an assertion shape, so it won by default: on CVE-2024-4443 the
+    # model produced `{"min_seconds": 5}` while its own failure analysis said
+    # "boolean-based blind sqli on same endpoint — mysql sleep may be disabled
+    # or filtered". It knew the right move and had no shape to express it.
+    #
+    # Gated on the command actually running a differential, the same two-halves
+    # rule as `anchored_error`: the assertion must require the marker AND the
+    # command must be able to produce it. The marker is printed only when the
+    # two TARGET responses differ, so it is evidence, not decoration.
+    rx = _regex_of(assertion)
+    if rx and DIFFERENTIAL_MARKERS[0] in rx:
+        return _command_runs_a_differential(command)
+
+    # FORM 2: the assertion declares the pair itself.
     diff = a.get("differential")
     if not isinstance(diff, dict):
         return False

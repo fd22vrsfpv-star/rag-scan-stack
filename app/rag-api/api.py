@@ -20174,6 +20174,12 @@ _PROOF_KIND_INSTRUCTION = {
         "  Pick a condition whose TRUE arm returns a row and whose FALSE arm",
         "  returns none - `AND 1=1` / `AND 1=2` on an existing record is the",
         "  standard pair. Do NOT write the pair as shell.",
+        "  The step prints DIFFERENTIAL-CONFIRMED when the two responses differ,",
+        "  so assert on that:",
+        '    assertion: {"expect_regex": "DIFFERENTIAL-CONFIRMED"}',
+        "  USE THIS FOR A BLIND SQLi. It needs no visible output and no clock,",
+        "  so it works where error-based cannot (the app hides DB errors) and",
+        "  is not fooled by a slow target or a filtered SLEEP.",
     ],
     "echo": [
         "ECHO - this class CAN reflect an injected marker, so anchor the proof",
@@ -20257,7 +20263,7 @@ def _target_shape_from_guidance(text):
 #: `{cve_anchored, expect_regex}`.
 _PROOF_KIND_ASSERT_TMPL = {
     "error":   '{"expect_regex": "You have an error in your SQL syntax"}',
-    "boolean": '(no assertion — the `differential` STEP carries the proof)',
+    "boolean": '{"expect_regex": "DIFFERENTIAL-CONFIRMED"}',
     "echo":    '{"expect_regex": "CANARY"}',
     "oob":     '{"expect_regex": "SINK-VERIFIED"}',
     "timing":  '{"min_seconds": 5, "max_seconds": 30, "canary": "CANARY"}',

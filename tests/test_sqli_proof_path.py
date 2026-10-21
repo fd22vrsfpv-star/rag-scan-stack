@@ -762,3 +762,74 @@ def test_no_declared_kind_is_left_without_an_anchor():
     assert not missing, (
         f"proof kinds declared in vuln_classes.yaml with no anchored_* function: "
         f"{missing} — those classes verify on a self-declaration alone")
+
+
+# ── boolean needed a shape the model could RETURN ──────────────────────────
+#
+# Step 9 landed and the boolean anchor still fired zero times. The cause was a
+# design flaw of mine, not the model ignoring guidance: boolean was
+# expressible ONLY as a plan step, while synth asks for an `assertion` — and
+# boolean's template literally read "(no assertion — the differential STEP
+# carries the proof)". A model thinking in assertions had nothing to return.
+#
+# Timing was then the only blind-capable kind WITH an assertion shape, so it
+# won by default. On CVE-2024-4443 the model produced `{"min_seconds": 5}`
+# while its own failure analysis said "boolean-based blind sqli on same
+# endpoint — mysql sleep may be disabled or filtered". It knew the right move
+# and had no way to say it.
+
+def _bool_cmd():
+    from etl.http_request import to_script
+    return to_script([{"id": "d", "differential": {
+        "true": {"request": {"method": "POST", "url": "http://t/login",
+                             "body": "u=x' AND 1=1-- "}},
+        "false": {"request": {"method": "POST", "url": "http://t/login",
+                              "body": "u=x' AND 1=2-- "}},
+        "must_differ": "body"}}], canary=CANARY)
+
+
+def test_boolean_anchors_on_a_returnable_assertion():
+    """The whole point: an ordinary `expect_regex` the model can put in the
+    `assertion` field like any other proof."""
+    _, _, is_anchored = _anchors()
+    ok, why = is_anchored({"expect_regex": "DIFFERENTIAL-CONFIRMED"}, CANARY,
+                          proof_kinds=["boolean"], command=_bool_cmd())
+    assert ok is True, why
+    assert "differential" in why
+
+
+def test_the_marker_cannot_be_faked_by_echoing_it():
+    """Only `_differential_lines` emits BOTH branches, so a command carrying
+    one of them never compared anything. Without this the assertion would be
+    satisfiable by `echo 'DIFFERENTIAL-CONFIRMED'` — the exact self-referential
+    shape that stored a model's refusal as a verified PoC on 2026-10-20."""
+    _, _, is_anchored = _anchors()
+    for cmd in ("curl -s http://t/a; echo 'DIFFERENTIAL-CONFIRMED'",
+                "curl -s http://t/a",
+                "echo 'DIFFERENTIAL-CONFIRMED: responses differ'"):
+        ok, _ = is_anchored({"expect_regex": "DIFFERENTIAL-CONFIRMED"}, CANARY,
+                            proof_kinds=["boolean"], command=cmd)
+        assert ok is False, f"a boolean proof was anchored by: {cmd!r}"
+
+
+def test_the_template_offered_is_the_one_the_anchor_accepts():
+    """The step-9 lesson, applied to itself: when the template and the anchor
+    disagree the model follows the template and the proof never anchors. They
+    have to name the same thing."""
+    tmpl = _assert_template_for()("nosql-injection", CANARY)
+    assert "DIFFERENTIAL-CONFIRMED" in tmpl, (
+        f"boolean's template is {tmpl!r}, which the anchor does not accept")
+    _, _, is_anchored = _anchors()
+    import json as _j
+    ok, _ = is_anchored(_j.loads(tmpl), CANARY, proof_kinds=["boolean"],
+                        command=_bool_cmd())
+    assert ok is True, "the offered template does not satisfy its own anchor"
+
+
+def test_the_declared_pair_form_still_works():
+    """Form 2 — an assertion that declares both arms itself. Kept so a plan
+    that inlines the pair is not suddenly unanchorable."""
+    _, _, is_anchored = _anchors()
+    ok, _ = is_anchored(GOOD_DIFF, CANARY, proof_kinds=["boolean"],
+                        command=_bool_cmd())
+    assert ok is True

@@ -194,6 +194,45 @@ ordered cheapest-first, which was the point of ordering it.
 lifetime to **0**. Removing timing as the class default worked. The proofs
 meant to replace it are a separate, still-unverified claim.
 
+## Step 10: boolean had no shape the model could RETURN
+
+Step 9 landed and the boolean anchor still fired zero times. The cause was a
+design flaw in this plan, not the model ignoring guidance.
+
+Boolean was expressible ONLY as a plan step, while synth asks for an
+`assertion` — and boolean's template literally read *"(no assertion — the
+differential STEP carries the proof)"*. A model thinking in assertions had
+nothing to put there. Timing was then the only blind-capable kind WITH an
+assertion shape, so it won by default.
+
+Observed on CVE-2024-4443: the model was handed
+`{"expect_regex": "You have an error in your SQL syntax"}`, produced
+`{"min_seconds": 5}`, and its OWN failure analysis for that build read
+*"boolean-based blind sqli on same endpoint — mysql sleep may be disabled or
+filtered"*. It had diagnosed the right move and had no way to express it.
+
+**Fix:** the rendered differential step already prints
+`DIFFERENTIAL-CONFIRMED` when the two responses differ, so that is the
+assertion — an ordinary `expect_regex` the model returns like any other proof.
+Gated on the command actually running a differential (BOTH marker branches
+present, which only `_differential_lines` emits), so `echo
+'DIFFERENTIAL-CONFIRMED'` anchors nothing. Same two-halves rule as
+`anchored_error`.
+
+**Also corrected here:** this plan framed `error` as the replacement for
+timing. It is not — error-based needs the app to leak DB errors, which a
+WordPress plugin generally does not. **Boolean is the universal blind proof**,
+and it was the one made hardest to reach.
+
+Verified against the real model on the exact failing scenario (blind, errors
+suppressed, SLEEP filtered):
+
+```
+step shapes : ['request', 'differential']
+assertion   : {"expect_regex": "DIFFERENTIAL-CONFIRMED"}
+ANCHORS     : True | boolean: the proof is a differential
+```
+
 ## What this does NOT change
 
 * The scope gate and `MAX_CONCURRENT_SCANS`. Proof methods decide what counts
