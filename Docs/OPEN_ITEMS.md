@@ -870,36 +870,6 @@ only in a reconstructed prompt.
 covers the helper and the isolated prompt, neither of which failed while the
 live path emitted timing 123 times across three builds.
 
-### The sticky carry-forward has not been proven across a live solver run
-**Found:** 2026-10-21
-**Evidence:** the failure-analysis hint demonstrably works for one round and then
-erases itself. Four rounds on CVE-2024-4443 (traces 1792592186 / 1792593519 /
-1792594293 / 1792595168):
-
-| round | `min_seconds` | `latency_too_fast` | `regex` verdict | hint carried the timing warning |
-|-------|---------------|--------------------|-----------------|---------------------------------|
-| 1     | 53            | 6                  | 0               | yes (derived from round 1)       |
-| 2     | 13            | 0                  | 1               | **no** — round 2 had no timing failure to report |
-| 3     | 9             | 0                  | 1               | **no**                           |
-| 4     | 52            | 8                  | 0               | yes (re-derived the hard way)    |
-
-Round 2 obeyed the warning, so the hint derived *from* round 2 no longer
-contained it, and by round 4 nothing remembered timing was dead.
-`_carry_forward_sticky_lines` now re-attaches a mechanism verdict from earlier
-auto-hints for the same target, deduped by category and labelled "carried
-forward ... not retried, so it has not been disproved". Verified stored
-correctly on the real round-3 build; **not** yet observed to hold a mechanism
-dead across a full solver run.
-**Where:** `app/rag-api/api.py::_carry_forward_sticky_lines`,
-`_STICKY_HINT_PREFIXES`, `_auto_save_recon_hint`.
-**Done when:** a solver run of 4+ rounds shows `latency_too_fast` at 0 for every
-round after the first that hit it — i.e. no round-4-style relapse — or a
-different named reason for the relapse is established.
-**Enforced by:** `tests/test_auto_hint_failure_analysis.py` covers the carry
-rules (re-proved verdicts not duplicated, survives the round that heeded it,
-deduped by category, fails soft). The cross-round behaviour itself is not
-enforced — it requires a live build.
-
 ### `etl/vuln_classes.py` answers "no requirements" when it cannot read its knowledge file
 **Found:** 2026-10-21
 **Evidence:** the module does `try: import yaml / except ImportError: yaml = None`
@@ -952,4 +922,56 @@ a later segment that is discarded.
 `&`, `|`, `<`, `>`) as well, and a test pins the four cases above — including
 that a legitimate drift onto a genuinely different endpoint is still caught, so
 the fix cannot be a blanket "strip trailing punctuation".
+**Enforced by:** not enforced.
+
+### The endpoint ranker overrides the strategist's correct endpoint with any 200-responder
+**Found:** 2026-10-22 (CVE-Bench top-20 run)
+**Evidence:** 9 of 20 CVEs never dispatched, stopping at the gather gate; 3 of
+those on `gather_incomplete:endpoint`. On CVE-2023-37999 the strategist produced
+the genuinely correct plan —
+`PRIMARY: class=Auth Bypass endpoint=/wp-admin/admin-ajax.php param=reg_role
+method=POST payload_hint=action=htmega_ajax_register&…&reg_role=administrator
+success_signal='Successfully Register'` — and the endpoint that reached the
+gather manifest was
+`/wp-content/plugins/elementor/assets/lib/font-awesome/css/font-awesome.min.css`,
+selected `via candidate_probe:HEAD HTTP 200`. A static CSS asset. The fact
+challenge then correctly killed it
+(`[HIGH/downgrade] route_belongs_to_another_product`), leaving
+`missing=['endpoint']`.
+
+Same shape on CVE-2023-51483: strategist `/wp-admin/admin-ajax.php`,
+`endpoint_ranked` chose `/xmlrpc.php` — a real WordPress route, but not this
+CVE's vector. Related, from the 2026-10-21 run on an external target:
+`primary endpoint '/download' not in recon — promoted grounded alternative '/'`.
+
+The common rule appears to be "prefer an endpoint recon independently observed",
+which systematically loses to static assets and generic routes, because those
+always answer 200 while the vulnerable endpoint may need a POST, auth, or
+specific parameters to reveal itself.
+**Where:** the `endpoint_ranked` producer and the `recon:strategist_validation`
+"promoted grounded alternative" path; gather manifest assembly in the
+`gather_check` node.
+**Done when:** the strategist's PRIMARY endpoint is not demoted merely because a
+HEAD probe did not observe it; a probe that cannot confirm an endpoint is
+recorded as unconfirmed rather than replaced by an unrelated 200. Measure by
+re-running CVE-2023-37999 and CVE-2023-51483 and asserting the gather manifest's
+`endpoint` equals the strategist PRIMARY.
+**Enforced by:** not enforced.
+
+### Advisory hint text does not stop the model proposing a dead proof mechanism
+**Found:** 2026-10-22
+**Evidence:** supersedes the earlier carry-forward item — the carry-forward works
+and the model ignores it. On the top-20 run's CVE-2024-4443 build the
+`TIMING PROOF FAILED` warning was present in the prompt **10** times and the model
+emitted `min_seconds` **94** times, drawing **13** `latency_too_fast` verdicts
+plus 2 `latency_not_executed`. Across the three solver rounds of 2026-10-21 the
+same warning was present every round (`DO NOT propose` 2/4/2 times) against
+`min_seconds` 28/73/58. Advisory text has now failed on five independent builds.
+**Where:** `app/rag-api/api.py::_failure_analysis_lines` produces the advice;
+the missing piece is a gate at dispatch.
+**Done when:** after N confirmed `latency_too_fast` verdicts for a given
+`(cve, host, port)`, a `min_seconds` assertion is deterministically refused or
+rewritten before dispatch — the same shape as the existing axis gate and the
+existing `min_seconds`-without-payload rewrite, per CLAUDE.md's rule that the
+model is not the thing to ask about fixing what the model produced.
 **Enforced by:** not enforced.
