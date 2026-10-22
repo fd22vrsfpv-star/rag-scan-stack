@@ -2563,8 +2563,11 @@ export default function AssetBrowser() {
               })()}
               <button
                 onClick={() => setHideBlankProductVersion(!hideBlankProductVersion)}
+                title={hideBlankProductVersion
+                  ? 'Hiding rows with no product name. Rows WITH a product but no version are shown — an unversioned detection is still a real one.'
+                  : 'Showing every row, including any with no product name.'}
                 className={`px-2.5 py-0.5 text-xs font-medium rounded border ${hideBlankProductVersion ? 'bg-primary/20 text-primary border-primary/50' : 'border-border text-muted-foreground hover:text-foreground'}`}
-              >Hide Blank</button>
+              >Hide Unnamed</button>
               <button
                 onClick={() => setShowCveOnly(!showCveOnly)}
                 className={`flex items-center gap-1 px-2.5 py-0.5 text-xs font-medium rounded border ${showCveOnly ? 'bg-red-500/20 text-red-400 border-red-500/50' : 'border-border text-muted-foreground hover:text-foreground'}`}
@@ -2670,7 +2673,15 @@ export default function AssetBrowser() {
             // Filter
             let filtered = deduped.filter(sw => {
               if (showCveOnly && (sw.cve_flags?.length ?? 0) === 0) return false
-              if (hideBlankProductVersion && (!sw.product || sw.product.trim() === '' || !sw.version || sw.version.trim() === '')) return false
+              // Hide a row with NO PRODUCT. A product with no VERSION is still a
+              // real detection — "PHP is running here, version unknown" is
+              // actionable; you go fingerprint it. The old test was
+              // `!product || !version`, and in one engagement that hid 9129 of
+              // 10360 rows (88%), every one of them naming a real product,
+              // while exactly ONE row genuinely had no product. Searching PHP
+              // then showed "0 rows" directly beneath a Technologies chip
+              // reading "PHP 13" — the page contradicting itself.
+              if (hideBlankProductVersion && (!sw.product || sw.product.trim() === '')) return false
               if (softwareProductFilter) {
                 const q = softwareProductFilter.toLowerCase()
                 const matchesProduct = sw.product?.toLowerCase().includes(q)
