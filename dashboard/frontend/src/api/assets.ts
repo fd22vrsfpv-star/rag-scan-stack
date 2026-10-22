@@ -728,6 +728,20 @@ export interface DetectedSoftware {
   cve_flags?: CveFlag[]
 }
 
+/** One row per PRODUCT across the whole filtered set — NOT subject to the row
+ *  limit. The item list is capped and ordered by ip, so whether a technology
+ *  appeared depended on its host's IP sort position; PHP was on 49 host/port
+ *  pairs in the redteam engagement and fell off the bottom. */
+export interface SoftwareProduct {
+  product: string
+  host_count: number
+  version_count: number
+  versions: string[] | null
+  sources: string[] | null
+  first_seen: string | null
+  last_seen: string | null
+}
+
 export interface SoftwareSummary {
   asset_count: number
   product_count: number
@@ -748,7 +762,18 @@ export function useDetectedSoftware(search?: string, product?: string, source?: 
   const qs = params.toString()
   return useQuery({
     queryKey: ['detected-software', search, product, source, excludeScope],
-    queryFn: () => apiFetch<{ count: number; summary: SoftwareSummary; items: DetectedSoftware[] }>(
+    queryFn: () => apiFetch<{
+      count: number
+      summary: SoftwareSummary
+      items: DetectedSoftware[]
+      /** Complete product rollup; null when the rollup query itself failed —
+       *  which is NOT the same as "no products", so the flag below says which. */
+      products: SoftwareProduct[] | null
+      products_available: boolean
+      total_rows: number | null
+      truncated: boolean
+      limit: number
+    }>(
       `/software${qs ? '?' + qs : ''}`
     ),
     refetchInterval: POLL.NORMAL,

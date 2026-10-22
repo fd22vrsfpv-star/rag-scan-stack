@@ -2595,6 +2595,55 @@ export default function AssetBrowser() {
               ))}
             </div>
           )}
+          {/* TECHNOLOGIES — the complete product rollup.
+              "Is PHP present?" is a question about products, not hosts, and the
+              row list below is capped at `limit` and ordered by ip, so a
+              technology on higher-sorting hosts fell off the bottom entirely.
+              This list is unbounded by that cap. Click a chip to filter the
+              rows below to it. */}
+          {softwareData?.products_available && (softwareData.products?.length ?? 0) > 0 && (
+            <details className="border border-border rounded-md group" open>
+              <summary className="cursor-pointer list-none p-2.5 flex items-center gap-2 flex-wrap text-sm">
+                <ChevronRight className="h-4 w-4 transition-transform group-open:rotate-90 shrink-0" />
+                <span className="font-semibold">Technologies</span>
+                <span className="text-[10px] text-muted-foreground">
+                  ({softwareData.products!.length} products, every one shown)
+                </span>
+                {softwareData.truncated && (
+                  <span
+                    title={`The row table below shows ${softwareData.count} of ${softwareData.total_rows} detections (limit ${softwareData.limit}), ordered by IP. This product list is NOT truncated.`}
+                    className="text-[10px] px-1.5 py-0.5 rounded border border-amber-500/40 bg-amber-500/10 text-amber-300">
+                    rows below truncated: {softwareData.count} of {softwareData.total_rows}
+                  </span>
+                )}
+              </summary>
+              <div className="px-2.5 pb-2.5 flex flex-wrap gap-1">
+                {softwareData.products!.map(p => {
+                  const active = softwareProductFilter.toLowerCase() === p.product.toLowerCase()
+                  return (
+                    <button key={p.product}
+                      onClick={() => {
+                        const next = active ? '' : p.product
+                        setSoftwareProductFilter(next)
+                        setSoftwareProductInput(next)
+                      }}
+                      title={[
+                        `${p.host_count} host${p.host_count === 1 ? '' : 's'}`,
+                        p.versions?.length ? `versions: ${p.versions.slice(0, 6).join(', ')}` : null,
+                        p.sources?.length ? `sources: ${p.sources.join(', ')}` : null,
+                      ].filter(Boolean).join(' · ')}
+                      className={cn('px-1.5 py-0.5 rounded border text-[11px] inline-flex items-center gap-1',
+                        active
+                          ? 'bg-blue-500/20 border-blue-400 text-blue-200'
+                          : 'border-border text-muted-foreground hover:text-foreground')}>
+                      <span className="truncate max-w-[16rem]">{p.product}</span>
+                      <span className="opacity-70">{p.host_count}</span>
+                    </button>
+                  )
+                })}
+              </div>
+            </details>
+          )}
           {softwareLoading ? (
             <p className="text-sm text-muted-foreground">Loading...</p>
           ) : !softwareItems.length ? (

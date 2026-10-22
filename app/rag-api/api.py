@@ -14236,7 +14236,54 @@ def get_detected_software(
         except Exception:
             pass
 
-    return {"count": len(rows), "summary": summary, "items": rows}
+    # A PRODUCT ROLLUP, unbounded by the row limit above.
+    #
+    # Operator: "in the redteam engagement I do not see php flagged as a
+    # technology" — and PHP was on 49 host/port pairs there. The row list ends
+    # `ORDER BY ip ... LIMIT 2000` against 3516 deduplicated rows, so 43% were
+    # dropped and WHICH technologies survived was decided by host IP sort
+    # order. "Is PHP present?" is a question about products, not hosts, so it
+    # gets a product-shaped answer: 274 distinct products in that engagement,
+    # every one of them returned.
+    products = []
+    try:
+        with get_db() as _c2, _c2.cursor(cursor_factory=RealDictCursor) as _cur2:
+            _cur2.execute(f"""
+                SELECT product,
+                       COUNT(DISTINCT ip)::int        AS host_count,
+                       COUNT(DISTINCT version)::int   AS version_count,
+                       MIN(first_seen)                AS first_seen,
+                       MAX(last_seen)                 AS last_seen,
+                       ARRAY_AGG(DISTINCT source)     AS sources,
+                       ARRAY_AGG(DISTINCT version)
+                         FILTER (WHERE version IS NOT NULL AND version <> '')
+                                                      AS versions
+                FROM detected_software
+                {where_sql}
+                GROUP BY product
+                ORDER BY COUNT(DISTINCT ip) DESC, product
+            """, params[:-1])          # same filters, no LIMIT
+            products = [dict(r) for r in (_cur2.fetchall() or [])]
+    except Exception as _pe:  # noqa: BLE001
+        # Fail soft: the row list is still useful without the rollup, but say
+        # so rather than returning an empty list that reads as "no products".
+        logging.warning("software product rollup failed: %s", _pe)
+        products = None
+
+    # Truncation must be VISIBLE. The summary block above counts the full
+    # deduplicated set while `items` is capped, so the header and the table
+    # disagreed by design and nothing said which number was which.
+    _total = None
+    try:
+        _total = int((summary or {}).get("total_detections") or 0) or None
+    except Exception:  # noqa: BLE001
+        _total = None
+    return {"count": len(rows), "summary": summary, "items": rows,
+            "products": products,
+            "products_available": products is not None,
+            "total_rows": _total,
+            "truncated": bool(_total and len(rows) < _total),
+            "limit": limit}
 
 
 # ── ExploitDB / Searchsploit Management ──────────────────────────────────────
