@@ -73,10 +73,15 @@ def test_the_chip_says_what_it_does():
         "the tooltip does not say which rows are hidden"
 
 
-def test_the_default_is_still_on():
-    """Keeping the default preserves the intent — drop unusable rows — while
-    fixing which rows count as unusable."""
+def test_the_filter_is_off_by_default():
+    """Operator, 2026-10-22: "don't have the hide blank on as the default".
+
+    A row-hiding filter is a poor default on an inventory page — the operator
+    cannot miss what they can see, but they can easily miss what a chip
+    silently removed. This one was on by default and hid 88% of the rows.
+    """
     src = UI.read_text(encoding="utf-8")
-    assert re.search(r"useState\(true\)[^\n]*\n?[^\n]*hideBlankProductVersion", src) \
-        or re.search(r"hideBlankProductVersion.{0,40}useState\(true\)", src), \
-        "the filter default changed; that is a separate decision from this fix"
+    m = re.search(r"hideBlankProductVersion,\s*setHideBlankProductVersion\]\s*=\s*useState\((\w+)\)", src)
+    assert m, "the hideBlankProductVersion state declaration was not found"
+    assert m.group(1) == "false", \
+        "the row-hiding filter is on by default again (useState(%s))" % m.group(1)

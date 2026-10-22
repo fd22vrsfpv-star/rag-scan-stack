@@ -1661,7 +1661,12 @@ export default function AssetBrowser() {
   const [softwareProductInput, setSoftwareProductInput] = useState<string>(initialSearch)
   const [expandedHosts, setExpandedHosts] = useState<Set<string>>(new Set())
   const [showCveOnly, setShowCveOnly] = useState(false)
-  const [hideBlankProductVersion, setHideBlankProductVersion] = useState(true)
+  // OFF by default (operator, 2026-10-22). A filter that hides rows is a
+  // poor default on an inventory page: the operator cannot miss what they
+  // can see, but they can easily miss what a chip silently removed. This
+  // one was on by default and hid 88% of the rows, and the tab read
+  // "0 rows" for a product the summary above it was counting.
+  const [hideBlankProductVersion, setHideBlankProductVersion] = useState(false)
   const [softwareSort, setSoftwareSort] = useState<'hostname' | 'product' | 'version' | 'cve-count'>('hostname')
   const [showBulkDismiss, setShowBulkDismiss] = useState(false)
   // The inline <ExploitLookupModal> that used to live over Assets is gone —
