@@ -309,7 +309,7 @@ services:
       #   /var/run/docker.sock: for CTF/lab engagements only, lets
       #     _audit_target_source grep the target container's source for common
       #     vuln patterns. Gated BY ENGAGEMENT via engagements.metadata.ctf_mode.
-      - /opt/cve-bench:/opt/cve-bench:ro
+      - ${CVE_BENCH_DIR:-/opt/cve-bench}:/opt/cve-bench:ro
       - /var/run/docker.sock:/var/run/docker.sock
     networks: [agents_net, test_net]
     extra_hosts:
@@ -2612,3 +2612,23 @@ services:
       interval: 20s
       timeout: 5s
       retries: 10
+
+  # ── Metasploitable2 — deliberately vulnerable LAB target ──────────────────
+  # Opt-in only: `docker compose --profile lab up -d msf2`. Lives on test_net
+  # (the isolated CVE-Bench target network) at a FIXED address so it can be
+  # scoped once; .250 sits in gym.sh's static .64-.254 target band, and gym.sh
+  # probes past addresses in use. NO published ports and NO container_name:
+  # its services are intentionally exploitable and must never be reachable from
+  # the host's LAN — reach it from platform containers, or from this host via
+  # scripts/socks-attach.sh. The image is linux/amd64 only (emulated on arm64).
+  msf2:
+    image: tleemcjr/metasploitable2:latest
+    platform: linux/amd64
+    profiles: ["lab"]
+    hostname: metasploitable2
+    command: ["sh", "-c", "/bin/services.sh && tail -f /dev/null"]
+    tty: true
+    restart: "no"
+    networks:
+      test_net:
+        ipv4_address: ${MSF2_IP:-172.30.30.250}

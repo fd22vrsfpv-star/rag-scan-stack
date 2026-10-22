@@ -53,12 +53,17 @@ def _refresh_llm_globals():
         return
     global LLM_BACKEND, OPENAI_API_BASE, OPENAI_MODEL, OPENAI_API_KEY
     global AZURE_ENDPOINT, AZURE_MODEL, AZURE_API_KEY, AZURE_API_VERSION
-    global ANTHROPIC_API_KEY, ANTHROPIC_MODEL
+    global ANTHROPIC_API_KEY, ANTHROPIC_MODEL, OLLAMA_URL
     try:
         s = get_llm_settings()
     except Exception:
         return
     LLM_BACKEND = (s.get("backend") or LLM_BACKEND).lower()
+    # Settings -> LLM Backend -> "Ollama (network)" writes llm.ollama_url; blank
+    # falls back to the OLLAMA_URL env (this machine). Without this refresh the
+    # LiteLLM leg honoured the saved URL but the hand-rolled fallback, the
+    # /api/* drop-in proxy and /ollama/health kept talking to the env host.
+    OLLAMA_URL = s.get("ollama_url") or OLLAMA_URL
     OPENAI_API_BASE = s.get("openai_api_base") or OPENAI_API_BASE
     OPENAI_MODEL = s.get("openai_model") or OPENAI_MODEL
     OPENAI_API_KEY = s.get("openai_api_key") or OPENAI_API_KEY

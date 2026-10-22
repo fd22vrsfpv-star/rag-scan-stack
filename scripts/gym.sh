@@ -15,11 +15,62 @@
 #  - CVE-Bench's own Kali "agent" sandbox is stopped — the PLATFORM is the attacker.
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
-CVEBENCH_DIR="/opt/cve-bench"
-STACK_PROJECT="rag-scan-stack"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Same knob docker-compose uses for rag-api's /opt/cve-bench mount, so the gym
+# and the CTF goal extractor read ONE checkout. Env wins, then .env, then the
+# Linux default. A relative path is relative to the repo (as compose treats it).
+CVEBENCH_DIR="${CVE_BENCH_DIR:-$(grep -E '^CVE_BENCH_DIR=' "$REPO_ROOT/.env" 2>/dev/null | tail -1 | cut -d= -f2-)}"
+CVEBENCH_DIR="${CVEBENCH_DIR:-/opt/cve-bench}"
+case "$CVEBENCH_DIR" in /*) ;; *) CVEBENCH_DIR="$REPO_ROOT/${CVEBENCH_DIR#./}" ;; esac
+[ -x "$CVEBENCH_DIR/run" ] || { echo "CVE-Bench not found at $CVEBENCH_DIR (git clone https://github.com/uiuc-kang-lab/cve-bench.git there, then uv sync)"; exit 1; }
 NET="test_net"
 ENGAGEMENT="cvebench"
 cd "$CVEBENCH_DIR"
+
+# CVE-Bench's own ./run uses bash-4 syntax (${x,,}); macOS ships bash 3.2, where
+# it dies with "bad substitution" AFTER pulling. Run it with a bash >= 4.
+_RUN_BASH=""
+for _b in "$BASH" /opt/homebrew/bin/bash /usr/local/bin/bash; do
+  [ -x "$_b" ] && [ "$("$_b" -c 'echo ${BASH_VERSINFO[0]}')" -ge 4 ] 2>/dev/null && { _RUN_BASH="$_b"; break; }
+done
+[ -n "$_RUN_BASH" ] || { echo "CVE-Bench ./run needs bash >= 4 (macOS: brew install bash)"; exit 1; }
+# ./run also calls GNU `timeout -v` (not on macOS); coreutils' gnubin supplies
+# it. Scoped to ./run so the rest of this script keeps the system tools.
+_GNUBIN=""
+for _d in /opt/homebrew/opt/coreutils/libexec/gnubin /usr/local/opt/coreutils/libexec/gnubin; do
+  [ -x "$_d/timeout" ] && { _GNUBIN="$_d:"; break; }
+done
+command -v timeout >/dev/null || [ -n "$_GNUBIN" ] || { echo "CVE-Bench ./run needs GNU timeout (macOS: brew install coreutils)"; exit 1; }
+_run() { PATH="${_GNUBIN}$PATH" "$_RUN_BASH" ./run "$@"; }
+
+# CVE-Bench publishes linux/amd64 images only; on Apple Silicon the pull fails
+# with "no matching manifest for linux/arm64/v8". Docker Desktop runs amd64
+# under emulation when asked. An explicit DOCKER_DEFAULT_PLATFORM wins.
+if [ "$(uname -m)" = "arm64" ] || [ "$(uname -m)" = "aarch64" ]; then
+  export DOCKER_DEFAULT_PLATFORM="${DOCKER_DEFAULT_PLATFORM:-linux/amd64}"
+fi
+
+# Static target IP inside test_net. On a /24 (setup.sh default, TEST_NET_SUBNET)
+# platform services get .1-.62 from the network's --ip-range and targets get a
+# deterministic .64-.254, probing forward past any address already in use so two
+# CVEs whose numbers collide mod 191 still get distinct IPs. On a legacy /16
+# the original 172.x.{1-254}.{1-254} mapping is kept.
+_static_ip() {  # $1 = numeric CVE suffix, $2 = target container (may hold an IP already)
+  local subnet base prefix used n i cand
+  subnet=$(docker network inspect "$NET" -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}')
+  base=${subnet%/*}; prefix=${subnet#*/}
+  used=$(docker network inspect "$NET" -f '{{range .Containers}}{{.Name}}={{.IPv4Address}} {{end}}' \
+         | tr ' ' '\n' | grep -v "^$2=" | sed -E 's#.*=##; s#/.*##')
+  if [ "$prefix" = "24" ]; then
+    n=$(( $1 % 191 ))
+    for i in $(seq 0 190); do
+      cand="${base%.*}.$(( 64 + (n + i) % 191 ))"
+      echo "$used" | grep -qx "$cand" || { echo "$cand"; return 0; }
+    done
+    echo "no free target address left in $subnet" >&2; return 1
+  fi
+  echo "$(echo "$base" | cut -d. -f1-2).$(( ($1 / 254) % 254 + 1 )).$(( $1 % 254 + 1 ))"
+}
 
 _eid() {  # ensure the cvebench engagement exists; print its id
   docker exec -i rag-api python3 - "$ENGAGEMENT" <<'PY'
@@ -35,27 +86,35 @@ PY
 }
 
 cmd="${1:-}"; cve="${2:-}"
+lc=$(printf '%s' "$cve" | tr '[:upper:]' '[:lower:]')  # not ${x,,}: bash 3.2 (macOS) lacks it
 case "$cmd" in
   up)
     [ -n "$cve" ] || { echo "usage: $0 up CVE-YYYY-NNNNN"; exit 1; }
-    ./run pull "$cve"
-    ./run up "$cve" --no-build
-    docker stop "${cve,,}-agent-1" 2>/dev/null || true
+    _run pull "$cve"
+    # A multi-arch base already present for the host arch (ubuntu:22.04 for
+    # secrets_init) is SKIPPED by `./run pull`, then rejected at `up` with
+    # "does not provide the specified platform (linux/amd64)". Pull every image
+    # the challenge uses for the forced platform so `up` finds the right variant.
+    if [ -n "${DOCKER_DEFAULT_PLATFORM:-}" ]; then
+      for _img in $(_run compose "$cve" config --images 2>/dev/null | sort -u); do
+        docker pull -q --platform "$DOCKER_DEFAULT_PLATFORM" "$_img" >/dev/null \
+          || echo "warn: could not pull $_img for $DOCKER_DEFAULT_PLATFORM"
+      done
+    fi
+    _run up "$cve" --no-build
+    docker stop "${lc}-agent-1" 2>/dev/null || true
     # CVE-Bench creates an `agent_internet` network for its own Kali sandbox,
     # which we stop on the line above because the PLATFORM is the attacker. The
     # network is then pure waste — and it is what exhausts Docker's address
     # pools: bringing up the focused-10 failed at 8 with "all predefined
     # address pools have been fully subnetted", and the failure reads like a
     # target problem rather than a pool problem.
-    docker network rm "${cve,,}_agent_internet" 2>/dev/null || true
-    tgt="${cve,,}-target-1"
-    # Deterministic static IP per CVE so targets never share an IP.
-    # Extract the numeric suffix (e.g. 22120 from CVE-2024-22120),
-    # map it into 172.19.{1-254}.{1-254} (platform services live at .0.x).
+    docker network rm "${lc}_agent_internet" 2>/dev/null || true
+    tgt="${lc}-target-1"
+    # Deterministic static IP per CVE so targets never share an IP (see
+    # _static_ip). Numeric suffix e.g. 22120 from CVE-2024-22120.
     cve_num=$(echo "$cve" | grep -oE '[0-9]+$')
-    _o3=$(( (cve_num / 254) % 254 + 1 ))
-    _o4=$(( cve_num % 254 + 1 ))
-    static_ip="172.19.${_o3}.${_o4}"
+    static_ip=$(_static_ip "$((10#$cve_num))" "$tgt")
     # Disconnect first in case a prior run left a different IP
     docker network disconnect "$NET" "$tgt" 2>/dev/null || true
     docker network connect --ip "$static_ip" "$NET" "$tgt" 2>/dev/null || true
@@ -86,11 +145,11 @@ PY
     ;;
   down)
     [ -n "$cve" ] || { echo "usage: $0 down CVE-YYYY-NNNNN"; exit 1; }
-    ./run down "$cve" || true
+    _run down "$cve" || true
     # Remove this CVE's networks so the address pool is actually returned.
     # `./run down` leaves them behind, and an orphaned network holds its
     # subnet forever — ten of them were sitting idle from previous rounds.
-    for _n in "${cve,,}_agent_internet" "${cve,,}_private_network" "${cve,,}_target_network"; do
+    for _n in "${lc}_agent_internet" "${lc}_private_network" "${lc}_target_network"; do
       docker network rm "$_n" 2>/dev/null || true
     done
     eid=$(_eid)

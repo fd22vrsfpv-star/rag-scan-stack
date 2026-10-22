@@ -3239,7 +3239,10 @@ function BurpApiConfig() {
 
 const LLM_BACKENDS = [
   { value: '', label: 'Default (env var)' },
-  { value: 'ollama', label: 'Ollama (local)' },
+  { value: 'ollama', label: 'Ollama (local — this machine)' },
+  // UI-only choice: saves backend=ollama plus llm.ollama_url. Never sent as a
+  // backend value — 'ollama_network' is not a backend type.
+  { value: 'ollama_network', label: 'Ollama (network)' },
   { value: 'openai', label: 'OpenAI (ChatGPT)' },
   { value: 'anthropic', label: 'Anthropic (Claude)' },
   { value: 'azure', label: 'Azure OpenAI' },
@@ -3252,6 +3255,12 @@ function LlmBackendSection({ backend, onBackendChange }: { backend: string; onBa
   const [model, setModel] = useState('')
   const [azureEndpoint, setAzureEndpoint] = useState('')
   const [openaiBaseUrl, setOpenaiBaseUrl] = useState('')
+  // Ollama location: 'local' = this machine (llm.ollama_url blank → the
+  // OLLAMA_URL env, host.docker.internal:11434); 'network' = another host.
+  const [ollamaMode, setOllamaMode] = useState<'local' | 'network'>('local')
+  const [ollamaHost, setOllamaHost] = useState('localhost')
+  const [ollamaPort, setOllamaPort] = useState('11434')
+  const [ollamaMsg, setOllamaMsg] = useState<{ ok: boolean; text: string } | null>(null)
   const [testResult, setTestResult] = useState<{ ok: boolean; response?: string; error?: string } | null>(null)
   const [testing, setTesting] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -3297,6 +3306,17 @@ function LlmBackendSection({ backend, onBackendChange }: { backend: string; onBa
     } else if (backend === 'azure') {
       setModel(llmSettings.azure_model || 'gpt-4o')
       setAzureEndpoint(llmSettings.azure_endpoint || '')
+    } else if (backend === 'ollama') {
+      setModel(llmSettings.ollama_model || '')
+      const saved = (llmSettings.ollama_url || '').trim()
+      if (saved) {
+        try {
+          const u = new URL(saved)
+          setOllamaMode('network')
+          setOllamaHost(u.hostname === 'host.docker.internal' ? 'localhost' : u.hostname.replace(/^\[|\]$/g, ''))
+          setOllamaPort(u.port || '11434')
+        } catch { setOllamaMode('network') }
+      }
     }
     setApiKey('')  // never prefill keys
     setTestResult(null)
@@ -3325,6 +3345,35 @@ function LlmBackendSection({ backend, onBackendChange }: { backend: string; onBa
         body: JSON.stringify(body),
       })
     } catch { /* ignore */ }
+    setSaving(false)
+  }
+
+  // Ollama: local clears llm.ollama_url (falls back to this machine); network
+  // saves http://host:port. The BFF rewrites localhost → host.docker.internal
+  // because the URL is dialled from inside the llm_query container.
+  const handleSaveOllama = async () => {
+    setSaving(true); setOllamaMsg(null)
+    try {
+      const host = ollamaHost.trim() || 'localhost'
+      const port = ollamaPort.trim() || '11434'
+      const url = ollamaMode === 'network'
+        ? `http://${host.includes(':') && !host.startsWith('[') ? `[${host}]` : host}:${port}` : ''
+      const body: Record<string, string> = { backend: 'ollama', ollama_url: url }
+      if (model.trim()) body.ollama_model = model.trim()
+      const r = await apiFetch<{ ok: boolean; updated: Record<string, boolean> }>('/settings/llm', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      if (!r.updated?.ollama_url) throw new Error('the ollama_url setting was not stored')
+      const fresh = await apiFetch<Record<string, string>>('/settings/llm')
+      setLlmSettings(fresh)
+      setOllamaMsg({ ok: true, text: url
+        ? `Saved — using ${fresh.ollama_url || url}. Takes effect within ~30s; Test Connection to confirm.`
+        : 'Saved — using the Ollama on this machine.' })
+    } catch (e: any) {
+      setOllamaMsg({ ok: false, text: `Save failed: ${String(e?.message || e)}` })
+    }
     setSaving(false)
   }
 
@@ -3362,8 +3411,13 @@ function LlmBackendSection({ backend, onBackendChange }: { backend: string; onBa
         <div>
           <label className="block text-xs text-muted-foreground mb-1">Provider</label>
           <select
-            value={backend}
-            onChange={e => onBackendChange(e.target.value)}
+            value={backend === 'ollama' && ollamaMode === 'network' ? 'ollama_network' : backend}
+            onChange={e => {
+              const v = e.target.value
+              if (v === 'ollama_network') { setOllamaMode('network'); onBackendChange('ollama') }
+              else { if (v === 'ollama') setOllamaMode('local'); onBackendChange(v) }
+              setOllamaMsg(null)
+            }}
             className="w-full bg-muted rounded-md px-3 py-1.5 text-sm border border-border"
           >
             {LLM_BACKENDS.map(b => (
@@ -3371,6 +3425,63 @@ function LlmBackendSection({ backend, onBackendChange }: { backend: string; onBa
             ))}
           </select>
         </div>
+
+        {/* Ollama location — this machine (default) or a host on the network */}
+        {backend === 'ollama' && (
+          <div className="space-y-2">
+            {ollamaMode === 'network' ? (
+              <div className="flex gap-2">
+                <div className="flex-1">
+                  <label className="block text-xs text-muted-foreground mb-1">Ollama host / IP</label>
+                  <input
+                    value={ollamaHost}
+                    onChange={e => setOllamaHost(e.target.value)}
+                    className="w-full bg-muted rounded-md px-3 py-1.5 text-sm border border-border font-mono"
+                    placeholder="localhost or 192.168.1.50"
+                  />
+                </div>
+                <div className="w-24">
+                  <label className="block text-xs text-muted-foreground mb-1">Port</label>
+                  <input
+                    value={ollamaPort}
+                    onChange={e => setOllamaPort(e.target.value.replace(/[^0-9]/g, ''))}
+                    className="w-full bg-muted rounded-md px-3 py-1.5 text-sm border border-border font-mono"
+                    placeholder="11434"
+                  />
+                </div>
+              </div>
+            ) : null}
+            <div>
+              <label className="block text-xs text-muted-foreground mb-1">Model (optional)</label>
+              <input
+                list="llm-model-options"
+                value={model}
+                onChange={e => setModel(e.target.value)}
+                className="w-full bg-muted rounded-md px-3 py-1.5 text-sm border border-border font-mono"
+                placeholder={llmSettings.ollama_model || 'gemma4:31b'}
+              />
+              <datalist id="llm-model-options">
+                {availableModels.map(m => <option key={m} value={m} />)}
+              </datalist>
+            </div>
+            <p className="text-[10px] text-muted-foreground">
+              {ollamaMode === 'network'
+                ? <>Point at an Ollama elsewhere on your network (it must listen on <code>0.0.0.0</code>, e.g. <code>OLLAMA_HOST=0.0.0.0</code>). <code>localhost</code> means this machine and is saved as <code>host.docker.internal</code>, because the call is made from inside a container.</>
+                : <>Uses the Ollama on this machine (the <code>OLLAMA_URL</code> env, normally <code>host.docker.internal:11434</code>).</>}
+              {' '}Currently saved: <code>{llmSettings.ollama_url || 'this machine (default)'}</code>
+            </p>
+            <button
+              onClick={handleSaveOllama}
+              disabled={saving}
+              className="px-3 py-1.5 bg-primary text-primary-foreground rounded-md text-xs font-medium disabled:opacity-50"
+            >
+              {saving ? 'Saving...' : 'Save Ollama Settings'}
+            </button>
+            {ollamaMsg && (
+              <div className={`text-xs ${ollamaMsg.ok ? 'text-green-400' : 'text-red-400'}`}>{ollamaMsg.text}</div>
+            )}
+          </div>
+        )}
 
         {/* Model — free-text with autocomplete from the backend's model list */}
         {needsApiKey && (
