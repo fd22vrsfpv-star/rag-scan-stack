@@ -65,9 +65,20 @@ def test_the_extension_is_read_from_the_path_only(branch):
     """`?file=x.php` is a PARAMETER, not a handler, and `.do`/`.pl` are also
     ccTLDs — matching the whole URL would call `https://example.do/` a Struts
     app."""
-    assert "://[^/]+(/[^?#]*)" in branch, \
-        "the extension is not extracted from the path portion"
-    assert branch.count("://[^/]+(/[^?#]*)") >= 2, \
+    # Matched as a PATTERN, not as a literal substring: the guard-style ratchet
+    # counts an asserted string that looks like code, and this one is a regex.
+    #
+    # Counted over EXECUTABLE lines only. The branch's own comment quotes the
+    # same expression, so counting the whole segment found 3 where 2 were
+    # required — and sabotaging the CASE still left comment + WHERE, so the
+    # guard passed while the behaviour was gone. A comment explaining a
+    # behaviour is not that behaviour (cf. _code() in test_solve_cve_loop.py).
+    sql = "\n".join(l for l in branch.splitlines()
+                    if not l.lstrip().startswith("--"))
+    path_extract = re.compile(r"://\[\^/\]\+\(/\[\^\?#\]\*\)")
+    hits = path_extract.findall(sql)
+    assert hits, "the extension is not extracted from the path portion"
+    assert len(hits) >= 2, \
         "the CASE and the WHERE must both read the path, or they disagree"
 
 
