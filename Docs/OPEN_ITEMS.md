@@ -975,3 +975,25 @@ rewritten before dispatch — the same shape as the existing axis gate and the
 existing `min_seconds`-without-payload rewrite, per CLAUDE.md's rule that the
 model is not the thing to ask about fixing what the model produced.
 **Enforced by:** not enforced.
+
+### The software inventory silently drops 43% of its rows, so a technology reads as absent
+**Found:** 2026-10-22 (operator: "in the redteam engagement I do not see php
+flagged as a technology")
+**Evidence:** `/software` (`get_detected_software`) ends
+`ORDER BY ip, product, source LIMIT %s` with `limit` defaulting to 2000. For the
+redteam engagement the deduplicated row count is **3516**, so **1516 rows (43%)
+are dropped with nothing in the response to say so**. Because the order is by
+`ip`, what survives is decided by host IP sort position, not relevance. PHP
+exists on **49** host/port combinations in that engagement and the UI receives
+**34** of them; a technology confined to higher-sorting hosts disappears
+entirely. The engagement filter itself is correct — `asset_id IN (SELECT id FROM
+assets WHERE engagement_id = %s)` — this is purely the truncation.
+**Where:** `app/rag-api/api.py::get_detected_software` (~line 14063), the
+`ORDER BY ip, product, source LIMIT %s` tail and the `limit` default of 2000;
+the summary block immediately below correctly counts the FULL set, so the header
+counts and the table disagree by design.
+**Done when:** the response reports whether it was truncated (a `truncated` flag
+plus the full deduped count, which the summary query already computes), and a
+technology-level view is not ordered by `ip` — grouping by product, or paging,
+so "is PHP present?" is answerable without scrolling 2000 host rows.
+**Enforced by:** not enforced.

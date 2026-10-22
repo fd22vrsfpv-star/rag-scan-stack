@@ -24613,6 +24613,63 @@ def _repair_unmeasurable_timing_assertion(assertion, command, canary):
             True)
 
 
+# After this many `latency_too_fast` verdicts against the same target, the
+# timing MECHANISM is treated as dead and a min_seconds assertion is refused.
+_TIMING_DEAD_AT = int(os.environ.get("REFINE_TIMING_DEAD_AT") or 3)
+
+
+def _repair_dead_timing_mechanism(assertion, canary, latency_fails,
+                                  threshold=None):
+    """SIBLING of `_repair_unmeasurable_timing_assertion`.
+
+    That one handles a `min_seconds` assertion on a command carrying NO timing
+    payload — nothing to measure. This handles the opposite and more stubborn
+    case: the payload IS there, it IS dispatched, and the target answers fast
+    every single time. After enough of those the claim "this is a blind-timing
+    vulnerability" has been empirically refuted for this target, whatever the
+    advisory says.
+
+    Why this must be deterministic rather than advice: it was tried as advice
+    and failed on five independent builds. `_failure_analysis_lines` puts
+    "TIMING PROOF FAILED Nx ... DO NOT propose another min_seconds assertion"
+    in the prompt and the model proposes one anyway —
+
+      2026-10-21 solver, 3 rounds : warning present every round, min_seconds 28/73/58
+      2026-10-22 top-20, 4443     : warning present 10x, min_seconds 94x,
+                                    latency_too_fast 13x
+
+    CLAUDE.md already settles the principle for the timing confirmation and the
+    unmeasurable-assertion repair: the model is what produced the assertion, so
+    it is not the thing to ask about fixing it.
+
+    This also has to CLEAR the caller's timing mode. The anti-drift rule exists
+    to stop the loop walking away from a genuine blind-timing proof, and it
+    would otherwise re-force `min_seconds` on the very next iteration — so the
+    caller must stop treating this as a timing proof, not merely swap one
+    assertion. The return value says so.
+
+    The rewrite cannot manufacture a pass: `expect_regex: <canary>` succeeds
+    only if the canary actually comes back, landing on the existing canary path
+    (anchor -> anti-drift -> reflection guard) where "canary absent" is a clean
+    negative. With no canary there is nothing honest to offer, so the assertion
+    stands — never invent a regex, that is fabricating a proof.
+
+    Returns (assertion, repaired: bool).
+    """
+    thr = _TIMING_DEAD_AT if threshold is None else int(threshold)
+    if not isinstance(assertion, dict) or assertion.get("min_seconds") is None:
+        return assertion, False
+    if not canary:
+        return assertion, False
+    try:
+        if int(latency_fails or 0) < thr:
+            return assertion, False
+    except Exception:  # noqa: BLE001
+        return assertion, False
+    return ({"expect_regex": canary, "canary": canary, "cve_anchored": True},
+            True)
+
+
 # ── Refine-loop escalation ────────────────────────────────────────────────
 # A repeated OUTCOME is provably zero-information: the target answered the same
 # thing, so whatever the model changed never reached the vulnerable surface.
@@ -26712,6 +26769,11 @@ def _store_tentative_spec(cve, product, version, spec, verdict, source):
                 VALUES (%s,%s,%s,%s,%s::jsonb, false, 'tentative',
                         %s, %s, %s, %s, %s, %s::jsonb)
                 ON CONFLICT (cve) DO UPDATE SET
+                  product = CASE
+                      WHEN lower(coalesce(EXCLUDED.product,'')) NOT IN ('', 'unknown', 'none')
+                      THEN EXCLUDED.product
+                      ELSE public.derived_cve_specs.product END,
+                  vuln_class = coalesce(EXCLUDED.vuln_class, public.derived_cve_specs.vuln_class),
                   spec = EXCLUDED.spec, status = 'tentative',
                   verify_method = EXCLUDED.verify_method,
                   verify_evidence = EXCLUDED.verify_evidence,
@@ -26719,13 +26781,134 @@ def _store_tentative_spec(cve, product, version, spec, verdict, source):
                   attempts = EXCLUDED.attempts,
                   last_failure = EXCLUDED.last_failure,
                   refine_hints = EXCLUDED.refine_hints
-            """, (str(cve).upper(), product, version, spec.get("vuln_class"),
+            """, (str(cve).upper(), _spec_product(spec, product), version,
+                  spec.get("vuln_class"),
                   _json.dumps(spec), verdict.get("method"),
                   (verdict.get("evidence") or "")[:1000], source,
                   new_attempts, verdict.get("method"), _json.dumps(hints)))
             c.commit()
     except Exception as e:  # noqa: BLE001
         logging.debug("store tentative spec failed: %s", e)
+
+
+_PRODUCT_UNKNOWN = ("", "unknown", "none", "null", "n/a", "-")
+
+
+# Words that name a VULNERABILITY or a generic noun, never a product. The
+# prose patterns below happily match "in Blind XSS before ..." or "The Web
+# application", and a vuln class written into the product column is worse than
+# `unknown` because it reads as a real finding.
+_NOT_A_PRODUCT = {
+    "xss", "blind xss", "stored xss", "reflected xss", "sqli", "sql injection",
+    "rce", "lfi", "rfi", "ssrf", "csrf", "xxe", "idor", "ssti", "dos",
+    "the", "a", "an", "the web", "web", "the server", "server", "the client",
+    "the application", "application", "the plugin", "plugin", "the site",
+    "wordpress", "apache", "nginx", "php", "the admin", "admin", "the user",
+    "user", "the attacker", "attacker", "the request", "the response",
+}
+
+
+def _is_product_name(name):
+    """A mined string is a product only if it is not a vuln class or a generic
+    noun phrase. Returning `unknown` honestly beats writing "Blind XSS" into the
+    product column, where everything downstream would treat it as a component."""
+    n = " ".join(str(name or "").split()).strip(" .,;:")
+    if not n or len(n) < 2:
+        return False
+    low = n.lower()
+    if low in _NOT_A_PRODUCT:
+        return False
+    # "Blind XSS", "Stored SQLi" — a class word carrying a modifier.
+    if any(low.endswith(" " + w) or low == w
+           for w in ("xss", "sqli", "rce", "lfi", "ssrf", "csrf", "xxe",
+                     "injection", "traversal", "bypass", "escalation")):
+        return False
+    if low.startswith("the ") and low[4:] in _NOT_A_PRODUCT:
+        return False
+    return True
+
+
+def _mine_product_from_spec(spec):
+    """Dig the VULNERABLE COMPONENT out of the advisory prose the spec carries.
+
+    The deeper dig the operator asked for when the product lands at `unknown`:
+    the name is almost always sitting in the text we already fetched. For
+    CVE-2023-51483 the notes read "The WP Frontend Profile plugin (<=1.3.1)
+    contains an AJAX handler ..." while the product column said `unknown`.
+
+    Deterministic and offline — it reads text already in hand, so it costs
+    nothing and cannot be steered by a model. Returns "" when the prose does
+    not name a component, which is an honest answer and leaves the caller to
+    escalate.
+    """
+    import re as _re
+    if not isinstance(spec, dict):
+        return ""
+    blob = " ".join(str(spec.get(k) or "") for k in
+                    ("notes", "description", "title", "summary",
+                     "advisory_poc", "derived_vector"))
+    if not blob.strip():
+        return ""
+    pats = (
+        # "The Glowlogix WP Frontend Profile plugin", "the HT Mega plugin"
+        r"\b[Tt]he\s+([A-Z][\w.&/-]*(?:\s+[A-Z0-9][\w.&/-]*){0,4})\s+"
+        r"(?:WordPress\s+)?(?:plugin|extension|module|theme|add-?on)\b",
+        # "<Name> plugin for WordPress"
+        r"\b([A-Z][\w.&/-]*(?:\s+[A-Z0-9][\w.&/-]*){0,4})\s+"
+        r"(?:plugin|extension|module|theme)\s+for\b",
+        # "in <Name> before 1.2.3"
+        r"\bin\s+([A-Z][\w.&/-]*(?:\s+[A-Z0-9][\w.&/-]*){0,4})\s+"
+        r"(?:before|prior to|through|<=|up to)\b",
+    )
+    for pat in pats:
+        m = _re.search(pat, blob)
+        if m:
+            name = " ".join(m.group(1).split()).strip(" .,;:")
+            if _is_product_name(name):
+                return name
+    return ""
+
+
+def _spec_product(spec, fallback, *, cve=None, run_id=None):
+    """The VULNERABLE COMPONENT, not the platform hosting it.
+
+    `fallback` is the scanned target's fingerprint — "WordPress", or
+    "unknown". The derived spec's own `product` is what the advisory actually
+    names: "Glowlogix WP Frontend Profile", "HasThemes HT Mega". That is the
+    thing with the bug, and it is what recon needs in order to probe
+    /wp-content/plugins/<it>/ and its AJAX actions instead of generic platform
+    routes.
+
+    The column used to be written from `fallback` alone, so 21 of 35 cached
+    specs read `product='unknown'` while their own JSON body carried the right
+    name. Everything downstream reads the column.
+
+    Order: the spec's own field, then the advisory prose (`_mine_product_from_spec`),
+    then the target fingerprint. Landing on `unknown` after all three is traced
+    rather than swallowed — an unidentified component is the single thing most
+    likely to send recon at the wrong surface, so it should be visible.
+    """
+    # Every tier is validated, including the spec's OWN product field: the
+    # derivation has written "Blind XSS" and "The Web" there, and a vuln class
+    # in the product column is worse than `unknown` because it reads as a real
+    # component and sends recon at a surface that does not exist.
+    for cand in ((spec or {}).get("product"),
+                 _mine_product_from_spec(spec),
+                 fallback):
+        c = str(cand or "").strip()
+        if c and c.lower() not in _PRODUCT_UNKNOWN and _is_product_name(c):
+            return c
+    try:
+        if run_id:
+            _poc_trace(run_id, "product_unknown_needs_dig",
+                       response=(f"no vulnerable component identified for {cve} "
+                                 "from the spec, the advisory prose, or the target "
+                                 "fingerprint — recon will target the platform, "
+                                 "not the component"),
+                       extra={"cve": cve, "fallback": str(fallback or "")})
+    except Exception:  # noqa: BLE001
+        pass
+    return "unknown"
 
 
 def _load_tentative_spec(cve):
@@ -30032,11 +30215,17 @@ def _store_derived_spec(cve, product, version, spec, verdict, source):
                    verify_method, verify_evidence, source, last_verified)
                 VALUES (%s,%s,%s,%s,%s::jsonb,true,'verified',%s,%s,%s,now())
                 ON CONFLICT (cve) DO UPDATE SET
+                  product = CASE
+                      WHEN lower(coalesce(EXCLUDED.product,'')) NOT IN ('', 'unknown', 'none')
+                      THEN EXCLUDED.product
+                      ELSE public.derived_cve_specs.product END,
+                  vuln_class = coalesce(EXCLUDED.vuln_class, public.derived_cve_specs.vuln_class),
                   spec = EXCLUDED.spec, verified = true, status = 'verified',
                   verify_method = EXCLUDED.verify_method,
                   verify_evidence = EXCLUDED.verify_evidence,
                   source = EXCLUDED.source, last_verified = now()
-            """, (str(cve).upper(), product, version, spec.get("vuln_class"),
+            """, (str(cve).upper(), _spec_product(spec, product), version,
+                  spec.get("vuln_class"),
                   _json.dumps(spec), verdict.get("method"),
                   (verdict.get("evidence") or "")[:1000], source))
             c.commit()
@@ -30469,6 +30658,10 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
     # the moment any command carries a real payload, timing mode engages below
     # and never clears.
     _timing_mode = (_timing_payload_scale(command or "", delta=0)[1] is not None)
+    # Dispatched runs whose verdict said the target answered faster than the
+    # payload claimed. Counts the MECHANISM failing, which is what decides
+    # whether a min_seconds assertion is still worth making.
+    _latency_fails = 0
     # An initial min_seconds assertion on a command with no payload is repaired
     # to the canary form BEFORE the first dispatch, so iteration 1 is spent on a
     # measurable assertion instead of discovering it is unconfirmable.
@@ -31040,6 +31233,8 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         success = _verdict["passed"]
         verification_method = _verdict["method"]
         verification_confidence = _verdict["confidence"]
+        if verification_method in _TIMING_FAIL_METHODS:
+            _latency_fails += 1
         # Cross-run error memory: normalise this iteration's error and remember
         # the command that produced it (the run record used to carry neither).
         try:
@@ -32128,6 +32323,24 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                               "reason": "blind-timing proof: canary never appears "
                                         "in output, expect_regex can't fire"})
         if _new_a is not None:
+            # Dead mechanism first: it must override the anti-drift decision
+            # just made. `_resolve_refine_assertion` keeps the latency shape
+            # while `_timing_mode` is set, so without clearing the mode the
+            # next iteration re-forces min_seconds and the gate never bites.
+            _dead_a, _dead = _repair_dead_timing_mechanism(
+                _new_a, canary, _latency_fails)
+            if _dead:
+                _new_a, _timing_mode, _drift = _dead_a, False, False
+                _poc_trace(run_id, "timing_mechanism_dead", iteration=it,
+                           extra={"latency_fails": _latency_fails,
+                                  "threshold": _TIMING_DEAD_AT,
+                                  "was": "min_seconds", "now": "expect_regex",
+                                  "canary": canary,
+                                  "reason": "the payload was dispatched and the "
+                                            "target answered fast every time; a "
+                                            "blind-timing claim is refuted for "
+                                            "this target regardless of the "
+                                            "advisory"})
             _new_a, _rep = _repair_unmeasurable_timing_assertion(
                 _new_a, command, canary)
             if _rep:
