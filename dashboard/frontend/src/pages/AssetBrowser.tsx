@@ -364,13 +364,14 @@ function ExploitWorkbenchOperationsTab({ product, version, collectedCves, embedd
   }) as Array<{ data?: { exploits: Array<{ id: string; cve: string; verified: boolean; target_host: string | null; target_port: number | null; built_at: string | null }> } }>
   const matchedExploits = useMemo(() => {
     const seen = new Set<string>()
-    const rows: Array<{ id: string; cve: string; verified: boolean; target: string }> = []
+    const rows: Array<{ id: string; cve: string; verified: boolean; target: string; host: string; port: number | null }> = []
     for (const q of cveQueries) {
       for (const ex of (q.data?.exploits || [])) {
         if (seen.has(ex.id)) continue
         seen.add(ex.id)
         rows.push({
           id: ex.id, cve: ex.cve, verified: ex.verified,
+          host: ex.target_host || '?', port: ex.target_port ?? null,
           target: `${ex.target_host || '?'}${ex.target_port ? ':' + ex.target_port : ''}`,
         })
       }
@@ -378,6 +379,32 @@ function ExploitWorkbenchOperationsTab({ product, version, collectedCves, embedd
     rows.sort((a, b) => (a.verified === b.verified ? 0 : a.verified ? -1 : 1))
     return rows
   }, [cveQueries])
+
+  // Group by host:port. One product's CVE set can carry PoCs built against
+  // several hosts and ports, and a flat list sorted only by verified-ness
+  // interleaved them — the operator could not see which target a run of
+  // entries belonged to, or that a host had any verified PoC at all without
+  // reading every row. Verified targets sort first, then by host:port, so the
+  // target worth attacking is at the top.
+  const exploitsByTarget = useMemo(() => {
+    const groups = new Map<string, {
+      target: string; host: string; port: number | null
+      rows: typeof matchedExploits; verified: number
+    }>()
+    for (const ex of matchedExploits) {
+      const key = ex.target
+      let g = groups.get(key)
+      if (!g) {
+        g = { target: ex.target, host: ex.host, port: ex.port, rows: [], verified: 0 }
+        groups.set(key, g)
+      }
+      g.rows.push(ex)
+      if (ex.verified) g.verified += 1
+    }
+    return [...groups.values()].sort((a, b) =>
+      (b.verified > 0 ? 1 : 0) - (a.verified > 0 ? 1 : 0)
+      || a.target.localeCompare(b.target, undefined, { numeric: true }))
+  }, [matchedExploits])
   const buildPoc = useBuildPoc()
   const [buildMsg, setBuildMsg] = useState<string>('')
   const firstCve = collectedCves[0]
@@ -420,29 +447,45 @@ function ExploitWorkbenchOperationsTab({ product, version, collectedCves, embedd
             No stored exploits yet for any of the collected CVEs. Click Build PoC below to generate one.
           </div>
         ) : (
-          <div className="space-y-1 max-h-72 overflow-y-auto">
-            {matchedExploits.slice(0, 25).map(ex => (
-              <div key={ex.id} className="flex items-center gap-2 px-2 py-1 rounded border border-border bg-muted/20 text-xs">
-                <span className={cn('h-5 px-1.5 rounded text-[9px] inline-flex items-center font-semibold uppercase',
-                  ex.verified ? 'bg-emerald-500/20 text-emerald-300' : 'bg-amber-500/20 text-amber-300')}>
-                  {ex.verified ? '✓ verified' : 'unverified'}
-                </span>
-                <span className="font-mono text-amber-400">{ex.cve}</span>
-                <span className="text-muted-foreground">on {ex.target}</span>
-                <div className="flex-1" />
-                {/* ?open= was read by nothing anywhere in the app — the link
-                    opened an unfiltered Exploits page. Target the host, which
-                    the PoC Store list now filters on. */}
-                <a href={`/exploits?tab=workbench&ip=${encodeURIComponent(ex.target || '')}`}
-                  target="_blank" rel="noopener"
-                  className="text-[10px] px-2 py-0.5 rounded border border-border hover:bg-muted">
-                  Open in /exploits
-                </a>
+          <div className="space-y-2 max-h-72 overflow-y-auto">
+            {exploitsByTarget.map(g => (
+              <div key={g.target} className="border border-border rounded">
+                {/* Target header — the host:port every PoC under it was built
+                    against, with its verified count so a target carrying a
+                    working PoC is visible without reading each row. */}
+                <div className="flex items-center gap-2 px-2 py-1 bg-muted/40 text-xs border-b border-border">
+                  <Server className="h-3 w-3 text-muted-foreground shrink-0" />
+                  <span className="font-mono">{g.host}</span>
+                  {g.port != null && <span className="font-mono text-muted-foreground">:{g.port}</span>}
+                  <span className="text-[10px] text-muted-foreground">
+                    {g.rows.length} PoC{g.rows.length === 1 ? '' : 's'}
+                    {g.verified > 0 && <span className="text-emerald-300"> · {g.verified} verified</span>}
+                  </span>
+                  <div className="flex-1" />
+                  {/* ?open= was read by nothing anywhere in the app — the link
+                      opened an unfiltered Exploits page. Target the host, which
+                      the PoC Store list now filters on. One link per target
+                      rather than one per row: they were all identical within a
+                      group. */}
+                  <a href={`/exploits?tab=workbench&ip=${encodeURIComponent(g.host)}`}
+                    target="_blank" rel="noopener"
+                    className="text-[10px] px-2 py-0.5 rounded border border-border hover:bg-muted">
+                    Open in /exploits
+                  </a>
+                </div>
+                <div className="divide-y divide-border/50">
+                  {g.rows.map(ex => (
+                    <div key={ex.id} className="flex items-center gap-2 px-2 py-1 text-xs">
+                      <span className={cn('h-5 px-1.5 rounded text-[9px] inline-flex items-center font-semibold uppercase',
+                        ex.verified ? 'bg-emerald-500/20 text-emerald-300' : 'bg-amber-500/20 text-amber-300')}>
+                        {ex.verified ? '✓ verified' : 'unverified'}
+                      </span>
+                      <span className="font-mono text-amber-400">{ex.cve}</span>
+                    </div>
+                  ))}
+                </div>
               </div>
             ))}
-            {matchedExploits.length > 25 && (
-              <div className="text-[10px] text-muted-foreground">+ {matchedExploits.length - 25} more…</div>
-            )}
           </div>
         )}
       </div>
@@ -1618,7 +1661,12 @@ export default function AssetBrowser() {
   const [softwareProductInput, setSoftwareProductInput] = useState<string>(initialSearch)
   const [expandedHosts, setExpandedHosts] = useState<Set<string>>(new Set())
   const [showCveOnly, setShowCveOnly] = useState(false)
-  const [hideBlankProductVersion, setHideBlankProductVersion] = useState(true)
+  // OFF by default (operator, 2026-10-22). A filter that hides rows is a
+  // poor default on an inventory page: the operator cannot miss what they
+  // can see, but they can easily miss what a chip silently removed. This
+  // one was on by default and hid 88% of the rows, and the tab read
+  // "0 rows" for a product the summary above it was counting.
+  const [hideBlankProductVersion, setHideBlankProductVersion] = useState(false)
   const [softwareSort, setSoftwareSort] = useState<'hostname' | 'product' | 'version' | 'cve-count'>('hostname')
   const [showBulkDismiss, setShowBulkDismiss] = useState(false)
   // The inline <ExploitLookupModal> that used to live over Assets is gone —
@@ -2520,8 +2568,11 @@ export default function AssetBrowser() {
               })()}
               <button
                 onClick={() => setHideBlankProductVersion(!hideBlankProductVersion)}
+                title={hideBlankProductVersion
+                  ? 'Hiding rows with no product name. Rows WITH a product but no version are shown — an unversioned detection is still a real one.'
+                  : 'Showing every row, including any with no product name.'}
                 className={`px-2.5 py-0.5 text-xs font-medium rounded border ${hideBlankProductVersion ? 'bg-primary/20 text-primary border-primary/50' : 'border-border text-muted-foreground hover:text-foreground'}`}
-              >Hide Blank</button>
+              >Hide Unnamed</button>
               <button
                 onClick={() => setShowCveOnly(!showCveOnly)}
                 className={`flex items-center gap-1 px-2.5 py-0.5 text-xs font-medium rounded border ${showCveOnly ? 'bg-red-500/20 text-red-400 border-red-500/50' : 'border-border text-muted-foreground hover:text-foreground'}`}
@@ -2552,6 +2603,55 @@ export default function AssetBrowser() {
               ))}
             </div>
           )}
+          {/* TECHNOLOGIES — the complete product rollup.
+              "Is PHP present?" is a question about products, not hosts, and the
+              row list below is capped at `limit` and ordered by ip, so a
+              technology on higher-sorting hosts fell off the bottom entirely.
+              This list is unbounded by that cap. Click a chip to filter the
+              rows below to it. */}
+          {softwareData?.products_available && (softwareData.products?.length ?? 0) > 0 && (
+            <details className="border border-border rounded-md group" open>
+              <summary className="cursor-pointer list-none p-2.5 flex items-center gap-2 flex-wrap text-sm">
+                <ChevronRight className="h-4 w-4 transition-transform group-open:rotate-90 shrink-0" />
+                <span className="font-semibold">Technologies</span>
+                <span className="text-[10px] text-muted-foreground">
+                  ({softwareData.products!.length} products, every one shown)
+                </span>
+                {softwareData.truncated && (
+                  <span
+                    title={`The row table below shows ${softwareData.count} of ${softwareData.total_rows} detections (limit ${softwareData.limit}), ordered by IP. This product list is NOT truncated.`}
+                    className="text-[10px] px-1.5 py-0.5 rounded border border-amber-500/40 bg-amber-500/10 text-amber-300">
+                    rows below truncated: {softwareData.count} of {softwareData.total_rows}
+                  </span>
+                )}
+              </summary>
+              <div className="px-2.5 pb-2.5 flex flex-wrap gap-1">
+                {softwareData.products!.map(p => {
+                  const active = softwareProductFilter.toLowerCase() === p.product.toLowerCase()
+                  return (
+                    <button key={p.product}
+                      onClick={() => {
+                        const next = active ? '' : p.product
+                        setSoftwareProductFilter(next)
+                        setSoftwareProductInput(next)
+                      }}
+                      title={[
+                        `${p.host_count} host${p.host_count === 1 ? '' : 's'}`,
+                        p.versions?.length ? `versions: ${p.versions.slice(0, 6).join(', ')}` : null,
+                        p.sources?.length ? `sources: ${p.sources.join(', ')}` : null,
+                      ].filter(Boolean).join(' · ')}
+                      className={cn('px-1.5 py-0.5 rounded border text-[11px] inline-flex items-center gap-1',
+                        active
+                          ? 'bg-blue-500/20 border-blue-400 text-blue-200'
+                          : 'border-border text-muted-foreground hover:text-foreground')}>
+                      <span className="truncate max-w-[16rem]">{p.product}</span>
+                      <span className="opacity-70">{p.host_count}</span>
+                    </button>
+                  )
+                })}
+              </div>
+            </details>
+          )}
           {softwareLoading ? (
             <p className="text-sm text-muted-foreground">Loading...</p>
           ) : !softwareItems.length ? (
@@ -2578,7 +2678,15 @@ export default function AssetBrowser() {
             // Filter
             let filtered = deduped.filter(sw => {
               if (showCveOnly && (sw.cve_flags?.length ?? 0) === 0) return false
-              if (hideBlankProductVersion && (!sw.product || sw.product.trim() === '' || !sw.version || sw.version.trim() === '')) return false
+              // Hide a row with NO PRODUCT. A product with no VERSION is still a
+              // real detection — "PHP is running here, version unknown" is
+              // actionable; you go fingerprint it. The old test was
+              // `!product || !version`, and in one engagement that hid 9129 of
+              // 10360 rows (88%), every one of them naming a real product,
+              // while exactly ONE row genuinely had no product. Searching PHP
+              // then showed "0 rows" directly beneath a Technologies chip
+              // reading "PHP 13" — the page contradicting itself.
+              if (hideBlankProductVersion && (!sw.product || sw.product.trim() === '')) return false
               if (softwareProductFilter) {
                 const q = softwareProductFilter.toLowerCase()
                 const matchesProduct = sw.product?.toLowerCase().includes(q)

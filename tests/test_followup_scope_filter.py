@@ -186,3 +186,92 @@ def test_page_passes_the_selected_scope_to_both():
         assert "scopeFilter" in m.group(1), (
             f"{call} is called without scopeFilter — the dropdown changes the "
             "table but not this view")
+
+
+# ── A scope NAME is not unique, and the panel defaulted to every engagement ──
+#
+# Reported 2026-10-19: "the follow-up panel engagement scope doesn't seem to
+# filter correctly." Two independent causes, both measured on the live DB:
+#
+#  1. `_scope_inclusion_clause` matched `scope_targets` on NAME ALONE.
+#     `unknown_scope` exists under FIVE engagements (`not_in_scope` under two,
+#     `default` under two). Filtering follow-ups by `unknown_scope` returned 11
+#     rows, of which **10 matched only because another engagement owns a list
+#     of that name** — 7 play_demo, 3 cvebench, 1 redteam3.
+#  2. The panel's engagement toggle defaulted to OFF, so the unfiltered list was
+#     all 5080 rows across 7 engagements (2267 redteam3 / 1933 play_demo /
+#     852 cvebench / …) shown under one engagement's header.
+#
+# NULL-engagement scope rows stay matched on purpose: `not_in_scope` is the
+# global deny-list by design and legacy rows predate attribution — the same
+# `= %s OR IS NULL` the listing endpoints use.
+
+def test_scope_clauses_take_an_engagement():
+    """Both clause builders must accept an engagement to narrow the list."""
+    import ast as _ast
+    tree = _ast.parse(_read(API))
+    fns = {n.name: n for n in tree.body if isinstance(n, _ast.FunctionDef)}
+    for name in ("_scope_inclusion_clause", "_scope_exclusion_clause"):
+        assert name in fns, f"{name} gone from api.py"
+        args = [a.arg for a in fns[name].args.args]
+        assert "engagement_id" in args, (
+            f"{name} matches scope_targets on NAME ALONE; unknown_scope exists "
+            "under five engagements, so every one of them answers at once")
+
+
+def test_engagement_predicate_keeps_global_rows():
+    """The narrowing must keep NULL-engagement rows: `not_in_scope` is the
+    cross-engagement deny-list by design, and dropping it would un-hide hosts
+    the operator deny-listed."""
+    import ast as _ast
+    tree = _ast.parse(_read(API))
+    fn = [n for n in tree.body
+          if isinstance(n, _ast.FunctionDef) and n.name == "_scope_engagement_predicate"]
+    assert fn, "_scope_engagement_predicate gone — the two clauses would drift"
+    src = _ast.get_source_segment(_read(API), fn[0]) or ""
+    # Whitespace-insensitive: the shape is what matters, not the spacing.
+    import re as _re
+    assert _re.search(r"st\.engagement_id\s*=\s*%s", src) and \
+           _re.search(r"st\.engagement_id\s+IS\s+NULL", src), (
+        "the predicate must be `= %s OR IS NULL`; equality alone drops the "
+        "global deny-list and the legacy pre-attribution rows")
+    # No engagement -> no predicate, so an explicit all-engagements view still
+    # works. Checked structurally: SOME return hands back an empty fragment and
+    # an empty param list, whatever the literal spelling.
+    empties = [n for n in _ast.walk(fn[0])
+               if isinstance(n, _ast.Return) and isinstance(n.value, _ast.Tuple)
+               and len(n.value.elts) == 2
+               and isinstance(n.value.elts[0], _ast.Constant)
+               and n.value.elts[0].value == ""
+               and isinstance(n.value.elts[1], _ast.List)
+               and not n.value.elts[1].elts]
+    assert empties, "None must append nothing, not match nothing"
+
+
+def test_all_followup_callsites_pass_the_engagement():
+    """Three handlers (list / stats / grouped), each applying both clauses.
+    A handler that forgets is a view filtered by somebody else's scope list."""
+    import re as _re
+    src = _read(API)
+    for fname in ("_scope_inclusion_clause", "_scope_exclusion_clause"):
+        calls = _re.findall(rf"{fname}\(HOST_EXPR_FOLLOWUP,[^)]*\)", src)
+        assert len(calls) == 3, f"expected 3 follow-up call sites of {fname}, found {len(calls)}"
+        for c in calls:
+            assert "engagement_id" in c, (
+                f"{c} does not pass the engagement — this surface matches every "
+                "engagement's list of that name")
+
+
+def test_panel_defaults_to_engagement_only():
+    """The read-path rule: a listing under an engagement header is that
+    engagement's data unless the operator opts out explicitly."""
+    page = _read(PAGE)
+    import re as _re
+    m = _re.search(r"filterByEngagement, setFilterByEngagement\] = useState\((.*?)\n", page, _re.S)
+    assert m, "filterByEngagement state gone from FollowUps.tsx"
+    init = m.group(1)
+    assert "false)" not in init, (
+        "the panel defaults to All Engagements — selecting an engagement then "
+        "changes the header and nothing else (5080 rows across 7 engagements)")
+    assert "localStorage" in page and "followups.filterByEngagement" in page, (
+        "the choice must persist, or a refresh silently widens the view back out")

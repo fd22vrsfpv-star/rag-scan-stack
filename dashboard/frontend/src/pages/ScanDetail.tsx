@@ -11,12 +11,29 @@ import { formatDate } from '@/lib/utils'
 type Tab = 'overview' | 'commands' | 'results'
 
 // Keys that are structural/not useful as scan metrics
+/** Hand the operator the raw artifact as a file. This is a collector — the
+ *  captured stdout is meant to leave for Burp, a report or an issue tracker,
+ *  and a scroll box is not an export. */
+function downloadText(filename: string, text: string) {
+  try {
+    const url = URL.createObjectURL(new Blob([text], { type: 'text/plain' }))
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+  } catch { /* download blocked — copy is still available */ }
+}
+
 const RESULT_SKIP_KEYS = new Set(['ok', 'report', 'ingest', 'no_ingest', 'raw_output', 'stdout', 'stderr', 'command', 'masscan_out'])
 const AUDIT_SKIP_KEYS = new Set(['timestamp', 'event', 'scan_type', 'source', 'job_id', 'hostname', 'external_ip', 'content_intel'])
 
 export default function ScanDetail() {
   const { jobId } = useParams<{ jobId: string }>()
   const { data, isLoading, error } = useScanDetail(jobId || '')
+  const [outputExpanded, setOutputExpanded] = useState(false)
   const stopScan = useStopScan()
   const resumeScan = useResumeScan()
   const navigate = useNavigate()
@@ -160,8 +177,19 @@ export default function ScanDetail() {
           : null
   )
 
-  // Helper: extract string values from result safely
-  const rStdout = r ? String(r['stdout'] || '') : ''
+  // Helper: extract string values from result safely.
+  //
+  // Scanner-service jobs nest their captured output under `result.stdout`.
+  // Kali tool executions do NOT: `/api/scans/{job_id}` returns their stdout as
+  // a TOP-LEVEL `output` (and errors as `error`), because they never went
+  // through a scanner service and have no `result` object at all. Reading only
+  // `result.stdout` therefore left the Tool Output panel hidden for every
+  // nmap / gobuster / nuclei / nikto / whatweb run — 869 rows with captured
+  // output — so the page said a tool completed while showing nothing it
+  // produced. Fall back to the top-level fields.
+  const rStdout = (r ? String(r['stdout'] || '') : '') || String(data.output || '')
+  // `data.error` is deliberately NOT folded in here — it already has its own
+  // Error panel below, and showing it twice reads as two separate failures.
   const rStderr = r ? String(r['stderr'] || '') : ''
   const hasOutput = !!(rStdout || rStderr)
 
@@ -466,11 +494,31 @@ export default function ScanDetail() {
           {/* Stdout / Stderr */}
           {hasOutput ? (
             <div className="bg-card border border-border rounded-lg p-3 space-y-2">
-              <h3 className="text-xs font-semibold text-muted-foreground">Tool Output</h3>
+              <div className="flex items-center justify-between">
+                <h3 className="text-xs font-semibold text-muted-foreground">Tool Output</h3>
+                {rStdout && (
+                  <div className="flex items-center gap-2 text-[10px]">
+                    <span className="text-muted-foreground">{rStdout.length.toLocaleString()} chars</span>
+                    <button onClick={() => setOutputExpanded(v => !v)}
+                      className="text-primary hover:underline">
+                      {outputExpanded ? 'collapse' : 'expand'}
+                    </button>
+                    <button onClick={() => navigator.clipboard?.writeText(rStdout)}
+                      className="text-primary hover:underline">copy</button>
+                    {/* A 27 KB nmap run is not reviewable in a scroll box and is
+                        usually wanted in another tool anyway — this is a
+                        collector, so let the operator take the artifact out. */}
+                    <button onClick={() => downloadText(
+                      `${data.type || 'tool'}-${data.job_id || jobId}.txt`, rStdout)}
+                      className="text-primary hover:underline">download</button>
+                  </div>
+                )}
+              </div>
               {rStdout ? (
                 <div>
                   <span className="text-[10px] text-muted-foreground">stdout</span>
-                  <pre className="text-xs font-mono bg-background rounded p-2 border border-border max-h-40 overflow-y-auto whitespace-pre-wrap">{rStdout}</pre>
+                  <pre className="text-xs font-mono bg-background rounded p-2 border border-border overflow-y-auto whitespace-pre-wrap"
+                    style={{ maxHeight: outputExpanded ? 'none' : '10rem' }}>{rStdout}</pre>
                 </div>
               ) : null}
               {rStderr ? (

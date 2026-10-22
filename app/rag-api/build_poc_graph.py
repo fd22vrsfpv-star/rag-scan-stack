@@ -95,6 +95,10 @@ class BuildPocState(TypedDict, total=False):
     # Refine loop state
     command: str
     assertion: Dict[str, Any]
+    #: The structured request plan behind `command` (etl/http_request.py),
+    #: when synth produced one. Carried so the pre-dispatch probe can read the
+    #: target rather than re-parsing the rendered command for it.
+    plan: Optional[list]
     canary: Optional[str]
     origin_family: Optional[tuple]
     llm_model: Optional[str]
@@ -1681,6 +1685,40 @@ def node_synth(state: BuildPocState) -> Dict[str, Any]:
         state.get("product"), state.get("version"), state.get("eid"),
         run_id=state["run_id"], guidance_extra=state.get("guidance") or "",
         model=state.get("model"))
+    # ── STRUCTURED REQUEST PLAN (etl/http_request.py) ──────────────────────
+    #
+    # When synth returns a `plan` — a list of steps, each a request as DATA —
+    # the command is RENDERED from it rather than written by the model as a
+    # shell string. That removes the largest class of pre-dispatch failure in
+    # the archive at its source: 444 shell_syntax refusals are a quoting
+    # decision, and a rendered command makes no quoting decisions.
+    #
+    # The plan is kept in state so the probe can READ the target instead of
+    # re-parsing the command for it — the mistake that had it probing the
+    # exploit's own callback sink (296 prerun_probe_fail rows).
+    #
+    # Additive: no plan, nothing changes. A plan that will not render is
+    # dropped with its reason traced, and the model's own command stands —
+    # a renderer fault must not cost the build an iteration.
+    _plan = built.get("plan") if isinstance(built, dict) else None
+    if _plan:
+        try:
+            from etl.http_request import (validate_plan as _vp, to_script as _ts,
+                                          target_of as _tgt)
+            _steps = _vp(_plan)
+            _rendered = _ts(_steps, canary=built.get("canary"))
+            _m, _u = _tgt(_steps)
+            _poc_trace(state["run_id"], "synth_plan_rendered",
+                       response=_rendered[:1200],
+                       extra={"steps": len(_steps), "target_method": _m,
+                              "target_url": _u,
+                              "replaced_model_command": bool(built.get("command"))})
+            built = {**built, "command": _rendered, "plan": _steps}
+        except Exception as _pe:  # noqa: BLE001
+            _poc_trace(state["run_id"], "synth_plan_rejected",
+                       response=str(_pe)[:400],
+                       extra={"kept": "the model's own command"})
+            built = {**built, "plan": None}
     # ENHANCEMENT 1: seed the loop with a command auto-assembled from a KNOWN
     # recipe. Precedence: a per-CVE exploit spec (endpoint+vector+payload, for
     # unauth web CVEs) first, then a command built from confirmed-probe facts.
@@ -1701,6 +1739,10 @@ def node_synth(state: BuildPocState) -> Dict[str, Any]:
         logging.debug("confirmed-command assembly failed: %s", e)
     return {"built": built,
             "command": built["command"], "assertion": built["assertion"],
+        # The structured plan behind the command, when synth produced one.
+        # Read by the pre-dispatch probe so it does not have to re-parse the
+        # rendered command to find out what is being attacked.
+        "plan": built.get("plan"),
             "canary": built.get("canary"), "origin_family": built.get("origin_family"),
             "llm_model": built.get("llm_model"),
             "metrics": built.get("metrics") or {}}
@@ -1773,6 +1815,9 @@ def node_run_refine(state: BuildPocState) -> Dict[str, Any]:
         canary=built.get("canary"), origin_family=built.get("origin_family"),
         llm_model=built.get("llm_model"),
         model=state.get("model"),
+        # The structured plan behind the first command, so the pre-dispatch
+        # probe reads the declared target instead of inferring it.
+        plan=built.get("plan"),
         recon_source_used=state.get("recon_source"),
         # Hand arjun's live findings + any operator-supplied focused URLs
         # (BuildPocBody.focused_urls) to the escalation path, which runs a
@@ -2257,13 +2302,19 @@ def node_save_store(state: BuildPocState) -> Dict[str, Any]:
             summary = _summarize_build_trace(entries)
             hint_text = _derive_auto_hint(summary)
             if hint_text:
-                hid = _auto_save_recon_hint(state["cve"], state["ip"], state["port"],
-                                             hint_text, state.get("eid"))
+                # The stored text can differ from the derived text: the save path
+                # carries forward mechanism verdicts proven on earlier builds
+                # against this target. Trace what was STORED.
+                hid, stored = _auto_save_recon_hint(state["cve"], state["ip"],
+                                                    state["port"], hint_text,
+                                                    state.get("eid"))
                 if hid:
                     _poc_trace(state["run_id"], "auto_hint_saved",
                                response=f"persisted auto-hint {hid} for next rebuild "
-                                        f"({len(hint_text)} chars from prior recon)",
-                               extra={"hint_id": str(hid), "hint_len": len(hint_text)})
+                                        f"({len(stored)} chars; {len(hint_text)} derived "
+                                        f"from this build)",
+                               extra={"hint_id": str(hid), "hint_len": len(stored),
+                                      "derived_len": len(hint_text)})
         except Exception:  # noqa: BLE001
             pass
     return {"exploit_store_id": store_id}
@@ -2292,11 +2343,41 @@ def node_tool_handoff(state: BuildPocState) -> Dict[str, Any]:
         return {}
     if not tools:
         return {}
+    # ── PROOF vs RELEASE ───────────────────────────────────────────────────
+    #
+    # Proving a CVE and exploiting it are different jobs. Proof needs the
+    # cheapest deterministic evidence that the vulnerability exists; sqlmap's
+    # job is enumeration and extraction, which belongs to a run the operator
+    # has RELEASED.
+    #
+    # Measured before splitting them: sqlmap ran 173 times in the proof path
+    # and confirmed 7 (4%) — and all 7 are simple form POSTs with a named
+    # parameter. Elsewhere it was handed a crippled technique set
+    # (`--technique=T` on 136 of 175, time-based only) or a broken request
+    # (42 of 175 carry an unexpanded $VAR such as `sid=$CSRF_TOKEN`, so the
+    # app rejects it before any injection test). It was spending build time
+    # on a question the proof path can now answer in one or two requests —
+    # see `anchored_error` / `anchored_boolean`.
+    #
+    # The DERIVED commands are still recorded, because they are what a
+    # released run executes. Only the execution moves.
+    #
+    # BUILD_POC_RUN_TOOLS=true restores the old behaviour. Phase two is not
+    # wired yet, so this is reversible without a rebuild while that lands.
+    _run_tools = os.environ.get("BUILD_POC_RUN_TOOLS", "false").strip().lower() \
+        in ("1", "true", "yes", "on")
     tested = []
     for te in tools:
         entry = {"tool": te["tool"], "class": te["class"],
                  "command": te.get("command"), "available": None,
                  "ran": False, "confirmed": False}
+        if te.get("command") and not _run_tools:
+            entry["refusal"] = ("not run in the proof path — sqlmap and friends "
+                                "belong to a released exploitation run; the "
+                                "command is recorded for it")
+            entry["deferred_to_release"] = True
+            tested.append(entry)
+            break
         if te.get("command"):
             try:
                 v = _run_tool_validation(state["ip"], state["port"], te,
@@ -2307,6 +2388,26 @@ def node_tool_handoff(state: BuildPocState) -> Dict[str, Any]:
                               "command": v.get("command")})
             except Exception as e:  # noqa: BLE001
                 entry["refusal"] = f"validation error: {e}"
+            # RECORD IT AS A SCAN. sqlmap has run 173 times through this path
+            # and `tool_executions` held zero rows for it, because the handoff
+            # dispatches the tool directly rather than through the recorded
+            # route. Every one of those runs was invisible to scan history,
+            # the monitor and any audit view — so "any sqlmap run should be
+            # tracked in the scans" was simply not true.
+            #
+            # Fire-and-forget: a bookkeeping failure must never cost a build.
+            try:
+                from api import _record_tool_execution as _rte
+                _rte(tool=entry["tool"], command=entry.get("command") or "",
+                     target=state["ip"], port=state.get("port"),
+                     service=entry.get("class"),
+                     status=("completed" if entry.get("ran") else "skipped"),
+                     exit_code=(0 if entry.get("confirmed") else 1),
+                     output=(entry.get("refusal") or
+                             ("confirmed" if entry.get("confirmed") else "not confirmed")))
+            except Exception as _rex:  # noqa: BLE001
+                logging.debug("tool_executions record failed for %s: %s",
+                              entry["tool"], _rex)
             tested.append(entry)
             break  # bounded: test ONE tool per build
         tested.append(entry)

@@ -70,10 +70,34 @@ def _declared(assertion, canary) -> bool:
 
 
 def anchored_echo(assertion, canary) -> bool:
-    """The original rule: the assertion requires the canary we injected."""
+    """The original rule: the assertion requires the canary we injected.
+
+    For an ECHO proof the canary IS the proof, so `_declared` alone does not
+    stand here: an assertion may CARRY the canary as metadata while matching
+    on something else entirely, and then the declaration is unfounded.
+
+    Observed 2026-10-20 on CVE-2024-34070, stored as a verified PoC:
+
+        command   = echo 'REFUSED: cannot provide exploit PoC'
+        assertion = {"canary": "POCz2c556557da", "cve_anchored": true,
+                     "expect_regex": "REFUSED"}
+
+    The model declined to write an exploit, the refusal text became the
+    command, an assertion was built that matches that text, and because the
+    canary rode along in a sibling field `_declared` said "anchored". The run
+    proved only that `echo` works.
+
+    So: a non-empty regex that does not mention the canary REFUTES the
+    declaration for this kind. An empty regex leaves nothing to contradict it
+    (timing and file_content proofs legitimately carry no canary regex, and
+    they are handled by their own anchors anyway).
+    """
     if not canary:
         return False
-    return _declared(assertion, canary) or canary in _regex_of(assertion)
+    rx = _regex_of(assertion)
+    if canary in rx:
+        return True
+    return _declared(assertion, canary) and not rx
 
 
 def anchored_oob(assertion, canary) -> bool:
@@ -86,8 +110,214 @@ def anchored_oob(assertion, canary) -> bool:
         return False
     rx = _regex_of(assertion)
     if not any(m in rx for m in _OOB_MARKERS):
-        return _declared(assertion, canary)
+        # No sink marker in the regex, so the declaration is all there is —
+        # and it only stands when there is no regex to contradict it. An
+        # assertion matching on something unrelated while CARRYING the canary
+        # in a sibling field is the same unfounded self-declaration that let
+        # `echo 'REFUSED: ...'` be stored as a verified PoC (see
+        # anchored_echo). Same rule, same reason.
+        return _declared(assertion, canary) and not rx
     return canary in rx or _declared(assertion, canary)
+
+
+#: DB error fragments that only a database emits. A page can contain the words
+#: "error" or "syntax"; it cannot contain MySQL's own parser message unless a
+#: database produced it. Keyed by engine so the proof names which one answered.
+#:
+#: Deliberately conservative and literal: a loose pattern here would let a
+#: generic 500 page anchor a SQLi proof, which is the failure mode this whole
+#: file exists to prevent.
+DB_ERROR_SIGNATURES = {
+    "mysql": (
+        "You have an error in your SQL syntax",
+        "check the manual that corresponds to your MySQL server version",
+        "supplied argument is not a valid MySQL result",
+        "mysql_fetch_array()",
+        "MySQLSyntaxErrorException",
+    ),
+    "postgres": (
+        "PG::SyntaxError",
+        "unterminated quoted string at or near",
+        "syntax error at or near",
+        "PSQLException",
+    ),
+    "mssql": (
+        "Unclosed quotation mark after the character string",
+        "Incorrect syntax near",
+        "System.Data.SqlClient.SqlException",
+    ),
+    "oracle": (
+        "ORA-00933",
+        "ORA-01756",
+        "quoted string not properly terminated",
+    ),
+    "sqlite": (
+        "SQLite3::SQLException",
+        "sqlite3.OperationalError",
+        "unrecognized token:",
+    ),
+}
+
+
+def db_error_engine(text) -> Optional[str]:
+    """Which engine emitted this, or None. Used by the anchor and reportable."""
+    t = str(text or "")
+    if not t:
+        return None
+    for engine, sigs in DB_ERROR_SIGNATURES.items():
+        for sig in sigs:
+            if sig.lower() in t.lower():
+                return engine
+    return None
+
+
+def anchored_error(assertion, command, canary=None) -> bool:
+    """The assertion requires a DB parser error that the command provoked.
+
+    The cheapest certain SQLi proof: one request. A database syntax error
+    naming the engine proves attacker input reached the SQL parser — nothing
+    but a database emits `You have an error in your SQL syntax`.
+
+    Two halves, same reasoning as `anchored_file_content`: the assertion must
+    require the signature, AND the command must carry something that would
+    provoke it. A page that happens to contain the words is not proof, and a
+    broken-quote payload with no assertion on the result proves nothing was
+    observed.
+
+    Why this matters here: the sqli class could only prove by `timing`, and
+    the archive has 920 `latency_too_fast` rows — a SLEEP that returned
+    instantly, i.e. the payload never reached the parser. An error-based proof
+    answers the SAME question (did the input reach the parser?) in one request
+    and with no dependence on how fast the target answers.
+    """
+    rx = _regex_of(assertion)
+    if not rx:
+        return False
+    if db_error_engine(rx) is None:
+        return False
+    # The command has to contain a syntax-breaking payload. An unbalanced
+    # quote or comment introducer is what provokes the parser; without one the
+    # error was already there and is pre-existing state, not this exploit's
+    # effect.
+    cmd = str(command or "")
+    if not cmd:
+        return False
+    provokers = ("'", '"', "--", "/*", ";", "%27", "%22")
+    return any(p in cmd for p in provokers)
+
+
+#: What a rendered `differential` step prints. BOTH branches are emitted by
+#: `etl/http_request._differential_lines` and nothing else writes the pair, so
+#: a command containing both really does compare two responses — an
+#: `echo 'DIFFERENTIAL-CONFIRMED'` carries only one and cannot fake it.
+DIFFERENTIAL_MARKERS = ("DIFFERENTIAL-CONFIRMED", "DIFFERENTIAL-ABSENT")
+
+
+def _command_runs_a_differential(command) -> bool:
+    """Did this command actually issue and compare a pair?"""
+    c = str(command or "")
+    return all(m in c for m in DIFFERENTIAL_MARKERS)
+
+
+def anchored_boolean(assertion, command, canary=None) -> bool:
+    """The assertion requires two responses to DIFFER.
+
+    A boolean proof is a differential: `' AND 1=1--` and `' AND 1=2--` give
+    different answers only if the database EVALUATED the expression. Two
+    requests, deterministic, and — unlike timing — immune to a slow target or
+    a WAF with a fixed delay, which are the two things that make a latency
+    verdict unreliable and that TIMING_CONFIRM_DELTA_SEC exists to work
+    around.
+
+    Anchored on the DIFFERENTIAL, never on a single response. "The page
+    rendered" is not evidence; "these two requests, differing only in a
+    boolean, produced different output" is. So the assertion must declare
+    both arms — a lone regex cannot anchor this kind, by construction.
+    """
+    a = assertion or {}
+
+    # FORM 1: assert on the marker the differential step prints.
+    #
+    # This exists because the first form was unreachable in practice. Synth
+    # asks for an `assertion`, and boolean's template said "(no assertion —
+    # the differential STEP carries the proof)" — which gives a model thinking
+    # in assertions nothing to return. Timing was then the only blind-capable
+    # kind WITH an assertion shape, so it won by default: on CVE-2024-4443 the
+    # model produced `{"min_seconds": 5}` while its own failure analysis said
+    # "boolean-based blind sqli on same endpoint — mysql sleep may be disabled
+    # or filtered". It knew the right move and had no shape to express it.
+    #
+    # Gated on the command actually running a differential, the same two-halves
+    # rule as `anchored_error`: the assertion must require the marker AND the
+    # command must be able to produce it. The marker is printed only when the
+    # two TARGET responses differ, so it is evidence, not decoration.
+    rx = _regex_of(assertion)
+    if rx and DIFFERENTIAL_MARKERS[0] in rx:
+        return _command_runs_a_differential(command)
+
+    # FORM 2: the assertion declares the pair itself.
+    diff = a.get("differential")
+    if not isinstance(diff, dict):
+        return False
+    true_arm = diff.get("true")
+    false_arm = diff.get("false")
+    if not (true_arm and false_arm):
+        return False
+    # The arms must actually be different payloads: asserting that identical
+    # requests differ is either a flake or a fabricated proof.
+    if str(true_arm).strip() == str(false_arm).strip():
+        return False
+    return bool(diff.get("must_differ"))
+
+
+def anchored_status_change(assertion, command, canary=None) -> bool:
+    """A DIFFERENCE between two requests — the same shape as `boolean`.
+
+    The guidance for this kind already says it: "send the honest value and the
+    attack value and assert on what differs; a 200 alone proves nothing,
+    because the honest request returns 200 too." That is a differential, so it
+    anchors on one.
+
+    9 classes declared `status_change` with NO anchor function behind it
+    (auth-bypass, idor, csrf, ldap-injection, open-redirect, xpath-injection,
+    hpp, privilege-escalation, nosql-injection). They fell through to the
+    self-declaration path, which means `cve_anchored: true` was their entire
+    verification — the same unfounded-declaration shape that let a model's
+    refusal be stored as a verified PoC on 2026-10-20.
+    """
+    return anchored_boolean(assertion, command, canary)
+
+
+def anchored_side_effect(assertion, command, canary=None) -> bool:
+    """State that CHANGED, observed by a FOLLOW-UP READ.
+
+    Two halves, and both are necessary:
+
+    * The assertion must require THIS run's canary. "State changed" is only
+      provable if we can name what it changed to; a generic success string
+      could describe state that was already there. The canary is how the
+      exploit names its own effect.
+    * The command must actually READ BACK. A single request that returns 200
+      proves nothing — the guidance says so directly: "The request causing the
+      effect usually returns a perfectly ordinary 200." Without a second
+      request there is nothing that observed the change.
+
+    8 classes declared `side_effect` with no anchor (upload, deserialization,
+    privilege-escalation, csrf, prototype-pollution, host-header-injection,
+    smtp-injection, format-string).
+    """
+    if not canary:
+        return False
+    if canary not in _regex_of(assertion):
+        return False
+    cmd = str(command or "")
+    if not cmd:
+        return False
+    # A follow-up read: a second request-issuing invocation, or a plan with
+    # more than one step. Counting the tool is cruder than parsing and cannot
+    # be fooled the other way — one request can never look like two.
+    reads = sum(cmd.lower().count(t) for t in ("curl ", "wget ", "http "))
+    return reads >= 2
 
 
 def anchored_timing(assertion, verdict_method) -> bool:
@@ -135,6 +365,40 @@ def anchored_file_content(assertion, command, signatures) -> bool:
     return False
 
 
+#: Tools that actually reach the target. A command built only from shell
+#: builtins contacts nothing, so whatever it "proves" came from this host.
+_TARGET_CONTACT = (
+    "curl", "wget", "nc ", "ncat", "netcat", "socat", "openssl s_client",
+    "python", "python3", "perl", "ruby", "php", "java", "nmap", "masscan",
+    "nuclei", "sqlmap", "ffuf", "gobuster", "feroxbuster", "katana", "httpx",
+    "hydra", "medusa", "msfconsole", "msfvenom", "ssh ", "ftp ", "telnet",
+    "smbclient", "redis-cli", "mysql", "psql", "mongo", "ldapsearch", "dig",
+    "host ", "nslookup", "wfuzz", "arjun", "whatweb", "nikto", "zap-cli",
+)
+
+
+def proof_requires_target(command) -> bool:
+    """Could this command have learned anything from the target?
+
+    A PoC whose command never contacts the target cannot prove a
+    vulnerability in it, whatever its assertion matches. `echo 'REFUSED: ...'`
+    satisfies `expect_regex: "REFUSED"` perfectly and demonstrates nothing —
+    it was stored as a verified PoC on 2026-10-20.
+
+    Deliberately a WHITELIST of contacting tools rather than a blacklist of
+    builtins: a new builtin would silently pass a blacklist, where a new tool
+    missing from this list only costs a refusal the operator can see and fix.
+    Fail-SAFE, not fail-open, because the output of this decides whether
+    something is recorded as a proven exploit.
+
+    Empty or unparseable command -> False: nothing is not a proof.
+    """
+    c = str(command or "").lower()
+    if not c.strip():
+        return False
+    return any(t in c for t in _TARGET_CONTACT)
+
+
 def is_anchored(assertion, canary, *, proof_kinds=None, command=None,
                 verdict_method=None, signatures=None) -> tuple:
     """(anchored, why).
@@ -143,12 +407,37 @@ def is_anchored(assertion, canary, *, proof_kinds=None, command=None,
     original canary rule exactly, so an unknown class cannot become verifiable
     by accident.
     """
+    # No contact with the target, no proof about the target. Checked FIRST and
+    # for every proof kind: an assertion cannot earn an anchor that the
+    # command's own reach makes impossible. `command` is optional on this
+    # signature, so an absent one skips the check rather than refusing — the
+    # callers that decide "verified" all pass it.
+    if command is not None and not proof_requires_target(command):
+        return False, ("the command never contacts the target "
+                       "(no request-issuing tool in it), so nothing it "
+                       "matched can be evidence about the target")
+
     kinds = [str(k) for k in (proof_kinds or [])]
     if not kinds:
         ok = anchored_echo(assertion, canary)
         return ok, ("canary in the assertion" if ok
                     else "no proof kind known and no canary in the assertion")
 
+    # Cheapest and most certain first. An error or boolean proof answers the
+    # same question timing does — did the input reach the SQL parser? — in one
+    # or two requests, with no dependence on how fast the target answers.
+    if "error" in kinds and anchored_error(assertion, command, canary):
+        return True, ("error: the assertion requires a %s parser error the "
+                      "command provokes" % (db_error_engine(_regex_of(assertion)),))
+    if "boolean" in kinds and anchored_boolean(assertion, command, canary):
+        return True, ("boolean: the proof is a differential — two requests "
+                      "differing only in a boolean produced different output")
+    if "status_change" in kinds and anchored_status_change(assertion, command, canary):
+        return True, ("status_change: the proof is a differential — two requests "
+                      "differing only in the attack value produced different output")
+    if "side_effect" in kinds and anchored_side_effect(assertion, command, canary):
+        return True, ("side_effect: the assertion requires this run's canary and "
+                      "the command reads the state back")
     if "echo" in kinds and anchored_echo(assertion, canary):
         return True, "echo: the injected canary is required by the assertion"
     if "oob" in kinds and anchored_oob(assertion, canary):
@@ -158,7 +447,29 @@ def is_anchored(assertion, canary, *, proof_kinds=None, command=None,
     if "file_content" in kinds and anchored_file_content(assertion, command, signatures):
         return True, ("file_content: the assertion is a known content signature "
                       "and the command requested that file")
+    # The generic self-declaration. It is the DESIGNED route for the proof
+    # kinds where the canary cannot appear in the regex: a file read asserts
+    # on content only the real file has (CLAUDE.md: a returning canary there
+    # is a REFUTATION), and a blind-timing proof has nothing to reflect into.
+    # For those, a content signature plus a declared canary is the correct
+    # shape and must keep anchoring.
+    #
+    # For a REFLECTION kind it is not. If `echo` or `oob` is on the table and
+    # neither anchor matched, the canary was supposed to be in the regex and
+    # is not, so the declaration is claiming an anchor it does not have —
+    # which is how `{"canary": "...", "cve_anchored": true,
+    # "expect_regex": "REFUSED"}` came to be stored as a verified PoC.
+    # Kinds where the canary is SUPPOSED to be in the regex, so a declaration
+    # that matches on something else is unfounded. status_change and
+    # side_effect now have their own anchors above, so reaching the generic
+    # declaration with either on the table means that anchor already said no.
+    _reflection = any(k in kinds for k in ("echo", "oob", "side_effect"))
     if _declared(assertion, canary):
+        if _reflection and _regex_of(assertion):
+            return False, ("the assertion declares itself anchored with this "
+                           "run's canary but matches on %r, which does not "
+                           "contain it — for a reflection proof the canary IS "
+                           "the proof" % (_regex_of(assertion)[:60],))
         return True, "the assertion declares itself anchored with this run's canary"
 
     # Say which kind was expected — "not anchored" with no reason is what made

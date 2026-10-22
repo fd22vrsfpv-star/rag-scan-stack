@@ -60,7 +60,23 @@ export default function FollowUps() {
   // Seed free-text search from a deep link (e.g. Attack Map "Follow-ups" → ?search=<host>).
   const [searchFilter, setSearchFilter] = useState(() => searchParams.get('search') || '')
   const [groupBy, setGroupBy] = useState<'none' | 'title' | 'target'>('title')
-  const [filterByEngagement, setFilterByEngagement] = useState(false)
+  // Engagement-ONLY is the default, per the read-path rule: a listing shown
+  // under an engagement header must be that engagement's data unless the
+  // operator explicitly opts into the cross-engagement view (and the toggle
+  // says which mode is active). It defaulted to All Engagements, so selecting
+  // an engagement changed the header and nothing else -- 5080 rows across 7
+  // engagements under one engagement's name. Persisted so a refresh does not
+  // silently widen the view back out.
+  const [filterByEngagement, setFilterByEngagement] = useState(() => {
+    try {
+      const v = localStorage.getItem('followups.filterByEngagement')
+      return v === null ? true : v === 'true'
+    } catch { return true }
+  })
+  useEffect(() => {
+    try { localStorage.setItem('followups.filterByEngagement', String(filterByEngagement)) }
+    catch { /* fail-soft: a private window must not break the page */ }
+  }, [filterByEngagement])
   // Customer-hosted sites (the `customer_scope` list) are hosts the
   // mark-customer-sites flow moved OUT of the scanned scope — part of the
   // engagement's data, but not ours to test or report on. They were 1310 of
@@ -519,8 +535,8 @@ export default function FollowUps() {
           <button
             onClick={() => setFilterByEngagement(!filterByEngagement)}
             title={filterByEngagement
-              ? 'Showing only follow-ups linked to the selected engagement. A follow-up links when its target matches an asset in that engagement by IP or hostname; unattributed rows are hidden.'
-              : 'Showing follow-ups from every engagement, including ones not linked to any.'}
+              ? 'Default. Showing only follow-ups linked to the selected engagement, and a selected scope list resolves to THIS engagement\u2019s list of that name (plus global ones). A follow-up links when its target matches an asset in that engagement by IP or hostname; unattributed rows are hidden.'
+              : 'Showing follow-ups from every engagement, including ones not linked to any. A selected scope list also matches every engagement\u2019s list of that name \u2014 scope names are not unique.'}
             className={cn(
               'h-7 px-2 text-xs rounded border',
               filterByEngagement

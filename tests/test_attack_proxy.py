@@ -300,3 +300,80 @@ def test_a_picked_node_never_falls_back_to_another():
 
 def test_a_picked_node_lookup_error_is_not_a_different_node():
     assert ap.node_proxy(_factory({}, raise_on="connect"), "n") == (None, None)
+
+
+# -- 8. the own-network exemption must be REACHABLE with zero nodes ---------
+#
+# Found 2026-10-19. `allow_direct_on_own_network` exists precisely so a lab or
+# CVE-Bench target can run when no external node can reach it — its docstring
+# says "The lab and CVE-Bench targets live on exactly these networks". But the
+# `is_on_own_network` check lived only inside `if target:` AFTER the per-node
+# subnet match, which the `not rows` branch returns before ever reaching. With
+# zero online nodes, resolve() returned `no_node_online`, and enforce() exempts
+# only `unreachable_by_any_node` — so the exemption could never apply in the
+# one case it was written for.
+#
+# Cost, observed on CVE-2024-37849: the benchmark follow-through aborted with
+# `[proxy] REFUSED ... no online node exposes a SOCKS port` after 146
+# blind-timing probes, so a verified blind SQLi scored no database_access goal.
+
+NO_NODES: dict = {}            # the SELECT over remote_nodes returns nothing
+
+
+def test_own_network_target_is_exempt_when_no_node_is_online():
+    d = ap.resolve(_factory(NO_NODES), target="172.19.150.4", own_cidrs=LAB)
+    assert d.source == "unreachable_by_any_node", (
+        f"got {d.source!r}/{d.reason!r} — an own-network target with no nodes "
+        "must be eligible for the exemption, not a plain no_node_online")
+    # ...and enforce() therefore lets it run direct.
+    assert ap.enforce(d, required=True, allow_own_network=True) is d
+
+
+def test_an_off_network_target_with_no_nodes_is_still_refused():
+    """The exemption must not widen into 'no nodes means anything goes'."""
+    d = ap.resolve(_factory(NO_NODES), target="203.0.113.10", own_cidrs=LAB)
+    assert d.source == "no_node_online"
+    with pytest.raises(ap.ProxyRequired):
+        ap.enforce(d, required=True, allow_own_network=True)
+
+
+def test_no_target_with_no_nodes_is_still_refused():
+    """Nothing to compare against is not an own-network target."""
+    d = ap.resolve(_factory(NO_NODES), target=None, own_cidrs=LAB)
+    assert d.source == "no_node_online"
+    with pytest.raises(ap.ProxyRequired):
+        ap.enforce(d, required=True, allow_own_network=True)
+
+
+def test_an_unreadable_node_list_is_not_an_exemption():
+    """COULD NOT ASK is not ASKED-AND-NONE-ONLINE.
+
+    `rows is None` means the query failed, which says nothing about the
+    target. Treating it as 'no nodes, so go direct' is this repo's recurring
+    unreachable-is-not-absent bug: a probe that could not run filed as a
+    negative result. Three outcomes, not two.
+    """
+    d = ap.resolve(_factory({}, raise_on="connect"), target="172.19.150.4",
+                   own_cidrs=LAB)
+    assert d.source == "no_node_online"
+    assert "could not be read" in d.reason
+    with pytest.raises(ap.ProxyRequired):
+        ap.enforce(d, required=True, allow_own_network=True)
+
+
+def test_the_exemption_still_obeys_its_setting_with_no_nodes():
+    """`exploit_proxy.allow_direct_local = false` must still refuse."""
+    d = ap.resolve(_factory(NO_NODES), target="172.19.150.4", own_cidrs=LAB)
+    with pytest.raises(ap.ProxyRequired) as e:
+        ap.enforce(d, required=True, allow_own_network=False)
+    assert "allow_direct_local" in str(e.value)
+
+
+def test_a_reachable_node_still_wins_over_the_exemption():
+    """The exemption is a last resort, not a preference. When a node IS on the
+    target's subnet it must be used — going direct would drop the egress
+    attribution a node provides."""
+    rows = {"FROM remote_nodes": [("lab_node", 10199, "172.19.150.1")]}
+    d = ap.resolve(_factory(rows), target="172.19.150.4", own_cidrs=LAB)
+    assert d.proxy_url and d.source == "same_subnet", (
+        f"got {d.source!r} — a node on the target's subnet must be preferred")

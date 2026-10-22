@@ -142,7 +142,9 @@ def test_graph_runs_local_source_recon_ahead_of_other_segments():
 # ── knowledge file + loader contract ──────────────────────────────────────
 
 def test_research_patterns_yaml_is_well_formed_and_has_no_literal_payload():
-    import yaml
+    # Skip, not fail: a missing optional dependency means "cannot run here",
+    # and a suite that mixes that with "broken" hides real breakage.
+    yaml = pytest.importorskip("yaml")
     d = yaml.safe_load(YAML.read_text())
     ids = {p["id"] for p in d["patterns"]}
     for must in ("read_local_target_source", "json_body_at_root_is_self_documentation",
@@ -294,7 +296,9 @@ def test_graph_returns_requirements_instead_of_refining():
 
 
 def test_contract_pattern_is_in_the_knowledge_file():
-    import yaml
+    # Skip, not fail: a missing optional dependency means "cannot run here",
+    # and a suite that mixes that with "broken" hides real breakage.
+    yaml = pytest.importorskip("yaml")
     d = yaml.safe_load(YAML.read_text())
     p = next(x for x in d["patterns"] if x["id"] == "artifact_requirements_contract")
     for word in ("needed", "have", "follow_ups", "skill_candidate", "follow_up_items", "build_poc_artifact_required"):
@@ -309,6 +313,13 @@ def test_contract_pattern_is_in_the_knowledge_file():
 # `etl/vuln_classes.py` rather than stubbed, so this exercises the shipped
 # table: the gate and the test cannot disagree about what `lfi` is.
 def _vc_predicates():
+    # etl/vuln_classes.py sets `yaml = None` on ImportError and then loads an
+    # EMPTY class table, so without PyYAML every predicate quietly answers
+    # False and these tests fail as if the gate were broken. Skip instead:
+    # "cannot run here" is not "broken". (The silent degradation itself is an
+    # open item — a knowledge file that could not be read must not answer the
+    # same as one that says "no requirements".)
+    pytest.importorskip("yaml")
     import sys as _sys
     from pathlib import Path as _P
     _sys.path.insert(0, str(_P(__file__).resolve().parent.parent))
@@ -421,7 +432,9 @@ def test_gather_manifest_is_recorded_and_injected():
 
 
 def test_gather_pattern_is_in_the_knowledge_file():
-    import yaml
+    # Skip, not fail: a missing optional dependency means "cannot run here",
+    # and a suite that mixes that with "broken" hides real breakage.
+    yaml = pytest.importorskip("yaml")
     d = yaml.safe_load(YAML.read_text())
     p = next(x for x in d["patterns"] if x["id"] == "gather_check_before_payload")
     for word in ("endpoint", "method", "OOB", "strict", "gather_incomplete", "build_poc_gather_check"):
@@ -781,7 +794,7 @@ def test_unsourced_credential_detector():
     r3 = f("curl -u admin:admin http://t/x", known_values=[])
     assert r3["kinds"] == ["basic"] and r3["unsourced"]
     body = _func_src("_run_refine_poc")
-    assert '"credential_unsourced"' in body and body.find("_command_credential_unsourced(command") < body.find("_prerun_payload_probe(ip, port, command")
+    assert '"credential_unsourced"' in body and body.find("_command_credential_unsourced(command") < body.find("_prerun_payload_probe(")
 
 
 # ── round-9 fixes: the login path the deep pass depends on ────────────────
