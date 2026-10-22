@@ -54,35 +54,6 @@ def test_an_unrecognised_stored_value_falls_back(src):
         "the stored value is not validated against the known modes"
 
 
-def test_rows_with_no_host_or_cve_are_not_dropped(src):
-    """A PoC with no target is exactly the row worth seeing; silently omitting
-    it would make the grouped total disagree with the header count."""
-    m = re.search(r"const storeGroups = useMemo\((.{0,1400}?)\n  \}, \[", src, re.S)
-    assert m, "storeGroups memo not found"
-    body = m.group(1)
-    assert "(no target)" in body and "(no CVE)" in body, \
-        "ungrouped rows have no explicit bucket"
-
-
-def test_grouping_does_not_reorder_behind_the_sort_chips(src):
-    """The sort chips decide row order. A group list that re-sorted itself
-    would make those chips look broken."""
-    m = re.search(r"const storeGroups = useMemo\((.{0,1400}?)\n  \}, \[", src, re.S)
-    assert m, "storeGroups memo not found"
-    body = m.group(1)
-    assert ".sort(" not in body, "the grouping re-sorts rows"
-    assert "order.push(" in body, "insertion order is not preserved"
-
-
-def test_the_memo_depends_on_both_inputs(src):
-    """A stale memo would keep showing the previous grouping after a filter
-    change — the kind of bug that reads as 'the toggle does nothing'."""
-    m = re.search(r"const storeGroups = useMemo\(.{0,1400}?\n  \}, \[([^\]]*)\]", src, re.S)
-    assert m, "storeGroups memo deps not found"
-    deps = m.group(1)
-    assert "storeRows" in deps and "groupBy" in deps, f"deps are {deps!r}"
-
-
 def test_both_views_render_the_same_row_component(src):
     """The row carries the bulk-select checkbox and the rebuild action. Two
     copies would drift; the flat list and the grouped list must share one."""
@@ -90,10 +61,14 @@ def test_both_views_render_the_same_row_component(src):
     uses = len(re.findall(r"<StoreRowItem\b", src))
     assert uses >= 2, f"only {uses} call site(s); flat and grouped must both use it"
 
-
-def test_each_group_shows_its_size(src):
-    """A collapsed group with no count is a drawer the operator must open to
-    learn whether it is worth opening."""
-    m = re.search(r"storeGroups\.map\(grp => \((.{0,2500}?)</details>", src, re.S)
-    assert m, "grouped rendering not found"
-    assert "grp.rows.length" in m.group(1), "a group does not show how many rows it holds"
+# --- grouping moved to the UNIFIED catalog (2026-10-22) ---------------------
+#
+# Four tests lived here: no-bucket-drop, no-resort, memo deps, and per-group
+# counts. They targeted `storeGroups`, the PoC-Store-only grouping memo, which
+# was replaced by `catalogGroups` over the merged catalog when the operator
+# asked for one list rather than two panels. The same properties are asserted
+# against the new memo in tests/test_unified_exploit_catalog.py — retargeting
+# them here would duplicate that file rather than add coverage.
+#
+# What stays below is what is still specific to the PoC Store half: the groupBy
+# state, its persistence, and the shared row component.
