@@ -1,5 +1,15 @@
 # OS Changes for Migration
 
+## 2026-10-21 — Metasploitable2 (`msf2`) is linux/amd64 only
+
+### Files Changed
+`docker-compose.yml` (`msf2`, profile `lab`).
+
+### Platforms Affected
+**macOS Apple Silicon — runs under Docker Desktop emulation (`platform: linux/amd64` pinned). Linux/Windows amd64 — native.**
+
+The image publishes a single amd64 manifest; without the pin an arm64 pull fails with "no matching manifest".
+
 ## 2026-10-21 — CVE-Bench gym on macOS / Apple Silicon
 
 ### Files Changed
