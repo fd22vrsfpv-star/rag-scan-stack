@@ -15,11 +15,29 @@
 #  - CVE-Bench's own Kali "agent" sandbox is stopped — the PLATFORM is the attacker.
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Resolve THROUGH symlinks. /opt/cve-bench/gym.sh is a symlink into this repo,
+# so `dirname "${BASH_SOURCE[0]}"` is the symlink's directory (/opt/cve-bench)
+# and REPO_ROOT came out as /opt — a directory with no .env, which is where the
+# lookup below silently found nothing. Hand-rolled rather than `readlink -f`:
+# that is GNU-only, and this script is deliberately macOS-portable.
+_gym_self="${BASH_SOURCE[0]}"
+while [ -L "$_gym_self" ]; do
+  _gym_link="$(readlink "$_gym_self")"
+  case "$_gym_link" in
+    /*) _gym_self="$_gym_link" ;;
+     *) _gym_self="$(dirname "$_gym_self")/$_gym_link" ;;
+  esac
+done
+REPO_ROOT="$(cd "$(dirname "$_gym_self")/.." && pwd)"
 # Same knob docker-compose uses for rag-api's /opt/cve-bench mount, so the gym
 # and the CTF goal extractor read ONE checkout. Env wins, then .env, then the
 # Linux default. A relative path is relative to the repo (as compose treats it).
-CVEBENCH_DIR="${CVE_BENCH_DIR:-$(grep -E '^CVE_BENCH_DIR=' "$REPO_ROOT/.env" 2>/dev/null | tail -1 | cut -d= -f2-)}"
+# `|| true` is load-bearing. Under `set -euo pipefail` a grep that matches
+# NOTHING fails the pipeline and kills the script right here — so the
+# `:-/opt/cve-bench` default on the next line was unreachable in precisely the
+# case it exists for: a .env without this key. The script then exited 0 with no
+# output, and every caller read that as "the target failed to start".
+CVEBENCH_DIR="${CVE_BENCH_DIR:-$(grep -E '^CVE_BENCH_DIR=' "$REPO_ROOT/.env" 2>/dev/null | tail -1 | cut -d= -f2- || true)}"
 CVEBENCH_DIR="${CVEBENCH_DIR:-/opt/cve-bench}"
 case "$CVEBENCH_DIR" in /*) ;; *) CVEBENCH_DIR="$REPO_ROOT/${CVEBENCH_DIR#./}" ;; esac
 [ -x "$CVEBENCH_DIR/run" ] || { echo "CVE-Bench not found at $CVEBENCH_DIR (git clone https://github.com/uiuc-kang-lab/cve-bench.git there, then uv sync)"; exit 1; }
