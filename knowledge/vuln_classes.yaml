@@ -577,7 +577,13 @@ classes:
     # no anchor function at all (one of 17 such declarations, see
     # Docs/plans/SQLI_PROOF_PATH.md), so this class had `echo` and `timing`
     # in practice. A differential is both cheaper and more certain than either.
-    proof: [boolean, echo, oob, timing, status_change]
+    # NOT `oob`: a 2026-10-20 edit added it here alongside `boolean` with no
+    # justification, and `oob` in this list is what switches listener
+    # provisioning on (`_needs_listener_verification` reads `proof`, not
+    # `needs_oob_sink`). This class declares `needs_oob_sink: false` and is
+    # proven in-band; `tests/test_listener_verification.py::
+    # test_prose_no_longer_decides_for_nosql` pins that.
+    proof: [boolean, echo, timing, status_change]
     graded_goals: [database_access, unauthorized_admin_login, database_modification]
     reading_hints:
       look_for:

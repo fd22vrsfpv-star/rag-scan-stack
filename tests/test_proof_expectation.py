@@ -188,9 +188,28 @@ class TestPromptWiring:
         assert tail, "the chain has no final else — every class gets a canary"
         src = " ".join(ast.unparse(x) for x in tail)
         assert "_assert_tmpl" in src
-        assert "canary" not in src, (
-            "a class that cannot echo is still handed a canary assertion "
-            "template: %s" % src)
+        # The per-kind DECISION moved into `_assert_template_for` (2026-10-20),
+        # so the old check — "the word `canary` must not appear here" — now
+        # fails on the ARGUMENT NAME in `_assert_template_for(vc, canary)`
+        # while the behaviour is correct. Asserting the absent substring would
+        # mean reverting a fix to satisfy a guard.
+        #
+        # What still has to hold at THIS call site is that the branch delegates
+        # to the selector and passes the class, so the choice is made in the one
+        # place that is executable-tested. The invariant itself — a class that
+        # cannot echo is never handed a canary template — is proven by RUNNING
+        # the selector in tests/test_sqli_proof_path.py
+        # (test_a_file_read_is_never_offered_a_canary,
+        #  test_sqli_is_offered_the_error_template_not_the_canary_one,
+        #  test_an_unknown_class_gets_no_invented_shape), which a source
+        # substring could never establish.
+        call = next((n for n in ast.walk(ast.parse(src))
+                     if isinstance(n, ast.Call)
+                     and getattr(n.func, "id", "") == "_assert_template_for"), None)
+        assert call is not None, (
+            "the non-echo branch no longer delegates to _assert_template_for — "
+            "it is picking a template inline, where nothing executes it: %s" % src)
+        assert call.args, "_assert_template_for is called without the vuln class"
 
     def test_the_rationale_no_longer_presupposes_injection(self):
         fn = ast.get_source_segment(SRC, _node("_synthesize_cve_poc")) or ""
