@@ -1010,7 +1010,26 @@ def _resolve_engagement_id(explicit: Optional[str] = None) -> Optional[str]:
 HOST_EXPR_FOLLOWUP = "followup_target_host(follow_up_items.target)"
 
 
-def _scope_exclusion_clause(host_expr: str, exclude_scope: Optional[str]):
+def _scope_engagement_predicate(engagement_id: Optional[str]):
+    """(sql_fragment, params) narrowing a `scope_targets st` subquery to one
+    engagement's lists plus the global (NULL-engagement) ones.
+
+    A scope NAME is not unique: `unknown_scope` exists under five engagements
+    and `not_in_scope` under two, so matching on the name alone consults every
+    engagement's list at once. NULL-engagement rows stay in deliberately --
+    `not_in_scope` is the cross-engagement deny-list by design, and legacy rows
+    predate attribution.
+
+    Returns ("", []) for None so a caller that genuinely wants every
+    engagement's list (an explicit all-engagements view) appends nothing.
+    """
+    if not engagement_id:
+        return "", []
+    return " AND (st.engagement_id = %s::uuid OR st.engagement_id IS NULL)", [engagement_id]
+
+
+def _scope_exclusion_clause(host_expr: str, exclude_scope: Optional[str],
+                            engagement_id: Optional[str] = None):
     """(sql_fragment, params) dropping rows whose host sits in a named scope list.
 
     WHY: `customer_scope` holds customer-hosted sites that the mark-customer-sites
@@ -1025,18 +1044,29 @@ def _scope_exclusion_clause(host_expr: str, exclude_scope: Optional[str]):
     the blank-target guard elsewhere: a matcher that is too generous silently
     removes the operator's real work.
 
+    SCOPE NAMES ARE PER-ENGAGEMENT, so `engagement_id` narrows which list of
+    that name is consulted: the engagement's own rows, plus the NULL-engagement
+    rows which are global by design (`not_in_scope` is the cross-engagement
+    deny-list, and pre-attribution rows are intentionally visible everywhere --
+    the same `= %s OR IS NULL` pattern the listing endpoints use). Without it,
+    `unknown_scope` exists under FIVE engagements and they all answer at once.
+    Passing None keeps the old name-only behaviour, which is what an explicit
+    all-engagements view wants.
+
     Returns ("", []) when nothing is excluded, so callers can append
     unconditionally.
     """
     names = [n.strip() for n in (exclude_scope or "").split(",") if n.strip()]
     if not names:
         return "", []
+    eng_sql, eng_params = _scope_engagement_predicate(engagement_id)
     return (f"NOT EXISTS (SELECT 1 FROM scope_targets st "
-            f"WHERE st.name = ANY(%s) AND st.target <> '' "
-            f"AND lower(st.target) = {host_expr})"), [names]
+            f"WHERE st.name = ANY(%s) AND st.target <> ''{eng_sql} "
+            f"AND lower(st.target) = {host_expr})"), [names, *eng_params]
 
 
-def _scope_inclusion_clause(host_expr: str, scope_name: Optional[str]):
+def _scope_inclusion_clause(host_expr: str, scope_name: Optional[str],
+                            engagement_id: Optional[str] = None):
     """(sql_fragment, params) keeping ONLY rows whose host sits in a named scope.
 
     The inverse of _scope_exclusion_clause, and the one that was missing. The
@@ -1054,16 +1084,24 @@ def _scope_inclusion_clause(host_expr: str, scope_name: Optional[str]):
     filter is a VIEW, not an authorization boundary (etl/scope_gate.py is that,
     and it fails closed).
 
+    SCOPE NAMES COLLIDE ACROSS ENGAGEMENTS -- `unknown_scope` exists under five
+    of them on the live database -- so `engagement_id` picks whose list to read
+    (that engagement's rows plus the global NULL-engagement ones). Measured
+    2026-10-19: filtering follow-ups by `unknown_scope` returned 11 rows, and
+    10 of them matched ONLY because another engagement owns a list of the same
+    name.
+
     Returns ("", []) when no scope is selected, so callers can append
     unconditionally.
     """
     name = (scope_name or "").strip()
     if not name:
         return "", []
+    eng_sql, eng_params = _scope_engagement_predicate(engagement_id)
     return (f"EXISTS (SELECT 1 FROM scope_targets st "
-            f"WHERE st.name = %s AND st.target <> '' "
+            f"WHERE st.name = %s AND st.target <> ''{eng_sql} "
             f"AND ({host_expr} = lower(st.target) "
-            f"     OR {host_expr} LIKE '%%.' || lower(st.target)))"), [name]
+            f"     OR {host_expr} LIKE '%%.' || lower(st.target)))"), [name, *eng_params]
 
 
 def _validate_engagement_uuid(eid: Optional[str]) -> Optional[str]:
@@ -14198,7 +14236,54 @@ def get_detected_software(
         except Exception:
             pass
 
-    return {"count": len(rows), "summary": summary, "items": rows}
+    # A PRODUCT ROLLUP, unbounded by the row limit above.
+    #
+    # Operator: "in the redteam engagement I do not see php flagged as a
+    # technology" — and PHP was on 49 host/port pairs there. The row list ends
+    # `ORDER BY ip ... LIMIT 2000` against 3516 deduplicated rows, so 43% were
+    # dropped and WHICH technologies survived was decided by host IP sort
+    # order. "Is PHP present?" is a question about products, not hosts, so it
+    # gets a product-shaped answer: 274 distinct products in that engagement,
+    # every one of them returned.
+    products = []
+    try:
+        with get_db() as _c2, _c2.cursor(cursor_factory=RealDictCursor) as _cur2:
+            _cur2.execute(f"""
+                SELECT product,
+                       COUNT(DISTINCT ip)::int        AS host_count,
+                       COUNT(DISTINCT version)::int   AS version_count,
+                       MIN(first_seen)                AS first_seen,
+                       MAX(last_seen)                 AS last_seen,
+                       ARRAY_AGG(DISTINCT source)     AS sources,
+                       ARRAY_AGG(DISTINCT version)
+                         FILTER (WHERE version IS NOT NULL AND version <> '')
+                                                      AS versions
+                FROM detected_software
+                {where_sql}
+                GROUP BY product
+                ORDER BY COUNT(DISTINCT ip) DESC, product
+            """, params[:-1])          # same filters, no LIMIT
+            products = [dict(r) for r in (_cur2.fetchall() or [])]
+    except Exception as _pe:  # noqa: BLE001
+        # Fail soft: the row list is still useful without the rollup, but say
+        # so rather than returning an empty list that reads as "no products".
+        logging.warning("software product rollup failed: %s", _pe)
+        products = None
+
+    # Truncation must be VISIBLE. The summary block above counts the full
+    # deduplicated set while `items` is capped, so the header and the table
+    # disagreed by design and nothing said which number was which.
+    _total = None
+    try:
+        _total = int((summary or {}).get("total_detections") or 0) or None
+    except Exception:  # noqa: BLE001
+        _total = None
+    return {"count": len(rows), "summary": summary, "items": rows,
+            "products": products,
+            "products_available": products is not None,
+            "total_rows": _total,
+            "truncated": bool(_total and len(rows) < _total),
+            "limit": limit}
 
 
 # ── ExploitDB / Searchsploit Management ──────────────────────────────────────
@@ -17812,7 +17897,11 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
     # answer. None means 'not observed' and is never read as 'open'.
     ep_probe_status = None
     cands = []
-    for m in _re.finditer(r"(PRIMARY|ALT\d):\s+class=(\S+)\s+endpoint=(\S+)\s+param=(\S+)", plan_text or ""):
+    # `class=(.+?)` not `(\S+)`: the strategist writes human class names and a
+    # two-word one — `class=Auth Bypass` — made the WHOLE candidate fail to
+    # match, so PRIMARY silently had no verdict and the correct endpoint was
+    # never probed. `endpoint=` anchors the non-greedy run.
+    for m in _re.finditer(r"(PRIMARY|ALT\d):\s+class=(.+?)\s+endpoint=(\S+)\s+param=(\S+)", plan_text or ""):
         cands.append({"label": m.group(1), "endpoint": m.group(3), "param": m.group(4)})
     verdicts = plan_verdicts or {}
     # Feed the miner every source we hold, not just advisory prose: the fix
@@ -17876,6 +17965,19 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
         except Exception as _ce:  # noqa: BLE001
             logging.debug("confirmed endpoint lookup skipped: %s", _ce)
         probe_list += _confirmed_eps
+        # THE STRATEGIST'S OWN ENDPOINTS. `cands` is the analysed form of the
+        # advisory — it names where the bug IS — but it was consulted only
+        # through `verdicts` above, so a candidate the verifier could not
+        # confirm was dropped entirely and never probed. On CVE-2023-37999 that
+        # left the correct /wp-admin/admin-ajax.php out of the candidate list
+        # and a font-awesome CSS file won the ranking on HTTP 200. Seeded early
+        # so they fall inside the 30-path cap, and ranked as advisory below.
+        # An unconfirmable endpoint is "not yet proven", not "wrong".
+        _plan_eps = [c["endpoint"] for c in cands
+                     if isinstance(c.get("endpoint"), str)
+                     and c["endpoint"].startswith("/")
+                     and c["endpoint"] != "/" and "{" not in c["endpoint"]]
+        probe_list += _plan_eps
         for _mp in mined["paths"]:
             probe_list += _path_variants(_mp)          # advisory path, then prefix-stripped
         probe_list += [c for c in (spec.get("candidate_endpoints") or []) if isinstance(c, str) and c.startswith("/") and c != "/"]
@@ -17979,6 +18081,8 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
                                 _note = " (probe-confirmed by the readiness gate)"
                             elif ep in mined["paths"]:
                                 _note = " (advisory/derived path)"
+                            elif ep in _plan_eps:
+                                _note = " (strategist plan endpoint)"
                             elif any(ep in _path_variants(x) for x in mined["paths"]):
                                 _note = " (prefix-stripped advisory path)"
                             elif ep in _scan_paths:
@@ -18002,7 +18106,10 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
                             # A 3xx on the advisory path is still the right
                             # endpoint behind a login redirect — it beats a
                             # 200 on some unrelated page.
+                            # A strategist endpoint counts as documented: the
+                            # plan IS the advisory, read and analysed.
                             _adv = (ep in mined["paths"]
+                                    or ep in _plan_eps
                                     or any(ep in _path_variants(x)
                                            for x in mined["paths"]))
                             _conf = ep in _confirmed_eps
@@ -20108,6 +20215,41 @@ except Exception as _cge:  # noqa: BLE001
 # of assumed, and the canary paragraph is emitted only for classes that can
 # actually echo.
 _PROOF_KIND_INSTRUCTION = {
+    # Cheapest and most certain FIRST — this dict's order is the order the
+    # guidance lists them, and the model takes the first one it can satisfy.
+    # Added 2026-10-20 for sqli/nosql; see Docs/plans/SQLI_PROOF_PATH.md. The
+    # archive had 1,215 timing attempts go wrong against 305 that landed, so
+    # timing being the FIRST thing a blind SQLi was offered was the problem.
+    "error": [
+        "DB ERROR - the cheapest certain proof, and it needs ONE request. Break",
+        "the quoting (a stray ' or \") so the database's own parser complains.",
+        "Nothing but a database emits its parser error, so the error IS the",
+        "proof that your input reached the SQL parser. Assert on the engine's",
+        "message, not on the word 'error' - a 500 page is not a database.",
+        '  assertion: {"expect_regex": "You have an error in your SQL syntax"}',
+        "  (or the Postgres / MSSQL / Oracle / SQLite equivalent)",
+    ],
+    "boolean": [
+        "BOOLEAN - two requests differing ONLY in a true/false condition. If the",
+        "database evaluated your expression the responses differ; if it did not,",
+        "they are identical. No clock, so a slow target or a WAF delay cannot",
+        "fake it - which is exactly what makes timing unreliable.",
+        "  Use a `differential` STEP in the plan, which issues both and compares",
+        "  them for you:",
+        '    {"id": "bool", "differential": {',
+        '       "true":  {"request": {... AND 1=1 ...}},',
+        '       "false": {"request": {... AND 1=2 ...}},',
+        '       "must_differ": "body"}}',
+        "  Pick a condition whose TRUE arm returns a row and whose FALSE arm",
+        "  returns none - `AND 1=1` / `AND 1=2` on an existing record is the",
+        "  standard pair. Do NOT write the pair as shell.",
+        "  The step prints DIFFERENTIAL-CONFIRMED when the two responses differ,",
+        "  so assert on that:",
+        '    assertion: {"expect_regex": "DIFFERENTIAL-CONFIRMED"}',
+        "  USE THIS FOR A BLIND SQLi. It needs no visible output and no clock,",
+        "  so it works where error-based cannot (the app hides DB errors) and",
+        "  is not fooled by a slow target or a filtered SLEEP.",
+    ],
     "echo": [
         "ECHO - this class CAN reflect an injected marker, so anchor the proof",
         "to it: make the exploit cause the exact marker CANARY to appear as a",
@@ -20137,7 +20279,14 @@ _PROOF_KIND_INSTRUCTION = {
         "elapsed to scale. So the command MUST carry a real delay payload",
         "(SLEEP / pg_sleep / WAITFOR / BENCHMARK); a min_seconds assertion over",
         "a command with no payload is rewritten before dispatch.",
+        "  Use a `timing` STEP so the clock arithmetic is generated for you -",
+        "  writing `START=$(date +%s)` by hand is where timing exploits lose",
+        "  their quoting:",
+        '    {"id": "blind", "timing": {"expect_seconds": 5,',
+        '       "request": {... OR SLEEP(5) ...}}}',
         '  assertion: {"min_seconds": 5}',
+        "  TRY error and boolean FIRST. Timing is the last resort: it is the",
+        "  only proof whose verdict depends on how fast the target answers.",
     ],
     "status_change": [
         "STATUS CHANGE - the proof is a DIFFERENCE between two requests, not a",
@@ -20168,6 +20317,56 @@ def _target_shape_from_guidance(text):
     o, r = m.group(1), m.group(2)
     return (None if o.upper().startswith("UNKNOWN") else o,
             None if r.upper().startswith("UNKNOWN") else r)
+
+
+#: The assertion TEMPLATE for each proof kind — the concrete shape the model
+#: is told to return. It must agree with the per-kind guidance, because when
+#: they disagree the model follows the template: it sits in the return-shape
+#: instruction while the guidance is prose further up.
+#:
+#: That disagreement is why the error and boolean anchors fired ZERO times
+#: after they shipped (2026-10-20). `_assert_tmpl` jumped to the canary shape
+#: whenever `echo` appeared ANYWHERE in a class's kinds, and sqli declares
+#: echo — so every sqli build was handed a canary template beside guidance
+#: asking for an error proof. Every assertion in that run came back
+#: `{cve_anchored, expect_regex}`.
+_PROOF_KIND_ASSERT_TMPL = {
+    "error":   '{"expect_regex": "You have an error in your SQL syntax"}',
+    "boolean": '{"expect_regex": "DIFFERENTIAL-CONFIRMED"}',
+    "echo":    '{"expect_regex": "CANARY"}',
+    "oob":     '{"expect_regex": "SINK-VERIFIED"}',
+    "timing":  '{"min_seconds": 5, "max_seconds": 30, "canary": "CANARY"}',
+}
+
+
+def _assert_template_for(vuln_class, canary) -> str:
+    """The template for the class's FIRST (cheapest) declared proof kind.
+
+    The kind list is ordered cheapest-and-most-certain first, which is the
+    whole point of ordering it — so the template follows that order rather
+    than preferring whichever kind happens to be mentioned.
+
+    Unknown class, or no template for its first kind: fall back to naming the
+    guidance instead of inventing a shape. Offering a canary template to a
+    class that cannot echo is how a file read ended up with an assertion it
+    could never satisfy.
+    """
+    kinds = _vc_proof_kinds(vuln_class) or []
+    if not kinds:
+        return "<the assertion matching the proof kind above>"
+    # The FIRST kind, and ONLY the first. Falling through to a later kind is
+    # how `lfi` (['file_content', 'echo']) got handed a canary template on
+    # 2026-10-20: there is no file_content template, so the loop skipped to
+    # echo. For a file read the canary is a REFUTATION — if it comes back, the
+    # app echoed your input instead of disclosing a file. Offering that shape
+    # is the exact mistake this selector replaced.
+    #
+    # No template for the cheapest kind means we have nothing honest to
+    # suggest, so the guidance stands on its own.
+    t = _PROOF_KIND_ASSERT_TMPL.get(kinds[0])
+    if not t:
+        return "<the assertion matching the proof kind above>"
+    return t.replace("CANARY", str(canary or ""))
 
 
 def _proof_expectation_block(vuln_class, canary, os=None, runtime=None) -> str:
@@ -20823,6 +21022,13 @@ def _poc_trace(run_id, phase, iteration=0, prompt=None, response=None,
              "assertion_passed": assertion_passed, "llm_model": llm_model}
     if extra:
         entry.update(extra)
+    # Name the producing tool on the row itself, so the JSONL on disk is
+    # self-describing. An explicit source_tool in `extra` wins — the emitting
+    # node knows better than a phase-name lookup.
+    if not entry.get("source_tool"):
+        _st = _poc_source_tool(phase)
+        if _st:
+            entry["source_tool"] = _st
     try:
         with open(_poc_run_file(run_id), "a") as f:
             f.write(_j.dumps(entry) + "\n")
@@ -20830,8 +21036,100 @@ def _poc_trace(run_id, phase, iteration=0, prompt=None, response=None,
         logging.debug("poc_trace write failed: %s", e)
 
 
+# ── Which tool produced a trace row ──────────────────────────────────────────
+# `response` is a generic text slot: the recon nodes write deterministic tool
+# output into it and the LLM nodes write model output into it. The viewer
+# therefore labelled a 1,600-char OpenAPI dump "llm response", and a reader had
+# no way to tell WHICH tool found something without grepping the phase string
+# back to its `_poc_trace` call in build_poc_graph.py.
+#
+# `llm_model` already marks the model calls. This names the tool behind the
+# deterministic ones. Only sources that are genuinely known go in — a phase
+# that is not listed falls back to showing its phase name, which is honest,
+# where a guessed tool would not be.
+_POC_SOURCE_TOOL_EXACT = {
+    "recon:port_sweep":              "TCP-connect port sweep (socket + httpx)",
+    "recon:waf":                     "WAF canary probes (httpx)",
+    "recon:waf_characterize":        "WAF characterisation probes (httpx)",
+    "recon:basic":                   "landing page + robots.txt (httpx)",
+    "recon:response_mine":           "info-disclosure probes (httpx)",
+    "recon:openapi":                 "OpenAPI/Swagger spec fetch (httpx)",
+    "recon:arjun":                   "Arjun (parameter discovery)",
+    "recon:playwright":              "Playwright (headless browser crawl)",
+    "recon:local_source":            "challenge source on disk (filesystem read)",
+    "recon:discovered_knowledge":    "prior-build facts (database)",
+    "recon:product_identification":  "product fingerprint (httpx + database)",
+    "recon:product_cve_enumeration": "CVE enumeration for product (database)",
+    "recon:auto_login":              "mined-credential login attempt (httpx)",
+    "recon:auth_establish":          "session establishment (httpx login)",
+    "recon:access_enumeration":      "post-access enumeration (httpx, authenticated)",
+    "recon:precondition_enumeration": "precondition probes (httpx)",
+    "recon:plan_verified":           "strategist-plan probes (httpx)",
+    "recon:strategist_validation":   "strategist-plan probes (httpx)",
+    # LLM-backed, listed for completeness: the UI prefers `llm_model` when it
+    # is set, so this only shows on a row where the model went unrecorded —
+    # and "LLM strategist" is still the honest answer to what produced it.
+    "recon:strategist":              "LLM strategist (plan, not a probe)",
+    "escalation:path_discovery":     "path-discovery probes (httpx)",
+    "prerun_probe":                  "pre-dispatch probe (httpx)",
+    "prerun_tool_check":             "runner binary check (kali-listener)",
+    "oob_sink_check":                "out-of-band sink reachability (httpx)",
+    "known_good_probe":              "known-good control probe (httpx)",
+    "inband_diff":                   "in-band response diff (httpx)",
+    "benchmark_oracle":              "CVE-Bench oracle endpoint",
+    "benchmark_oracle_win":          "CVE-Bench oracle endpoint",
+    "nuclei_template_available":     "nuclei template index",
+    "tool_handoff":                  "derived tool commands (sqlmap / nuclei)",
+    "run":                           "kali-listener (command execution)",
+    "correct_run":                   "kali-listener (command execution)",
+    "latency_confirmation":          "kali-listener (scaled timing re-run)",
+    "embed_enum_facts":              "embedder service",
+    "error_memory_recorded":         "error memory (database)",
+    "auto_autopage":                 "post-ex primitive skill (autopage)",
+    # Graph bookkeeping, not a finding. A `node` row is LangGraph's own
+    # task_result event: node name, whether it RAISED, and wall-clock. "ok"
+    # means "did not throw" — never "succeeded" or "found something", which is
+    # exactly how `failure_analysis ok in 1.35s` gets misread as an analysis
+    # that produced a result.
+    "node":                          "LangGraph (node finished — ok = did not raise)",
+    "node_path":                     "LangGraph (nodes executed, in order)",
+    "graph_state_summary":           "LangGraph (final state field census)",
+    "resume":                        "LangGraph (resumed from checkpoint)",
+}
+
+# Prefix rules for phase FAMILIES that share one source. Longest prefix wins,
+# so this tuple stays ordered most-specific first; `recon:zap_active` must not
+# be decided by the `recon:zap` row.
+_POC_SOURCE_TOOL_PREFIX = (
+    ("escalation:zap_focused_active", "ZAP (focused active scan)"),
+    ("escalation:zap_active",         "ZAP (active scan)"),
+    ("recon:zap_active",              "ZAP (spider + passive + active scan)"),
+    ("recon:zap",                     "ZAP (spider + passive alerts)"),
+    ("deep_recon",                    "deep recon (gated probes)"),
+    ("primitive:",                    "post-ex primitive skill"),
+    ("recall_",                       "RAG retrieval (pgvector)"),
+)
+
+
+def _poc_source_tool(phase) -> Optional[str]:
+    """Name the tool/source behind a trace phase, or None when it is not known.
+
+    None is a real answer: the caller then shows the phase name rather than a
+    guess. Used both when writing a row and when serving an older trace that
+    predates the stamp, so one table covers past and future logs."""
+    if not isinstance(phase, str) or not phase:
+        return None
+    hit = _POC_SOURCE_TOOL_EXACT.get(phase)
+    if hit:
+        return hit
+    for prefix, tool in _POC_SOURCE_TOOL_PREFIX:
+        if phase.startswith(prefix):
+            return tool
+    return None
+
+
 _POC_TRACE_STD_KEYS = frozenset(("ts", "epoch", "phase", "iteration", "prompt", "response",
-                                 "run_output", "assertion_passed", "llm_model"))
+                                 "run_output", "assertion_passed", "llm_model", "source_tool"))
 
 
 def _trace_extra(entry: dict) -> dict:
@@ -21563,7 +21861,13 @@ def _poc_target_family(command):
     CVE's endpoint onto an easier/adjacent finding can be detected. Best-effort: reads the
     first URL in the shell string. Returns (host, seg) or ('', '')."""
     import re as _re
-    m = _re.search(r"https?://([^/\s'\"]+)(/[^\s'\"?]*)?", command or "")
+    # The path stops at shell metacharacters as well as whitespace/quotes/`?`.
+    # Without `)` `;` and a backtick, a URL that ends a command substitution —
+    # `_r1=$(curl ... https://host/)` — parses as path "/)", which never equals
+    # the CVE endpoint "/", so the drift gate refused every such command before
+    # dispatch. The structured-plan renderer emits exactly that shape, so the
+    # platform was rejecting its own commands.
+    m = _re.search(r"https?://([^/\s'\"?);`&|<>]+)(/[^\s'\"?);`&|<>]*)?", command or "")
     if not m:
         return ("", "")
     host = (m.group(1) or "").lower()
@@ -23248,6 +23552,12 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None,
     # effect of the exploit, so "success" proves the CVE's real effect (an admin the
     # exploit CREATED, a value it WROTE/REFLECTED) — not a pre-existing/adjacent state.
     canary = _poc_canary()
+    # Bound BEFORE the response loop. `plan` is assigned only inside a
+    # branch that depends on what the model returned, while the return
+    # reads it unconditionally — the use-before-assignment shape that took
+    # the trace summariser down this morning. pyflakes does not flag
+    # conditional binding, so this initialiser is the guard.
+    plan = None
     # What this class can REALISTICALLY prove. The prompt used to mandate
     # inject-and-reflect for every class and pre-fill a canary assertion; for a
     # file read, an out-of-band class or an IDOR that is an instruction the
@@ -23263,12 +23573,12 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None,
             f"reflect it), then read it back so it shows in the output. Do NOT "
             f"match a value that could already exist.\n")
         _assert_tmpl = '{"expect_regex": "%s"}' % canary
-    elif "echo" in _vc_proof_kinds(_listener_vc):
-        _assert_tmpl = '{"expect_regex": "%s"}' % canary
     else:
-        # No canary template for a class that cannot echo — offering one is how
-        # a file read ended up with an assertion it could never satisfy.
-        _assert_tmpl = "<the assertion matching the proof kind above>"
+        # Follow the class's FIRST declared proof kind, not whichever kind is
+        # merely present. `echo` appears in most classes' lists, so preferring
+        # it made the template contradict the guidance for every class whose
+        # cheapest proof is something else — see _assert_template_for.
+        _assert_tmpl = _assert_template_for(_listener_vc, canary)
     # Shape improvement #2: when the GHSA advisory included a verbatim PoC
     # snippet, hand it to synth as a KNOWN_GOOD_SHAPE block. The LLM should
     # mimic the shape (method/path/body-key/content-type) and only vary the
@@ -23318,6 +23628,76 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None,
         logging.debug("description read failed for %s: %s", cve, _rde)
         _req = {}
     _class_block = (_class_block or "") + _requirements_block(_req)
+    # ── STRUCTURED REQUEST PLAN ────────────────────────────────────────────
+    #
+    # Asking for a shell STRING is upstream of most pre-dispatch failures:
+    # 444 shell_syntax refusals in the trace archive are a quoting decision
+    # made inside a JSON field, and the old prompt actively taught the shape
+    # that causes them ("chain curl calls with ; and shell vars"). A plan is
+    # data: the model says WHAT to send and etl/http_request.py decides how to
+    # spell it, so quoting stops being a decision anyone makes.
+    #
+    # `command` stays in the contract and stays accepted. Plenty of exploits
+    # are not a sequence of HTTP requests — sqlmap, nc, a python one-liner —
+    # and a plan cannot express those. The model picks.
+    #
+    # Kill switch: BUILD_POC_STRUCTURED_PLAN=false restores the old contract
+    # verbatim, including the chaining hint. Same reasoning as
+    # LITELLM_ROUTER_ENABLED — a prompt change alters what the model produces
+    # on EVERY build, so it has to be revertible without a rebuild.
+    _structured = os.environ.get("BUILD_POC_STRUCTURED_PLAN", "true").strip().lower() \
+        in ("1", "true", "yes", "on")
+    if _structured:
+        _plan_field = ('"plan": [{"id": "<short name>", "request": {"method": "POST", '
+                       '"url": "<absolute url>", "headers": {}, "body": "<raw body>" '
+                       'OR "json": {}, "cookies": {}}, '
+                       '"extract": {"<name>": {"grep_p": "<PCRE with \\\\K>"}}}], ')
+        # The two step shapes that exist so a proof need not be hand-written
+        # shell. A boolean proof is two requests and a comparison; a timing
+        # proof is clock arithmetic. Neither fits a plain request, which is why
+        # they were falling back to `command` and losing their quoting there.
+        _plan_field += ('// a step may instead be '
+                        '{"id":"x","differential":{"true":{"request":{...}},'
+                        '"false":{"request":{...}},"must_differ":"body"}} '
+                        'or {"id":"x","timing":{"expect_seconds":5,'
+                        '"request":{...}}} ')
+        _plan_block = (
+            "PREFER `plan` over `command`. A plan is a list of HTTP steps as DATA — "
+            "you describe the request, the platform renders it. Do NOT escape "
+            "quotes, do NOT build a shell string, do NOT use shell variables: put "
+            "the literal payload in `body` and it is quoted correctly for you. "
+            f'Write this run\'s canary as the literal token {{{{CANARY}}}} — it is '
+            "substituted before the request is sent. Use one step per request; a "
+            "later step may carry \"wait_seconds\": N. Each step reports its own "
+            "result, so a failure names the step that failed. "
+            "To carry a CSRF token or session id from one step to the next, give "
+            "the earlier step an `extract`: a name plus `grep_p`, a PCRE whose "
+            "\\K marks where the value starts (e.g. "
+            "name=\"csrf_token\"\\s+value=\"\\K[^\"]+). Reference it in a later "
+            "step as {{<name>}} — the platform wires it up. Do NOT write "
+            "$VARIABLES or $(...) yourself. "
+            "For a BOOLEAN proof the `differential` goes INSIDE A STEP of the "
+            "plan, NOT in `assertion` — the step issues both requests and "
+            "compares them, so there is nothing left for an assertion to say. "
+            "For a BLIND TIMING proof use a `timing` step the same way (the "
+            "clock arithmetic is generated). Writing either as shell is where "
+            "those proofs lose their quoting. "
+            "Put the payload in `body` (`data` is accepted); an unrecognised "
+            "field is REFUSED, not ignored. "
+            "Use `command` INSTEAD of `plan` only when the exploit is not a "
+            "sequence of HTTP requests (sqlmap, nc, a python one-liner). "
+            "Never send both.\n")
+        _chain_hint = ("If the vuln needs a CSRF nonce/token or session, make it a "
+                       "SEPARATE EARLIER STEP with an `extract`, and reference the "
+                       "value as {{name}} — never chain shell commands or write "
+                       "$(curl ...). ")
+    else:
+        _plan_field = ""
+        _plan_block = ""
+        _chain_hint = ("If the vuln needs a CSRF nonce/token or session, FETCH it inline "
+                       "first (GET the page, extract the token with grep/sed, keep the "
+                       "cookie) then use it — chain curl calls with ; and shell vars. ")
+
     prompt = (f"AUTHORIZED lab pentest. Build a proof-of-concept for {cve} on {tgt} "
               f"({product or ''} {version or ''}).\n"
               f"CVE description: {details.get('description') or '(none)'}\n"
@@ -23329,13 +23709,12 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None,
               f"{_proof_block}"
               f"STAY ON {cve}'s specific vulnerability — do not pivot to an easier/adjacent "
               f"finding (e.g. generic user enumeration).\n"
-              f"Return ONE JSON object only: {{\"command\": \"<single shell command, prefer "
+              f"{_plan_block}"
+              f"Return ONE JSON object only: {{{_plan_field}\"command\": \"<single shell command, prefer "
               f"curl, that EXPLOITS {cve} against {tgt} and produces the proof described above>\", "
               f"\"assertion\": {_assert_tmpl}, "
               f"\"rationale\": \"<why this proves {cve}, and what the proof actually is>\"}}. "
-              f"If the vuln needs a CSRF nonce/token or session, FETCH it inline first (GET the "
-              f"page, extract the token with grep/sed, keep the cookie) then use it — chain curl "
-              f"calls with ; and shell vars. "
+              f"{_chain_hint}"
               f"TIMING-BASED EXPLOITS (blind time-based SQLi with SLEEP/pg_sleep/WAITFOR DELAY, "
               f"timing side-channels, slow-loris) often cannot inject a visible marker. For those, "
               f"set assertion to {{\"min_seconds\": N, \"max_seconds\": M, \"canary\": \"{canary}\"}} "
@@ -23379,6 +23758,22 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None,
                    extra={"model_requested": model, "ok": bool(last_res and last_res.get("ok")),
                           "error": last_err})
         obj = _poc_extract_json(text)
+        # A plan is accepted BEFORE a command: when the model sends both, the
+        # structured one is the one whose quoting we can guarantee. It is
+        # validated here so a malformed plan falls back to `command` in the
+        # same response rather than failing the build.
+        if obj and obj.get("plan"):
+            try:
+                from etl.http_request import validate_plan as _vp
+                plan = _vp(obj["plan"])
+                _poc_trace(run_id, "synth_plan_accepted",
+                           extra={"steps": len(plan),
+                                  "ids": [str(x.get("id") or i) for i, x in enumerate(plan, 1)],
+                                  "also_sent_command": bool(obj.get("command"))})
+            except Exception as _pe:  # noqa: BLE001
+                plan = None
+                _poc_trace(run_id, "synth_plan_invalid", response=str(_pe)[:400],
+                           extra={"falling_back_to": "command" if obj.get("command") else "nothing"})
         if obj and obj.get("command"):
             command = str(obj["command"]).strip()
             # Keep the anchor unless the LLM's own assertion also requires the canary.
@@ -23444,6 +23839,10 @@ def _synthesize_cve_poc(cve, ip, port, product, version, eid, run_id=None,
                             "augmented command with sink-verification tail and broadened assertion",
                    extra={"sink_url": sink_url})
     return {"command": command, "assertion": assertion, "rationale": rationale,
+            # The structured plan, when the model sent a renderable one.
+            # node_synth renders it into the command; the probe reads its
+            # declared target. None keeps every path exactly as it was.
+            "plan": plan,
             "synth_kind": synth_kind, "run_id": run_id, "canary": canary,
             "origin_family": _poc_target_family(command), "llm_model": llm_model,
             "metrics": metrics,
@@ -23500,6 +23899,10 @@ _LLM_REFUSAL_MARKERS = (
     "i will not", "i won't provide", "i'm sorry, but i cannot", "i am sorry, but i cannot",
     "cannot assist with", "cannot generate exploit", "refuse to generate",
     "unable to provide exploit", "as an ai", "i cannot write exploit",
+    # Bare forms. The list above all required a leading "i", so the model
+    # saying "REFUSED: cannot provide exploit PoC" matched nothing.
+    "cannot provide exploit", "cannot provide a poc", "refuse to provide",
+    "refused: cannot", "will not provide exploit", "cannot comply",
 )
 
 
@@ -23518,6 +23921,24 @@ def _poc_detect_llm_refusal(command):
     first_tok = (first[0] if first else "").rstrip(":,.").lower()
     if first_tok in ("refuse", "sorry", "unfortunately", "apologies"):
         return (True, command[:200])
+
+    # A refusal WRAPPED in a valid command. `echo 'REFUSED: cannot provide
+    # exploit PoC'` is syntactically fine shell whose first token is `echo`,
+    # so neither the first-token check above nor the dry-parse saw anything
+    # wrong — and an assertion built from that text matched it perfectly. It
+    # was stored as a verified PoC for CVE-2024-34070 on 2026-10-20.
+    #
+    # Only when the ENTIRE command is that echo: a conditional
+    # `curl ... && echo 'SINK: $CANARY'` is a legitimate and common shape, and
+    # refusing it would break every out-of-band proof.
+    _stripped = command.strip()
+    _m = _re_module.fullmatch(r"""(?:echo|printf)\s+(?:-[eEn]+\s+)?(['"])(.*)\1\s*""",
+                              _stripped, _re_module.S)
+    if _m:
+        _inner = _m.group(2).lower()
+        if any(mk in _inner for mk in _LLM_REFUSAL_MARKERS) or _inner.startswith("refused"):
+            return (True, _stripped[:200])
+
     lc = command.lower()
     for m in _LLM_REFUSAL_MARKERS:
         if m in lc:
@@ -24239,6 +24660,63 @@ def _repair_unmeasurable_timing_assertion(assertion, command, canary):
             True)
 
 
+# After this many `latency_too_fast` verdicts against the same target, the
+# timing MECHANISM is treated as dead and a min_seconds assertion is refused.
+_TIMING_DEAD_AT = int(os.environ.get("REFINE_TIMING_DEAD_AT") or 3)
+
+
+def _repair_dead_timing_mechanism(assertion, canary, latency_fails,
+                                  threshold=None):
+    """SIBLING of `_repair_unmeasurable_timing_assertion`.
+
+    That one handles a `min_seconds` assertion on a command carrying NO timing
+    payload — nothing to measure. This handles the opposite and more stubborn
+    case: the payload IS there, it IS dispatched, and the target answers fast
+    every single time. After enough of those the claim "this is a blind-timing
+    vulnerability" has been empirically refuted for this target, whatever the
+    advisory says.
+
+    Why this must be deterministic rather than advice: it was tried as advice
+    and failed on five independent builds. `_failure_analysis_lines` puts
+    "TIMING PROOF FAILED Nx ... DO NOT propose another min_seconds assertion"
+    in the prompt and the model proposes one anyway —
+
+      2026-10-21 solver, 3 rounds : warning present every round, min_seconds 28/73/58
+      2026-10-22 top-20, 4443     : warning present 10x, min_seconds 94x,
+                                    latency_too_fast 13x
+
+    CLAUDE.md already settles the principle for the timing confirmation and the
+    unmeasurable-assertion repair: the model is what produced the assertion, so
+    it is not the thing to ask about fixing it.
+
+    This also has to CLEAR the caller's timing mode. The anti-drift rule exists
+    to stop the loop walking away from a genuine blind-timing proof, and it
+    would otherwise re-force `min_seconds` on the very next iteration — so the
+    caller must stop treating this as a timing proof, not merely swap one
+    assertion. The return value says so.
+
+    The rewrite cannot manufacture a pass: `expect_regex: <canary>` succeeds
+    only if the canary actually comes back, landing on the existing canary path
+    (anchor -> anti-drift -> reflection guard) where "canary absent" is a clean
+    negative. With no canary there is nothing honest to offer, so the assertion
+    stands — never invent a regex, that is fabricating a proof.
+
+    Returns (assertion, repaired: bool).
+    """
+    thr = _TIMING_DEAD_AT if threshold is None else int(threshold)
+    if not isinstance(assertion, dict) or assertion.get("min_seconds") is None:
+        return assertion, False
+    if not canary:
+        return assertion, False
+    try:
+        if int(latency_fails or 0) < thr:
+            return assertion, False
+    except Exception:  # noqa: BLE001
+        return assertion, False
+    return ({"expect_regex": canary, "canary": canary, "cve_anchored": True},
+            True)
+
+
 # ── Refine-loop escalation ────────────────────────────────────────────────
 # A repeated OUTCOME is provably zero-information: the target answered the same
 # thing, so whatever the model changed never reached the vulnerable surface.
@@ -24943,7 +25421,20 @@ def _poc_shell_syntax_check(command, canary=None, assertion=None):
     # payload, so nothing the exploit did could ever reflect it. Catch the
     # token in both raw and percent-encoded form, before dispatch.
     import re as _re_ph
-    _ph = _re_ph.search(r"(?:\{|%7[Bb])\s*(CANARY|canary)[^}]*?(?:\}|%7[Dd])", command)
+    # Substitute the PLAN token first. `{{CANARY}}` is what the plan contract
+    # teaches (etl/http_request.CANARY_TOKEN), and a model that learned it
+    # there uses it in a plain `command` too — where nothing substitutes it,
+    # so the check below refused a command whose only fault was using the
+    # token we taught it.
+    if canary:
+        command = command.replace("{{CANARY}}", str(canary)).replace("{{canary}}", str(canary))
+    # A SHELL VARIABLE IS NOT A PLACEHOLDER. `${CANARY}` contains the
+    # characters `{CANARY}`, so this check fired on commands that correctly
+    # set `CANARY='POCz…'` and referenced it — 11 refusals on 2026-10-20
+    # alone, every one of them valid shell the shell would have expanded.
+    # A refusal of correct work reads as the model failing.
+    _ph = _re_ph.search(r"(?<!\$)(?:\{|%7[Bb])\s*(CANARY|canary)[^}]*?(?:\}|%7[Dd])",
+                        command)
     if _ph:
         return (False, f"unsubstituted canary placeholder {_ph.group(0)!r} in the "
                        "command — substitute the real canary string into the payload")
@@ -24980,6 +25471,55 @@ def _poc_shell_syntax_check(command, canary=None, assertion=None):
                            "(after -- or within /* */), where the server discards "
                            "it and it can never be reflected — place it in a "
                            "selected column or other reflected position")
+    # ── THE SHELL'S OWN PARSE — ADVISORY, NOT A REFUSAL ────────────────────
+    #
+    # Everything above is a heuristic. `shlex` models QUOTING but not shell
+    # GRAMMAR, and the `&&`/`;` split is a regex, so an unbalanced `(`, a
+    # quote spanning a separator or an unterminated heredoc all sail through —
+    # 117 commands in the trace archive reached the listener and died in the
+    # remote shell, 86 of them `"(" unexpected`. (Those predate the executor
+    # switching to bash on 2026-10-15; zero since. This is the belt to that
+    # fix's braces, and it catches the quoting class the dialect fix does not.)
+    #
+    # `bash -n` is the exact oracle for the SHELL lane: the same parser that
+    # will run the command, reading it without executing a single word.
+    # (Not shellcheck — a style linter that rejects plenty of legitimate
+    # pentest idiom. The question here is only "will this parse".)
+    #
+    # ADVISORY, because the measurement said so. Replaying every COMPLETE
+    # stored command through it: 23 of 1,368 commands that RAN FINE are
+    # rejected by bash (1.7%). They are the nested-quote `grep -oP` shapes
+    # that go down the PYTHON lane (`_curl_to_request` turns the curl into an
+    # HTTP request), where bash grammar never applies. And the classes do not
+    # separate — 15 of those 23 are "unexpected EOF while looking for
+    # matching", the same class as a genuine unterminated quote — so there is
+    # no error type that can be refused safely.
+    #
+    # Refusing would therefore block ~1.7% of working builds to catch a class
+    # that is already near-zero: the remote shell errors this was aimed at
+    # (117 historically, 86 of them `"(" unexpected`) stopped on 2026-10-15
+    # when the executor switched to bash, and there have been NONE since.
+    #
+    # So it reports. The error is carried back to the refine loop as feedback
+    # the model can act on, and the loop's own gates decide what to do.
+    #
+    # No shell=True and no interpolation: the command is an argv element, so
+    # nothing here can execute it. FAIL-OPEN on a missing bash or a timeout —
+    # a validator that cannot run must never read as "the command is bad".
+    try:
+        import subprocess as _sp_syn
+        _r = _sp_syn.run(["bash", "-n", "-c", command],
+                         capture_output=True, text=True, timeout=5)
+        if _r.returncode != 0:
+            _msg = (_r.stderr or "").strip().splitlines()
+            _msg = _msg[-1][:200] if _msg else "bash -n rejected the command"
+            # "advisory:" is the prefix the caller downgrades on — the command
+            # is still dispatched, and the parse error rides along as context.
+            return (True, f"advisory: bash -n could not parse this: {_msg}")
+    except FileNotFoundError:
+        pass          # no bash on this runner — heuristics already passed
+    except Exception:  # noqa: BLE001
+        pass          # timeout / OS error — never block on the validator
     return (True, "")
 
 
@@ -26276,6 +26816,11 @@ def _store_tentative_spec(cve, product, version, spec, verdict, source):
                 VALUES (%s,%s,%s,%s,%s::jsonb, false, 'tentative',
                         %s, %s, %s, %s, %s, %s::jsonb)
                 ON CONFLICT (cve) DO UPDATE SET
+                  product = CASE
+                      WHEN lower(coalesce(EXCLUDED.product,'')) NOT IN ('', 'unknown', 'none')
+                      THEN EXCLUDED.product
+                      ELSE public.derived_cve_specs.product END,
+                  vuln_class = coalesce(EXCLUDED.vuln_class, public.derived_cve_specs.vuln_class),
                   spec = EXCLUDED.spec, status = 'tentative',
                   verify_method = EXCLUDED.verify_method,
                   verify_evidence = EXCLUDED.verify_evidence,
@@ -26283,13 +26828,134 @@ def _store_tentative_spec(cve, product, version, spec, verdict, source):
                   attempts = EXCLUDED.attempts,
                   last_failure = EXCLUDED.last_failure,
                   refine_hints = EXCLUDED.refine_hints
-            """, (str(cve).upper(), product, version, spec.get("vuln_class"),
+            """, (str(cve).upper(), _spec_product(spec, product), version,
+                  spec.get("vuln_class"),
                   _json.dumps(spec), verdict.get("method"),
                   (verdict.get("evidence") or "")[:1000], source,
                   new_attempts, verdict.get("method"), _json.dumps(hints)))
             c.commit()
     except Exception as e:  # noqa: BLE001
         logging.debug("store tentative spec failed: %s", e)
+
+
+_PRODUCT_UNKNOWN = ("", "unknown", "none", "null", "n/a", "-")
+
+
+# Words that name a VULNERABILITY or a generic noun, never a product. The
+# prose patterns below happily match "in Blind XSS before ..." or "The Web
+# application", and a vuln class written into the product column is worse than
+# `unknown` because it reads as a real finding.
+_NOT_A_PRODUCT = {
+    "xss", "blind xss", "stored xss", "reflected xss", "sqli", "sql injection",
+    "rce", "lfi", "rfi", "ssrf", "csrf", "xxe", "idor", "ssti", "dos",
+    "the", "a", "an", "the web", "web", "the server", "server", "the client",
+    "the application", "application", "the plugin", "plugin", "the site",
+    "wordpress", "apache", "nginx", "php", "the admin", "admin", "the user",
+    "user", "the attacker", "attacker", "the request", "the response",
+}
+
+
+def _is_product_name(name):
+    """A mined string is a product only if it is not a vuln class or a generic
+    noun phrase. Returning `unknown` honestly beats writing "Blind XSS" into the
+    product column, where everything downstream would treat it as a component."""
+    n = " ".join(str(name or "").split()).strip(" .,;:")
+    if not n or len(n) < 2:
+        return False
+    low = n.lower()
+    if low in _NOT_A_PRODUCT:
+        return False
+    # "Blind XSS", "Stored SQLi" — a class word carrying a modifier.
+    if any(low.endswith(" " + w) or low == w
+           for w in ("xss", "sqli", "rce", "lfi", "ssrf", "csrf", "xxe",
+                     "injection", "traversal", "bypass", "escalation")):
+        return False
+    if low.startswith("the ") and low[4:] in _NOT_A_PRODUCT:
+        return False
+    return True
+
+
+def _mine_product_from_spec(spec):
+    """Dig the VULNERABLE COMPONENT out of the advisory prose the spec carries.
+
+    The deeper dig the operator asked for when the product lands at `unknown`:
+    the name is almost always sitting in the text we already fetched. For
+    CVE-2023-51483 the notes read "The WP Frontend Profile plugin (<=1.3.1)
+    contains an AJAX handler ..." while the product column said `unknown`.
+
+    Deterministic and offline — it reads text already in hand, so it costs
+    nothing and cannot be steered by a model. Returns "" when the prose does
+    not name a component, which is an honest answer and leaves the caller to
+    escalate.
+    """
+    import re as _re
+    if not isinstance(spec, dict):
+        return ""
+    blob = " ".join(str(spec.get(k) or "") for k in
+                    ("notes", "description", "title", "summary",
+                     "advisory_poc", "derived_vector"))
+    if not blob.strip():
+        return ""
+    pats = (
+        # "The Glowlogix WP Frontend Profile plugin", "the HT Mega plugin"
+        r"\b[Tt]he\s+([A-Z][\w.&/-]*(?:\s+[A-Z0-9][\w.&/-]*){0,4})\s+"
+        r"(?:WordPress\s+)?(?:plugin|extension|module|theme|add-?on)\b",
+        # "<Name> plugin for WordPress"
+        r"\b([A-Z][\w.&/-]*(?:\s+[A-Z0-9][\w.&/-]*){0,4})\s+"
+        r"(?:plugin|extension|module|theme)\s+for\b",
+        # "in <Name> before 1.2.3"
+        r"\bin\s+([A-Z][\w.&/-]*(?:\s+[A-Z0-9][\w.&/-]*){0,4})\s+"
+        r"(?:before|prior to|through|<=|up to)\b",
+    )
+    for pat in pats:
+        m = _re.search(pat, blob)
+        if m:
+            name = " ".join(m.group(1).split()).strip(" .,;:")
+            if _is_product_name(name):
+                return name
+    return ""
+
+
+def _spec_product(spec, fallback, *, cve=None, run_id=None):
+    """The VULNERABLE COMPONENT, not the platform hosting it.
+
+    `fallback` is the scanned target's fingerprint — "WordPress", or
+    "unknown". The derived spec's own `product` is what the advisory actually
+    names: "Glowlogix WP Frontend Profile", "HasThemes HT Mega". That is the
+    thing with the bug, and it is what recon needs in order to probe
+    /wp-content/plugins/<it>/ and its AJAX actions instead of generic platform
+    routes.
+
+    The column used to be written from `fallback` alone, so 21 of 35 cached
+    specs read `product='unknown'` while their own JSON body carried the right
+    name. Everything downstream reads the column.
+
+    Order: the spec's own field, then the advisory prose (`_mine_product_from_spec`),
+    then the target fingerprint. Landing on `unknown` after all three is traced
+    rather than swallowed — an unidentified component is the single thing most
+    likely to send recon at the wrong surface, so it should be visible.
+    """
+    # Every tier is validated, including the spec's OWN product field: the
+    # derivation has written "Blind XSS" and "The Web" there, and a vuln class
+    # in the product column is worse than `unknown` because it reads as a real
+    # component and sends recon at a surface that does not exist.
+    for cand in ((spec or {}).get("product"),
+                 _mine_product_from_spec(spec),
+                 fallback):
+        c = str(cand or "").strip()
+        if c and c.lower() not in _PRODUCT_UNKNOWN and _is_product_name(c):
+            return c
+    try:
+        if run_id:
+            _poc_trace(run_id, "product_unknown_needs_dig",
+                       response=(f"no vulnerable component identified for {cve} "
+                                 "from the spec, the advisory prose, or the target "
+                                 "fingerprint — recon will target the platform, "
+                                 "not the component"),
+                       extra={"cve": cve, "fallback": str(fallback or "")})
+    except Exception:  # noqa: BLE001
+        pass
+    return "unknown"
 
 
 def _load_tentative_spec(cve):
@@ -29596,11 +30262,17 @@ def _store_derived_spec(cve, product, version, spec, verdict, source):
                    verify_method, verify_evidence, source, last_verified)
                 VALUES (%s,%s,%s,%s,%s::jsonb,true,'verified',%s,%s,%s,now())
                 ON CONFLICT (cve) DO UPDATE SET
+                  product = CASE
+                      WHEN lower(coalesce(EXCLUDED.product,'')) NOT IN ('', 'unknown', 'none')
+                      THEN EXCLUDED.product
+                      ELSE public.derived_cve_specs.product END,
+                  vuln_class = coalesce(EXCLUDED.vuln_class, public.derived_cve_specs.vuln_class),
                   spec = EXCLUDED.spec, verified = true, status = 'verified',
                   verify_method = EXCLUDED.verify_method,
                   verify_evidence = EXCLUDED.verify_evidence,
                   source = EXCLUDED.source, last_verified = now()
-            """, (str(cve).upper(), product, version, spec.get("vuln_class"),
+            """, (str(cve).upper(), _spec_product(spec, product), version,
+                  spec.get("vuln_class"),
                   _json.dumps(spec), verdict.get("method"),
                   (verdict.get("evidence") or "")[:1000], source))
             c.commit()
@@ -29950,7 +30622,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                     recon_source_used=None, arjun_discovered=None,
                     focused_urls_from_body=None, resolved_ids=None, gather_facts=None,
                     prior_cmd_signatures=None, vuln_class_override=None,
-                    tried_classes=None):
+                    tried_classes=None, plan=None):
     """Increment 2: run the PoC against the target; on failure, refine via the LLM,
     re-run — up to max_iters. Verbose trail -> filesystem.
 
@@ -30033,6 +30705,10 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
     # the moment any command carries a real payload, timing mode engages below
     # and never clears.
     _timing_mode = (_timing_payload_scale(command or "", delta=0)[1] is not None)
+    # Dispatched runs whose verdict said the target answered faster than the
+    # payload claimed. Counts the MECHANISM failing, which is what decides
+    # whether a min_seconds assertion is still worth making.
+    _latency_fails = 0
     # An initial min_seconds assertion on a command with no payload is repaired
     # to the canary form BEFORE the first dispatch, so iteration 1 is spent on a
     # measurable assertion instead of discovering it is unconfirmable.
@@ -30300,6 +30976,16 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                                                 "proven fact; dispatching anyway "
                                                 "(quality gate, fails open)"})
         _syn_ok, _syn_err = _poc_shell_syntax_check(command, canary=canary, assertion=assertion)
+        # An advisory rides back on the OK path: `bash -n` could not parse the
+        # command, but refusing on that blocks ~1.7% of working builds (the
+        # Python-lane `grep -oP` shapes), so it is recorded rather than
+        # enforced. Visible in the trace, and carried into the refine context
+        # below so the model can fix a genuine quoting mistake on its own.
+        if _syn_ok and _syn_err.startswith("advisory:"):
+            _poc_trace(run_id, "shell_parse_advisory", iteration=it,
+                       response=_syn_err[:300],
+                       extra={"enforced": False,
+                              "command_preview": (command or "")[:200]})
         # A GUARD THAT NEVER YIELDS IS A DEAD END. The canary-placement rule is
         # right — a canary inside a SQL comment cannot satisfy an expect_regex
         # assertion — but the model does not act on the message, so it returns
@@ -30398,7 +31084,13 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
             except (Exception, StopIteration):  # noqa: BLE001
                 pass
             try:
-                _probe = _prerun_payload_probe(ip, port, command, timeout=5)
+                # `plan` is the structured request behind the FIRST command.
+                # Once refine rewrites the command by hand the plan no longer
+                # describes it, so it is only trusted on iteration 1 — a stale
+                # declared target would be worse than inferring one.
+                _probe = _prerun_payload_probe(
+                    ip, port, command, timeout=5,
+                    plan=(plan if it == 1 else None))
             except Exception as _pbe:  # noqa: BLE001 — probe never breaks dispatch
                 _probe = {"ok": True, "skipped": True, "reason": f"probe raised {type(_pbe).__name__}"}
             _poc_trace(run_id, "prerun_probe", iteration=it,
@@ -30588,6 +31280,8 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         success = _verdict["passed"]
         verification_method = _verdict["method"]
         verification_confidence = _verdict["confidence"]
+        if verification_method in _TIMING_FAIL_METHODS:
+            _latency_fails += 1
         # Cross-run error memory: normalise this iteration's error and remember
         # the command that produced it (the run record used to carry neither).
         try:
@@ -30709,7 +31403,39 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                           "method": verification_method,
                           "confidence": verification_confidence,
                           "reason": _verdict.get("reason", ""),
-                          "command": (command or "")[:600],
+                          # The command is the single most valuable field in a
+                          # trace — it is what a reviewer reproduces by hand.
+                          # At 600 it was cut mid-token, so a perfectly valid
+                          # command displayed as unbalanced quotes and read as
+                          # "the generator emits broken shell". It does not:
+                          # `_dry_parse_command` refuses malformed shell
+                          # pre-dispatch (426 refusals on record). Keep the
+                          # whole thing, and state the true length so any
+                          # downstream cap is visibly a cap.
+                          "command": (command or "")[:4000],
+                          "command_len": len(command or ""),
+                          # Did this pass actually reach the target?
+                          #
+                          # `max_iters` bounds DISPATCHED attempts, and a pass
+                          # refused pre-dispatch (bad shell, LLM refusal prose,
+                          # a proven-fact violation, a failed prerun probe)
+                          # correctly costs no budget — `_dispatched_attempts`
+                          # only moves after a real listener call. But the row
+                          # is still written, with assertion_passed=False, and
+                          # every reader counted it as a failed attempt. Worse,
+                          # `it = _dispatched_attempts + 1`, so a refused pass
+                          # and the real attempt that follows SHARE an
+                          # iteration number: CVE-2024-5452 wrote five rows all
+                          # labelled `iter 3`.
+                          #
+                          # Recorded here because this is the only place that
+                          # knows: _tr_before was taken at the top of this pass.
+                          # A remote shell parse error means the command never
+                          # executed, so it is a repair like the pre-dispatch
+                          # refusals, not an attempt on the vulnerability.
+                          "dispatched": bool((metrics.get("target_runs") or 0) > _tr_before)
+                                        and not _is_shell_syntax_failure(output),
+                          "shell_syntax_error": _is_shell_syntax_failure(output) or None,
                           "error_signature": _sig_now, "error_tier": _tier_now,
                           "attempt_score": _sc,
                           "evidence_path": (_ev or {}).get("path")})
@@ -30842,7 +31568,30 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         # moving is the proof: it increments at exactly one place, immediately
         # after the listener call returns.
         _tr_after = (metrics.get("target_runs") or 0)
-        if _tr_after > _tr_before:
+        # A command the remote shell could not PARSE produced no exploit
+        # traffic: the listener ran, so target_runs moved, but nothing of the
+        # command executed. Charging it spends a quarter of a four-iteration
+        # budget on a quoting mistake, and files it as evidence the approach
+        # failed. Repair it and retry instead — bounded by _loop_passes, and
+        # _consecutive_syntax_fails still drives the model-fallback swap, so a
+        # model that cannot write shell is still swapped rather than looped on.
+        _remote_syntax = _is_shell_syntax_failure(output)
+        if _remote_syntax:
+            _consecutive_syntax_fails += 1
+            metrics.setdefault("skipped_runs_bad_syntax", 0)
+            metrics["skipped_runs_bad_syntax"] += 1
+            _poc_trace(run_id, "shell_syntax_refused", iteration=it,
+                       response=_remote_syntax,
+                       extra={"detector": "remote-shell", "charged": False,
+                              "command_preview": (command or "")[:200]})
+            _poc_trace(run_id, "iteration_not_charged", iteration=it,
+                       extra={"reason": "the remote shell could not parse the "
+                                        "command, so nothing executed; repairing "
+                                        "rather than counting it as an attempt",
+                              "shell_error": _remote_syntax,
+                              "dispatched_so_far": _dispatched_attempts,
+                              "loop_passes": _loop_passes})
+        elif _tr_after > _tr_before:
             _dispatched_attempts += 1
         else:
             _poc_trace(run_id, "iteration_not_charged", iteration=iters,
@@ -31621,6 +32370,24 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                               "reason": "blind-timing proof: canary never appears "
                                         "in output, expect_regex can't fire"})
         if _new_a is not None:
+            # Dead mechanism first: it must override the anti-drift decision
+            # just made. `_resolve_refine_assertion` keeps the latency shape
+            # while `_timing_mode` is set, so without clearing the mode the
+            # next iteration re-forces min_seconds and the gate never bites.
+            _dead_a, _dead = _repair_dead_timing_mechanism(
+                _new_a, canary, _latency_fails)
+            if _dead:
+                _new_a, _timing_mode, _drift = _dead_a, False, False
+                _poc_trace(run_id, "timing_mechanism_dead", iteration=it,
+                           extra={"latency_fails": _latency_fails,
+                                  "threshold": _TIMING_DEAD_AT,
+                                  "was": "min_seconds", "now": "expect_regex",
+                                  "canary": canary,
+                                  "reason": "the payload was dispatched and the "
+                                            "target answered fast every time; a "
+                                            "blind-timing claim is refuted for "
+                                            "this target regardless of the "
+                                            "advisory"})
             _new_a, _rep = _repair_unmeasurable_timing_assertion(
                 _new_a, command, canary)
             if _rep:
@@ -32807,7 +33574,9 @@ def _verify_strategist_plan(ip, port, plan_text, session_cookie=None, timeout=3,
     # Extract PRIMARY + ALTs from the plan text (regex over the compact string form).
     candidates = []
     for m in _re.finditer(
-        r"(PRIMARY|ALT\d):\s+class=(\S+)\s+endpoint=(\S+)\s+param=(\S+)(?:\s+method=(\S+))?",
+        # see the class=(.+?) note in _gather_manifest: a two-word class name
+        # dropped PRIMARY from the verdict map entirely.
+        r"(PRIMARY|ALT\d):\s+class=(.+?)\s+endpoint=(\S+)\s+param=(\S+)(?:\s+method=(\S+))?",
         plan_text,
     ):
         candidates.append({"label": m.group(1), "class": m.group(2),
@@ -36068,6 +36837,43 @@ def _read_trace_entries(exploit_id):
         return []
 
 
+# Fixed prefixes written by the pre-dispatch refusal branches in the refine
+# loop. Each is emitted by exactly one branch and none can be produced by a
+# target, so a `run` row starting with one describes a pass that was repaired
+# rather than sent. Used only for traces written before rows carried
+# `dispatched` — new rows state it outright.
+def _is_shell_syntax_failure(output) -> str:
+    """The shell's own parse error, or "" — i.e. the command never ran.
+
+    Distinct from the PRE-dispatch dry-parse: this is the REMOTE shell
+    refusing the command the listener handed it, so `target_runs` moved and
+    the attempt was charged even though no exploit traffic was produced.
+    117 of 4,280 dispatched runs in the trace archive are these, dominated by
+    86 x `"(" unexpected` — a subshell/process-substitution that is valid bash
+    and invalid under dash. Under a max_iters of 4 one of them is a quarter of
+    the build's budget, spent on a command that never executed.
+
+    Matched on the shell's own prefix (`/bin/sh: 12: Syntax error: ...`,
+    `/bin/bash: line 3: syntax error ...`) so a target echoing the phrase back
+    in a response body cannot be mistaken for one.
+    """
+    import re as _re
+    text = str(output or "")
+    m = _re.match(r"\s*/bin/(?:sh|bash|dash):\s*(?:line\s*)?\d+:\s*"
+                  r"([Ss]yntax error[^\n]*)", text)
+    return m.group(1).strip()[:160] if m else ""
+
+
+_PRE_DISPATCH_MARKERS = (
+    "/bin/sh: syntax error (pre-dispatch",
+    "REFUSE: I cannot provide (pre-dispatch",
+    "PROVEN_FACT_UNUSED (pre-dispatch)",
+    "PRERUN_PROBE_FAIL",
+    "[proxy] REFUSED",
+    "MISSING_PROGRAM",
+)
+
+
 def _summarize_build_trace(entries):
     """Extract structured intel from a build's JSONL trace so the operator gets a
     one-glance view instead of scrolling through every phase.
@@ -36084,6 +36890,11 @@ def _summarize_build_trace(entries):
         "credentials_found": [], "admin_paths": [], "has_captcha": False,
         "strategist_primary": None, "strategist_alts": [],
         "plan_verdicts": {}, "iterations_summary": [],
+        # Passes that never reached the target — fixed before sending, so they
+        # are repairs, not attempts. Kept visible: a build that needed six
+        # syntax repairs to land four attempts is a different story from one
+        # that landed four cleanly.
+        "pre_dispatch_refusals": [],
         "dead_endpoints": [], "waf_blocks": 0,
     }
     for e in entries:
@@ -36141,12 +36952,12 @@ def _summarize_build_trace(entries):
         elif ph == "recon:auto_login":
             if "captcha" in resp.lower(): s["has_captcha"] = True
         elif ph == "recon:strategist":
-            m = _re.search(r"PRIMARY:\s+class=(\S+)\s+endpoint=(\S+)\s+param=(\S+)\s+method=(\S+)",
+            m = _re.search(r"PRIMARY:\s+class=(.+?)\s+endpoint=(\S+)\s+param=(\S+)\s+method=(\S+)",
                            resp)
             if m:
                 s["strategist_primary"] = {"class": m.group(1), "endpoint": m.group(2),
                                             "param": m.group(3), "method": m.group(4)}
-            for am in _re.finditer(r"(ALT\d):\s+class=(\S+)\s+endpoint=(\S+)\s+param=(\S+)", resp):
+            for am in _re.finditer(r"(ALT\d):\s+class=(.+?)\s+endpoint=(\S+)\s+param=(\S+)", resp):
                 s["strategist_alts"].append({"label": am.group(1), "class": am.group(2),
                                               "endpoint": am.group(3), "param": am.group(4)})
         elif ph == "recon:plan_verified":
@@ -36154,15 +36965,56 @@ def _summarize_build_trace(entries):
                 s["plan_verdicts"] = extra["verdicts"]
         elif ph == "run":
             it = int(e.get("iteration") or 0)
-            out = str(e.get("run_output") or "")[:400]
+            # A pass refused BEFORE dispatch is not an attempt. It costs no
+            # `max_iters` budget already; it must not read as a failed attempt
+            # either, or "4 iterations, all failed" describes one real attempt
+            # and three commands that were fixed before they were ever sent.
+            #
+            # `dispatched` is authoritative when present. Older traces predate
+            # it, so fall back to the refusal markers the pre-dispatch branches
+            # write into `output` — each is a fixed prefix emitted by exactly
+            # one branch, never produced by a target.
+            # 800, not 400: this is the only place the operator sees what the
+            # target actually answered, and the first 400 characters of a curl
+            # run are headers. Read BEFORE the dispatched check, which needs it.
+            out = str(e.get("run_output") or "")[:800]
+            _disp = e.get("dispatched")
+            if _disp is None:
+                _disp = not any(out.startswith(mk) for mk in _PRE_DISPATCH_MARKERS)
+            if not _disp:
+                s["pre_dispatch_refusals"].append({
+                    "iter": it,
+                    "reason": str(extra.get("reason") or "")[:200],
+                    "tier": str(extra.get("error_tier") or ""),
+                    "detail": str(out)[:200],
+                    "command": str(extra.get("command") or "")[:500],
+                })
+                continue
             passed = bool(e.get("assertion_passed"))
             status = "PASSED" if passed else "FAILED"
             if "404 Not Found" in out or "\"404 Not Found\"" in out:
                 status = "404"
             elif "网站防火墙" in out or "blocked by" in out.lower():
                 status = "WAF-BLOCKED"; s["waf_blocks"] += 1
-            s["iterations_summary"].append({"iter": it, "status": status,
-                                             "output_head": out[:200]})
+            # "#3 FAILED" on its own is unactionable: it says an attempt
+            # happened and nothing about WHAT was tried or WHAT came back. The
+            # `run` row already carries the command and the verdict's own
+            # reason/method/tier in extra — carry them through so the summary
+            # can answer both questions without the operator opening the raw
+            # trace and counting iterations by hand.
+            s["iterations_summary"].append({
+                "iter": it, "status": status,
+                "output_head": out[:800],
+                "command": str(extra.get("command") or "")[:500],
+                # The real length, so a 500-char slice is labelled as a slice
+                # rather than silently looking like a malformed command.
+                "command_len": int(extra.get("command_len")
+                                   or len(str(extra.get("command") or ""))),
+                "reason": str(extra.get("reason") or "")[:300],
+                "method": str(extra.get("method") or ""),
+                "error_tier": str(extra.get("error_tier") or ""),
+                "drifted": bool(e.get("drifted") or extra.get("drifted")),
+            })
         elif ph == "waf_block_detected":
             s["waf_blocks"] += 1
         elif ph == "result":
@@ -36176,6 +37028,82 @@ def _summarize_build_trace(entries):
             if m and m.group(1) not in s["dead_endpoints"]:
                 s["dead_endpoints"].append(m.group(1))
     return s
+
+
+# Verdict methods that each mean "the timing proof did not land". A build that
+# spent its budget on these has empirically shown the sleep payload never
+# executed, so the next build must not re-propose a `min_seconds` assertion.
+_TIMING_FAIL_METHODS = ("latency_too_fast", "latency_unconfirmed",
+                        "latency_unconfirmable")
+
+
+def _failure_analysis_lines(summary):
+    """Lines derived from HOW the prior build failed, not from what recon saw.
+
+    `_derive_auto_hint` read only the recon half of the summary, so a target
+    whose recon found a single fact produced a near-identical hint every round.
+    Feeding a build back its own recon tells it nothing it did not already know,
+    and the solver loop stalls on three identical outcomes while the hint
+    "updates" each round. The actionable half is the attempt record: which proof
+    mechanism was tried, what the target answered, and which commands were
+    refused. Those are what the next build must do DIFFERENTLY.
+
+    Returns [] when the build never attempted anything (empty recon-only run).
+    """
+    from collections import Counter
+    lines = []
+    iters = summary.get("iterations_summary") or []
+    refusals = summary.get("pre_dispatch_refusals") or []
+    if not iters and not refusals:
+        return lines
+
+    passed = [i for i in iters if i.get("status") == "PASSED"]
+    if iters:
+        lines.append(f"PRIOR BUILD: {len(iters)} attempt(s) reached the target, "
+                     f"{len(passed)} passed. Do not repeat what follows.")
+
+    methods = Counter(str(i.get("method") or "") for i in iters if i.get("method"))
+
+    # Timing is the mechanism that fails while looking healthy: the command
+    # runs, the target answers 200, and only the clock says nothing executed.
+    timing_hit = sorted(m for m in methods if m in _TIMING_FAIL_METHODS)
+    timing_n = sum(methods[m] for m in timing_hit)
+    if timing_n:
+        lines.append(
+            f"TIMING PROOF FAILED {timing_n}x ({', '.join(timing_hit)}): the "
+            "request was sent and the response did NOT slow down, so the sleep "
+            "payload never executed. DO NOT propose another `min_seconds` "
+            "assertion against this target - the mechanism is what is failing, "
+            "not the payload. Use a non-timing proof: error-based, "
+            "boolean/differential, or a reflected canary.")
+
+    regex_n = methods.get("regex_missed", 0)
+    if regex_n:
+        lines.append(
+            f"REGEX PROOF MISSED {regex_n}x: the response arrived but did not "
+            "contain the asserted string - either the injection did not land, "
+            "or the assertion asserts something this response would never carry.")
+
+    # A repeated outcome is the strongest "this axis is dead" signal a build
+    # produces: whatever changed never reached the vulnerable code.
+    sigs = Counter(str(i.get("reason") or "")[:120] for i in iters if i.get("reason"))
+    for sig, n in sigs.most_common(3):
+        if n >= 2 and sig:
+            lines.append(f"REPEATED OUTCOME ({n}x, zero information): {sig}")
+
+    # Pre-dispatch refusals are the build's own gate rejecting its command.
+    # They cost no iteration, but they say the emitted command was malformed in
+    # a way the next build can simply not repeat.
+    if refusals:
+        rtiers = Counter(str(r.get("tier") or "?") for r in refusals)
+        details = sorted({str(r.get("detail") or r.get("reason") or "")[:150]
+                          for r in refusals if (r.get("detail") or r.get("reason"))})
+        line = ("REFUSED BEFORE DISPATCH " + str(len(refusals)) + "x ("
+                + ", ".join(f"{t} x{n}" for t, n in rtiers.most_common()) + ")")
+        if details:
+            line += ": " + "; ".join(details[:2])
+        lines.append(line)
+    return lines
 
 
 def _derive_auto_hint(summary):
@@ -36236,10 +37164,79 @@ def _derive_auto_hint(summary):
     if summary.get("waf_blocks", 0) > 0:
         lines.append(f"WAF blocks previously hit: {summary['waf_blocks']} times. "
                      "Use only empirical proven-passable variants (see CONTEXT above).")
-    if not lines:
+    # Failure analysis leads: on a rebuild, "stop doing X" changes behaviour
+    # where a restatement of recon the build already performed does not.
+    fail_lines = _failure_analysis_lines(summary)
+    if not lines and not fail_lines:
         return ""
-    return ("AUTO-HINT (derived from prior build's recon — the pipeline already saw "
-            "these signals live on this target): " + " | ".join(lines))
+    return ("AUTO-HINT (derived from the prior build - what it saw live on this "
+            "target AND how its attempts failed): "
+            + " | ".join(fail_lines + lines))
+
+
+# A mechanism proven dead on a target stays dead. These prefixes mark hint lines
+# that are a verdict about the TARGET rather than a report on the last build, so
+# they must survive into the next hint even when the build that heeded them
+# produced no such failure.
+_STICKY_HINT_PREFIXES = ("TIMING PROOF FAILED",)
+
+
+def _sticky_lines(hint_text):
+    """The subset of a hint's lines that are verdicts about the target."""
+    return [ln for ln in str(hint_text or "").split(" | ")
+            if ln.strip().startswith(_STICKY_HINT_PREFIXES)]
+
+
+def _carry_forward_sticky_lines(cve, ip, port, hint_text):
+    """Merge mechanism verdicts from earlier auto-hints for the same target.
+
+    `_derive_auto_hint` reads ONE build, so a warning erases itself the moment it
+    is heeded. Observed across four solver rounds on CVE-2024-4443:
+
+      round 1  min_seconds 53, latency_too_fast 6  -> hint says TIMING PROOF FAILED
+      round 2  min_seconds 13, latency_too_fast 0  -> obeyed; hint drops the warning
+      round 3  min_seconds  9, latency_too_fast 0  -> still obeying, still no warning
+      round 4  min_seconds 52, latency_too_fast 8  -> no memory it was ever dead
+
+    A lesson that exists only while the mistake is still being made is an echo,
+    not a memory. Carried-forward lines are labelled as such so the synth agent
+    can tell "this build saw it" from "an earlier build against this same target
+    proved it" - both are evidence, but they are not the same claim.
+
+    Fails soft: an unavailable hint history must not block saving the new hint.
+    """
+    try:
+        if any(_sticky_lines(hint_text)):
+            return hint_text  # this build re-proved it; nothing to carry
+        with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""SELECT hint FROM poc_hints
+                            WHERE cve=%s AND target_host=%s
+                              AND (target_port = %s OR (%s IS NULL AND target_port IS NULL))
+                              AND created_by = 'auto_from_recon'
+                            ORDER BY created_at DESC LIMIT 8""",
+                        (cve, ip, port, port))
+            prior = [r["hint"] for r in (cur.fetchall() or [])]
+    except Exception:  # noqa: BLE001
+        return hint_text
+    # Deduped by CATEGORY, not by line: the same verdict from three rounds
+    # differs only in its count ("FAILED 6x" / "7x"), and three near-identical
+    # copies of one finding is how a hint stops being read.
+    carried, seen = [], set()
+    for text in prior:
+        for ln in _sticky_lines(text):
+            cat = next((p for p in _STICKY_HINT_PREFIXES if ln.strip().startswith(p)), None)
+            if cat is None or cat in seen:
+                continue
+            seen.add(cat)
+            base = ln.split(" (carried forward", 1)[0].strip()
+            carried.append(base + " (carried forward from an earlier build "
+                                  "against this target - it was not retried, "
+                                  "so it has not been disproved)")
+    if not carried:
+        return hint_text
+    parts = str(hint_text or "").split(" | ")
+    # After the preamble, before the rest: a verdict outranks a report.
+    return " | ".join(parts[:1] + carried + parts[1:]) if parts else " | ".join(carried)
 
 
 def _auto_save_recon_hint(cve, ip, port, hint_text, engagement_id=None):
@@ -36247,7 +37244,12 @@ def _auto_save_recon_hint(cve, ip, port, hint_text, engagement_id=None):
     the same (cve, host, port) picks it up. Dedupes: replaces any prior auto-hint
     for the same target rather than accumulating."""
     if not hint_text:
-        return None
+        return None, ""
+    # Carry-forward happens HERE, which is the only place that knows the target,
+    # so the stored text differs from the text the caller offered. Return what
+    # was stored: a caller that reports the pre-carry string tells the operator
+    # a hint they do not have.
+    hint_text = _carry_forward_sticky_lines(cve, ip, port, hint_text)
     _ensure_poc_hints_table()
     try:
         with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -36262,9 +37264,9 @@ def _auto_save_recon_hint(cve, ip, port, hint_text, engagement_id=None):
                            VALUES (%s,%s,%s,%s,%s,'auto_from_recon') RETURNING id""",
                         (cve, ip, port, hint_text, engagement_id))
             new_id = cur.fetchone()["id"]; conn.commit()
-        return new_id
+        return new_id, hint_text
     except Exception:  # noqa: BLE001
-        return None
+        return None, hint_text
 
 
 @app.get("/exploit-store/{exploit_id}/summary", tags=["Exploit Store"])
@@ -36320,10 +37322,11 @@ def derive_and_save_hint(exploit_id: str, authorized: bool = Depends(auth)):
     hint_text = _derive_auto_hint(summary)
     if not hint_text:
         return {"ok": False, "reason": "no hint-worthy signals in this build's trace"}
-    hint_id = _auto_save_recon_hint(row["cve"], row["target_host"], row["target_port"],
-                                      hint_text, row.get("engagement_id"))
+    hint_id, stored_text = _auto_save_recon_hint(
+        row["cve"], row["target_host"], row["target_port"],
+        hint_text, row.get("engagement_id"))
     return {"ok": bool(hint_id), "hint_id": str(hint_id) if hint_id else None,
-            "hint_text": hint_text}
+            "hint_text": stored_text}
 
 
 @app.post("/software/poc-hints", tags=["Assets"])
@@ -36390,7 +37393,158 @@ def _resolve_target_url(target_url, ip, port, endpoint_hint, hint):
     return (ip, port, composed or None)
 
 
-def _prerun_payload_probe(ip, port, command: str, timeout: int = 5) -> dict:
+def _expand_simple_assignments(command: str) -> str:
+    """Substitute the command's OWN leading `VAR=value` assignments into it.
+
+    The probe reads a URL out of the command text without running a shell, so
+    `CANARY=POCz4fea7e473a; curl ... "http://t:9091/$CANARY"` was probed with
+    a literal `/$CANARY` path, 404'd, and the command was refused — a command
+    the shell would have expanded correctly. Every $-bearing probe failure in
+    the trace archive is this shape: the variable is always set.
+
+    Only plain `NAME=value` / `NAME='value'` / `NAME="value"` with no
+    substitution of their own, and only the forms this actually sees. A
+    `$(...)` capture is left alone: its value is unknowable without running
+    it, which is the thing we are avoiding.
+    """
+    import re as _re
+    out = command or ""
+    for m in _re.finditer(r"(?:^|[;&]\s*)\s*([A-Za-z_][A-Za-z0-9_]*)="
+                          r"(?:'([^']*)'|\"([^\"$`]*)\"|([^\s;&|'\"$`]+))",
+                          out):
+        name = m.group(1)
+        val = m.group(2) or m.group(3) or m.group(4) or ""
+        if not val:
+            continue
+        out = out.replace("${%s}" % name, val).replace("$%s" % name, val)
+    return out
+
+
+#: curl flags whose VALUE is payload/metadata, never the request target. A URL
+#: appearing as one of these is the thing being sent, not the thing being
+#: contacted — the distinction the probe used to miss on every SSRF and
+#: out-of-band command.
+_CURL_VALUE_FLAGS = frozenset({
+    "-d", "--data", "--data-raw", "--data-binary", "--data-ascii",
+    "--data-urlencode", "-F", "--form", "--form-string", "-H", "--header",
+    "-b", "--cookie", "-c", "--cookie-jar", "-e", "--referer", "-A",
+    "--user-agent", "-o", "--output", "-w", "--write-out", "-u", "--user",
+    "-x", "--proxy", "--proxy-user", "-T", "--upload-file", "--url-query",
+})
+
+
+def _curl_target_url(command: str):
+    """(method, url) curl would actually REQUEST, or (method, None).
+
+    The probe used to take the first `https?://` anywhere in the command. For
+    an SSRF or out-of-band exploit the first URL is the PAYLOAD —
+
+        curl -X POST -d "http://t:9091/$CANARY" 'http://t:9090/api/proxy'
+
+    — so it probed the attacker's own callback sink, got 404 (correctly: the
+    sink has no such path until the exploit fires), and refused the command.
+    296 probe failures in the archive, 8 in the 20-CVE run of 2026-10-19.
+
+    The host guard did not save it. It accepted any port on the target IP
+    (`startswith(f"{ip}:")`), and CVE-Bench puts the oracle/sink on the SAME
+    IP at 9091 — so the one environment this runs in is the one where that
+    check cannot tell a sink from a target.
+    """
+    import shlex as _shlex
+    import re as _re
+    method = "GET"
+    m = _re.search(r"-X\s+([A-Z]+)", command or "")
+    if m:
+        method = m.group(1).upper()
+    # Tokenise ONCE, quote-aware, then find the segment. Splitting the raw
+    # string on `;`/`&&` first is wrong for the same reason the original
+    # first-URL-wins was: a separator inside a quoted value is not a
+    # separator. `-H 'Content-Type: text/plain;charset=UTF-8'` carries a
+    # semicolon, and splitting on it cut the command mid-quote.
+    try:
+        toks = _shlex.split(command or "")
+    except Exception:  # noqa: BLE001 — unbalanced quotes are caught elsewhere
+        return method, None
+    _SEPS = {";", "&&", "||", "|", "&"}
+    seen_curl = False
+    skip_next = False
+    explicit = None
+    candidates = []
+    for i, t in enumerate(toks):
+        if t in _SEPS:
+            if seen_curl:
+                break      # first curl segment only; a trailing verification
+                           # curl is not the exploit
+            skip_next = False
+            continue
+        if skip_next:
+            skip_next = False
+            continue
+        if t == "curl" or t.endswith("/curl"):
+            seen_curl = True
+            continue
+        if not seen_curl:
+            continue       # still in a leading assignment / another program
+        if t == "--url":
+            skip_next = True
+            explicit = toks[i + 1] if i + 1 < len(toks) else None
+            continue
+        if t in _CURL_VALUE_FLAGS:
+            skip_next = True
+            continue
+        if "=" in t and t.split("=", 1)[0] in _CURL_VALUE_FLAGS:
+            continue          # --data=... inline form
+        if t.startswith("-"):
+            continue
+        if t in (">", ">>", "2>", "2>&1", "<"):
+            skip_next = t not in ("2>&1",)
+            continue
+        if t.startswith("http://") or t.startswith("https://"):
+            candidates.append(t)
+    url = explicit or (candidates[0] if candidates else None)
+    return method, url
+
+
+def _record_tool_execution(*, tool, command, target, port=None, service=None,
+                           status="completed", exit_code=None, output="",
+                           error=None, scan_id=None):
+    """Write one `tool_executions` row for a tool this platform ran.
+
+    Why: the build-PoC tool handoff dispatches sqlmap (and tplmap, commix)
+    DIRECTLY rather than through the recorded dispatch route, so 173 sqlmap
+    runs existed only inside trace JSONL — invisible to scan history, the
+    scan monitor, and every audit view. An operator asking "what have we run
+    against this host?" got an answer that was missing all of them.
+
+    `output` is CAPPED. An uncapped text column is a latent outage here: 127 MB
+    of captured stderr once emptied two dashboard pages, and a verbose sqlmap
+    run is exactly the shape that produces it.
+
+    Best-effort by contract — the caller treats a failure as nothing. Recording
+    that a scan happened must never be able to fail the scan.
+    """
+    _OUT_CAP = 100_000
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO tool_executions
+                     (tool, command, target, port, service, status, exit_code,
+                      output, error, scan_id, started_at, completed_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())""",
+                (str(tool)[:100], str(command or "")[:20000], str(target or "")[:255],
+                 int(port) if port else None, str(service)[:100] if service else None,
+                 str(status)[:40], int(exit_code) if exit_code is not None else None,
+                 str(output or "")[:_OUT_CAP], str(error)[:4000] if error else None,
+                 scan_id))
+            conn.commit()
+        return True
+    except Exception as e:  # noqa: BLE001
+        logging.debug("_record_tool_execution(%s) failed: %s", tool, e)
+        return False
+
+
+def _prerun_payload_probe(ip, port, command: str, timeout: int = 5,
+                          plan=None) -> dict:
     """Lightweight method-aware endpoint probe before executing the real exploit.
 
     Extracts the first HTTP method + URL from a curl-ish command and sends a
@@ -36415,25 +37569,43 @@ def _prerun_payload_probe(ip, port, command: str, timeout: int = 5) -> dict:
 
     # Parse the first `curl ... URL` chunk out of a possibly chained command.
     # Prefer explicit `-X METHOD`, else infer GET (curl's default).
-    method = "GET"
-    m_method = _re.search(r"-X\s+([A-Z]+)", command)
-    if m_method:
-        method = m_method.group(1).upper()
-    # URL extraction: look for the first scheme://host[:port]/path. Must point
-    # to the target host (not localhost / 169.254 / sink / other). If URL
-    # doesn't match the target, we're probably probing an OOB listener or an
-    # SSRF-dest — skip, don't block.
-    m_url = _re.search(r"https?://([^\s'\"`]+)", command)
-    if not m_url:
+    # Expand the command's own VAR= assignments first: without this a
+    # perfectly good `CANARY=POCz...; curl ".../$CANARY"` was probed with the
+    # literal `$CANARY` in the path and refused on the resulting 404.
+    command = _expand_simple_assignments(command)
+    # A structured plan DECLARES its target, so there is nothing to infer.
+    # Extraction from the rendered command is the fallback for the string
+    # path, and every bug this probe has had was in that inference.
+    method = url = None
+    if plan:
+        try:
+            from etl.http_request import target_of as _tgt
+            method, url = _tgt(plan)
+        except Exception as _pe:  # noqa: BLE001 — fall back, never refuse
+            logging.debug("probe: plan target lookup failed: %s", _pe)
+            method = url = None
+    if not url:
+        # The URL curl will REQUEST — not the first URL in the string, which
+        # for an SSRF or OOB command is the payload's callback destination.
+        method, url = _curl_target_url(command)
+    if not url:
         return {"ok": True, "skipped": True, "reason": "no HTTP URL in command — not an HTTP exploit"}
-    url = "http" + command[m_url.start()+4 : m_url.end()]  # keep scheme as-is
-    # Strip trailing shell/quote junk the regex may have grabbed.
     url = _re.sub(r"[\"'`;&|]+$", "", url).rstrip()
-    host_part = m_url.group(1).split("/", 1)[0]
-    target_hosts = {str(ip), f"{ip}:{port}", f"{ip}:{port or 80}"}
-    if host_part not in target_hosts and not host_part.startswith(f"{ip}:"):
+    host_part = url.split("//", 1)[-1].split("/", 1)[0]
+    # EXACT host:port when a port is known. The old check accepted any port on
+    # the target IP, and CVE-Bench runs its oracle/sink on the SAME IP at 9091
+    # — so the guard meant to skip "OOB/SSRF dest" passed the sink through as
+    # if it were the target.
+    if port:
+        target_hosts = {f"{ip}:{port}"}
+        if str(port) in ("80", "443"):
+            target_hosts.add(str(ip))
+    else:
+        target_hosts = {str(ip), f"{ip}:80", f"{ip}:443"}
+    if host_part not in target_hosts:
         return {"ok": True, "skipped": True,
-                "reason": f"URL host {host_part!r} is not the target {ip!r} — probably OOB/SSRF dest"}
+                "reason": f"URL host {host_part!r} is not the target {ip}:{port} — "
+                          f"probably an OOB sink or SSRF destination"}
 
     # Probe. Prefer the exploit's own method so a path that is GET-only but
     # exploited with POST is correctly caught. Use `httpx.request` so any
@@ -37331,6 +38503,48 @@ def _synth_poc_token(ip: str, port, product=None) -> str:
     return f"{base}-{highest + 1:03d}"
 
 
+def _engagement_for_build_target(host):
+    """(engagement_id | None) that OWNS this build target — asset, then scope.
+
+    `etl.identity_upsert.resolve_engagement_for_host` is the same idea but its
+    scope lookup is `target_type = 'ip'` only, so a HOSTNAME target resolves to
+    nothing there — and a hostname is exactly what an external engagement's
+    scope is full of. This widens the scope leg to any target_type while
+    keeping the asset leg first.
+
+    Deliberately returns None rather than guessing: an unattributable target
+    keeps the request's engagement, which is the old behaviour and the right
+    fallback for a host nothing knows about yet. The global `not_in_scope`
+    deny-list carries `engagement_id IS NULL` by design and is excluded by the
+    NOT NULL predicate, so it can never claim a build.
+    """
+    host = str(host or "").strip()
+    if not host:
+        return None
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT engagement_id FROM assets "
+                " WHERE (host(ip) = %s OR hostname = %s) AND engagement_id IS NOT NULL "
+                " LIMIT 1", (host, host))
+            row = cur.fetchone()
+            if row and row[0]:
+                return row[0]
+            # Any scope entry naming this exact target, IP- or hostname-typed.
+            cur.execute(
+                "SELECT engagement_id FROM scope_targets "
+                " WHERE split_part(target, '/', 1) = %s AND engagement_id IS NOT NULL "
+                " LIMIT 1", (host,))
+            row = cur.fetchone()
+            if row and row[0]:
+                return row[0]
+    except Exception as e:  # noqa: BLE001
+        # Best-effort: a lookup failure must not block a build. Falling back to
+        # the request's engagement is the pre-existing behaviour, not a new risk.
+        logging.warning("build_poc: engagement lookup for %s failed: %s", host, e)
+    return None
+
+
 @app.post("/software/build-poc", tags=["Assets"])
 def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
     """PoC-builder: research -> synthesize -> run-and-refine. Invoking this authorizes
@@ -37351,6 +38565,43 @@ def build_poc_endpoint(body: BuildPocBody, authorized: bool = Depends(auth)):
         body.target_url, body.ip, body.port, body.endpoint_hint, body.hint)
     if not ip:
         raise HTTPException(400, "either ip or target_url is required")
+
+    # ── Attribute to the TARGET's engagement, not the operator's tab ────────
+    #
+    # `eid` above is whatever engagement the UI happens to be on. Every
+    # artifact this build writes (exploit_store, build_poc_attempts, vulns,
+    # credentials) was being stamped with it, so a build launched against
+    # engagement A's host while the operator was looking at engagement B
+    # filed the result under B. Observed 2026-10-19: one exploit_store row
+    # and one build_poc_attempts row for a host that belongs to another
+    # engagement's scope were labelled with the engagement that happened to
+    # be active, which both surfaced them under the wrong engagement AND put
+    # them out of reach of the owning engagement's data purge.
+    #
+    # CLAUDE.md: "A writer that creates collected target data MUST set
+    # engagement_id, resolving it from the target's asset or scope". The
+    # header is the fallback for a target nothing knows about yet, never the
+    # authority when the target IS attributable.
+    #
+    # This is attribution, NOT authorization: `etl/scope_gate.py` still
+    # decides whether a single packet may be sent, and re-attributing a build
+    # neither widens nor narrows that.
+    _target_eid = _engagement_for_build_target(ip)
+    if _target_eid and str(_target_eid) != str(eid or ""):
+        logging.warning(
+            "build_poc: target %s belongs to engagement %s but the request carried "
+            "%s — attributing to the target's engagement", ip, _target_eid, eid)
+        try:
+            from webhooks import emit_webhook
+            emit_webhook("build_poc_engagement_reattributed", "build_poc", {
+                "target": ip, "cve": cve or None,
+                "request_engagement_id": str(eid) if eid else None,
+                "attributed_engagement_id": str(_target_eid),
+            })
+        except Exception:  # noqa: BLE001
+            pass
+        eid = _target_eid
+
     # ── Already running? ────────────────────────────────────────────────────
     #
     # The form blocks for the whole build, so an operator with no progress to
@@ -38832,6 +40083,120 @@ def regenerate_exploit_artifacts(exploit_id: str, authorized: bool = Depends(aut
     return dict(out)
 
 
+class ReleasedToolRunBody(BaseModel):
+    #: Which derived tool to run. None = the first one recorded.
+    tool: Optional[str] = None
+    #: Operator override of the derived command, for a one-off tweak. The
+    #: scope gate still applies to it — an override changes the command, never
+    #: the authorization.
+    command: Optional[str] = None
+
+
+@app.post("/exploit-store/{exploit_id}/released-run", tags=["Exploit Store"])
+def run_released_tool(exploit_id: str, body: ReleasedToolRunBody = None,
+                      authorized: bool = Depends(auth)):
+    """Execute a tool command the PROOF path derived but deliberately did not run.
+
+    Phase two of Docs/plans/SQLI_PROOF_PATH.md. Proving a CVE and exploiting it
+    are different jobs: proof needs the cheapest deterministic evidence that the
+    vulnerability exists, while sqlmap's job is enumeration and extraction. The
+    handoff derives the command and records it with `deferred_to_release`; this
+    is where an operator runs it, once there is a PoC worth exploiting.
+
+    Four conditions, and each exists for a reason:
+
+    * **The PoC must be VERIFIED.** Running an enumeration tool against a
+      vulnerability we have not proven is a scan, not an exploitation, and it
+      belongs in the recon phase where it is already available.
+    * **The scope gate.** Unconditional and fail-closed, exactly as for any
+      other dispatch. An operator-supplied `command` override is still gated —
+      CLAUDE.md: an override overrules the platform's SUPPRESSION judgement,
+      never the operator's AUTHORIZATION.
+    * **MAX_CONCURRENT_SCANS.** This initiates a scan, so it takes a slot and
+      sheds with 429 rather than queueing.
+    * **It is recorded as a scan.** `tool_executions`, like every other tool
+      this platform runs — the whole point of step 5.
+    """
+    import time as _t
+    _ensure_exploit_store()
+    body = body or ReleasedToolRunBody()
+    with get_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM exploit_store WHERE id = %s", (exploit_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "exploit not found")
+
+    # 1. A PoC, not a hunch.
+    if not row.get("verified"):
+        raise HTTPException(
+            409, "this PoC is not verified — a released exploitation run needs a "
+                 "proven vulnerability. Prove it first, or use the recon phase.")
+
+    # 2. Which command.
+    md = row.get("metadata") or {}
+    handoff = (md.get("tool_handoff") or {}) if isinstance(md, dict) else {}
+    derived = [d for d in (handoff.get("derived") or []) if d.get("command")]
+    chosen = None
+    if body.command:
+        chosen = {"tool": body.tool or "operator", "command": body.command,
+                  "class": "operator-supplied"}
+    elif body.tool:
+        chosen = next((d for d in derived if d.get("tool") == body.tool), None)
+    elif derived:
+        chosen = derived[0]
+    if not chosen:
+        return {"ok": False, "reason": ("no derived tool command on this exploit"
+                                        if not body.tool else
+                                        f"no derived command for tool {body.tool!r}"),
+                "available": [d.get("tool") for d in derived]}
+
+    target = str(row.get("target_host") or "")
+    port = row.get("target_port") or 80
+
+    # 3. Scope gate — unconditional, fail-closed, and it covers an override.
+    _enforce_scan_scope([target], chosen["command"])
+
+    # 4. A slot, or shed fast.
+    if not _api_scan_slots.acquire(blocking=False):
+        raise HTTPException(
+            429, f"{_MAX_CONCURRENT_SCANS} concurrent scans already in flight "
+                 "(MAX_CONCURRENT_SCANS) — nothing was dispatched, retry shortly")
+    listener = os.environ.get("KALI_LISTENER_URL", "https://kali-listener:8019")
+    vt = int(os.environ.get("RELEASED_TOOL_TIMEOUT", "900"))
+    t0 = _t.time()
+    output, exit_code = "", None
+    try:
+        lr = _listener_vectors_run(listener, chosen["command"], target, port, vt,
+                                   eid=row.get("engagement_id"))
+        d = lr.json() if lr.status_code < 400 else {}
+        output = (d.get("output", "") if isinstance(d, dict) else "") or lr.text
+        exit_code = d.get("exit_code") if isinstance(d, dict) else None
+    except Exception as e:  # noqa: BLE001
+        output, exit_code = f"listener error: {e}", None
+    finally:
+        _api_scan_slots.release()
+    seconds = round(_t.time() - t0, 2)
+
+    # 5. It happened, so it is a scan.
+    _record_tool_execution(tool=chosen.get("tool") or "unknown",
+                           command=chosen["command"], target=target, port=port,
+                           service=chosen.get("class"),
+                           status=("completed" if exit_code == 0 else "failed"),
+                           exit_code=exit_code, output=output)
+    try:
+        from webhooks import emit_webhook
+        emit_webhook("released_tool_run", "exploit_store", {
+            "exploit_store_id": exploit_id, "cve": row.get("cve"),
+            "tool": chosen.get("tool"), "target": target, "port": port,
+            "exit_code": exit_code, "seconds": seconds,
+            "engagement_id": str(row.get("engagement_id") or "") or None})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "tool": chosen.get("tool"), "command": chosen["command"],
+            "target": f"{target}:{port}", "exit_code": exit_code,
+            "seconds": seconds, "output": (output or "")[:20000]}
+
+
 @app.post("/exploit-store/{exploit_id}/run", tags=["Exploit Store"])
 def run_exploit(exploit_id: str, authorized: bool = Depends(auth)):
     """Run the stored PoC's shell command through the listener and return the output.
@@ -40128,9 +41493,17 @@ def get_exploit_trace(exploit_id: str, authorized: bool = Depends(auth)):
                 if not line:
                     continue
                 try:
-                    entries.append(_j.loads(line))
+                    _e = _j.loads(line)
                 except Exception:  # noqa: BLE001
                     continue
+                # Backfill the producing tool for rows written before the stamp
+                # existed. Every trace already on disk predates it, so deriving
+                # only at write time would leave the whole archive unlabelled.
+                if isinstance(_e, dict) and not _e.get("source_tool"):
+                    _st = _poc_source_tool(_e.get("phase"))
+                    if _st:
+                        _e["source_tool"] = _st
+                entries.append(_e)
         return {"ok": True, "log_path": log_path, "count": len(entries), "phases": entries}
     except FileNotFoundError:
         return {"ok": True, "log_path": log_path, "phases": [], "reason": "log file missing"}
@@ -53946,13 +55319,13 @@ def follow_up_stats(
     if engagement_id:
         stat_clauses.append("engagement_id = %s::uuid")
         params.append(engagement_id)
-    _ex, _exp = _scope_exclusion_clause(HOST_EXPR_FOLLOWUP, exclude_scope)
+    _ex, _exp = _scope_exclusion_clause(HOST_EXPR_FOLLOWUP, exclude_scope, engagement_id)
     if _ex:
         stat_clauses.append(_ex)
         params.extend(_exp)
     # Keep ONLY the selected scope. A header counting the whole engagement
     # under a scope's name is the same lie as a table showing it.
-    _in, _inp = _scope_inclusion_clause(HOST_EXPR_FOLLOWUP, scope_name)
+    _in, _inp = _scope_inclusion_clause(HOST_EXPR_FOLLOWUP, scope_name, engagement_id)
     if _in:
         stat_clauses.append(_in)
         params.extend(_inp)
@@ -54036,13 +55409,13 @@ def follow_ups_grouped(
         if engagement_id:
             where_clauses.append("engagement_id = %s::uuid")
             params.append(engagement_id)
-        _ex, _exp = _scope_exclusion_clause(HOST_EXPR_FOLLOWUP, exclude_scope)
+        _ex, _exp = _scope_exclusion_clause(HOST_EXPR_FOLLOWUP, exclude_scope, engagement_id)
         if _ex:
             where_clauses.append(_ex)
             params.extend(_exp)
         # The grouped view renders host_samples — unfiltered, those are the
         # out-of-scope IPs the operator reported seeing under a scope header.
-        _in, _inp = _scope_inclusion_clause(HOST_EXPR_FOLLOWUP, scope_name)
+        _in, _inp = _scope_inclusion_clause(HOST_EXPR_FOLLOWUP, scope_name, engagement_id)
         if _in:
             where_clauses.append(_in)
             params.extend(_inp)
@@ -54164,13 +55537,13 @@ def list_follow_ups(
     if search:
         clauses.append("(title ILIKE %s OR target ILIKE %s OR reason ILIKE %s OR rule_id ILIKE %s)")
         params.extend([f"%{search}%", f"%{search}%", f"%{search}%", f"%{search}%"])
-    _ex, _exp = _scope_exclusion_clause(HOST_EXPR_FOLLOWUP, exclude_scope)
+    _ex, _exp = _scope_exclusion_clause(HOST_EXPR_FOLLOWUP, exclude_scope, engagement_id)
     if _ex:
         clauses.append(_ex)
         params.extend(_exp)
     # Server-side too, not only the client filter: the client one cannot fix
     # the counts, and pagination over an unfiltered set hides in-scope rows.
-    _in, _inp = _scope_inclusion_clause(HOST_EXPR_FOLLOWUP, scope_name)
+    _in, _inp = _scope_inclusion_clause(HOST_EXPR_FOLLOWUP, scope_name, engagement_id)
     if _in:
         clauses.append(_in)
         params.extend(_inp)

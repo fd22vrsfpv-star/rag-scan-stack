@@ -728,6 +728,20 @@ export interface DetectedSoftware {
   cve_flags?: CveFlag[]
 }
 
+/** One row per PRODUCT across the whole filtered set — NOT subject to the row
+ *  limit. The item list is capped and ordered by ip, so whether a technology
+ *  appeared depended on its host's IP sort position; PHP was on 49 host/port
+ *  pairs in the redteam engagement and fell off the bottom. */
+export interface SoftwareProduct {
+  product: string
+  host_count: number
+  version_count: number
+  versions: string[] | null
+  sources: string[] | null
+  first_seen: string | null
+  last_seen: string | null
+}
+
 export interface SoftwareSummary {
   asset_count: number
   product_count: number
@@ -748,7 +762,18 @@ export function useDetectedSoftware(search?: string, product?: string, source?: 
   const qs = params.toString()
   return useQuery({
     queryKey: ['detected-software', search, product, source, excludeScope],
-    queryFn: () => apiFetch<{ count: number; summary: SoftwareSummary; items: DetectedSoftware[] }>(
+    queryFn: () => apiFetch<{
+      count: number
+      summary: SoftwareSummary
+      items: DetectedSoftware[]
+      /** Complete product rollup; null when the rollup query itself failed —
+       *  which is NOT the same as "no products", so the flag below says which. */
+      products: SoftwareProduct[] | null
+      products_available: boolean
+      total_rows: number | null
+      truncated: boolean
+      limit: number
+    }>(
       `/software${qs ? '?' + qs : ''}`
     ),
     refetchInterval: POLL.NORMAL,
@@ -1137,7 +1162,32 @@ export interface ExploitSummary {
   strategist_primary: { class: string; endpoint: string; param: string; method: string } | null
   strategist_alts: Array<{ label: string; class: string; endpoint: string; param: string }>
   plan_verdicts: Record<string, string>
-  iterations_summary: Array<{ iter: number; status: string; output_head: string }>
+  /** Passes that never reached the target — refused pre-dispatch, or rejected
+   *  by the remote shell before anything executed. Repairs, not attempts:
+   *  they cost no `max_iters` budget and must not read as failed attempts. */
+  pre_dispatch_refusals?: Array<{
+    iter: number; reason?: string; tier?: string; detail?: string; command?: string
+  }>
+  iterations_summary: Array<{
+    iter: number
+    status: string
+    /** First 800 chars of what the target actually answered. */
+    output_head: string
+    /** The command that was dispatched — "what was tried". May be a prefix;
+     *  compare against `command_len` before reading it as complete shell. */
+    command?: string
+    /** True length of the dispatched command. When it exceeds `command.length`
+     *  the UI MUST say so: a silently-cut command shows unbalanced quotes and
+     *  reads as a generator bug rather than a display cap. */
+    command_len?: number
+    /** The verdict's own words, e.g. "canary not in output — regex-authoritative failure". */
+    reason?: string
+    /** Verdict method: regex / regex_missed / latency_confirmed / probe / … */
+    method?: string
+    /** Which axis the outcome killed: endpoint / auth / carrier / parameter. */
+    error_tier?: string
+    drifted?: boolean
+  }>
   dead_endpoints: string[]
   waf_blocks: number
   final_verdict?: { verified: boolean; reason: string }

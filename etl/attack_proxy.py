@@ -237,10 +237,37 @@ def resolve(conn_factory, target=None, engagement_id=None,
 
     rows = _rows(conn_factory)
     if rows is None:
+        # COULD NOT ASK. Deliberately NOT eligible for the own-network
+        # exemption below: "the node list is unreadable" is not evidence about
+        # the target, and this repo's recurring bug is a probe that could not
+        # run being filed as a negative result. Three outcomes, not two.
         return Decision(None, None, "no_node_online",
                         "the node list could not be read — treat as no proxy "
                         "available, not as no proxy needed")
     if not rows:
+        # ASKED, NONE ONLINE — and that is exactly when the own-network
+        # exemption is needed, so it has to be evaluated HERE too.
+        #
+        # The check below used to live only inside `if target:` AFTER the
+        # per-node subnet match, which this branch returns before ever
+        # reaching. So `allow_direct_on_own_network` — whose docstring says
+        # "The lab and CVE-Bench targets live on exactly these networks" —
+        # could never apply in the one case it was written for: no nodes
+        # online. `enforce()` exempts only `unreachable_by_any_node`, and this
+        # branch returned `no_node_online`, so a lab target was refused.
+        #
+        # Cost of the gap, observed 2026-10-19 on CVE-2024-37849: the
+        # benchmark follow-through aborted with `[proxy] REFUSED ... no online
+        # node exposes a SOCKS port` after 146 blind-timing probes, so a
+        # verified blind SQLi scored no database_access goal.
+        #
+        # This does NOT widen authorization: `etl/scope_gate.py` decides
+        # whether a packet may be sent, and an off-own-network target with no
+        # nodes still gets `no_node_online` and is still refused.
+        if target and is_on_own_network(str(target), own_cidrs):
+            return Decision(None, None, "unreachable_by_any_node",
+                            f"{target} is on a network this host is already "
+                            f"attached to, and no node is online to proxy it")
         return Decision(None, None, "no_node_online",
                         "no online node exposes a SOCKS port")
 

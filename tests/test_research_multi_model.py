@@ -95,17 +95,41 @@ def test_a_failed_candidate_is_recorded_not_dropped():
 
 
 def test_three_slow_models_run_in_parallel_not_serial():
-    """A fanout that serialised 3 1-second calls would take ~3 s. Each call
-    sleeps 1 s; wall must stay under 1.5 s with the fanout parallel."""
+    """The fanout must run its calls CONCURRENTLY.
+
+    Measured by observed overlap, not by a wall-clock budget. The previous
+    version asserted `elapsed < 2.5s` for three 1-second calls, which fails on
+    a loaded CI runner for reasons that have nothing to do with the code --
+    that whole suite run took 26m50s. A flaky red is worse than no test,
+    because it trains everyone to ignore the colour.
+
+    Each stub call registers itself as in-flight, holds briefly, then leaves.
+    A serial implementation can never see more than one in flight at a time, so
+    `peak > 1` is exactly the property under test and it does not care how
+    slow the machine is.
+    """
+    import threading
+    lock = threading.Lock()
+    state = {"live": 0, "peak": 0}
+
     def _slow(prompt, model=None, caller=None):
-        time.sleep(1)
+        with lock:
+            state["live"] += 1
+            state["peak"] = max(state["peak"], state["live"])
+        # Long enough that genuinely concurrent callers overlap, short enough
+        # that the test stays quick even if they do not.
+        time.sleep(0.3)
+        with lock:
+            state["live"] -= 1
         return {"response": json.dumps({"summary": model, "seed_command": "x",
                                         "confidence": 0.5}), "model": model}
+
     ns = _load({"_poc_extract_json": lambda t: json.loads(t) if t.strip().startswith("{") else None,
                 "_llm_for_model": _slow})
-    t0 = time.monotonic()
     out = ns["_research_exploit_fanout"]("p", ["a", "b", "c"])
-    assert len(out) == 3 and time.monotonic() - t0 < 2.5, "fanout did not run in parallel"
+    assert len(out) == 3, "fanout dropped a candidate"
+    assert state["peak"] > 1, (
+        f"fanout ran serially: never more than {state['peak']} call in flight")
 
 
 # ------------------------------------------------------------------ pick

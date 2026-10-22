@@ -819,10 +819,35 @@ function FindingDetailPanel({
   const [followUpCreated, setFollowUpCreated] = useState(false)
   const [ruleCreated, setRuleCreated] = useState(false)
 
-  // Fetch screenshots matching this finding's hostname
-  const screenshotSearch = finding.hostname || finding.ip || (finding.url ? new URL(finding.url).hostname : '') || ''
+  // Screenshots for THIS finding's host.
+  //
+  // `useScreenshots(undefined)` lists EVERY screenshot on the box (3087 of
+  // them), so a finding with no hostname/ip/url -- an exploit-store PoC row,
+  // for one -- used to render the first six of someone else's host under an
+  // "Evidence" heading. A PoC on 172.19.18.3 showed six 192.168.1.150 pages.
+  // No host means NO screenshots: showing the wrong evidence is worse than
+  // showing none, because the operator cannot tell it is wrong.
+  const screenshotSearch = (() => {
+    const h = finding.hostname || finding.ip
+    if (h) return h
+    try { return finding.url ? new URL(finding.url).hostname : '' } catch { return '' }
+  })()
   const { data: screenshotsData } = useScreenshots(screenshotSearch || undefined)
-  const matchingScreenshots = (screenshotsData?.screenshots ?? []).slice(0, 6)
+  // Belt and braces: the server search is a substring match over GoWitness
+  // filenames, so re-check the host client-side before calling it evidence.
+  // GoWitness encodes `://` as `---` and `/` and `.` as `-`, so the host can
+  // appear either verbatim (an IP keeps its dots) or fully dashed.
+  const matchingScreenshots = useMemo(() => {
+    if (!screenshotSearch) return []
+    const needle = screenshotSearch.toLowerCase()
+    const dashed = needle.replace(/\./g, '-')
+    return (screenshotsData?.screenshots ?? [])
+      .filter(s => {
+        const f = (s.filename || '').toLowerCase()
+        return f.includes(needle) || f.includes(dashed)
+      })
+      .slice(0, 6)
+  }, [screenshotsData, screenshotSearch])
 
   // Fetch port context when finding has IP + port
   const { data: portsData } = useAssetPorts(finding.ip || '')
@@ -1473,7 +1498,8 @@ function FindingDetailPanel({
             </h5>
             <div className="grid grid-cols-2 gap-2">
               {matchingScreenshots.map((s, i) => (
-                <ScreenshotThumbnail key={i} path={s.path} filename={s.filename} />
+                <ScreenshotThumbnail key={i} path={s.path} filename={s.filename}
+                                     statusCode={s.status_code} title={s.title} />
               ))}
             </div>
           </div>

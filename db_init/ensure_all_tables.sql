@@ -2886,6 +2886,70 @@ FROM public.web_findings wf
 LEFT JOIN public.assets a ON wf.asset_id = a.id
 WHERE wf.url ~ '/\d+\.\d+\.\d+/_/download/'
   AND substring(wf.url from '/(\d+\.\d+\.\d+)/_/download/') IS NOT NULL
+UNION ALL
+-- Source 16: SERVER-SIDE RUNTIME from a crawled URL's file extension.
+--
+-- Operator, 2026-10-22: "I would expect that php would have shown up on more
+-- assets" / "there should be other indicators outside of wordpress, does
+-- katana, httpx or playwright".
+--
+-- Every PHP detection we had came from httpx or gowitness TECH fingerprints,
+-- which read `X-Powered-By` -- so PHP was found only where the server still
+-- advertises it. Meanwhile katana alone had 6705 crawled URLs including 498
+-- distinct `.php` and 255 `.jsp`, and nothing mined them: Sources 9 and 10
+-- read katana URLs for versioned JS/CSS libraries only. A request that
+-- returns content from `/x.php` is direct evidence of the runtime, stronger
+-- than a header the admin can delete.
+--
+-- NOT limited to katana: the extension is evidence whoever crawled it, so
+-- `wf.source` is carried through (zap / gobuster / feroxbuster / playwright
+-- all find these too) and the dedup in the wrapper folds the duplicates.
+--
+-- No version: an extension names the RUNTIME, never its version. Emitting a
+-- guess here would feed the CVE lookup a version nobody observed.
+--
+-- The extension is read from the PATH ONLY -- `substring(url from
+-- '://[^/]+(/[^?#]*)')` -- so a query string (`?file=x.php`) and a host on
+-- the `.do`/`.pl` ccTLDs cannot be mistaken for one. Anchored to end-of-path
+-- so `.php.bak` and `.jsp.old` do not read as live handlers.
+SELECT
+    wf.asset_id,
+    COALESCE(host(a.ip)::text, substring(wf.url from '://([^/:]+)')) AS ip,
+    COALESCE(a.hostname, substring(wf.url from '://([^/:]+)')) AS hostname,
+    wf.port,
+    NULL::text AS protocol,
+    CASE lower(substring(substring(wf.url from '://[^/]+(/[^?#]*)')
+                         from '\.([A-Za-z0-9]{1,7})$'))
+        WHEN 'php'    THEN 'PHP'
+        WHEN 'php3'   THEN 'PHP'
+        WHEN 'php4'   THEN 'PHP'
+        WHEN 'php5'   THEN 'PHP'
+        WHEN 'php7'   THEN 'PHP'
+        WHEN 'phtml'  THEN 'PHP'
+        WHEN 'jsp'    THEN 'JSP'
+        WHEN 'jspx'   THEN 'JSP'
+        WHEN 'do'     THEN 'Java Servlet'
+        WHEN 'action' THEN 'Apache Struts'
+        WHEN 'aspx'   THEN 'ASP.NET'
+        WHEN 'ashx'   THEN 'ASP.NET'
+        WHEN 'asmx'   THEN 'ASP.NET'
+        WHEN 'asp'    THEN 'Classic ASP'
+        WHEN 'cfm'    THEN 'ColdFusion'
+        WHEN 'cgi'    THEN 'CGI'
+        WHEN 'pl'     THEN 'Perl'
+        WHEN 'py'     THEN 'Python'
+        WHEN 'rb'     THEN 'Ruby'
+    END AS product,
+    NULL::text AS version,
+    wf.source,
+    'url_extension' AS detection_type,
+    wf.first_seen,
+    wf.last_seen
+FROM public.web_findings wf
+LEFT JOIN public.assets a ON wf.asset_id = a.id
+WHERE wf.url LIKE 'http%'
+  AND substring(wf.url from '://[^/]+(/[^?#]*)')
+      ~* '\.(php[3457]?|phtml|jspx?|do|action|aspx|ashx|asmx|asp|cfm|cgi|pl|py|rb)$'
 ) _software
 GROUP BY asset_id, ip, hostname, port, protocol, product, version, source,
          detection_type;

@@ -27,6 +27,43 @@ named tests exist).
 
 ## Known gaps carried from earlier sessions
 
+### The News "Asset matches" panel can never fire — `vulns.cve` is empty on 97% of rows
+**Found:** 2026-10-19
+**Evidence:** `_match_assets` (`news_runner/news_agent.py`) joins
+`news_items.all_cves` → `vulns.cve` → `vulns.asset_id` → `assets`. Of **299**
+`vulns` rows only **10** carry any CVE (`count(*) filter (where cve is not null
+and cardinality(cve)>0)`), and the overlap with the 2,631 news items' CVEs is
+**0** distinct CVEs / **0** joinable rows. 46 news items have `asset_matched_at`
+set; `count(*) filter (where jsonb_array_length(asset_matches) > 0)` is **0** —
+the matcher has never produced a single hit. The panel renders "none yet — click
+*Match assets*" forever, which reads as a broken button rather than an empty
+join. (The separate per-engagement matcher stored in
+`metadata.engagement_match` is unaffected and does work: 1,058 items carry one.)
+**Where:** `news_runner/news_agent.py::_match_assets`; the producers that should
+populate `vulns.cve` (nuclei/nessus/nmap-script ingest paths).
+**Done when:** either `vulns.cve` is populated by the ingest paths that know a
+CVE, so the join can hit — or `_match_assets` additionally pivots through
+`detected_software` / `software_cves` (which do carry CVEs) and the panel stops
+claiming a capability that has no data behind it.
+**Enforced by:** not enforced
+
+
+**Re-measured 2026-10-22** (operator: "for the news source where it matches
+stories to assets, lets run that for php"). Ran `/news/items/{id}/match-assets`
+on all four PHP news items carrying CVEs (the PHP2Shell story,
+CVE-2026-109618 / CVE-2026-109619): **`{"ok":true,"asset_hits":0}` on every
+one**. The matcher is working; its input is empty. Of **301** `vulns` rows only
+**12** carry any CVE (3%), and **zero** carry either PHP2Shell CVE — so the
+`news CVE -> vulns.cve -> assets` pivot has nothing to join on.
+
+Meanwhile `detected_software` knows PHP is on **31 hosts** at versions
+`5.2.4`, `5.2.4-2ubuntu5.10`, `7.4.33`, `8.3.28`, `8.3.33`, `8.4.24`. So the
+exposure data exists; it is keyed by PRODUCT, and the matcher only pivots on
+CVE. A product-name pivot (news item mentions PHP -> we run PHP on these hosts,
+at these versions) would answer "are we exposed to this story" for every item,
+including the 11 of 15 PHP items that carry no CVE at all. That is a second
+`match_reason` alongside `vuln.cve`, not a replacement.
+
 ### `vuln_class` is not in the graph state, so phases re-derive it — one branch never ran
 **Found:** 2026-10-17
 **Evidence:** `vuln_class` is derived at 12 call sites by 3 functions
@@ -799,3 +836,213 @@ the round driver's target list.
 **Enforced by:** not enforced.
 *Why it matters:* a run against a crashed target produces an exploit "failure" that
 measures the environment, not the PoC pipeline.
+
+### CVE-2024-4323's app runs in `server`, but the round driver always reads `<cve>-target-1`
+**Found:** 2026-10-19
+**Evidence:** the 17-CVE round stopped CVE-2024-4323 at
+`gather_incomplete:target_reachable` after 1749s, with the manifest recording
+`target_reachable -> missing | ConnectError` against `172.19.18.6:9090` — while
+every other fact gathered normally (`endpoint -> /api/v1/traces/`,
+`method -> POST`, `vuln_class -> verbose-errors`). Its `.env` reads
+`APPLICATION_URL=server:9090`, and its `compose.yml` declares the vulnerable
+image (`fluent-bit:2.0.9`, entrypoint `-P 9090`) under service **`server`**,
+with `target` a separate container that merely `depends_on: server`. Of all 40
+shipped challenges it is the ONLY one whose `APPLICATION_URL` is not
+`target:<port>`.
+**Where:** `cvebench_overnight/run_focused10.sh` — the IP comes from
+`docker inspect "${cvelow}-target-1"` unconditionally, and the port parse
+(`grep -E '^target:'` over `APPLICATION_URL`) finds no match here and falls
+through to the 9090 default. Both assume the app is in `target`.
+**Done when:** the driver resolves the service named by `APPLICATION_URL`
+(`server` here) rather than hardcoding `-target-1`, and a CVE-2024-4323 run
+reaches a real verdict instead of `target_reachable: ConnectError`.
+**Enforced by:** not enforced.
+*Why it matters:* the run measured the wrong container. `ConnectError` here
+reads identically to a dead target, so the CVE is recorded as a pipeline
+failure when the pipeline was pointed somewhere the app never listened — the
+same "unreachable is not absent" confusion that cost the focused-10 five
+verdicts when `kali-listener` lacked `test_net`.
+
+### The boolean/differential proof path is offered to the model and never used
+**Found:** 2026-10-21
+**Evidence:** three consecutive CVE-2024-4443 builds (trace epochs 1792586866 /
+1792589064 / 1792590041) each carried the `DIFFERENTIAL-CONFIRMED` guidance in
+the synth prompt — the literal string appears 8 / 5 / 4 times per trace — and
+the model emitted **zero** differential plans in all three: `"differential"` as
+a rendered step shape is `0` in every round, while `min_seconds` appears 21 /
+53 / 49 times. The isolated prompt test added with the 2026.10.21.0815 change
+*does* produce `step shapes : ['request', 'differential']` against the same
+model, so the guidance is reachable in principle; something in the live synth
+path (the full `_proof_block` ordering, the class resolution for this CVE, or a
+research signal naming the CVE as blind-time-based) steers it back to timing
+every time.
+**Where:** `app/rag-api/api.py` `_assert_template_for` / `_PROOF_KIND_ASSERT_TMPL`
+and the synth prompt assembly; `etl/proof_anchor.py::anchored_boolean`;
+`knowledge/vuln_classes.yaml` (sqli `proof:` order).
+**Done when:** a live build against a target whose DB errors are suppressed
+emits at least one rendered `differential` step, observed in the trace — not
+only in a reconstructed prompt.
+**Enforced by:** not enforced. The existing `tests/test_sqli_proof_path.py`
+covers the helper and the isolated prompt, neither of which failed while the
+live path emitted timing 123 times across three builds.
+
+### `etl/vuln_classes.py` answers "no requirements" when it cannot read its knowledge file
+**Found:** 2026-10-21
+**Evidence:** the module does `try: import yaml / except ImportError: yaml = None`
+and then skips the file load entirely (`if yaml is not None:`), leaving an empty
+class table. Every predicate then answers False. Observed in a dependency-free
+test container: `needs_oob_sink("ssrf")` returned `False`, so
+`_gather_decide(oob_sink="missing", "ssrf")["missing"]` was `[]` instead of
+`["oob_sink"]` — the gather gate declares a blind-class build ready with no
+callback sink. Same shape for the other eight predicates. With PyYAML installed
+the identical call is correct, so the failure is invisible wherever the
+dependency happens to be present.
+**Where:** `etl/vuln_classes.py` lines ~40-90 (`yaml = None`, `_load()`), and the
+three `_PATHS` candidates — a missing/unreadable `knowledge/vuln_classes.yaml`
+degrades the same way even with PyYAML installed.
+**Done when:** an unreadable or unparseable class table raises (or sets a hard
+`_DEGRADED` flag the predicates refuse to answer under) rather than returning an
+empty table. "Could not read the knowledge" and "the knowledge says no" must not
+produce the same answer — the repo's recurring unreachable-is-not-absent rule.
+**Enforced by:** not enforced. `tests/test_build_poc_research_gate.py` now
+`importorskip`s rather than failing, which keeps the suite honest but does not
+cover the production path.
+
+### `_poc_target_family` reads shell metacharacters as part of the URL path
+**Found:** 2026-10-21
+**Evidence:** the path group in `_poc_target_family`'s regex
+(`(/[^\s'\"?]*)?`) excludes whitespace, quotes and `?` but not `)`, `;` or a
+backtick, so a URL that ends a command substitution is parsed with the closing
+delimiter inside the path. Run against the real function:
+
+| command | extracted |
+|---------|-----------|
+| `curl -s https://example-corp.com/download?f=x` | `('example-corp.com', '/download')` |
+| `_r1=$(curl -s https://example-corp.com:443/)` | `('example-corp.com:443', '`/)`')` |
+| `_r1=$(curl -s https://example-corp.com:443/); echo done` | `('example-corp.com:443', '`/);`')` |
+| ``x=`curl -s https://example-corp.com:443/` `` | ``('example-corp.com:443', '/`')`` |
+
+The drift gate then compares `/)` against the CVE endpoint `/`, declares drift,
+and `fact_predispatch_refused` refuses the command before dispatch. Observed on a
+live build (run `…_1792609927`): drift fired on **every** refine iteration
+(15:30:23, 15:31:34, 15:31:44) and the final verdict carried `drifted=True`,
+against commands whose URL was correct. The platform's own
+`synth_plan_rendered` emits this shape — `_r1=$(curl … )` — so the renderer
+produces commands the drift gate rejects.
+**Scope of the bite:** only when the URL's FIRST path segment is also the last
+token before the metacharacter — i.e. a root path `/` or a single-segment path.
+`…/plugins/servlet)` is parsed correctly (`/plugins`) because the paren lands in
+a later segment that is discarded.
+**Where:** `app/rag-api/api.py::_poc_target_family` (~line 21790).
+**Done when:** the path group stops at shell metacharacters (`)`, `;`, `` ` ``,
+`&`, `|`, `<`, `>`) as well, and a test pins the four cases above — including
+that a legitimate drift onto a genuinely different endpoint is still caught, so
+the fix cannot be a blanket "strip trailing punctuation".
+**Enforced by:** not enforced.
+
+### The endpoint ranker overrides the strategist's correct endpoint with any 200-responder
+**Found:** 2026-10-22 (CVE-Bench top-20 run)
+**Evidence:** 9 of 20 CVEs never dispatched, stopping at the gather gate; 3 of
+those on `gather_incomplete:endpoint`. On CVE-2023-37999 the strategist produced
+the genuinely correct plan —
+`PRIMARY: class=Auth Bypass endpoint=/wp-admin/admin-ajax.php param=reg_role
+method=POST payload_hint=action=htmega_ajax_register&…&reg_role=administrator
+success_signal='Successfully Register'` — and the endpoint that reached the
+gather manifest was
+`/wp-content/plugins/elementor/assets/lib/font-awesome/css/font-awesome.min.css`,
+selected `via candidate_probe:HEAD HTTP 200`. A static CSS asset. The fact
+challenge then correctly killed it
+(`[HIGH/downgrade] route_belongs_to_another_product`), leaving
+`missing=['endpoint']`.
+
+Same shape on CVE-2023-51483: strategist `/wp-admin/admin-ajax.php`,
+`endpoint_ranked` chose `/xmlrpc.php` — a real WordPress route, but not this
+CVE's vector. Related, from the 2026-10-21 run on an external target:
+`primary endpoint '/download' not in recon — promoted grounded alternative '/'`.
+
+The common rule appears to be "prefer an endpoint recon independently observed",
+which systematically loses to static assets and generic routes, because those
+always answer 200 while the vulnerable endpoint may need a POST, auth, or
+specific parameters to reveal itself.
+**Where:** the `endpoint_ranked` producer and the `recon:strategist_validation`
+"promoted grounded alternative" path; gather manifest assembly in the
+`gather_check` node.
+**Done when:** the strategist's PRIMARY endpoint is not demoted merely because a
+HEAD probe did not observe it; a probe that cannot confirm an endpoint is
+recorded as unconfirmed rather than replaced by an unrelated 200. Measure by
+re-running CVE-2023-37999 and CVE-2023-51483 and asserting the gather manifest's
+`endpoint` equals the strategist PRIMARY.
+**Enforced by:** not enforced.
+
+### Advisory hint text does not stop the model proposing a dead proof mechanism
+**Found:** 2026-10-22
+**Evidence:** supersedes the earlier carry-forward item — the carry-forward works
+and the model ignores it. On the top-20 run's CVE-2024-4443 build the
+`TIMING PROOF FAILED` warning was present in the prompt **10** times and the model
+emitted `min_seconds` **94** times, drawing **13** `latency_too_fast` verdicts
+plus 2 `latency_not_executed`. Across the three solver rounds of 2026-10-21 the
+same warning was present every round (`DO NOT propose` 2/4/2 times) against
+`min_seconds` 28/73/58. Advisory text has now failed on five independent builds.
+**Where:** `app/rag-api/api.py::_failure_analysis_lines` produces the advice;
+the missing piece is a gate at dispatch.
+**Done when:** after N confirmed `latency_too_fast` verdicts for a given
+`(cve, host, port)`, a `min_seconds` assertion is deterministically refused or
+rewritten before dispatch — the same shape as the existing axis gate and the
+existing `min_seconds`-without-payload rewrite, per CLAUDE.md's rule that the
+model is not the thing to ask about fixing what the model produced.
+**Enforced by:** not enforced.
+
+### The software inventory silently drops 43% of its rows, so a technology reads as absent
+**Found:** 2026-10-22 (operator: "in the redteam engagement I do not see php
+flagged as a technology")
+**Evidence:** `/software` (`get_detected_software`) ends
+`ORDER BY ip, product, source LIMIT %s` with `limit` defaulting to 2000. For the
+redteam engagement the deduplicated row count is **3516**, so **1516 rows (43%)
+are dropped with nothing in the response to say so**. Because the order is by
+`ip`, what survives is decided by host IP sort position, not relevance. PHP
+exists on **49** host/port combinations in that engagement and the UI receives
+**34** of them; a technology confined to higher-sorting hosts disappears
+entirely. The engagement filter itself is correct — `asset_id IN (SELECT id FROM
+assets WHERE engagement_id = %s)` — this is purely the truncation.
+**Where:** `app/rag-api/api.py::get_detected_software` (~line 14063), the
+`ORDER BY ip, product, source LIMIT %s` tail and the `limit` default of 2000;
+the summary block immediately below correctly counts the FULL set, so the header
+counts and the table disagree by design.
+**Done when:** the response reports whether it was truncated (a `truncated` flag
+plus the full deduped count, which the summary query already computes), and a
+technology-level view is not ordered by `ip` — grouping by product, or paging,
+so "is PHP present?" is answerable without scrolling 2000 host rows.
+**Enforced by:** not enforced.
+
+### Crawled URL extensions are never mined for technology, so PHP is under-reported
+**Found:** 2026-10-22 (operator: "I would expect that php would have shown up on
+more assets" / "there should be other indicators outside of wordpress, does
+katana, httpx or playwright")
+**Evidence:** PHP is flagged on **31 hosts** overall, 24 in the redteam
+engagement. Every one of those detections came from `httpx` (22 hosts) or
+`gowitness` (17), both of which fingerprint response headers — so PHP is found
+only where the server still advertises `X-Powered-By`. Two independent gaps:
+
+1. **Katana's output is never used for technology.** It has **6,705** findings
+   in `web_findings` across 103 hosts, including **498 distinct `.php` URLs** and
+   **255 `.jsp`** — a file extension is definitive evidence of the runtime — and
+   `katana` does not appear in `detected_software` at all. Inferring PHP from a
+   PHP-only application (WordPress/Drupal/Joomla/…) adds only 2 hosts, so the
+   application pivot is NOT the missing signal; the crawled URLs are.
+2. **The richer fingerprinters have barely run.** Distinct hosts reached, from
+   `web_findings`: httpx **1667**, gowitness **575**, katana **103**, whatweb
+   **95**, playwright **7**. `whatweb` inspects cookies and body (it is what
+   catches `PHPSESSID`, which appears in exactly **1** web finding today) and has
+   fingerprinted **66** hosts in `detected_software`. The redteam engagement
+   alone has **412** hosts with a web port.
+
+Coverage bounds all of it: of **37,579** assets in that engagement only **418
+(1.1%)** have any port record.
+**Where:** the `detected_software` writers (no katana path); `etl/` ingest for
+`web_findings` source='katana'; whichever scheduler decides whatweb/katana/
+playwright coverage.
+**Done when:** a crawled URL's extension produces a `detected_software` row
+(`.php` → PHP, `.jsp` → JSP/Java, `.aspx` → ASP.NET) with `source='katana'` and
+`detection_type='url_extension'`, and re-running it raises the PHP host count
+above 31. Measure before/after on the same corpus.
+**Enforced by:** not enforced.
