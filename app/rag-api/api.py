@@ -17850,7 +17850,11 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
     # answer. None means 'not observed' and is never read as 'open'.
     ep_probe_status = None
     cands = []
-    for m in _re.finditer(r"(PRIMARY|ALT\d):\s+class=(\S+)\s+endpoint=(\S+)\s+param=(\S+)", plan_text or ""):
+    # `class=(.+?)` not `(\S+)`: the strategist writes human class names and a
+    # two-word one — `class=Auth Bypass` — made the WHOLE candidate fail to
+    # match, so PRIMARY silently had no verdict and the correct endpoint was
+    # never probed. `endpoint=` anchors the non-greedy run.
+    for m in _re.finditer(r"(PRIMARY|ALT\d):\s+class=(.+?)\s+endpoint=(\S+)\s+param=(\S+)", plan_text or ""):
         cands.append({"label": m.group(1), "endpoint": m.group(3), "param": m.group(4)})
     verdicts = plan_verdicts or {}
     # Feed the miner every source we hold, not just advisory prose: the fix
@@ -17914,6 +17918,19 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
         except Exception as _ce:  # noqa: BLE001
             logging.debug("confirmed endpoint lookup skipped: %s", _ce)
         probe_list += _confirmed_eps
+        # THE STRATEGIST'S OWN ENDPOINTS. `cands` is the analysed form of the
+        # advisory — it names where the bug IS — but it was consulted only
+        # through `verdicts` above, so a candidate the verifier could not
+        # confirm was dropped entirely and never probed. On CVE-2023-37999 that
+        # left the correct /wp-admin/admin-ajax.php out of the candidate list
+        # and a font-awesome CSS file won the ranking on HTTP 200. Seeded early
+        # so they fall inside the 30-path cap, and ranked as advisory below.
+        # An unconfirmable endpoint is "not yet proven", not "wrong".
+        _plan_eps = [c["endpoint"] for c in cands
+                     if isinstance(c.get("endpoint"), str)
+                     and c["endpoint"].startswith("/")
+                     and c["endpoint"] != "/" and "{" not in c["endpoint"]]
+        probe_list += _plan_eps
         for _mp in mined["paths"]:
             probe_list += _path_variants(_mp)          # advisory path, then prefix-stripped
         probe_list += [c for c in (spec.get("candidate_endpoints") or []) if isinstance(c, str) and c.startswith("/") and c != "/"]
@@ -18017,6 +18034,8 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
                                 _note = " (probe-confirmed by the readiness gate)"
                             elif ep in mined["paths"]:
                                 _note = " (advisory/derived path)"
+                            elif ep in _plan_eps:
+                                _note = " (strategist plan endpoint)"
                             elif any(ep in _path_variants(x) for x in mined["paths"]):
                                 _note = " (prefix-stripped advisory path)"
                             elif ep in _scan_paths:
@@ -18040,7 +18059,10 @@ def _gather_manifest(cve, ip, port, product, version, eid, *, plan_text="", plan
                             # A 3xx on the advisory path is still the right
                             # endpoint behind a login redirect — it beats a
                             # 200 on some unrelated page.
+                            # A strategist endpoint counts as documented: the
+                            # plan IS the advisory, read and analysed.
                             _adv = (ep in mined["paths"]
+                                    or ep in _plan_eps
                                     or any(ep in _path_variants(x)
                                            for x in mined["paths"]))
                             _conf = ep in _confirmed_eps
@@ -33292,7 +33314,9 @@ def _verify_strategist_plan(ip, port, plan_text, session_cookie=None, timeout=3,
     # Extract PRIMARY + ALTs from the plan text (regex over the compact string form).
     candidates = []
     for m in _re.finditer(
-        r"(PRIMARY|ALT\d):\s+class=(\S+)\s+endpoint=(\S+)\s+param=(\S+)(?:\s+method=(\S+))?",
+        # see the class=(.+?) note in _gather_manifest: a two-word class name
+        # dropped PRIMARY from the verdict map entirely.
+        r"(PRIMARY|ALT\d):\s+class=(.+?)\s+endpoint=(\S+)\s+param=(\S+)(?:\s+method=(\S+))?",
         plan_text,
     ):
         candidates.append({"label": m.group(1), "class": m.group(2),
@@ -36668,12 +36692,12 @@ def _summarize_build_trace(entries):
         elif ph == "recon:auto_login":
             if "captcha" in resp.lower(): s["has_captcha"] = True
         elif ph == "recon:strategist":
-            m = _re.search(r"PRIMARY:\s+class=(\S+)\s+endpoint=(\S+)\s+param=(\S+)\s+method=(\S+)",
+            m = _re.search(r"PRIMARY:\s+class=(.+?)\s+endpoint=(\S+)\s+param=(\S+)\s+method=(\S+)",
                            resp)
             if m:
                 s["strategist_primary"] = {"class": m.group(1), "endpoint": m.group(2),
                                             "param": m.group(3), "method": m.group(4)}
-            for am in _re.finditer(r"(ALT\d):\s+class=(\S+)\s+endpoint=(\S+)\s+param=(\S+)", resp):
+            for am in _re.finditer(r"(ALT\d):\s+class=(.+?)\s+endpoint=(\S+)\s+param=(\S+)", resp):
                 s["strategist_alts"].append({"label": am.group(1), "class": am.group(2),
                                               "endpoint": am.group(3), "param": am.group(4)})
         elif ph == "recon:plan_verified":
