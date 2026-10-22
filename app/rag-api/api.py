@@ -2205,7 +2205,14 @@ def get_assets(
                        a.first_seen, a.last_seen, a.provider, a.provider_evidence
                 FROM assets a
                 {where_sql}
-                ORDER BY a.ip
+                -- a.id breaks the tie. `ORDER BY a.ip` alone is NOT a total
+                -- order: many hostnames share one address here (52 on a single
+                -- IP), so the row that lands at a page boundary was whichever
+                -- one the scan happened to return first. Under LIMIT/OFFSET
+                -- that silently duplicates some assets across pages and skips
+                -- others. Caught comparing this query against the old one:
+                -- same IP, different asset, same position.
+                ORDER BY a.ip, a.id
                 LIMIT %s OFFSET %s
             )
             SELECT a.id,
@@ -2258,7 +2265,9 @@ def get_assets(
             ) cm ON a.hostname IS NULL
             GROUP BY a.id, a.ip, a.hostname, a.os, a.tags, a.engagement_id,
                      a.first_seen, a.last_seen, a.provider, a.provider_evidence, cm.hostname
-            ORDER BY a.ip
+            -- Same total order as the CTE, or the page is re-shuffled after
+            -- being chosen.
+            ORDER BY a.ip, a.id
         """
         # The filters and the page bounds now both live in the CTE, so the
         # parameter order is unchanged for callers.
@@ -38912,7 +38921,39 @@ def software_cves_without_poc(limit: int = 100,
                        FROM exploit_store
                        WHERE cve IS NOT NULL AND cve ILIKE 'CVE-%'""")
         has_poc = {(r["cve"], r["ip"]) for r in cur.fetchall()}
+        # ONE query for every port, not one per row.
+        #
+        # The loop below used to run a `SELECT port FROM detected_software` per
+        # follow-up item — up to 500 of them — and detected_software is a
+        # 16-branch UNION ALL view over web_findings / recon_findings / ports.
+        # Measured 2026-10-22: 1.37s per lookup, so a single request took
+        # ~137s. The Exploit Workbench polls this endpoint every 10 seconds
+        # (POLL.FAST), so each poll started long before the last one finished
+        # and they ACCUMULATED until the database was saturated and unrelated
+        # pages — News among them — timed out and rendered blank.
+        #
+        # Ordered by last_seen DESC and inserted with setdefault, so the first
+        # value kept per key is the most recent, exactly as the per-row
+        # `ORDER BY last_seen DESC LIMIT 1` did.
+        _fu_ips = {(fu.get("target") or "") for fu in fu_rows}
+        _fu_ips.discard("")
+        _port_by_ip: dict = {}
+        _port_by_ip_product: dict = {}
+        if _fu_ips:
+            try:
+                cur.execute("""SELECT ip, lower(product) AS product, port
+                                 FROM detected_software
+                                WHERE ip = ANY(%s) AND port IS NOT NULL
+                                ORDER BY last_seen DESC""", (list(_fu_ips),))
+                for _r in cur.fetchall():
+                    _port_by_ip.setdefault(_r["ip"], _r["port"])
+                    _port_by_ip_product.setdefault((_r["ip"], _r["product"]), _r["port"])
+            except Exception:  # noqa: BLE001
+                # Best-effort enrichment, as before: no port is a missing
+                # field, not a failed request.
+                pass
         # Enrich: resolve port+product+version from detected_software
+        _scope_ok: dict = {}
         for fu in fu_rows:
             title = fu.get("title") or ""
             ip = fu.get("target") or ""
@@ -38920,8 +38961,20 @@ def software_cves_without_poc(limit: int = 100,
             # (192.168.1.0/24), domain wildcards and URL rules all behave
             # identically on read as on dispatch. Skip rows that aren't in
             # scope for the resolved engagement.
-            if scope_only and eid and scope_rows and not _is_in_scope(ip, scope_rows):
-                continue
+            # Memoised per IP. `is_in_scope` linear-scans the engagement's
+            # scope rows doing CIDR / wildcard / URL matching — 6597 rows here,
+            # measured at 69ms per call. The loop ran it once per follow-up
+            # item (400), so the scope filter alone cost ~28s of a 36.7s
+            # request against an endpoint the workbench polls every 10s. The
+            # 400 items carry only 213 distinct targets, and the answer depends
+            # on nothing but the IP, so the repeats are pure waste.
+            if scope_only and eid and scope_rows:
+                _ok = _scope_ok.get(ip)
+                if _ok is None:
+                    _ok = _is_in_scope(ip, scope_rows)
+                    _scope_ok[ip] = _ok
+                if not _ok:
+                    continue
             # Extract CVE ids
             cves = _re.findall(r"CVE-\d{4}-\d{4,}", title.upper())
             if not cves:
@@ -38931,20 +38984,13 @@ def software_cves_without_poc(limit: int = 100,
             m = _re.match(r"Vulnerable:\s+(.+?)\s+(\S+)\s+on\s+", title)
             if m:
                 product, version = m.group(1), m.group(2)
-            # Resolve port via detected_software (best-effort)
-            port = None
-            try:
-                cur.execute("""SELECT port FROM detected_software
-                               WHERE ip = %s
-                                 AND (%s IS NULL OR lower(product) = lower(%s))
-                                 AND port IS NOT NULL
-                               ORDER BY last_seen DESC LIMIT 1""",
-                            (ip, product, product))
-                r = cur.fetchone()
-                if r:
-                    port = r["port"]
-            except Exception:  # noqa: BLE001
-                pass
+            # Resolve port from the map built above (best-effort). A named
+            # product does NOT fall back to "any product on this IP" — that is
+            # what the old `(%s IS NULL OR lower(product) = lower(%s))` meant,
+            # and widening it here would silently attach a port from an
+            # unrelated service.
+            port = (_port_by_ip_product.get((ip, product.lower())) if product
+                    else _port_by_ip.get(ip))
             for cve in cves:
                 if (cve, ip) in has_poc:
                     continue
