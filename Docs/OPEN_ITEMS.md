@@ -1013,3 +1013,36 @@ plus the full deduped count, which the summary query already computes), and a
 technology-level view is not ordered by `ip` — grouping by product, or paging,
 so "is PHP present?" is answerable without scrolling 2000 host rows.
 **Enforced by:** not enforced.
+
+### Crawled URL extensions are never mined for technology, so PHP is under-reported
+**Found:** 2026-10-22 (operator: "I would expect that php would have shown up on
+more assets" / "there should be other indicators outside of wordpress, does
+katana, httpx or playwright")
+**Evidence:** PHP is flagged on **31 hosts** overall, 24 in the redteam
+engagement. Every one of those detections came from `httpx` (22 hosts) or
+`gowitness` (17), both of which fingerprint response headers — so PHP is found
+only where the server still advertises `X-Powered-By`. Two independent gaps:
+
+1. **Katana's output is never used for technology.** It has **6,705** findings
+   in `web_findings` across 103 hosts, including **498 distinct `.php` URLs** and
+   **255 `.jsp`** — a file extension is definitive evidence of the runtime — and
+   `katana` does not appear in `detected_software` at all. Inferring PHP from a
+   PHP-only application (WordPress/Drupal/Joomla/…) adds only 2 hosts, so the
+   application pivot is NOT the missing signal; the crawled URLs are.
+2. **The richer fingerprinters have barely run.** Distinct hosts reached, from
+   `web_findings`: httpx **1667**, gowitness **575**, katana **103**, whatweb
+   **95**, playwright **7**. `whatweb` inspects cookies and body (it is what
+   catches `PHPSESSID`, which appears in exactly **1** web finding today) and has
+   fingerprinted **66** hosts in `detected_software`. The redteam engagement
+   alone has **412** hosts with a web port.
+
+Coverage bounds all of it: of **37,579** assets in that engagement only **418
+(1.1%)** have any port record.
+**Where:** the `detected_software` writers (no katana path); `etl/` ingest for
+`web_findings` source='katana'; whichever scheduler decides whatweb/katana/
+playwright coverage.
+**Done when:** a crawled URL's extension produces a `detected_software` row
+(`.php` → PHP, `.jsp` → JSP/Java, `.aspx` → ASP.NET) with `source='katana'` and
+`detection_type='url_extension'`, and re-running it raises the PHP host count
+above 31. Measure before/after on the same corpus.
+**Enforced by:** not enforced.
