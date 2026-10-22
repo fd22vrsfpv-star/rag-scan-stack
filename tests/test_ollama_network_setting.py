@@ -113,7 +113,31 @@ def test_get_lists_ollama_keys():
 
 def test_llm_query_refreshes_ollama_url():
     """Without this the hand-rolled path and /api/* proxy kept the env host."""
+    # Asserted STRUCTURALLY, not as source text: the guard-style ratchet counts
+    # an asserted string that looks like code, and a literal
+    # `OLLAMA_URL = s.get("ollama_url")` breaks on any reformat while proving
+    # nothing a reader could not have assumed. tests/_ast_assert.py exists for
+    # this; here the shape is specific enough to read the AST directly.
+    import ast as _ast
     src = open(os.path.join(REPO, "llm_query", "llm_query.py"), encoding="utf-8").read()
-    body = src.split("def _refresh_llm_globals", 1)[1].split("\ndef ", 1)[0]
-    assert "OLLAMA_URL" in body.split("try:", 1)[0], "OLLAMA_URL not declared global"
-    assert 'OLLAMA_URL = s.get("ollama_url")' in body
+    fn = next((n for n in _ast.walk(_ast.parse(src))
+               if isinstance(n, _ast.FunctionDef) and n.name == "_refresh_llm_globals"),
+              None)
+    assert fn is not None, "_refresh_llm_globals is gone"
+
+    # Declared global, or the assignment below binds a LOCAL and the refresh
+    # silently does nothing — the exact failure this test exists to catch.
+    declared = {nm for g in _ast.walk(fn) if isinstance(g, _ast.Global) for nm in g.names}
+    assert "OLLAMA_URL" in declared, "OLLAMA_URL not declared global"
+
+    assigns = [a for a in _ast.walk(fn) if isinstance(a, _ast.Assign)
+               and any(getattr(t, "id", "") == "OLLAMA_URL" for t in a.targets)]
+    assert assigns, "OLLAMA_URL is never refreshed from the saved settings"
+    value = _ast.unparse(assigns[0].value)
+    assert "ollama_url" in value, (
+        "OLLAMA_URL is not read from the saved setting: %s" % value)
+    # A blank saved URL must fall back to the env value rather than blanking
+    # the global — that fallback is what keeps this machine working when the
+    # operator has not set a network Ollama.
+    assert "OLLAMA_URL" in value, (
+        "a blank saved URL would blank the global instead of falling back: %s" % value)
