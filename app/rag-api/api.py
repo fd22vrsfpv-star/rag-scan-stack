@@ -2180,7 +2180,34 @@ def get_assets(
         cur.execute(f"SELECT count(*) AS n FROM assets a {where_sql}", where_params)
         total = cur.fetchone()["n"]
 
+        # PAGE FIRST, JOIN SECOND.
+        #
+        # This used to filter, join, aggregate and only THEN `ORDER BY a.ip
+        # LIMIT` — so every call did the full fan-out over the whole engagement
+        # (37,708 assets here) to return 100 rows. Three expensive things ran
+        # per asset: the `assets a2` self-join on a shared IP (52 hostnames
+        # share one address on this estate), a LATERAL lookup into
+        # credential_findings, and a correlated COUNT(*) over recon_findings
+        # (537,514 rows).
+        #
+        # The result took >60s while the dashboard polls on a 30s interval, so
+        # each poll started before the last finished and they ACCUMULATED — 29
+        # concurrent copies observed, the oldest 34 minutes old, saturating the
+        # database until unrelated pages (News) timed out and rendered blank.
+        # CLAUDE.md's "shed, do not queue" on the read path.
+        #
+        # Every WHERE clause above references `a.` only, so the page can be
+        # chosen before any join without changing which rows come back. The
+        # joins then run against `limit` rows instead of the whole estate.
         sql = f"""
+            WITH page AS (
+                SELECT a.id, a.ip, a.hostname, a.os, a.tags, a.engagement_id,
+                       a.first_seen, a.last_seen, a.provider, a.provider_evidence
+                FROM assets a
+                {where_sql}
+                ORDER BY a.ip
+                LIMIT %s OFFSET %s
+            )
             SELECT a.id,
                    host(a.ip)::text AS ip,
                    COALESCE(a.hostname, cm.hostname) AS hostname,
@@ -2194,7 +2221,7 @@ def get_assets(
                    COUNT(DISTINCT (p.proto, p.port)) AS open_ports_count,
                    (SELECT count(*) FROM recon_findings rf WHERE rf.asset_id = a.id)
                        AS recon_findings_count
-            FROM assets a
+            FROM page a
             -- PORTS FOLLOW THE IP, NOT THE HOSTNAME.
             --
             -- A port scan reports an IP, so its results land on whichever asset
@@ -2229,12 +2256,12 @@ def get_assets(
                 WHERE asset_id = a.id AND metadata->>'hostname' IS NOT NULL
                 ORDER BY created_at DESC LIMIT 1
             ) cm ON a.hostname IS NULL
-            {where_sql}
             GROUP BY a.id, a.ip, a.hostname, a.os, a.tags, a.engagement_id,
                      a.first_seen, a.last_seen, a.provider, a.provider_evidence, cm.hostname
             ORDER BY a.ip
-            LIMIT %s OFFSET %s
         """
+        # The filters and the page bounds now both live in the CTE, so the
+        # parameter order is unchanged for callers.
         cur.execute(sql, (*where_params, limit, offset))
         rows = cur.fetchall()
 
