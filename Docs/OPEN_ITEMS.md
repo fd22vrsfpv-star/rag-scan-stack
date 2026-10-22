@@ -48,6 +48,22 @@ claiming a capability that has no data behind it.
 **Enforced by:** not enforced
 
 
+**Re-measured 2026-10-22** (operator: "for the news source where it matches
+stories to assets, lets run that for php"). Ran `/news/items/{id}/match-assets`
+on all four PHP news items carrying CVEs (the PHP2Shell story,
+CVE-2026-109618 / CVE-2026-109619): **`{"ok":true,"asset_hits":0}` on every
+one**. The matcher is working; its input is empty. Of **301** `vulns` rows only
+**12** carry any CVE (3%), and **zero** carry either PHP2Shell CVE — so the
+`news CVE -> vulns.cve -> assets` pivot has nothing to join on.
+
+Meanwhile `detected_software` knows PHP is on **31 hosts** at versions
+`5.2.4`, `5.2.4-2ubuntu5.10`, `7.4.33`, `8.3.28`, `8.3.33`, `8.4.24`. So the
+exposure data exists; it is keyed by PRODUCT, and the matcher only pivots on
+CVE. A product-name pivot (news item mentions PHP -> we run PHP on these hosts,
+at these versions) would answer "are we exposed to this story" for every item,
+including the 11 of 15 PHP items that carry no CVE at all. That is a second
+`match_reason` alongside `vuln.cve`, not a replacement.
+
 ### `vuln_class` is not in the graph state, so phases re-derive it — one branch never ran
 **Found:** 2026-10-17
 **Evidence:** `vuln_class` is derived at 12 call sites by 3 functions
