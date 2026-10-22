@@ -1046,3 +1046,28 @@ playwright coverage.
 `detection_type='url_extension'`, and re-running it raises the PHP host count
 above 31. Measure before/after on the same corpus.
 **Enforced by:** not enforced.
+
+### `is_in_scope` costs 69ms a call, so any per-row scope filter is seconds
+**Found:** 2026-10-22
+**Evidence:** `etl/scope_gate.is_in_scope` linear-scans the engagement's scope
+rows doing CIDR / wildcard / URL matching. For the redteam engagement that is
+**6597 rows**, measured at **69ms per call**:
+
+    load_engagement_scope : 6597 rows   0.24s
+    is_in_scope x213      : 14.72s      (69ms each)
+
+`/software/cves-without-poc` called it once per follow-up item (400), so the
+scope filter alone cost **~28s** of a 36.7s request. Memoising per unique IP
+(400 calls -> 213) took the endpoint to 18.8-27.2s; the remaining time is still
+almost entirely this function. Any other read that scope-filters row-by-row
+pays the same toll.
+**Where:** `etl/scope_gate.py::is_in_scope`, and its callers on read paths —
+`app/rag-api/api.py::software_cves_without_poc` is the one measured.
+**Done when:** a scope decision for one host costs well under a millisecond —
+e.g. the row set is compiled once per engagement into an IP-network list plus a
+hostname-suffix trie, instead of being re-parsed per call. Measure with the same
+213-IP sample: 14.72s must become sub-second.
+**Enforced by:** not enforced. Note this is AUTHORIZATION code — the dispatch
+gate uses the same function, so any change needs the existing agreement tests
+(`tests/test_dispatch_scope.py::test_bff_and_scope_gate_agree`) green plus a
+case table proving identical verdicts before and after.
