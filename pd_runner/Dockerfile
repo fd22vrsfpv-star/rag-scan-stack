@@ -4,9 +4,15 @@
 # common/Dockerfile. Build it first: scripts/build-base-image.sh
 FROM rag-common:latest
 
+# nmap is here for SERVICE DETECTION, not port discovery — naabu already does
+# the latter and does it faster. Measured on Metasploitable2 (2026-10-22):
+# naabu found 21 open ports and named none of them; `nmap -sV` on the same
+# ports identified 20 and gave exact versions for 11 — vsftpd 2.3.4,
+# UnrealIRCd, Samba 3.x, MySQL 5.0.51a. The CVE lookup keys on product+version,
+# so without this the host had 22 ports and ZERO vulns recorded.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl dnsutils libpcap-dev \
-    whatweb \
+    whatweb nmap \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy pre-built Go binaries (built by scripts/build-go-tools.sh)

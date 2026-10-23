@@ -5,7 +5,7 @@ Passive OSINT tools are in osint-runner. Credential testing is in brutus-runner.
 """
 
 import os, uuid, pathlib, subprocess, threading, logging, json, tempfile, shutil
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 from datetime import datetime
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -372,6 +372,59 @@ class HttpxReq(BaseModel):
     proxy: Optional[str] = None  # e.g. socks5://node-manager:10120
     no_ingest: Optional[bool] = False
 
+class NmapServiceReq(BaseModel):
+    """Service detection over ALREADY-DISCOVERED ports.
+
+    Deliberately not a port scanner: naabu does discovery and does it faster.
+    This answers the question naabu cannot — WHAT is listening. Measured on
+    Metasploitable2 (2026-10-22): naabu reported 21 open ports and named none;
+    `nmap -sV` on those same ports identified 20 and gave exact versions for
+    11, including vsftpd 2.3.4 (CVE-2011-2523), UnrealIRCd (CVE-2010-2075) and
+    Samba 3.x (CVE-2007-2447). The host had 22 ports recorded and ZERO vulns,
+    because the CVE lookup keys on product+version and had neither.
+    """
+    # 'from_db' resolves each host's OPEN ports from the ports table, so the
+    # -sV sweep is bounded by what discovery actually found instead of
+    # re-scanning 65535 ports per host.
+    targets: Union[List[str], str] = "from_db"
+    # Per-host override. Omit it and each target is scanned on its own
+    # discovered ports; a shared list here would scan every host for every
+    # other host's ports.
+    ports: Optional[str] = None
+    # -sV intensity. 7 is nmap's default; 0-9 are valid. Lower is faster and
+    # identifies less.
+    version_intensity: Optional[int] = 7
+    # Hosts in these labs do not answer ping, and a host that is up but
+    # filtered must not be skipped before we ever ask what it runs.
+    skip_host_discovery: Optional[bool] = True
+    max_hosts: Optional[int] = 50
+    no_ingest: Optional[bool] = False
+
+
+def get_scanned_hosts(limit: int = 50):
+    """Hosts with at least one open port, and the ports themselves.
+
+    Returns [{ip, ports: "21,22,80"}]. One entry per host so each is scanned on
+    its OWN ports — a single merged port list would scan every host for every
+    other host's services, which is both slower and noisier than the discovery
+    that produced it.
+    """
+    q = """
+    SELECT host(a.ip)::text AS ip,
+           string_agg(DISTINCT p.port::text, ',' ORDER BY p.port::text) AS ports
+    FROM ports p
+    JOIN assets a ON a.id = p.asset_id
+    WHERE COALESCE(p.is_open, true)
+      AND host(a.ip)::text NOT IN ('0.0.0.0', '::')
+    GROUP BY 1
+    ORDER BY 1
+    LIMIT %s;
+    """
+    with conn() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(q, (limit,))
+        return cur.fetchall()
+
+
 class NaabuReq(BaseModel):
     targets: List[str]
     # None means "not specified" — run_naabu then falls back to naabu's own
@@ -382,6 +435,31 @@ class NaabuReq(BaseModel):
     rate: Optional[int] = 1000
     top_ports: Optional[str] = None
     proxy: Optional[str] = None
+    # RE-SCAN what we already found, instead of sweeping the top-1000 again.
+    # A host with known-open ports does not need rediscovering to confirm those
+    # ports are still up — and a 1000-port sweep per re-scan is traffic at a
+    # customer's estate for an answer already in the database.
+    #
+    # Opt-in, not the default: a narrowed re-scan CANNOT discover a port that
+    # opened since the last run, so making it automatic would quietly convert
+    # discovery into verification. Callers that want fresh discovery keep the
+    # existing behaviour by leaving this off.
+    known_ports_only: Optional[bool] = False
+    # SERVICE DETECTION, ON BY DEFAULT.
+    #
+    # naabu answers "which ports are open" and structurally cannot answer
+    # "what is on them" — its JSON has no service/product/version field at
+    # all. Measured on Metasploitable2: 21 ports found, 0 named. The CVE rules
+    # join on product+version, so a discovery-only scan left that host at 22
+    # ports and ZERO vulns while running vsftpd 2.3.4 (CVE-2011-2523),
+    # UnrealIRCd (CVE-2010-2075) and Samba 3.x (CVE-2007-2447).
+    #
+    # So identification is part of a port scan, not a second thing to
+    # remember. Chained AFTER naabu and bounded to the ports it just found —
+    # FastAPI runs background tasks in order, so the seed query sees them.
+    # Set false for discovery-only (a broad sweep where -sV would multiply the
+    # traffic for hosts nobody will look at).
+    service_detect: Optional[bool] = True
     no_ingest: Optional[bool] = False
 
 class KatanaReq(BaseModel):
@@ -526,8 +604,26 @@ def run_naabu(req: NaabuReq, background_tasks: BackgroundTasks):
     output_file = str(REPORT_DIR / f"naabu_{job_id[:8]}.jsonl")
 
     cmd = ["naabu", "-list", targets_file, "-json", "-o", output_file, "-silent"]
+
+    # Bound the sweep to ports discovery already found for THESE hosts.
+    # Explicit `ports` still wins — an operator naming a list means it.
+    _known = None
+    if req.known_ports_only and not req.ports:
+        _by_host = {r["ip"]: r["ports"] for r in get_scanned_hosts(limit=500)
+                    if r.get("ports")}
+        _hit = sorted({p for t in req.targets for p in (_by_host.get(t) or "").split(",") if p},
+                      key=lambda x: int(x) if x.isdigit() else 0)
+        if _hit:
+            _known = ",".join(_hit)
+        # No hit means these hosts have never been scanned. Falling through to
+        # the top-1000 is correct: "we hold no ports for this host" is not
+        # "this host has no open ports", and narrowing to an empty list would
+        # scan nothing while reporting success.
+
     if req.ports:
         cmd.extend(["-p", req.ports])
+    elif _known:
+        cmd.extend(["-p", _known])
     if req.rate:
         cmd.extend(["-rate", str(req.rate)])
     if req.top_ports:
@@ -537,14 +633,63 @@ def run_naabu(req: NaabuReq, background_tasks: BackgroundTasks):
     # masscan, which has no such flag and forces profiles to resolve to explicit
     # lists. Without this, omitting ports fell through to naabu's own default of
     # its top-100, a tenth of the intended scope.
-    if not req.ports and not req.top_ports:
+    if not req.ports and not _known and not req.top_ports:
         cmd.extend(["-top-ports", "1000"])
     if req.proxy:
         cmd.extend(["-proxy", req.proxy])
 
     _job_tracker.update_progress(job_id, targets_count=len(req.targets))
     background_tasks.add_task(_run_tool_job, job_id, "naabu", cmd, targets_file, output_file, no_ingest=req.no_ingest)
-    return {"ok": True, "job_id": job_id, "status": "queued", "status_url": f"/jobs/{job_id}", "no_ingest": req.no_ingest}
+
+    sd_job = None
+    if req.service_detect and not req.no_ingest:
+        # Queued second, so it runs after naabu has finished AND ingested —
+        # its port seed is a query against what this scan just stored. With
+        # no_ingest there is nothing stored to seed from, so it is skipped
+        # rather than run against stale rows.
+        sd_job = _job_tracker.create_job(job_type="nmap")
+        background_tasks.add_task(_service_detect_after_discovery, sd_job,
+                                  list(req.targets), req.no_ingest)
+
+    return {"ok": True, "job_id": job_id, "status": "queued",
+            "status_url": f"/jobs/{job_id}",
+            "service_detect_job_id": sd_job,
+            "no_ingest": req.no_ingest}
+
+
+def _service_detect_after_discovery(job_id: str, targets: List[str], no_ingest: bool):
+    """`nmap -sV` over the ports discovery just found for these hosts.
+
+    Runs as the second background task of a naabu job, so the ports table
+    already holds this scan's results. A host with nothing stored is skipped,
+    not swept: "discovery found no open ports" and "discovery has not run" look
+    identical from here, and the second is not a reason to scan 65535 ports.
+    """
+    try:
+        known = {r["ip"]: r["ports"] for r in get_scanned_hosts(limit=500)
+                 if r.get("ports")}
+        pairs = [(t, known[t]) for t in targets if known.get(t)]
+        if not pairs:
+            # Distinct from a completed scan: nothing was fingerprinted, and
+            # saying so beats a silent "done" that reads as "no services".
+            _job_tracker.update_progress(
+                job_id, stage="skipped", findings_count=0,
+                message="no discovered ports for these targets — nothing to fingerprint")
+            return
+        ports = sorted({p for _, pl in pairs for p in pl.split(",") if p},
+                       key=lambda x: int(x) if x.isdigit() else 0)
+        out = str(REPORT_DIR / f"nmap_{job_id[:8]}.xml")
+        cmd = ["nmap", "-sV", "--version-intensity", "7", "-Pn", "-oX", out]
+        if ports:
+            cmd += ["-p", ",".join(ports)]
+        cmd += [ip for ip, _ in pairs]
+        tf = _write_targets_file([ip for ip, _ in pairs])
+        _job_tracker.update_progress(job_id, targets_count=len(pairs))
+        _run_tool_job(job_id, "nmap", cmd, tf, out, no_ingest=no_ingest)
+    except Exception as e:  # noqa: BLE001
+        # Never let the follow-up take the discovery result down with it: the
+        # ports are already stored and useful without their service names.
+        logging.warning("service detection after discovery failed: %s", e)
 
 
 @app.post("/jobs/katana")
@@ -645,6 +790,79 @@ def run_tlsx(req: TlsxReq, background_tasks: BackgroundTasks):
     _job_tracker.update_progress(job_id, targets_count=len(targets))
     background_tasks.add_task(_run_tool_job, job_id, "tlsx", cmd, targets_file, output_file, env=tool_env, no_ingest=req.no_ingest)
     return {"ok": True, "job_id": job_id, "status": "queued", "status_url": f"/jobs/{job_id}", "no_ingest": req.no_ingest}
+
+
+@app.post("/jobs/nmap")
+def run_nmap_service_detection(req: NmapServiceReq, background_tasks: BackgroundTasks):
+    """Service + version detection over already-discovered ports.
+
+    The pipeline ran naabu and nothing else, so every port landed with a number
+    and no service. `etl/parse_nmap.py` and `/ingest/nmap` already existed to
+    consume nmap XML — nothing produced any.
+    """
+    job_id = _job_tracker.create_job(job_type="nmap")
+
+    # One (host, ports) pair per target so each is scanned on its own open
+    # ports. A merged list would scan every host for every other host's.
+    pairs: List[tuple] = []
+    if req.targets == "from_db":
+        for row in get_scanned_hosts(limit=max(1, min(500, req.max_hosts or 50))):
+            if row.get("ports"):
+                pairs.append((row["ip"], row["ports"]))
+    elif isinstance(req.targets, list):
+        if req.ports:
+            pairs = [(t, req.ports) for t in req.targets]
+        else:
+            # Explicit targets with no ports: look each one up, and fall back
+            # to nmap's top-1000 only for a host we have never scanned —
+            # "no discovery yet" is not "no open ports".
+            known = {r["ip"]: r["ports"] for r in get_scanned_hosts(limit=500)}
+            pairs = [(t, known.get(t, "")) for t in req.targets]
+    else:
+        raise HTTPException(status_code=400, detail="targets must be a list or 'from_db'")
+
+    if not pairs:
+        return {"ok": True, "job_id": job_id, "status": "completed",
+                "result": {"findings_count": 0,
+                           "message": "no scanned hosts with open ports — run naabu first"}}
+
+    output_file = str(REPORT_DIR / f"nmap_{job_id[:8]}.xml")
+    # -sV is the point. -Pn because a filtered host that is up must not be
+    # skipped before we ask what it runs. --version-intensity is the caller's
+    # speed/accuracy dial. No -O: OS detection needs raw sockets and doubles
+    # the runtime for a guess the service banners usually settle anyway.
+    iv = max(0, min(9, req.version_intensity if req.version_intensity is not None else 7))
+    cmd = ["nmap", "-sV", "--version-intensity", str(iv), "-oX", output_file]
+    if req.skip_host_discovery:
+        cmd.append("-Pn")
+
+    # nmap takes ONE -p list per invocation, so hosts sharing a port list are
+    # batched and the rest run as separate targets in the same job.
+    by_ports: Dict[str, List[str]] = {}
+    for ip, ports in pairs:
+        by_ports.setdefault(ports or "", []).append(ip)
+    if len(by_ports) == 1:
+        ports, hosts = next(iter(by_ports.items()))
+        if ports:
+            cmd += ["-p", ports]
+        cmd += hosts
+    else:
+        # Mixed port lists: take the union and scan every host over it. Less
+        # precise than per-host, but one nmap run, and still bounded by what
+        # discovery found rather than by 65535.
+        union = sorted({p for ports in by_ports for p in ports.split(",") if p},
+                       key=lambda x: int(x) if x.isdigit() else 0)
+        if union:
+            cmd += ["-p", ",".join(union)]
+        cmd += [ip for hosts in by_ports.values() for ip in hosts]
+
+    targets_file = _write_targets_file([ip for ip, _ in pairs])
+    _job_tracker.update_progress(job_id, targets_count=len(pairs))
+    background_tasks.add_task(_run_tool_job, job_id, "nmap", cmd, targets_file,
+                              output_file, no_ingest=req.no_ingest)
+    return {"ok": True, "job_id": job_id, "status": "queued",
+            "status_url": f"/jobs/{job_id}", "hosts": len(pairs),
+            "no_ingest": req.no_ingest}
 
 
 @app.post("/jobs/whatweb")

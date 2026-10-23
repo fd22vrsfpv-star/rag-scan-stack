@@ -1071,3 +1071,36 @@ hostname-suffix trie, instead of being re-parsed per call. Measure with the same
 gate uses the same function, so any change needs the existing agreement tests
 (`tests/test_dispatch_scope.py::test_bff_and_scope_gate_agree`) green plus a
 case table proving identical verdicts before and after.
+
+### Nothing maps a detected product+version to a CVE
+**Found:** 2026-10-22, verifying that service detection would flag exploit paths.
+**Evidence:** after `nmap -sV` landed real versions on Metasploitable2 —
+`vsftpd 2.3.4`, `Samba smbd 3.X`, `ProFTPD 1.3.1`, `MySQL 5.0.51a-3ubuntu5`,
+`PostgreSQL 8.3`, `UnrealIRCd`, `Apache Tomcat/Coyote 1.1`, 15 products and 11
+versions across 21 ports — the host still shows **vulns: 0** and
+**software_known_cve follow-ups: 0**.
+
+The only promoter is `/software/bridge-scanner-cves`
+(`etl/cve_exploit_bridge.promote_scanner_cves`), whose sources are CVEs a
+scanner already named:
+
+    -- Source A: web_findings whose name is a CVE (nuclei/ZAP CVE templates)
+    WHERE x.name ~* 'CVE-[0-9]'
+
+It does not take "vsftpd 2.3.4" and return CVE-2011-2523. So the chain reads
+`naabu -> nmap -sV -> (nothing) -> CVE flag -> exploit path`, and the gap is the
+third link. vsftpd 2.3.4 (backdoor, CVE-2011-2523), UnrealIRCd (CVE-2010-2075)
+and Samba 3.x (CVE-2007-2447) are all present, all identified, and none flagged.
+
+Half the scaffolding exists: `etl/parse_vulnx.py` parses vulnx records into
+`vulns` AND creates `software_known_cve` follow-ups, and `/ingest/vulnx` accepts
+them — but `vulnx` has no job route in pd_runner and is not installed in the
+image, so nothing produces that input. Same shape as the nmap gap this item was
+found alongside: a parser and an ingest endpoint with no producer.
+**Where:** `pd_runner/pd_runner.py` (no `/jobs/vulnx`), `pd_runner/Dockerfile`
+(vulnx absent), `etl/parse_vulnx.py`, `etl/cve_exploit_bridge.py`.
+**Done when:** a host with `product='vsftpd', version='2.3.4'` in `ports`
+produces a `software_known_cve` follow-up naming CVE-2011-2523 without a
+scanner having already found that CVE by name. Measure on 172.19.250.250, which
+currently yields 0 from 11 versioned services.
+**Enforced by:** not enforced.
