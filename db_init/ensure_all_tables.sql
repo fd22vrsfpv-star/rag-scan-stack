@@ -4441,6 +4441,21 @@ CREATE TABLE IF NOT EXISTS scope_classification_rules (
 --
 -- Matched on `name`, which is not unique, so the guard is a NOT EXISTS rather
 -- than ON CONFLICT. Re-running is a no-op; an operator edit is never reverted.
+-- The seeds below use rule_type 'asset_state', which a database created
+-- before 2026-10-13 does not allow: its CHECK predates that value. The relax
+-- that adds it (TIER 17 "Step 5") lives ~500 lines further down, so on an
+-- EXISTING database every one of these INSERTs failed with
+--   violates check constraint "scope_classification_rules_rule_type_check"
+-- while a FRESH database passed, because its CREATE TABLE already lists the
+-- value. Found 2026-10-23 bringing a 2026-05 database back online: three
+-- classification rules had silently never installed. Idempotent, and a no-op
+-- where the constraint is already correct.
+DO $$ BEGIN
+  ALTER TABLE scope_classification_rules DROP CONSTRAINT IF EXISTS scope_classification_rules_rule_type_check;
+  ALTER TABLE scope_classification_rules ADD CONSTRAINT scope_classification_rules_rule_type_check
+    CHECK (rule_type IN ('domain_pattern','whois_org','asn','tls_issuer','ip_cidr','composite','typosquat','asset_state'));
+EXCEPTION WHEN OTHERS THEN NULL; END $$;
+
 INSERT INTO scope_classification_rules (name, scope_name, priority, rule_type, conditions, auto_apply)
 SELECT 'no-services:unresolved-and-no-open-ports', 'no_services', 20, 'asset_state',
        '{"probed": true, "unresolved": true, "max_open_ports": 0}'::jsonb, true

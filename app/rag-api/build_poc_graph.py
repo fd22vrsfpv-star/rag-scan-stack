@@ -62,7 +62,9 @@ class BuildPocState(TypedDict, total=False):
     readiness_blocked: bool           # strict-gate: hard blocker → skip the run-refine loop
     readiness_blockers: List[str]     # why it was blocked (for the result)
     gather_blocked: bool              # strict gather check: required facts missing → skip synth + refine
-    deep_recon_done: bool             # one deeper-recon pass per run (gaps / early stop)
+    deep_recon_done: bool             # kept: true once ANY deep pass has run
+    deep_recon_max: int               # passes this posture allows (recon_depth)
+    deep_recon_runs: int              # passes actually spent
     deep_recon: Dict[str, Any]        # what the pass ran and found
     gather_manifest: Dict[str, Any]   # the manifest (items/missing/follow_ups/facts) for the result
     reuse_recon: Optional[str]        # per-run auto|always|never recon reuse; None = default
@@ -154,7 +156,8 @@ def initial_state(cve: str, ip: str, port: int, product=None, version=None, eid=
                   focused_urls: Optional[List[str]] = None,
                   fact_challenge: Optional[str] = None,
                   reuse_recon: Optional[str] = None,
-                  run_id: Optional[str] = None) -> BuildPocState:
+                  run_id: Optional[str] = None,
+                  deep_recon_max: int = 1) -> BuildPocState:
     """Build the initial state dict handed to the graph. Mirrors the argument shape
     of _build_poc_core so the wrapper is trivial."""
     # Supplied credentials are the FIRST cred_hint so node_auto_login logs in
@@ -188,6 +191,10 @@ def initial_state(cve: str, ip: str, port: int, product=None, version=None, eid=
         # changed can be forced to re-scan.
         "reuse_recon": reuse_recon,
         "detected_frameworks": [], "waf_family": None, "waf_characterization": {},
+        # How many remedial deep-recon passes this posture allows, and how many
+        # have run. Was a bare `deep_recon_done` boolean — one pass, always,
+        # with no way to ask for more however little the first one found.
+        "deep_recon_max": max(1, int(deep_recon_max or 1)), "deep_recon_runs": 0,
         "auth": auth or {}, "auth_guidance": "", "session_info": None,
         "hint_guidance": "", "hint_parts": [], "research_out": None,
         "recon_guidance": "", "strategy": "", "plan_verdicts": {}, "guidance": "", "guidance_base": "",
@@ -1461,6 +1468,24 @@ def node_assemble_guidance(state: BuildPocState) -> Dict[str, Any]:
 
 
 # ── strategist + plan verifier ─────────────────────────────────────────────────
+def _observed_paths(state: BuildPocState) -> List[str]:
+    """Paths this run has actually seen, for the strategist's grounding gate.
+
+    The gate used to read ZAP's guidance string alone, so on a run where
+    `zap_recon` is not wanted it had nothing to ground against and demoted every
+    endpoint but `/` (CVE-2023-37999, 2026-10-22). These accumulators hold the
+    same observations regardless of which recon nodes ran."""
+    out: List[str] = []
+    for key in ("zap_paths", "arjun_discovered", "admin_paths_mined", "focused_urls"):
+        out.extend(state.get(key) or [])
+    dr = state.get("deep_recon") or {}
+    out.extend(dr.get("candidate_paths") or [])
+    for row in (dr.get("prior_live_recon") or []):
+        if isinstance(row, dict):
+            out.extend(row.get("crawl_urls") or [])
+    return [p for p in out if p]
+
+
 def node_strategist(state: BuildPocState) -> Dict[str, Any]:
     from api import _recon_strategist
     if not (state.get("recon_guidance") or state.get("hint_guidance") or state.get("research_out")):
@@ -1472,7 +1497,8 @@ def node_strategist(state: BuildPocState) -> Dict[str, Any]:
             hint_guidance=state.get("hint_guidance"),
             research_analysis=(state.get("research_out") or {}).get("analysis")
                               if state.get("research") else None,
-            model=state.get("model"), run_id=state["run_id"])
+            model=state.get("model"), run_id=state["run_id"],
+            observed_paths=_observed_paths(state))
     except Exception as e:  # noqa: BLE001
         logging.debug("recon strategist skipped: %s", e)
         strategy = ""
@@ -1490,12 +1516,17 @@ def node_plan_verify(state: BuildPocState) -> Dict[str, Any]:
         # paths like /dtale/test-filter/{data_id} before they are probed
         _ids = _collect_id_pool(" ".join(state.get("segments") or [])[:30000],
                                 state.get("access_inventory"), state.get("precond_result"))
-        strategy_verified, verdicts = _verify_strategist_plan(
+        strategy_verified, verdicts, verify_notes = _verify_strategist_plan(
             state["ip"], state["port"], strategy, session_cookie=_auto_cookie, id_pool=_ids)
         if verdicts:
+            # The REASON belongs in the verdict event. Without it a FAKE is
+            # unauditable: the trace said {'PRIMARY': 'FAKE'} and the actual
+            # cause ("baseline=1, probed=1 — no delta") was only findable by
+            # grepping the guidance blob of a later phase.
             _poc_trace(state["run_id"], "recon:plan_verified",
-                       response=f"verdicts: {verdicts}",
-                       extra={"verdicts": verdicts})
+                       response=f"verdicts: {verdicts}"
+                                + ("\n  " + "\n  ".join(verify_notes) if verify_notes else ""),
+                       extra={"verdicts": verdicts, "notes": verify_notes})
             strategy = strategy_verified
     except Exception as e:  # noqa: BLE001
         logging.debug("plan verification skipped: %s", e)
@@ -1588,7 +1619,11 @@ def node_gather_check(state: BuildPocState) -> Dict[str, Any]:
             eid=state.get("eid"), run_id=state["run_id"],
             product=state.get("product"), probe_results=_probe_results,
             auth_required=bool(_auth_item and _auth_item.get("status") == "missing"),
-            auth_observations=_obs, mode=state.get("fact_challenge_mode"))
+            auth_observations=_obs, mode=state.get("fact_challenge_mode"),
+            # What recon identified, so a `product=unknown` caller does not
+            # make a correctly-fingerprinted target look unidentified.
+            frameworks=state.get("detected_frameworks"),
+            secondary_products=state.get("secondary_products"))
     except Exception as _ce:  # noqa: BLE001
         _challenge = {"ran": False, "error": f"{type(_ce).__name__}: {_ce}"}
         man["challenge"] = _challenge
@@ -1641,7 +1676,9 @@ def node_deep_recon(state: BuildPocState) -> Dict[str, Any]:
                extra={"deep_recon": {k: v for k, v in res.items() if k != "segments"}})
     from api import _build_poc_second_pass_iters
     _second_pass_cap = _build_poc_second_pass_iters()
-    upd: Dict[str, Any] = {"deep_recon_done": True, "deep_recon": {k: v for k, v in res.items() if k != "segments"},
+    _runs = int(state.get("deep_recon_runs") or 0) + 1
+    upd: Dict[str, Any] = {"deep_recon_done": True, "deep_recon_runs": _runs,
+                           "deep_recon": {k: v for k, v in res.items() if k != "segments"},
                            # The go-around is a SECOND chance, not a second budget — but the
                            # cap is now the operator's (Settings → Scan Timeouts →
                            # "Build-PoC second-pass iterations", default 50). At the old
@@ -1660,6 +1697,16 @@ def node_deep_recon(state: BuildPocState) -> Dict[str, Any]:
         upd["auth"] = res["auth"]
     if res.get("session_info"):
         upd["session_info"] = res["session_info"]
+    # A product named by the deep pass is the whole point of the product_id
+    # step: every later phase takes `product`, and the fact challenge reads it
+    # to decide whether a route belongs to this target at all.
+    if res.get("product") and not state.get("product"):
+        upd["product"] = res["product"]
+        if res.get("product_version") and not state.get("version"):
+            upd["version"] = res["product_version"]
+        _fw = list(state.get("detected_frameworks") or [])
+        if res["product"] not in _fw:
+            upd["detected_frameworks"] = _fw + [res["product"]]
     return upd
 
 
@@ -1826,6 +1873,12 @@ def node_run_refine(state: BuildPocState) -> Dict[str, Any]:
         arjun_discovered=state.get("arjun_discovered"),
         focused_urls_from_body=state.get("focused_urls"),
         gather_facts=(_gather_manifest_text(state["gather_manifest"]) if state.get("gather_manifest") else None),
+        # The manifest ITSELF, not only its text rendering. `confirmed_facts`
+        # is keyed on ip:port, so it carries every value any prior build proved
+        # there — including ones proved against a DIFFERENT endpoint. The
+        # proven-fact gate needs this run's own values to prefer.
+        gather_manifest=state.get("gather_manifest"),
+        strategy=state.get("strategy"),
         # Carry the escalation counters forward across a go-around. The second
         # pass starts from a fresh `built["metrics"]`, so without this the
         # stored result reports only the LAST pass — on CVE-2024-22120
@@ -1889,6 +1942,8 @@ def node_run_refine(state: BuildPocState) -> Dict[str, Any]:
                 focused_urls_from_body=state.get("focused_urls"),
                 gather_facts=(_gather_manifest_text(state["gather_manifest"])
                               if state.get("gather_manifest") else None),
+                gather_manifest=state.get("gather_manifest"),
+                strategy=state.get("strategy"),
                 metrics={**(built2.get("metrics") or {}),
                          "refine_passes": int((result.get("metrics") or {})
                                               .get("refine_passes") or 0) + 1,
@@ -2675,17 +2730,32 @@ def build_graph(checkpointer=None):
     g.add_edge("assemble_guidance", "strategist")
     g.add_edge("strategist", "plan_verify")
     g.add_edge("plan_verify", "gather_check")
-    # Gaps → one deeper-recon pass → gather again; early/0-iteration stop → same pass → go around once.
+    # Gaps → a deeper-recon pass → gather again; early/0-iteration stop → same.
+    # The budget is `deep_recon_max` (from recon_depth), not a hardcoded one:
+    # `basic`/`standard` allow one pass, `deep` allows two. `deep_recon_runs`
+    # still bounds the deep_recon → assemble_guidance → gather_check loop, so
+    # this cannot spin however the posture is set.
+    def _deep_passes_left(state) -> bool:
+        return int(state.get("deep_recon_runs") or 0) < int(state.get("deep_recon_max") or 1)
+
     def _route_after_gather(state):
         from api import _BUILD_POC_DEEP_RECON
         man = state.get("gather_manifest") or {}
-        if (_BUILD_POC_DEEP_RECON == "on" and state.get("gather_blocked") and not state.get("deep_recon_done")
+        if (_BUILD_POC_DEEP_RECON == "on" and state.get("gather_blocked") and _deep_passes_left(state)
                 and set(man.get("missing") or []) - {"artifact"}):
             return "deep_recon"
         return "synth"
     g.add_conditional_edges("gather_check", _route_after_gather,
                             {"deep_recon": "deep_recon", "synth": "synth"})
-    g.add_edge("deep_recon", "gather_check")
+    # deep_recon → assemble_guidance → strategist → plan_verify → gather_check.
+    # Deep recon is where the ZAP spider and verb sweep finally run, and on
+    # CVE-2023-37999 they produced the very endpoint the strategist had been
+    # forced to demote 111s earlier. Routing straight back to gather_check meant
+    # the plan was never re-derived, so that evidence changed nothing. The
+    # `deep_recon_runs` budget in _route_after_gather keeps this to the posture's
+    # pass — assemble_guidance is pure string assembly over `segments`, and
+    # plan_verify re-probes at most the three plan candidates.
+    g.add_edge("deep_recon", "assemble_guidance")
     g.add_edge("synth", "run_refine")
 
     def _route_after_refine(state):
@@ -2723,7 +2793,7 @@ def build_graph(checkpointer=None):
         # "early" = the loop gave up (whatever the count — round 8 stopped at
         # iteration 3 and never widened) OR it ended within the first iterations
         early = (not res.get("success")) and (gave_up or int(res.get("iterations") or 0) <= _BUILD_POC_EARLY_STOP_ITERS)
-        if (_BUILD_POC_DEEP_RECON == "on" and early and not state.get("deep_recon_done")
+        if (_BUILD_POC_DEEP_RECON == "on" and early and _deep_passes_left(state)
                 and not res.get("artifact_required")):
             return "deep_recon"
         return "save_store"

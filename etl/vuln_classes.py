@@ -271,6 +271,42 @@ def needs_input_field(name) -> bool:
     return bool((get(name) or {}).get("input_field_required"))
 
 
+def account_fields(name) -> List[str]:
+    """Request fields that NAME the account, most specific first.
+
+    Declared per class in knowledge/vuln_classes.yaml so an app whose
+    registration uses a different field is a YAML edit, not a code change.
+    Empty list for a class that does not act on accounts.
+    """
+    v = (get(name) or {}).get("account_fields") or []
+    return [str(x) for x in v if str(x).strip()]
+
+
+def password_fields(name) -> List[str]:
+    """Request fields that set the account's PASSWORD, most specific first.
+
+    Goal-derived like `account_fields`: a graded environment proves the
+    escalation by logging in with the credentials it published, so the created
+    account must carry the supplied password, not a generated one.
+    """
+    v = (get(name) or {}).get("password_fields") or []
+    return [str(x) for x in v if str(x).strip()]
+
+
+def needs_identity(name) -> bool:
+    """Must the ACCOUNTS on the target be enumerated before synthesis?
+
+    DECLARED, not inferred. A class whose whole premise is "this principal ends
+    up with privileges it should not have" cannot be built, let alone proven,
+    until something establishes which principals exist and what they already
+    hold. Answered by the user_enum_* tools in knowledge/gap_tools.yaml, which
+    declare `gaps: [identity, ...]`.
+    """
+    if not is_exploitable(name):
+        return False
+    return bool((get(name) or {}).get("identity_required"))
+
+
 def needs_oob_sink(name) -> bool:
     return is_exploitable(name) and bool((get(name) or {}).get("needs_oob_sink"))
 

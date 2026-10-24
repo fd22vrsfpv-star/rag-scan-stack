@@ -127,8 +127,12 @@ def test_verified_run_still_uses_the_normal_row_not_failed_poc():
 
 
 def test_ui_has_a_failed_filter():
+    """2026-10-23: the rail's duplicate picker card was merged into the catalog
+    (operator: "it should be either catalog or the workbench for new"), so the
+    Failed chip now drives the catalog's own `storeFilter` rather than a second
+    `filter` state. Same control, one copy of it — assert the BEHAVIOUR."""
     ui = UI.read_text()
-    assert "filter === 'failed' ? { kind: 'failed_poc' }" in ui
+    assert "'failed' ? { kind: 'failed_poc' }" in ui, "no query filters to failed_poc"
     assert "'all' | 'verified' | 'tweaking' | 'failed'" in ui
-    assert "Failed ({failedCount})" in ui
-    assert "r.kind === 'failed_poc'" in ui
+    assert "Failed (" in ui, "the Failed chip is gone from the UI"
+    assert "x.kind === 'failed_poc'" in ui or "r.kind === 'failed_poc'" in ui

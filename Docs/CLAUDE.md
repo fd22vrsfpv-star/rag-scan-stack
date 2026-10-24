@@ -359,6 +359,51 @@ large change. Add the test in the same commit as the rule.
   `max_iters`. `error_memory_rows` was 7 on each, so we had already retrieved
   the identical prior error and used it only as prompt advice.
 
+### A refusal must carry the context its evidence was proven in
+- **Refusing is the strongest thing the platform does to its own work.** A
+  refused command is never dispatched, so whatever the target would have said
+  is never heard. A refusal is only as good as its evidence, and evidence is
+  never context-free — it was established against some endpoint, some CVE, some
+  run. Enforced anywhere else it is a guess wearing the authority of a fact.
+- **Every refusal site is classified.** `SELF_CONTAINED` (refuses on this run's
+  own evidence — drift, axis, duplicate, shell syntax), `SCOPED` (reads a
+  STORED fact, and must consult `etl/enforcement_scope`), or `SCOPE_DEBT` with
+  a reason. A new refusal site fails by name until declared, because whoever
+  adds one knows whether it reads stored evidence and nobody can infer that
+  later.
+- **The primitives are `etl/enforcement_scope.py`** — `tag`/`scope_of` record
+  and read the context on a fact's provenance string; `may_enforce` answers
+  whether a fact may refuse an action; `prefer_current` merges stored evidence
+  with this run's, the current run winning.
+- **Fail OPEN.** Only a KNOWN mismatch declines enforcement. An unscoped legacy
+  fact still arms the gate — silently dropping every one of them would empty an
+  existing gate, which is this defect inverted. These are quality checks;
+  `etl/scope_gate.py` is the one that fails CLOSED, and nothing here may decide
+  whether traffic is permitted.
+- **An unnamed value is not a context.** `unknown`, `unidentified`, `n/a`, `-`
+  and blank all mean "no fingerprint". A filled field is not an identity — the
+  CVE-Bench runner sends `product=unknown` whenever a challenge `.env` omits
+  `APPLICATION_NAME`, and `_norm("unknown")` is truthy.
+- *Enforced by:* `tests/test_enforcement_scope.py` (the primitives' contract,
+  the registry of refusal sites, the `SCOPE_DEBT` ratchet, and that each
+  `SCOPED` site actually consults the primitive),
+  `tests/test_proven_fact_scope.py` (the proven-fact gate's own wiring).
+- *Why:* five instances of this one defect were found and fixed separately over
+  2026-10-22/23, each costing a run to diagnose. The strategist grounded its
+  endpoint against a ZAP string from a stage that had not run, so the grounded
+  set was `{"/", ""}` and every candidate was "ungrounded". The fact challenge
+  read the literal `"unknown"` as a product NAME and called a WordPress route
+  on a WordPress target foreign. Plan-verify probed `?param=canary` where the
+  plan said POST-with-a-body, so a dispatcher endpoint (`admin-ajax.php`, which
+  routes on `action=`) could not pass by ANY parameter — it probed the dispatch
+  key itself and still read IGNORED. The proven-fact gate enforced
+  `input_field='roles'`, proven against `/wp-json/wp/v2/users`, on a command
+  targeting `/wp-admin/admin-ajax.php`, refusing the one command that carried
+  the advisory's real parameters and sending the next nine to a parameter the
+  plugin ignores. And `known_dead` pools error signatures across every CVE and
+  host while counting the harness's own pre-dispatch refusals — a refusal we
+  generated becoming evidence that the exploit approach is dead.
+
 ### Scan volume
 - Any component that initiates OR triggers a scan MUST bound itself by
   `MAX_CONCURRENT_SCANS`. No component invents a private concurrency number.

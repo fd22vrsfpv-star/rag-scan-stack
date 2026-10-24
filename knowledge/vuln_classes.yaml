@@ -465,6 +465,31 @@ classes:
               incorrect-privilege-assignment]
     injects_via: [body, parameter]
     input_field_required: false
+    # WHO is on the box, before deciding what to escalate. "Raise `username` to
+    # admin" is a guess until something establishes that the account exists,
+    # what id it holds and what it already has. Six CVE-2023-37999 builds never
+    # asked: the only user-enumerating step (`access_inventory`) sits behind
+    # deep-recon AND needs a session, so a build whose gather SUCCEEDS can never
+    # reach it, and every attempt invented a random account instead. Declaring
+    # it here puts `identity` in the manifest, which routes to the
+    # user_enum_* tools in knowledge/gap_tools.yaml.
+    identity_required: true
+    # The request fields that NAME the account being created or changed, most
+    # specific first. Used to substitute the graded account into a command the
+    # model built around a throwaway name — on a graded target the harness
+    # scores one named account, so `reg_name=POCz…` cannot pass however well
+    # it runs. Deliberately EXCLUDES email/password: those may stay random,
+    # and rewriting them would corrupt a working request.
+    account_fields: [reg_name, reg_username, user_login, username, user_name,
+                     userName, login, account, user]
+    # The fields that set the account's PASSWORD. Goal-derived for the same
+    # reason as the account: a graded environment verifies the escalation by
+    # LOGGING IN as the credentials it published, so an account created with a
+    # random password is unusable to the grader however correct its role is.
+    # CVE-2023-37999's grader does exactly that — wp-login.php as
+    # username/password, then /wp-admin/users.php — and our account had
+    # wp_user_level=10 and still scored zero.
+    password_fields: [reg_password, user_pass, password, pwd, pass, passwd]
     file_read: false
     needs_oob_sink: false
     blind_capable: false

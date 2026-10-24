@@ -17,6 +17,10 @@ from pathlib import Path
 
 import pytest
 
+import sys as _sys2, pathlib as _pl2
+_sys2.path.insert(0, str(_pl2.Path(__file__).resolve().parent))
+import _ast_assert as _aa  # noqa: E402
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _ast_assert import calls  # noqa: E402
 
@@ -326,6 +330,9 @@ def _vc_predicates():
     from etl import vuln_classes as _m
     return {"_vc_needs_input_field": _m.needs_input_field,
             "_vc_needs_oob_sink": _m.needs_oob_sink,
+            # privilege-escalation declares identity_required — the gate asks
+            # the class table whether accounts must be enumerated first.
+            "_vc_needs_identity": _m.needs_identity,
             "_vc_path_is_the_field": _m.path_is_the_field,
             "_vc_canonical": _m.canonical,
             "_vc_is_file_read": _m.is_file_read,
@@ -508,10 +515,15 @@ def test_header_params_are_recognised():
 def test_plan_verify_probes_header_inputs_as_headers_and_reports_needs_id():
     body = _func_src("_verify_strategist_plan")
     assert "hdr_param = _is_header_param(param)" in body
-    assert "_fetch(endpoint, headers={param: canary}) if hdr_param" in body, "header input must be sent as a header"
+    # The header case now routes through _probe_with_plan_shape, which keeps a
+    # header-carried input a header before considering the plan's body.
+    assert _aa.calls(body, "_probe_with_plan_shape"), "step 2 must probe the plan's own request shape"
+    hdr = _func_src("_probe_with_plan_shape")
+    assert _aa.call_kwarg(hdr, "fetch", "headers"), "header input must be sent as a header"
     assert '"127.0.0.1:1" if hdr_param' in body, "SSRF class probe must be a host value for a header input"
     assert 'verdicts[c["label"]] = "NEEDS_ID"' in body and "_resolve_placeholder_path(endpoint" in body
-    assert 'in ("LIVE", "SUSPECT", "NEEDS_ID")' in body, "NEEDS_ID must not trigger the ALL-FAKE directive"
+    assert {"LIVE", "SUSPECT", "NEEDS_ID", "UNPROVEN"} <= _aa.string_constants(body), \
+        "NEEDS_ID and UNPROVEN must not trigger the ALL-FAKE directive"
 
 
 def test_placeholder_resolution_and_id_pool():
@@ -708,14 +720,26 @@ def test_graph_loops_once_through_deep_recon_on_gaps_and_early_stop():
     # g.add_node directly — this assertion pinned the pre-wrapper form and had
     # been failing since that refactor.
     assert '_add_node(g, "deep_recon", node_deep_recon)' in g
-    assert 'g.add_conditional_edges("gather_check", _route_after_gather' in g and 'g.add_edge("deep_recon", "gather_check")' in g
+    # deep_recon returns via assemble_guidance (not straight to gather_check)
+    # so the plan is RE-DERIVED with the paths the deep pass just found —
+    # CVE-2023-37999 discovered its real endpoint there and nothing re-read it.
+    assert _aa.calls_with(g, "g.add_edge", args=("deep_recon", "assemble_guidance"))
+    assert not _aa.calls_with(g, "g.add_edge", args=("deep_recon", "gather_check"))
     assert 'g.add_conditional_edges("run_refine", _route_after_refine' in g
     assert 'g.add_edge("gather_check", "synth")' not in g and 'g.add_edge("run_refine", "save_store")' not in g
-    assert 'not state.get("deep_recon_done")' in g, "exactly one pass per run"
+    # Passes are bounded by the POSTURE (recon_depth -> deep_recon_max), not by
+    # a hardcoded single pass — but they are still bounded, and by the same
+    # predicate on both routes, or one of them loops.
+    assert g.count("_deep_passes_left(state)") == 3, \
+        "both the gather route and the early-stop route must share one budget check"
+    _left = _func_src("_deep_passes_left", GRAPH)
+    assert "deep_recon_runs" in _left and "deep_recon_max" in _left, \
+        "the budget must compare passes spent against passes allowed"
     assert 'set(man.get("missing") or []) - {"artifact"}' in g, "an artifact-only gap must not trigger recon"
     assert 'int(res.get("iterations") or 0) <= _BUILD_POC_EARLY_STOP_ITERS' in g
     node = _func_src("node_deep_recon", GRAPH)
     assert '"deep_recon_done": True' in node and '"gather_blocked": False' in node
+    assert "deep_recon_runs" in node, "a pass that is not counted is not bounded"
     assert '_BUILD_POC_EARLY_STOP_ITERS = int(os.environ.get("BUILD_POC_EARLY_STOP_ITERS") or "2")' in API.read_text()
 
 
@@ -726,7 +750,9 @@ def test_solutions_step_asks_what_do_i_need_and_maps_executable_steps():
         if isinstance(node, _ast.Assign) and getattr(node.targets[0], "id", "") in (
                 "_BUILD_POC_GAP_SOLUTIONS_LLM", "_DEEP_RECON_STEPS", "_GAP_SOLUTIONS"):
             exec(_ast.get_source_segment(src, node), ns)
-    for name in ("_deep_recon_plan", "_solutions_for_gaps"):
+    # `_focus_plan` narrows the plan to what answers the gaps — pure, and
+    # called by _solutions_for_gaps, so it has to come along.
+    for name in ("_deep_recon_plan", "_focus_plan", "_solutions_for_gaps"):
         node = next(x for x in _ast.walk(tree) if isinstance(x, _ast.FunctionDef) and x.name == name)
         exec(_ast.get_source_segment(src, node), ns)
     out = ns["_solutions_for_gaps"](["auth", "endpoint_id"], product="dtale", vuln_class="auth-bypass",

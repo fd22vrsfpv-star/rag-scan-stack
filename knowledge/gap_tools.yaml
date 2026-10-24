@@ -82,6 +82,67 @@ tools:
       operator could not tell a wrong port from a tool that is not installed.
       An error message is more useful than silence.
 
+  - id: user_enum_rest
+    # WHO IS ON THIS BOX. A privilege-escalation build has to answer that
+    # BEFORE it can escalate anything: "raise `username` to admin" is a guess
+    # until you know whether that account exists, what id it holds and what it
+    # already has. CVE-2023-37999 ran six times without ever asking — the one
+    # step that enumerates users (`access_inventory`) is gated behind
+    # deep-recon AND needs a session, so on a build whose gather SUCCEEDS it is
+    # unreachable, and every attempt invented a random account instead.
+    #
+    # WordPress publishes this unauthenticated at /wp-json/wp/v2/users — the
+    # same path that kept surfacing as a distraction in those runs. It is not
+    # the exploit endpoint; it is the enumeration oracle.
+    gaps: [identity, user_ids, endpoint_id]
+    indicators: [wordpress, wp-json, wp-content, wp-admin]
+    yields: identity
+    command: "curl -s -k --max-time 15 {scheme}://{ip}:{port}/wp-json/wp/v2/users"
+    # How to read this tool's own output. Beside the command that produces it,
+    # so adding an identity source stays a YAML edit.
+    identity_pattern: '"slug"\s*:\s*"([^"]{1,64})"' 
+    cost: 5
+    safe: true
+    why: >
+      Returns id, name and slug for every user the REST API exposes, with no
+      credentials. Answers "does the graded account exist, and at what id"
+      directly, which is the precondition for any escalation and for the
+      proof that follows it.
+
+  - id: user_enum_author_scan
+    # The fallback when the REST route is disabled: ?author=N redirects to
+    # /author/<slug>/, so the slug leaks one id at a time. Bounded to the low
+    # ids on purpose — this is identity discovery, not enumeration at scale.
+    gaps: [identity, user_ids]
+    indicators: [wordpress, wp-content, wp-admin]
+    yields: identity
+    # -I and read the Location header: curl's write-out format (%{http_code})
+    # leaves braces, and the renderer rejects a template with braces left.
+    command: "sh -lc 'for i in 1 2 3 4 5 6 7 8; do echo \"== author $i\"; curl -s -k -I --max-time 5 \"{scheme}://{ip}:{port}/?author=$i\" | grep -iE \"^HTTP/|^location:\"; done'"
+    identity_pattern: '/author/([^/\s]{1,64})/' 
+    cost: 12
+    safe: true
+    why: >
+      Works where the REST users route is blocked. A 301 whose Location
+      contains /author/<slug>/ confirms the id exists and names its account.
+
+  - id: user_enum_generic
+    # Non-WordPress targets. Tries the conventional unauthenticated identity
+    # endpoints and stops at the first that answers.
+    gaps: [identity, user_ids]
+    yields: identity
+    command: "sh -lc 'for p in /api/users /api/v1/users /users /api/me /api/account; do echo \"== $p\"; curl -s -k --max-time 5 \"{scheme}://{ip}:{port}$p\" | head -c 400; echo; done'"
+    # `name` is NOT in this list. It matched a WordPress 404 page's site title
+    # ("My WordPress Site") when /api/users returned HTML, and an identity that
+    # is really a site name is worse than none once identities are enforced:
+    # the gate would demand every command contain it.
+    identity_pattern: '"(?:username|user_name|userName|login|slug)\s*"\s*:\s*"([^"]{1,64})"' 
+    cost: 10
+    safe: true
+    why: >
+      A privilege-escalation goal names an account; something has to establish
+      that the account is real before the build spends iterations on it.
+
   - id: httpx_probe
     # MUST run on pd-runner / osint-runner, NOT kali-listener. The listener's
     # `httpx` is the PYTHON HTTP LIBRARY's CLI, not ProjectDiscovery's scanner
