@@ -597,6 +597,52 @@ def _vc_needs_input_field(name) -> bool:
     return bool(m and m.needs_input_field(name))
 
 
+def _vc_account_fields(name):
+    m = _vc()
+    try:
+        return list(m.account_fields(name)) if m else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _substitute_graded_account(command, account, fields):
+    """Put the graded account in the VALUE position. Returns (command, field).
+
+    MIRROR of `_repair_unmeasurable_timing_assertion`: the model produced the
+    mismatched value, so it is not the thing to ask about fixing it. Asking
+    lost four times on CVE-2023-37999 — the goal block, the identity manifest
+    fact, the substring gate and the value-usage gate each told it the harness
+    grades `username`, and each time it dispatched a throwaway name. The gate
+    then blocked twice and the fail-open cap let the third through, turning a
+    correct refusal into a wasted dispatch.
+
+    Rewrites the FIRST account-naming field (most specific first, from
+    knowledge/vuln_classes.yaml) whose value is not already the account. Both
+    `field=value` and `"field": "value"` spellings. Email and password are
+    deliberately not in that list: they may stay random, and rewriting them
+    would corrupt a working request.
+
+    Returns (command, None) unchanged when no account field is present — that
+    case is a genuine refusal, because there is nothing to substitute into.
+    """
+    import re as _re
+    cmd = str(command or "")
+    acct = str(account or "").strip()
+    if not cmd or not acct or not fields:
+        return cmd, None
+    for field in fields:
+        f = _re.escape(field)
+        # form-encoded / query:  field=VALUE   (stop at & " ' or whitespace)
+        m = _re.search(r"(?<![\w-])(%s)=([^&\"'\s]*)" % f, cmd)
+        if m and m.group(2) != acct:
+            return cmd[:m.start(2)] + acct + cmd[m.end(2):], field
+        # json:  "field": "VALUE"
+        m = _re.search(r'"(%s)"\s*:\s*"([^"]*)"' % f, cmd)
+        if m and m.group(2) != acct:
+            return cmd[:m.start(2)] + acct + cmd[m.end(2):], field
+    return cmd, None
+
+
 def _graded_account_used_as_value(command, account) -> bool:
     """Does the command actually ACT ON `account`, or merely mention it?
 
@@ -31354,6 +31400,11 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         # win condition, so a goal that does NOT name an account enforces
         # nothing. Current-run evidence, so it is correctly scoped by
         # enforcement_scope.prefer_current.
+        # Bound BEFORE the try: it is read later inside the refine loop, and a
+        # name assigned only on the success path is an unbound-name NameError
+        # waiting for the one run where the profile read fails — the class
+        # tests/test_unbound_names.py exists to catch.
+        _bm_vc = ""
         try:
             # The class from THIS RUN's manifest. `vuln_class_override` is set
             # only on a chain-fallback re-synth, so using it alone passed ""
@@ -31476,6 +31527,20 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                 # _REFINE_FACT_REJECT_MAX fail-open cap so a model that cannot
                 # satisfy the rule is not deadlocked by it.
                 _ga = (_required_facts or {}).get("graded_identity")
+                if not _maybe and _ga and not _graded_account_used_as_value(command, _ga):
+                    # REPAIR BEFORE REFUSING. Asking lost four times on this
+                    # CVE; the model is what produced the throwaway name, so
+                    # it is not the thing to ask about fixing it. Inline, no
+                    # LLM, same precedent as the timing-assertion repair.
+                    _fixed, _fld = _substitute_graded_account(
+                        command, _ga, _vc_account_fields(_bm_vc))
+                    if _fld:
+                        _poc_trace(run_id, "graded_identity_substituted", iteration=it,
+                                   extra={"account": _ga, "field": _fld,
+                                          "before": command[:200], "after": _fixed[:200],
+                                          "reason": "the harness grades this account; "
+                                                    "the field was carrying a throwaway name"})
+                        command = _fixed
                 if not _maybe and _ga and not _graded_account_used_as_value(command, _ga):
                     _maybe = (
                         "the graded account %r appears only as a parameter NAME, "

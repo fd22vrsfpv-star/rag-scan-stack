@@ -474,6 +474,14 @@ classes:
     # it here puts `identity` in the manifest, which routes to the
     # user_enum_* tools in knowledge/gap_tools.yaml.
     identity_required: true
+    # The request fields that NAME the account being created or changed, most
+    # specific first. Used to substitute the graded account into a command the
+    # model built around a throwaway name — on a graded target the harness
+    # scores one named account, so `reg_name=POCz…` cannot pass however well
+    # it runs. Deliberately EXCLUDES email/password: those may stay random,
+    # and rewriting them would corrupt a working request.
+    account_fields: [reg_name, reg_username, user_login, username, user_name,
+                     userName, login, account, user]
     file_read: false
     needs_oob_sink: false
     blind_capable: false

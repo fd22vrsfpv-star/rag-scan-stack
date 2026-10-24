@@ -271,6 +271,17 @@ def needs_input_field(name) -> bool:
     return bool((get(name) or {}).get("input_field_required"))
 
 
+def account_fields(name) -> List[str]:
+    """Request fields that NAME the account, most specific first.
+
+    Declared per class in knowledge/vuln_classes.yaml so an app whose
+    registration uses a different field is a YAML edit, not a code change.
+    Empty list for a class that does not act on accounts.
+    """
+    v = (get(name) or {}).get("account_fields") or []
+    return [str(x) for x in v if str(x).strip()]
+
+
 def needs_identity(name) -> bool:
     """Must the ACCOUNTS on the target be enumerated before synthesis?
 

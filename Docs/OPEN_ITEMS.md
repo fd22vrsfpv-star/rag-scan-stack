@@ -27,6 +27,41 @@ named tests exist).
 
 ## Known gaps carried from earlier sessions
 
+### The build drifts off the advisory's field names and the plugin says so
+**Found:** 2026-10-24 (CVE-2023-37999, after the graded-account substitution)
+**Evidence:** the chain is now correct end to end — correct endpoint, correct
+`action`, correct `reg_role`, and the graded account substituted into the
+command (4 substitutions, 0 refusals, 6 of 7 dispatches acting on `username`).
+The target still refuses, and names exactly why:
+
+    {"registerauth":false,"message":"Username, Password and E-Mail are required"}
+
+The strategist had the right shape and the build did not use it:
+
+    advisory   : action=htmega_ajax_register&reg_name=…&reg_password=…&reg_email=…&reg_role=administrator
+    dispatched : action, email, password, reg_role, username
+
+`action` and `reg_role` survived; `reg_name`, `reg_password` and `reg_email`
+were replaced with `username`, `password`, `email`. Those three are exactly
+what the handler validates, so it rejects every request before reaching the
+vulnerable code. The plugin's own error message uses the words "Username,
+Password and E-Mail", which reads as confirmation of the wrong names — the
+build is being told it is close by the thing refusing it.
+
+Note the graded-account substitution is working as designed and is not the
+cause: it rewrote the field the command HAD (`username`). With `reg_name`
+present it would have rewritten that instead — `account_fields` lists
+`reg_name` first.
+**Where:** synth/refine prompt assembly, which carries `payload_hint` as
+advice; the same place the four previous "tell the model" mechanisms lost.
+**Done when:** when the strategist's `payload_hint` names fields the dispatched
+command omits, those fields are added deterministically before dispatch (the
+`_substitute_graded_account` / `_repair_unmeasurable_timing_assertion`
+pattern), rather than described in the prompt. Measure on CVE-2023-37999: the
+dispatched command must carry `reg_name`, `reg_password` and `reg_email`, and
+the response must stop being the "are required" validation error.
+**Enforced by:** not enforced.
+
 ### The News "Asset matches" panel can never fire — `vulns.cve` is empty on 97% of rows
 **Found:** 2026-10-19
 **Evidence:** `_match_assets` (`news_runner/news_agent.py`) joins
@@ -1319,38 +1354,3 @@ that actually left the endpoint. Measure on CVE-2023-37999: the run must
 continue past iteration 1 and attempt an admin-only assertion.
 **Enforced by:** not enforced.
 
-### The graded account should be substituted into the command, not asked for
-**Found:** 2026-10-24 (CVE-2023-37999, after the graded-identity gate landed)
-**Evidence:** the gate now arms correctly and blocks correctly —
-
-    graded_identity_refused: 2
-    dispatched: 1   (was 9 refusals / 7 dispatches when it only traced)
-
-— but the model does not comply with the refusal, and
-`_REFINE_FACT_REJECT_MAX` opens the gate after 2 refusals ("dispatching anyway
-(quality gate, fails open)"). The command that then runs is still:
-
-    U=user${POC}${R}; curl -d "username=${U}&...&reg_role=administrator"
-
-The harness grades `username`; this creates `userPOCzf39b0cfa34…`. The fail-open
-cap is correct in general — a model that CANNOT satisfy a rule must not be
-deadlocked — but here the model can satisfy it and simply does not, so the cap
-converts a correct refusal into a wasted dispatch.
-
-This is the fourth mechanism on this CVE to lose to "tell the model and hope":
-the goal block, the identity manifest fact, the substring gate and now the
-value-usage gate. CLAUDE.md already names the remedy for exactly this shape:
-"the assertion is deterministically rewritten ... the model is what produced
-the mismatched assertion, so it is not the thing to ask about fixing it."
-**Where:** `_run_refine_poc`, beside the `_maybe` refusal that currently stops
-at refusing; the existing `_repair_unmeasurable_timing_assertion` is the
-precedent for an inline deterministic repair.
-**Done when:** when the graded account is armed and the command names an
-account field whose value is a canary/random identifier, that value is
-REWRITTEN to the graded account before dispatch — inline, no LLM — and the
-refusal is reserved for the case where no account field can be identified.
-Measure on CVE-2023-37999: the dispatched command must carry the graded account
-in the value position without the model having been asked twice.
-**Enforced by:** `tests/test_graded_identity_gate.py` pins the detection
-(`_graded_account_used_as_value`) and that the refusal blocks dispatch; the
-rewrite is not built.
