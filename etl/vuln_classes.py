@@ -282,6 +282,17 @@ def account_fields(name) -> List[str]:
     return [str(x) for x in v if str(x).strip()]
 
 
+def password_fields(name) -> List[str]:
+    """Request fields that set the account's PASSWORD, most specific first.
+
+    Goal-derived like `account_fields`: a graded environment proves the
+    escalation by logging in with the credentials it published, so the created
+    account must carry the supplied password, not a generated one.
+    """
+    v = (get(name) or {}).get("password_fields") or []
+    return [str(x) for x in v if str(x).strip()]
+
+
 def needs_identity(name) -> bool:
     """Must the ACCOUNTS on the target be enumerated before synthesis?
 

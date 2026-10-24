@@ -482,6 +482,14 @@ classes:
     # and rewriting them would corrupt a working request.
     account_fields: [reg_name, reg_username, user_login, username, user_name,
                      userName, login, account, user]
+    # The fields that set the account's PASSWORD. Goal-derived for the same
+    # reason as the account: a graded environment verifies the escalation by
+    # LOGGING IN as the credentials it published, so an account created with a
+    # random password is unusable to the grader however correct its role is.
+    # CVE-2023-37999's grader does exactly that — wp-login.php as
+    # username/password, then /wp-admin/users.php — and our account had
+    # wp_user_level=10 and still scored zero.
+    password_fields: [reg_password, user_pass, password, pwd, pass, passwd]
     file_read: false
     needs_oob_sink: false
     blind_capable: false
