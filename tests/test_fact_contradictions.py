@@ -135,6 +135,64 @@ class TestTheRealLedger:
             RULES)
         assert "route_belongs_to_another_product" not in _ids(res)
 
+    # ── the fingerprint the rule could not see (2026-10-23) ──────────────
+    #
+    # CVE-2023-37999, CVE-Bench top-20 run 2. Both fact_challenge passes fired
+    #   [HIGH/downgrade] route_belongs_to_another_product: endpoint
+    #   /wp-json/wp/v2/users carries a route marker for 'wordpress', but the
+    #   target was fingerprinted as 'unknown'
+    # on a target the SAME run fingerprinted as WordPress 6.8.3 four separate
+    # times (`Generator=WordPress 6.8.3`, `* FRAMEWORK: WordPress`, a
+    # `recon:deep_enum:WordPress` phase, `'framework': 'WordPress'` in
+    # failure_analysis). `product` was the literal string "unknown" because the
+    # CVE-Bench runner sends that when a challenge .env has no
+    # APPLICATION_NAME — and `_norm("unknown")` is truthy, so the rule read a
+    # blank as a product name and every wp-* route became another product's.
+    #
+    # It reached the right verdict from a false premise: /wp-json/wp/v2/users
+    # IS wrong for this CVE, but because it is WP *core* rather than the HT
+    # Mega AJAX handler. The same rule would have downgraded the CORRECT
+    # /wp-admin/admin-ajax.php for the identical reason.
+
+    def test_unknown_product_is_not_a_fingerprint(self):
+        """You cannot prove a route belongs to ANOTHER product without knowing
+        which product this one is."""
+        res = fc.evaluate(
+            {"product": "unknown",
+             "facts": {"endpoint": "/wp-admin/admin-ajax.php"}}, RULES)
+        assert "route_belongs_to_another_product" not in _ids(res)
+
+    @pytest.mark.parametrize("blank", ["unknown", "", None, "n/a", "-", "none"])
+    def test_every_blank_product_form_is_treated_as_unfingerprinted(self, blank):
+        res = fc.evaluate(
+            {"product": blank, "facts": {"endpoint": "/wp-json/wp/v2/users"}},
+            RULES)
+        assert "route_belongs_to_another_product" not in _ids(res)
+
+    def test_recon_framework_identifies_the_target_when_the_caller_cannot(self):
+        """The real CVE-2023-37999 intel shape: the caller declared nothing,
+        recon found WordPress."""
+        res = fc.evaluate(
+            {"product": "unknown", "frameworks": ["WordPress"],
+             "secondary_products": [{"product": "PHP", "version": "8.3.28"}],
+             "facts": {"endpoint": "/wp-admin/admin-ajax.php"}}, RULES)
+        assert "route_belongs_to_another_product" not in _ids(res)
+
+    def test_a_framework_does_not_excuse_a_foreign_route(self):
+        """SABOTAGE GUARD. Widening identity must not disarm the rule: a
+        WordPress target reaching a /jira/ route is still a contradiction."""
+        res = fc.evaluate(
+            {"product": "unknown", "frameworks": ["WordPress"],
+             "facts": {"endpoint": "/jira/browse/X"}}, RULES)
+        assert "route_belongs_to_another_product" in _ids(res)
+
+    def test_a_real_mismatch_still_fires_with_a_declared_product(self):
+        """The original case must not regress."""
+        res = fc.evaluate(
+            {"product": "jira", "frameworks": [],
+             "facts": {"endpoint": "/bamboo/browse"}}, RULES)
+        assert "route_belongs_to_another_product" in _ids(res)
+
     def test_a_command_parameter_on_a_traversal_is_caught(self):
         res = fc.evaluate(
             {"vuln_class": "path-traversal", "facts": {"input_field": "command"}},
@@ -382,3 +440,40 @@ def test_the_renderer_emits_one_document_per_rule():
     joined = " ".join(b for _, b in docs)
     for r in RULES:
         assert r["id"] in " ".join(t for t, _ in docs) or r["id"] in joined, r["id"]
+
+
+# ── the plumbing (2026-10-23) ────────────────────────────────────────────────
+#
+# A check that CAN read recon's fingerprint is worthless if nothing hands it
+# one. These pin the two hops between the graph state and `_identities`.
+
+_API = REPO / "app" / "rag-api" / "api.py"
+_GRAPH = REPO / "app" / "rag-api" / "build_poc_graph.py"
+
+
+def _fn(path, name):
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return next((n for n in ast.walk(tree)
+                 if isinstance(n, ast.FunctionDef) and n.name == name), None)
+
+
+def test_challenge_intel_carries_the_recon_fingerprint():
+    fn = _fn(_API, "_challenge_intel")
+    assert fn is not None, "_challenge_intel is gone from api.py"
+    kwonly = {a.arg for a in fn.args.kwonlyargs} | {a.arg for a in fn.args.args}
+    assert {"frameworks", "secondary_products"} <= kwonly, (
+        "the challenge intel no longer carries what recon identified; "
+        "a product=unknown caller makes a fingerprinted target unidentified"
+    )
+    src = ast.get_source_segment(_API.read_text(encoding="utf-8"), fn) or ""
+    assert '"frameworks"' in src, "frameworks is accepted but never put in the intel dict"
+
+
+def test_the_graph_passes_detected_frameworks_to_the_challenge():
+    fn = _fn(_GRAPH, "node_gather_check") or _fn(_GRAPH, "node_gather")
+    src = _GRAPH.read_text(encoding="utf-8")
+    call_ok = "frameworks=state.get(\"detected_frameworks\")" in src
+    assert call_ok, (
+        "node_gather_check no longer passes recon's frameworks to "
+        "_challenge_derived_facts"
+    )

@@ -72,6 +72,10 @@ def _vc_predicates():
     from etl import vuln_classes as _m
     return {"_vc_needs_input_field": _m.needs_input_field,
             "_vc_needs_oob_sink": _m.needs_oob_sink,
+            # privilege-escalation declares identity_required, so the gate now
+            # asks the class table whether the accounts must be enumerated
+            # before synthesis (knowledge/vuln_classes.yaml).
+            "_vc_needs_identity": _m.needs_identity,
             "_vc_path_is_the_field": _m.path_is_the_field,
             "_vc_canonical": _m.canonical,
             "_vc_is_file_read": _m.is_file_read,

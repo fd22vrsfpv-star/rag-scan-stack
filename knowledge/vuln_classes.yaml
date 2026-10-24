@@ -465,6 +465,15 @@ classes:
               incorrect-privilege-assignment]
     injects_via: [body, parameter]
     input_field_required: false
+    # WHO is on the box, before deciding what to escalate. "Raise `username` to
+    # admin" is a guess until something establishes that the account exists,
+    # what id it holds and what it already has. Six CVE-2023-37999 builds never
+    # asked: the only user-enumerating step (`access_inventory`) sits behind
+    # deep-recon AND needs a session, so a build whose gather SUCCEEDS can never
+    # reach it, and every attempt invented a random account instead. Declaring
+    # it here puts `identity` in the manifest, which routes to the
+    # user_enum_* tools in knowledge/gap_tools.yaml.
+    identity_required: true
     file_read: false
     needs_oob_sink: false
     blind_capable: false

@@ -271,6 +271,20 @@ def needs_input_field(name) -> bool:
     return bool((get(name) or {}).get("input_field_required"))
 
 
+def needs_identity(name) -> bool:
+    """Must the ACCOUNTS on the target be enumerated before synthesis?
+
+    DECLARED, not inferred. A class whose whole premise is "this principal ends
+    up with privileges it should not have" cannot be built, let alone proven,
+    until something establishes which principals exist and what they already
+    hold. Answered by the user_enum_* tools in knowledge/gap_tools.yaml, which
+    declare `gaps: [identity, ...]`.
+    """
+    if not is_exploitable(name):
+        return False
+    return bool((get(name) or {}).get("identity_required"))
+
+
 def needs_oob_sink(name) -> bool:
     return is_exploitable(name) and bool((get(name) or {}).get("needs_oob_sink"))
 

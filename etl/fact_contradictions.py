@@ -126,11 +126,54 @@ def _check_placeholder_in_value(rule: dict, intel: dict) -> List[dict]:
     return out
 
 
+# A product field can be FILLED and still say nothing. The CVE-Bench runner
+# sends `product=unknown` whenever a challenge's .env carries no
+# APPLICATION_NAME, and other callers use their own blanks. These are the
+# absence of a fingerprint wearing the shape of one.
+_UNFINGERPRINTED = {"unknown", "unidentified", "unidentified service",
+                    "none", "null", "n/a", "na", "-", "?", "undefined",
+                    "generic", "other"}
+
+
+def _identities(intel: dict) -> List[str]:
+    """Every name this run has for what the target IS, placeholders removed.
+
+    `product` is what the CALLER declared; `frameworks` and
+    `secondary_products` are what recon FOUND. A target can be
+    `product=unknown` and `frameworks=['WordPress']` at the same time — that is
+    not an unidentified target, it is an unidentified caller."""
+    names = [intel.get("product")]
+    for key in ("frameworks", "secondary_products"):
+        v = intel.get(key)
+        for item in (v if isinstance(v, (list, tuple, set)) else ([v] if v else [])):
+            # secondary_products rows are dicts ({"product": ..., "version": ...});
+            # detected_frameworks are plain strings. Take either.
+            if isinstance(item, dict):
+                names.append(item.get("product") or item.get("name"))
+            else:
+                names.append(item)
+    out = []
+    for n in names:
+        n = _norm(n)
+        if n and n not in _UNFINGERPRINTED and n not in out:
+            out.append(n)
+    return out
+
+
 def _check_route_product_mismatch(rule: dict, intel: dict) -> List[dict]:
-    product = _norm(intel.get("product"))
+    identities = _identities(intel)
     endpoint = (intel.get("facts") or {}).get("endpoint")
-    if not product or not endpoint:
-        return []          # nothing to contradict
+    if not identities or not endpoint:
+        # Nothing to contradict. An UNFINGERPRINTED target is the loud case:
+        # this rule used to read the literal string "unknown" as a product
+        # name, so every wp-*/jira/grafana route on a target nobody had
+        # identified was "another product's route". On CVE-2023-37999
+        # (2026-10-22) that downgraded the endpoint on a target the same run
+        # had fingerprinted as WordPress 6.8.3 four separate times, with the
+        # finding reading `carries a route marker for 'wordpress', but the
+        # target was fingerprinted as 'unknown'`. You cannot prove a route
+        # belongs to ANOTHER product without knowing which product this is.
+        return []
     segs = _segments(endpoint)
     joined = "/".join(segs)
     out = []
@@ -140,12 +183,12 @@ def _check_route_product_mismatch(rule: dict, intel: dict) -> List[dict]:
         if not hit:
             continue
         own = _norm(owner)
-        # The marker's owner IS the fingerprinted product (either containing
-        # the other) -> consistent, not a contradiction.
-        if own and (own in product or product in own):
+        # The marker's owner IS something this target was identified as
+        # (either containing the other) -> consistent, not a contradiction.
+        if own and any(own in ident or ident in own for ident in identities):
             continue
         out.append({"item": "endpoint", "value": str(endpoint)[:200],
-                    "owner": own, "product": product, "marker": m})
+                    "owner": own, "product": identities[0], "marker": m})
     return out
 
 
